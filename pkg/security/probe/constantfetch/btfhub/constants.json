@@ -1,5 +1,5 @@
 {
-	"commit": "0810ea32e42a7caeeb884d6d34e5d80ab06b5396",
+	"commit": "12986b7127d3a55b9737b527c50b0141e4cab6e9",
 	"constants": [
 		{
 			"binprm_file_offset": 168,
@@ -13409,6 +13409,13 @@
 			"distrib": "ol",
 			"version": "7",
 			"arch": "arm64",
+			"uname_release": "4.14.35-2047.532.3.el7uek.aarch64",
+			"cindex": 78
+		},
+		{
+			"distrib": "ol",
+			"version": "7",
+			"arch": "arm64",
 			"uname_release": "4.14.35-2048.el7uek.aarch64",
 			"cindex": 77
 		},
@@ -14138,6 +14145,13 @@
 			"version": "7",
 			"arch": "x86_64",
 			"uname_release": "3.10.0-1160.105.1.0.1.el7.x86_64",
+			"cindex": 82
+		},
+		{
+			"distrib": "ol",
+			"version": "7",
+			"arch": "x86_64",
+			"uname_release": "3.10.0-1160.105.1.0.2.el7.x86_64",
 			"cindex": 82
 		},
 		{
@@ -15839,6 +15853,13 @@
 			"version": "7",
 			"arch": "x86_64",
 			"uname_release": "4.1.12-124.80.1.el7uek.x86_64",
+			"cindex": 83
+		},
+		{
+			"distrib": "ol",
+			"version": "7",
+			"arch": "x86_64",
+			"uname_release": "4.1.12-124.81.2.el7uek.x86_64",
 			"cindex": 83
 		},
 		{
@@ -18436,6 +18457,13 @@
 			"version": "7",
 			"arch": "x86_64",
 			"uname_release": "4.14.35-2047.532.2.el7uek.x86_64",
+			"cindex": 86
+		},
+		{
+			"distrib": "ol",
+			"version": "7",
+			"arch": "x86_64",
+			"uname_release": "4.14.35-2047.532.3.el7uek.x86_64",
 			"cindex": 86
 		},
 		{
