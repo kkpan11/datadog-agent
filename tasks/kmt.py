@@ -56,6 +56,7 @@ from tasks.system_probe import (
     BPF_TAG,
     EMBEDDED_SHARE_DIR,
     NPM_TAG,
+    TEST_HELPER_CBINS,
     TEST_PACKAGES_LIST,
     check_for_ninja,
     get_ebpf_build_dir,
@@ -166,6 +167,12 @@ def gen_config(
     else:
         vcpu = DEFAULT_VCPU if vcpu is None else vcpu
         memory = DEFAULT_MEMORY if memory is None else memory
+
+        if use_local_if_possible:
+            raise Exit(
+                "--use-local-if-possible can only be used with --from-ci-pipeline. If you want to set up local VMs, use the local specifier in the VM list (e.g., ubuntu_22-distro-local instead of ubuntu_22-distro-arm64)"
+            )
+
         vmconfig.gen_config(
             ctx, stack, vms, sets, init_stack, vcpu, memory, new, ci, arch, output_file, vmconfig_template, yes=yes
         )
@@ -226,7 +233,9 @@ def gen_config_from_ci_pipeline(
                 if result is False:
                     package, test = test.split(":", maxsplit=1)
                     failed_tests.add(test)
-                    failed_packages.add(package)
+                    failed_packages.add(
+                        f"./{package}"
+                    )  # Use relative path to the package so the suggestions for kmt.test work correctly
                 elif result is True:  # It can also be None if the test was skipped
                     successful_tests.add(test)
 
@@ -411,11 +420,8 @@ def config_ssh_key(ctx: Context):
             ssh_keys = []
 
             for f in ssh_key_files:
-                key_comment = get_ssh_key_name(f.with_suffix(".pub"))
-                if key_comment is None:
-                    warn(f"[x] {f} does not have a valid key name, cannot be used")
-                else:
-                    ssh_keys.append({'path': os.fspath(f), 'name': key_comment, 'aws_key_name': ''})
+                key_name = get_ssh_key_name(f.with_suffix(".pub")) or f.name
+                ssh_keys.append({'path': os.fspath(f), 'name': key_name, 'aws_key_name': ''})
 
         keys_str = "\n".join([f" - [{i + 1}] {key['name']} (path: {key['path']})" for i, key in enumerate(ssh_keys)])
         result = ask(f"[?] Found these valid key files:\n{keys_str}\nChoose one of these files (1-{len(ssh_keys)}): ")
@@ -426,6 +432,10 @@ def config_ssh_key(ctx: Context):
         except IndexError as e:  # out of range
             raise Exit(f"Invalid choice {result}, must be a number between 1 and {len(ssh_keys)} (inclusive)") from e
 
+        info("[+] KMT needs this SSH key to be loaded in AWS so that it can be used to access the instances")
+        info(
+            "[+] If you haven't loaded it yet, go to https://dtdg.co/aws-sso-prod -> DataDog Sandbox -> EC2 -> Network & Security -> Key Pairs"
+        )
         aws_key_name = ask(
             f"Enter the key name configured in AWS for this key (leave blank to set the same as the local key name '{ssh_key['name']}'): "
         )
@@ -541,6 +551,11 @@ def ninja_define_rules(nw: NinjaWriter):
         command="$chdir && $env $go build -o $out $tags $ldflags $in $tool",
     )
     nw.rule(name="copyfiles", command="mkdir -p $$(dirname $out) && install $in $out $mode")
+
+    nw.rule(
+        name="cbin",
+        command="$cc $cflags -o $out $in $ldflags",
+    )
 
 
 def ninja_build_dependencies(ctx: Context, nw: NinjaWriter, kmt_paths: KMTPaths, go_path: str, arch: Arch):
@@ -872,12 +887,12 @@ def build_run_config(run: str | None, packages: list[str]):
     return c
 
 
-def build_target_packages(filter_packages):
-    all_packages = go_package_dirs(TEST_PACKAGES_LIST, [NPM_TAG, BPF_TAG])
-    if filter_packages == []:
+def build_target_packages(filter_packages: list[str], build_tags: list[str]):
+    all_packages = go_package_dirs(TEST_PACKAGES_LIST, build_tags)
+    if not filter_packages:
         return all_packages
 
-    filter_packages = [os.path.relpath(p) for p in go_package_dirs(filter_packages, [NPM_TAG, BPF_TAG])]
+    filter_packages = [os.path.relpath(p) for p in go_package_dirs(filter_packages, build_tags)]
     return [pkg for pkg in all_packages if os.path.relpath(pkg) in filter_packages]
 
 
@@ -887,9 +902,8 @@ def build_object_files(ctx, fp, arch: Arch):
     ctx.run(f"ninja -d explain -f {fp}")
 
 
-def compute_package_dependencies(ctx: Context, packages: list[str]) -> dict[str, set[str]]:
+def compute_package_dependencies(ctx: Context, packages: list[str], build_tags: list[str]) -> dict[str, set[str]]:
     dd_pkg_name = "github.com/DataDog/datadog-agent/"
-    build_tags = get_sysprobe_buildtags(False, False)
     pkg_deps: dict[str, set[str]] = defaultdict(set)
 
     packages_list = " ".join(packages)
@@ -923,7 +937,6 @@ def kmt_sysprobe_prepare(
     ctx: Context,
     arch: str | Arch,
     stack: str | None = None,
-    kernel_release: str | None = None,
     packages=None,
     extra_arguments: str | None = None,
     ci: bool = False,
@@ -956,8 +969,9 @@ def kmt_sysprobe_prepare(
     build_object_files(ctx, f"{kmt_paths.arch_dir}/kmt-object-files.ninja", arch)
 
     info("[+] Computing Go dependencies for test packages...")
-    target_packages = build_target_packages(filter_pkgs)
-    pkg_deps = compute_package_dependencies(ctx, target_packages)
+    build_tags = get_sysprobe_buildtags(False, False)
+    target_packages = build_target_packages(filter_pkgs, build_tags)
+    pkg_deps = compute_package_dependencies(ctx, target_packages, build_tags)
 
     info("[+] Generating build instructions..")
     with open(nf_path, 'w') as ninja_file:
@@ -976,6 +990,7 @@ def kmt_sysprobe_prepare(
         ninja_build_dependencies(ctx, nw, kmt_paths, go_path, arch)
         ninja_copy_ebpf_files(nw, "system-probe", kmt_paths, arch)
 
+        build_tags = get_sysprobe_buildtags(False, False)
         for pkg in target_packages:
             pkg_name = os.path.relpath(pkg, os.getcwd())
             target_path = os.path.join(kmt_paths.sysprobe_tests, pkg_name)
@@ -983,7 +998,7 @@ def kmt_sysprobe_prepare(
             variables = {
                 "env": env_str,
                 "go": go_path,
-                "build_tags": get_sysprobe_buildtags(False, False),
+                "build_tags": build_tags,
             }
             timeout = get_test_timeout(os.path.relpath(pkg, os.getcwd()))
             if timeout:
@@ -1015,9 +1030,9 @@ def kmt_sysprobe_prepare(
                     rule="copyfiles",
                 )
 
-        # handle testutils and testdata seperately since they are
+        # handle testutils and testdata separately since they are
         # shared across packages
-        target_pkgs = build_target_packages([])
+        target_pkgs = build_target_packages([], build_tags)
         for pkg in target_pkgs:
             target_path = os.path.join(kmt_paths.sysprobe_tests, os.path.relpath(pkg, os.getcwd()))
 
@@ -1033,6 +1048,7 @@ def kmt_sysprobe_prepare(
                 "fmapper",
                 "prefetch_file",
                 "fake_server",
+                "sample_service",
             ]:
                 src_file_path = os.path.join(pkg, f"{gobin}.go")
                 if os.path.isdir(pkg) and os.path.isfile(src_file_path):
@@ -1048,6 +1064,19 @@ def kmt_sysprobe_prepare(
                             "tags": "-tags=\"test\"",
                             "ldflags": "-ldflags=\"-extldflags '-static'\"",
                             "env": env_str,
+                        },
+                    )
+
+            for cbin in TEST_HELPER_CBINS:
+                source = Path(pkg) / "testdata" / f"{cbin}.c"
+                if source.is_file():
+                    binary_path = os.path.join(target_path, "testdata", cbin)
+                    nw.build(
+                        inputs=[os.fspath(source)],
+                        outputs=[binary_path],
+                        rule="cbin",
+                        variables={
+                            "cc": "clang",
                         },
                     )
 
