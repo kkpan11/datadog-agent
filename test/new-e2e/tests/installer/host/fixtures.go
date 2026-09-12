@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +38,7 @@ func (h *Host) uploadFixtures() {
 	for _, fixture := range fixtures {
 		if filepath.Ext(fixture.Name()) == ".sh" {
 			fixturePath := filepath.Join("/opt/fixtures", fixture.Name())
-			h.remote.MustExecute(fmt.Sprintf("chmod +x %s", fixturePath))
+			h.remote.MustExecute("chmod +x " + fixturePath)
 		}
 	}
 
@@ -73,7 +73,8 @@ func (h *Host) CallExamplePythonApp(traceID string) {
 // StartExamplePythonAppInDocker starts the example Python app in Docker
 func (h *Host) StartExamplePythonAppInDocker() {
 	h.WaitForTraceAgentSocketReady()
-	h.remote.MustExecute(`sudo docker run --name python-app -d -p 8081:8080 -v /opt/fixtures/http_server.py:/usr/src/app/http_server.py public.ecr.aws/docker/library/python:3.8-slim python /usr/src/app/http_server.py`)
+	h.remote.MustExecute(fmt.Sprintf("sudo docker run --name python-app -d -p 8081:8080 -v /opt/fixtures/http_server.py:/usr/src/app/http_server.py %s python /usr/src/app/http_server.py",
+		h.dockerImage("dockerhub/library/python:3.9-slim", "python:3.9-slim")))
 }
 
 // StopExamplePythonAppInDocker stops the example Python app in Docker

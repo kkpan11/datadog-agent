@@ -27,7 +27,7 @@ type PoliciesDirProvider struct {
 }
 
 // SetOnNewPoliciesReadyCb implements the policy provider interface
-func (p *PoliciesDirProvider) SetOnNewPoliciesReadyCb(_ func()) {}
+func (p *PoliciesDirProvider) SetOnNewPoliciesReadyCb(_ func(silent bool)) {}
 
 // Start starts the policy dir provider
 func (p *PoliciesDirProvider) Start() {}
@@ -35,22 +35,22 @@ func (p *PoliciesDirProvider) Start() {}
 func (p *PoliciesDirProvider) loadPolicy(filename string, macroFilters []MacroFilter, ruleFilters []RuleFilter) (*Policy, error) {
 	f, err := os.Open(filename)
 	if err != nil {
-		return nil, &ErrPolicyLoad{Name: filename, Err: err}
+		return nil, &ErrPolicyLoad{Name: filename, Source: PolicyProviderTypeDir, Err: err}
 	}
 	defer f.Close()
 
 	name := filepath.Base(filename)
-	var policyType PolicyType
+	var internalPolicyType InternalPolicyType
 	if name == DefaultPolicyName {
-		policyType = DefaultPolicyType
+		internalPolicyType = DefaultPolicyType
 	} else {
-		policyType = CustomPolicyType
+		internalPolicyType = CustomPolicyType
 	}
 
 	pInfo := &PolicyInfo{
-		Name:   name,
-		Source: PolicyProviderTypeDir,
-		Type:   policyType,
+		Name:         name,
+		Source:       PolicyProviderTypeDir,
+		InternalType: internalPolicyType,
 	}
 
 	return LoadPolicy(pInfo, f, macroFilters, ruleFilters)

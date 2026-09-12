@@ -12,16 +12,48 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	model "github.com/DataDog/agent-payload/v5/process"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	taggertypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	wmutil "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/util"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/common"
 	k8sTransformers "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/transformers/k8s"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
-	"github.com/DataDog/datadog-agent/pkg/orchestrator/redact"
+	"github.com/DataDog/datadog-agent/pkg/redact"
 )
 
 // NetworkPolicyHandlers implements the Handlers interface for Kubernetes NetworkPolicy.
 type NetworkPolicyHandlers struct {
 	common.BaseHandlers
+	tagger tagger.Component
+}
+
+// NewNetworkPolicyHandlers creates a new NetworkPolicyHandlers.
+func NewNetworkPolicyHandlers(tagger tagger.Component) *NetworkPolicyHandlers {
+	return &NetworkPolicyHandlers{tagger: tagger}
+}
+
+// EnrichModel is a handler called before cache lookup.
+//
+//nolint:revive
+func (h *NetworkPolicyHandlers) EnrichModel(ctx processors.ProcessorContext, resource, resourceModel interface{}) (skip bool) {
+	r := resource.(*netv1.NetworkPolicy)
+	m := resourceModel.(*model.NetworkPolicy)
+
+	entityID := taggertypes.NewEntityID(
+		taggertypes.KubernetesMetadata,
+		string(wmutil.GenerateKubeMetadataEntityID(ctx.GetCollectorGroup(), ctx.GetCollectorName(), r.Namespace, r.Name)),
+	)
+	taggerTags, err := h.tagger.Tag(entityID, taggertypes.HighCardinality)
+	if err != nil {
+		log.Debugf("Could not retrieve tags for networkpolicy %s/%s: %s", r.Namespace, r.Name, err)
+		return
+	}
+
+	m.Tags = append(m.Tags, taggerTags...)
+	return
 }
 
 // AfterMarshalling is a handler called after resource marshalling.
@@ -60,6 +92,7 @@ func (h *NetworkPolicyHandlers) BuildMessageBody(ctx processors.ProcessorContext
 		GroupSize:       int32(groupSize),
 		NetworkPolicies: models,
 		Tags:            util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
+		AgentVersion:    ctx.GetAgentVersion(),
 	}
 }
 
@@ -80,10 +113,24 @@ func (h *NetworkPolicyHandlers) ResourceList(ctx processors.ProcessorContext, li
 	resources = make([]interface{}, 0, len(resourceList))
 
 	for _, resource := range resourceList {
-		resources = append(resources, resource.DeepCopy())
+		resources = append(resources, resource)
 	}
 
 	return resources
+}
+
+// CloneResource returns a deep copy of the resource.
+//
+//nolint:revive
+func (h *NetworkPolicyHandlers) CloneResource(resource interface{}) interface{} {
+	return resource.(*netv1.NetworkPolicy).DeepCopy()
+}
+
+// ResourceVersionFromRaw returns the resource version from the raw resource.
+//
+//nolint:revive
+func (h *NetworkPolicyHandlers) ResourceVersionFromRaw(_ processors.ProcessorContext, resource interface{}) string {
+	return resource.(*netv1.NetworkPolicy).ResourceVersion
 }
 
 // ResourceUID is a handler called to retrieve the resource UID.

@@ -10,16 +10,16 @@ import (
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners"
-	awsdocker "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/docker"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/apps"
-	"github.com/DataDog/test-infra-definitions/components/docker"
-	"github.com/DataDog/test-infra-definitions/resources/aws"
-	"github.com/DataDog/test-infra-definitions/scenarios/aws/ec2"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/apps"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/docker"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/resources/aws"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2docker"
 )
 
 type dockerHostNginxEnv struct {
@@ -39,11 +39,11 @@ func dockerHostHttpbinEnvProvisioner() provisioners.PulumiEnvRunFunc[dockerHostN
 			return err
 		}
 
-		opts := []awsdocker.ProvisionerOption{
-			awsdocker.WithAgentOptions(systemProbeConfigNPMEnv()...),
+		opts := []ec2docker.Option{
+			ec2docker.WithAgentOptions(systemProbeConfigNPMEnv()...),
 		}
-		params := awsdocker.GetProvisionerParams(opts...)
-		awsdocker.Run(ctx, &env.DockerHost, awsdocker.RunParams{Environment: &awsEnv, ProvisionerParams: params})
+		params := ec2docker.GetParams(opts...)
+		ec2docker.Run(ctx, awsEnv, &env.DockerHost, params)
 
 		vmName := "httpbinvm"
 
@@ -56,8 +56,7 @@ func dockerHostHttpbinEnvProvisioner() provisioners.PulumiEnvRunFunc[dockerHostN
 			return err
 		}
 
-		// install docker.io
-		manager, err := docker.NewManager(&awsEnv, nginxHost)
+		manager, err := docker.NewAWSManager(&awsEnv, nginxHost)
 		if err != nil {
 			return err
 		}
@@ -92,8 +91,6 @@ func (v *ec2VMContainerizedSuite) SetupSuite() {
 	// SetupSuite needs to defer CleanupOnSetupFailure() if what comes after BaseSuite.SetupSuite() can fail.
 	defer v.CleanupOnSetupFailure()
 
-	v.Env().RemoteHost.MustExecute("sudo apt install -y apache2-utils")
-
 	// prefetch docker image locally
 	v.Env().RemoteHost.MustExecute("docker pull ghcr.io/datadog/apps-npm-tools:" + apps.Version)
 }
@@ -122,7 +119,7 @@ func (v *ec2VMContainerizedSuite) AfterTest(suiteName, testName string) {
 //
 // The test start by 00 to validate the agent/system-probe is up and running
 func (v *ec2VMContainerizedSuite) Test00FakeIntakeNPM_HostRequests() {
-	testURL := "http://" + v.Env().HTTPBinHost.Address + "/"
+	testURL := "http://" + v.Env().HTTPBinHost.Address + ":8080/"
 
 	// generate a connection
 	v.Env().RemoteHost.MustExecute("curl " + testURL)
@@ -135,10 +132,10 @@ func (v *ec2VMContainerizedSuite) Test00FakeIntakeNPM_HostRequests() {
 //   - looking for 1 host to send CollectorConnections payload to the fakeintake
 //   - looking for 3 payloads and check if the last 2 have a span of 30s +/- 500ms
 func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM_DockerRequests() {
-	testURL := "http://" + v.Env().HTTPBinHost.Address + "/"
+	testURL := "http://" + v.Env().HTTPBinHost.Address + ":8080/"
 
 	// generate a connection
-	v.Env().RemoteHost.MustExecute("docker run ghcr.io/datadog/apps-npm-tools:" + apps.Version + " curl " + testURL)
+	v.Env().RemoteHost.MustExecute("docker run --rm ghcr.io/datadog/apps-npm-tools:" + apps.Version + " curl " + testURL)
 
 	test1HostFakeIntakeNPM(&v.BaseSuite, v.Env().FakeIntake)
 }
@@ -148,7 +145,7 @@ func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM_DockerRequests() {
 //   - looking for 1 host to send CollectorConnections payload to the fakeintake
 //   - looking for n payloads and check if the last 2 have a maximum span of 200ms
 func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM600cnxBucket_HostRequests() {
-	testURL := "http://" + v.Env().HTTPBinHost.Address + "/"
+	testURL := "http://" + v.Env().HTTPBinHost.Address + ":8080/"
 
 	// generate connections
 	v.Env().RemoteHost.MustExecute("ab -n 600 -c 600 " + testURL)
@@ -161,10 +158,10 @@ func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM600cnxBucket_HostRequests() {
 //   - looking for 1 host to send CollectorConnections payload to the fakeintake
 //   - looking for n payloads and check if the last 2 have a maximum span of 200ms
 func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM600cnxBucket_DockerRequests() {
-	testURL := "http://" + v.Env().HTTPBinHost.Address + "/"
+	testURL := "http://" + v.Env().HTTPBinHost.Address + ":8080/"
 
 	// generate connections
-	v.Env().RemoteHost.MustExecute("docker run ghcr.io/datadog/apps-npm-tools:" + apps.Version + " ab -n 600 -c 600 " + testURL)
+	v.Env().RemoteHost.MustExecute("docker run --rm ghcr.io/datadog/apps-npm-tools:" + apps.Version + " ab -n 600 -c 600 " + testURL)
 
 	test1HostFakeIntakeNPM600cnxBucket(&v.BaseSuite, v.Env().FakeIntake)
 }
@@ -172,7 +169,7 @@ func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM600cnxBucket_DockerRequests()
 // TestFakeIntakeNPM_TCP_UDP_DNS_HostRequests validate we received tcp, udp, and DNS connections
 // with some basic checks, like IPs/Ports present, DNS query has been captured, ...
 func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM_TCP_UDP_DNS_HostRequests() {
-	testURL := "http://" + v.Env().HTTPBinHost.Address + "/"
+	testURL := "http://" + v.Env().HTTPBinHost.Address + ":8080/"
 
 	// generate connections
 	v.Env().RemoteHost.MustExecute("curl " + testURL)
@@ -184,11 +181,11 @@ func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM_TCP_UDP_DNS_HostRequests() {
 // TestFakeIntakeNPM_TCP_UDP_DNS_DockerRequests validate we received tcp, udp, and DNS connections
 // with some basic checks, like IPs/Ports present, DNS query has been captured, ...
 func (v *ec2VMContainerizedSuite) TestFakeIntakeNPM_TCP_UDP_DNS_DockerRequests() {
-	testURL := "http://" + v.Env().HTTPBinHost.Address + "/"
+	testURL := "http://" + v.Env().HTTPBinHost.Address + ":8080/"
 
 	// generate connections
-	v.Env().RemoteHost.MustExecute("docker run ghcr.io/datadog/apps-npm-tools:" + apps.Version + " curl " + testURL)
-	v.Env().RemoteHost.MustExecute("docker run ghcr.io/datadog/apps-npm-tools:" + apps.Version + " dig @8.8.8.8 www.google.ch")
+	v.Env().RemoteHost.MustExecute("docker run --rm ghcr.io/datadog/apps-npm-tools:" + apps.Version + " curl " + testURL)
+	v.Env().RemoteHost.MustExecute("docker run --rm ghcr.io/datadog/apps-npm-tools:" + apps.Version + " dig @8.8.8.8 www.google.ch")
 
 	test1HostFakeIntakeNPMTCPUDPDNS(&v.BaseSuite, v.Env().FakeIntake)
 }

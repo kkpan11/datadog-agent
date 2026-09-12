@@ -7,17 +7,9 @@ package model
 
 import "time"
 
-var processContextZero = ProcessCacheEntry{}
-
 // NewPlaceholderProcessCacheEntry returns an empty process cache entry for failed process resolutions
 func NewPlaceholderProcessCacheEntry(pid uint32) *ProcessCacheEntry {
 	return &ProcessCacheEntry{ProcessContext: ProcessContext{Process: Process{PIDContext: PIDContext{Pid: pid}}}}
-}
-
-// GetPlaceholderProcessCacheEntry returns an empty process cache entry for failed process resolutions
-func GetPlaceholderProcessCacheEntry(pid uint32) *ProcessCacheEntry {
-	processContextZero.Pid = pid
-	return &processContextZero
 }
 
 // SetAncestor sets the ancestor
@@ -26,13 +18,8 @@ func (pc *ProcessCacheEntry) SetAncestor(parent *ProcessCacheEntry) {
 		return
 	}
 
-	if pc.Ancestor != nil {
-		pc.Ancestor.Release()
-	}
-
 	pc.Ancestor = parent
 	pc.Parent = &parent.Process
-	parent.Retain()
 }
 
 // Exit a process

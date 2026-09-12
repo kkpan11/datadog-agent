@@ -37,7 +37,7 @@ func (cw *ChannelWriter) Write(p []byte) (n int, err error) {
 	// Flush full stacktrace without splitting by new line
 	if cw.IsError {
 		cw.sendPayload(p)
-		return
+		return len(p), nil
 	}
 
 	n, err = cw.Buffer.Write(p)
@@ -46,10 +46,10 @@ func (cw *ChannelWriter) Write(p []byte) (n int, err error) {
 	}
 
 	for {
-		line, err := cw.Buffer.ReadString('\n')
+		line, err := cw.Buffer.ReadBytes('\n')
 		if err == io.EOF {
 			// If EOF, push the line back to buffer and wait for more data
-			cw.Buffer.WriteString(line)
+			cw.Buffer.Write(line)
 			break
 		}
 		if err != nil {
@@ -61,14 +61,17 @@ func (cw *ChannelWriter) Write(p []byte) (n int, err error) {
 			continue
 		}
 
-		cw.sendPayload([]byte(line[:len(line)-1]))
+		cw.sendPayload(line[:len(line)-1])
 	}
 	return n, nil
 }
 
 func (cw *ChannelWriter) sendPayload(payload []byte) {
+	bufCopy := make([]byte, len(payload))
+	copy(bufCopy, payload)
+
 	channelMessage := &logConfig.ChannelMessage{
-		Content: payload,
+		Content: bufCopy,
 		IsError: cw.IsError,
 	}
 

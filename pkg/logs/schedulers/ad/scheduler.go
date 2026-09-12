@@ -3,18 +3,19 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//nolint:revive // TODO(AML) Fix revive linter
+// Package ad provides autodiscovery-based log scheduling
 package ad
 
 import (
 	"fmt"
 	"strings"
 
-	yaml "gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
+	autodiscovery "github.com/DataDog/datadog-agent/comp/core/autodiscovery/def"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	logsConfig "github.com/DataDog/datadog-agent/comp/logs/agent/config"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/util/adlistener"
@@ -36,10 +37,18 @@ type Scheduler struct {
 
 var _ schedulers.Scheduler = &Scheduler{}
 
-// New creates a new scheduler.
+// New creates a new scheduler with the default name ("logs-agent AD scheduler").
+// Use NewNamed to create a scheduler with a custom name.
 func New(ac autodiscovery.Component) schedulers.Scheduler {
+	return NewNamed(ac, "logs-agent AD scheduler")
+}
+
+// NewNamed creates a new scheduler with the given name.
+// The name must be unique within autodiscovery — registering two schedulers
+// with the same name causes the second to silently replace the first.
+func NewNamed(ac autodiscovery.Component, name string) schedulers.Scheduler {
 	sch := &Scheduler{}
-	sch.listener = adlistener.NewADListener("logs-agent AD scheduler", ac, sch.Schedule, sch.Unschedule)
+	sch.listener = adlistener.NewADListener(name, ac, sch.Schedule, sch.Unschedule)
 	return sch
 }
 
@@ -64,7 +73,7 @@ func (s *Scheduler) Schedule(configs []integration.Config) {
 		if !config.IsLogConfig() {
 			continue
 		}
-		if config.HasFilter(containers.LogsFilter) {
+		if config.HasFilter(workloadfilter.LogsFilter) {
 			log.Debugf("Config %s is filtered out for logs collection, ignoring it", configName(config))
 			continue
 		}
@@ -76,7 +85,9 @@ func (s *Scheduler) Schedule(configs []integration.Config) {
 				log.Warnf("Invalid configuration: %v", err)
 				continue
 			}
-			for _, source := range sources {
+
+			filtered := s.filterConflictingSources(sources, config.Provider)
+			for _, source := range filtered {
 				s.mgr.AddSource(source)
 			}
 		default:
@@ -86,10 +97,57 @@ func (s *Scheduler) Schedule(configs []integration.Config) {
 	}
 }
 
+// filterConflictingSources filters out sources that conflict with existing
+// sources based on priority.  Manually configured logs (file provider) take
+// precedence over dynamically discovered logs (process_log provider).
+//
+// Note that this makes an assumption that manually configured logs are added
+// before dynamically discovered logs, which should be true since parsing of
+// configuration files is done before discovery of running services.
+func (s *Scheduler) filterConflictingSources(sources []*sourcesPkg.LogSource, provider string) []*sourcesPkg.LogSource {
+	if provider != names.ProcessLog {
+		// For non-process_log providers, add all sources without filtering
+		return sources
+	}
+
+	paths := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		if source.Config.Type == logsConfig.FileType {
+			paths[source.Config.Path] = struct{}{}
+		}
+	}
+
+	// Check for conflicts with existing sources
+	for _, source := range s.mgr.GetSources() {
+		if source.Config.Type != logsConfig.FileType {
+			continue
+		}
+
+		path := source.Config.Path
+		if _, exists := paths[path]; exists {
+			log.Debugf("Ignoring %s config for %s due to existing manual configuration", names.ProcessLog, path)
+			delete(paths, path)
+		}
+	}
+
+	filtered := make([]*sourcesPkg.LogSource, 0, len(sources))
+
+	for _, source := range sources {
+		if source.Config.Type != logsConfig.FileType {
+			filtered = append(filtered, source)
+		} else if _, exists := paths[source.Config.Path]; exists {
+			// This file source wasn't removed due to conflicts
+			filtered = append(filtered, source)
+		}
+	}
+
+	return filtered
+}
+
 // Unschedule removes all the sources and services matching the integration configs.
 func (s *Scheduler) Unschedule(configs []integration.Config) {
 	for _, config := range configs {
-		if !config.IsLogConfig() || config.HasFilter(containers.LogsFilter) {
+		if !config.IsLogConfig() || config.HasFilter(workloadfilter.LogsFilter) {
 			continue
 		}
 		switch {
@@ -139,7 +197,7 @@ func configName(config integration.Config) string {
 	return config.Provider
 }
 
-// createsSources creates new sources from an integration config,
+// CreateSources creates new sources from an integration config,
 // returns an error if the parsing failed.
 func CreateSources(config integration.Config) ([]*sourcesPkg.LogSource, error) {
 	var configs []*logsConfig.LogsConfig
@@ -149,8 +207,8 @@ func CreateSources(config integration.Config) ([]*sourcesPkg.LogSource, error) {
 	case names.File:
 		// config defined in a file
 		configs, err = logsConfig.ParseYAML(config.LogsConfig)
-	case names.Container, names.Kubernetes, names.KubeContainer:
-		// config attached to a container label or a pod annotation
+	case names.Container, names.Kubernetes, names.KubeContainer, names.ProcessLog, names.InstrumentationChecks:
+		// config attached to a container label, a pod annotation, or an instrumentation check
 		configs, err = logsConfig.ParseJSON(config.LogsConfig)
 	case names.RemoteConfig:
 		if pkgconfigsetup.Datadog().GetBool("remote_configuration.agent_integrations.allow_log_config_scheduling") {
@@ -190,17 +248,26 @@ func CreateSources(config integration.Config) ([]*sourcesPkg.LogSource, error) {
 
 	configName := configName(config)
 	var sources []*sourcesPkg.LogSource
-	for _, cfg := range configs {
+	for index, cfg := range configs {
+		// Skip nil configurations
+		if cfg == nil {
+			log.Warnf("Skipping nil log configuration at index %d in config %s", index, configName)
+			continue
+		}
+
 		// if no service is set fall back to the global one
 		if cfg.Service == "" && globalServiceDefined {
 			cfg.Service = commonGlobalOptions.Service
 		}
 
+		cfg.IntegrationSourceIndex = index
+		cfg.IntegrationSource = config.Source
+
 		if service != nil {
 			// a config defined in a container label or a pod annotation does not always contain a type,
 			// override it here to ensure that the config won't be dropped at validation.
-			if (cfg.Type == logsConfig.FileType || cfg.Type == logsConfig.TCPType || cfg.Type == logsConfig.UDPType) && (config.Provider == names.Kubernetes || config.Provider == names.Container || config.Provider == names.KubeContainer || config.Provider == logsConfig.FileType) {
-				// cfg.Type is not overwritten as tailing a file from a Docker or Kubernetes AD configuration
+			if preservesExplicitLogType(config.Provider, cfg.Type) {
+				// cfg.Type is not overwritten as tailing a file from a Docker, Kubernetes, or DDI AD configuration
 				// is explicitly supported (other combinations may be supported later)
 				cfg.Identifier = service.Identifier
 			} else {
@@ -220,12 +287,27 @@ func CreateSources(config integration.Config) ([]*sourcesPkg.LogSource, error) {
 		sources = append(sources, source)
 		if err := cfg.Validate(); err != nil {
 			log.Warnf("Invalid logs configuration: %v", err)
-			source.Status.Error(err)
+			source.Status().Error(err)
 			continue
 		}
 	}
 
 	return sources, nil
+}
+
+func preservesExplicitLogType(provider, logType string) bool {
+	switch logType {
+	case logsConfig.FileType, logsConfig.TCPType, logsConfig.UDPType, logsConfig.IntegrationType:
+	default:
+		return false
+	}
+
+	switch provider {
+	case names.Kubernetes, names.Container, names.KubeContainer, logsConfig.FileType, names.ProcessLog, names.InstrumentationChecks:
+		return true
+	default:
+		return false
+	}
 }
 
 // toService creates a new service for an integrationConfig.

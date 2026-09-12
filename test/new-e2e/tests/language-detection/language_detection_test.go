@@ -15,14 +15,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
 
-	"github.com/DataDog/datadog-agent/pkg/util/testutil/flake"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awshost "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/host"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
 )
 
 //go:embed etc/process_config.yaml
@@ -41,39 +40,30 @@ type languageDetectionSuite struct {
 	e2e.BaseSuite[environments.Host]
 }
 
-func TestLanguageDetectionSuite(t *testing.T) {
-	flake.Mark(t)
+func getProvisionerOptions(agentParams []func(*agentparams.Params) error) []awshost.ProvisionerOption {
+	return []awshost.ProvisionerOption{
+		awshost.WithRunOptions(
+			ec2.WithAgentOptions(agentParams...),
+		),
+	}
+}
 
+func TestLanguageDetectionSuite(t *testing.T) {
 	agentParams := []func(*agentparams.Params) error{
 		agentparams.WithAgentConfig(processConfigStr),
 	}
 
 	options := []e2e.SuiteOption{
-		e2e.WithProvisioner(awshost.ProvisionerNoFakeIntake(awshost.WithAgentOptions(agentParams...))),
+		e2e.WithProvisioner(awshost.ProvisionerNoFakeIntake(
+			getProvisionerOptions(agentParams)...,
+		)),
 	}
 
 	e2e.Run(t, &languageDetectionSuite{}, options...)
 }
 
-func (s *languageDetectionSuite) SetupSuite() {
-	s.BaseSuite.SetupSuite()
-	// SetupSuite needs to defer s.CleanupOnSetupFailure() if what comes after BaseSuite.SetupSuite() can fail.
-	defer s.CleanupOnSetupFailure()
-
-	s.installPython()
-	s.installPHP()
-}
-
-func (s *languageDetectionSuite) checkDetectedLanguage(command string, language string, source string) {
-	var pid string
-	require.Eventually(s.T(),
-		func() bool {
-			pid = s.getPidForCommand(command)
-			return len(pid) > 0
-		},
-		60*time.Second, 100*time.Millisecond,
-		fmt.Sprintf("pid not found for command %s", command),
-	)
+func (s *languageDetectionSuite) checkDetectedLanguage(pid string, language string, source string) {
+	s.Env().RemoteHost.MustExecute("kill -0 " + pid) // check PID refers to an existing, signalable process
 
 	var actualLanguage string
 	var err error
@@ -87,18 +77,7 @@ func (s *languageDetectionSuite) checkDetectedLanguage(command string, language 
 			pid, language, actualLanguage, err),
 	)
 
-	s.Env().RemoteHost.MustExecute(fmt.Sprintf("kill -SIGTERM %s", pid))
-}
-
-func (s *languageDetectionSuite) getPidForCommand(command string) string {
-	pid, err := s.Env().RemoteHost.Execute(fmt.Sprintf("ps -C %s -o pid=", command))
-	if err != nil {
-		return ""
-	}
-	pid = strings.TrimSpace(pid)
-	// special handling in case multiple commands match
-	pids := strings.Split(pid, "\n")
-	return pids[0]
+	s.Env().RemoteHost.MustExecute("kill -SIGTERM " + pid)
 }
 
 func (s *languageDetectionSuite) getLanguageForPid(pid string, source string) (string, error) {
@@ -115,6 +94,9 @@ func (s *languageDetectionSuite) getLanguageForPid(pid string, source string) (s
 		if line == headerLine {
 			scanner.Scan() // entity line
 			scanner.Scan() // pid
+			scanner.Scan() // name
+			scanner.Scan() // exe
+			scanner.Scan() // cmdline
 			scanner.Scan() // nspid
 			scanner.Scan() // container id
 			scanner.Scan() // creation time

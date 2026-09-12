@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewPersistentVolumeCollectorVersions builds the group of collector versions.
-func NewPersistentVolumeCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewPersistentVolumeCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewPersistentVolumeCollector(metadataAsTags),
+		NewPersistentVolumeCollector(tagger),
 	)
 }
 
@@ -38,11 +39,7 @@ type PersistentVolumeCollector struct {
 
 // NewPersistentVolumeCollector creates a new collector for the Kubernetes
 // PersistentVolume resource.
-func NewPersistentVolumeCollector(metadataAsTags utils.MetadataAsTags) *PersistentVolumeCollector {
-	resourceType := getResourceType(persistentVolumeName, persistentVolumeVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewPersistentVolumeCollector(tagger tagger.Component) *PersistentVolumeCollector {
 	return &PersistentVolumeCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -50,15 +47,14 @@ func NewPersistentVolumeCollector(metadataAsTags utils.MetadataAsTags) *Persiste
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 persistentVolumeName,
+			Name:                                 utilTypes.PersistentVolumeName,
 			Kind:                                 kubernetes.PersistentVolumeKind,
 			NodeType:                             orchestrator.K8sPersistentVolume,
-			Version:                              persistentVolumeVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.PersistentVolumeGroup,
+			Version:                              utilTypes.PersistentVolumeVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.PersistentVolumeHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewPersistentVolumeHandlers(tagger)),
 	}
 }
 

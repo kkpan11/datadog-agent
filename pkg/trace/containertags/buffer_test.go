@@ -1,0 +1,394 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+// Package containertagsbuffer contains the logic to buffer payloads for container tags
+// enrichment
+package containertagsbuffer
+
+import (
+	"errors"
+	"math/rand"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/DataDog/datadog-agent/pkg/trace/config"
+	"github.com/DataDog/datadog-go/v5/statsd"
+	"github.com/stretchr/testify/assert"
+)
+
+type mockResolver struct {
+	mu       sync.RWMutex
+	tags     []string
+	complete bool
+	err      error
+}
+
+func (m *mockResolver) setTags(t []string, complete bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tags = t
+	m.complete = complete
+}
+
+func (m *mockResolver) Resolve(string) ([]string, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.tags, m.complete, m.err
+}
+
+func TestBuffer_DelayedSuccess(t *testing.T) {
+	synctest.Test(t, syncTestBufferDelayedSuccess)
+}
+
+func syncTestBufferDelayedSuccess(t *testing.T) {
+	mock := &mockResolver{tags: []string{"short_image:java"}}
+
+	buff := newContainerTagsBuffer(&config.AgentConfig{
+		ContainerTagsBuffer: true,
+		MaxMemory:           2000.0,
+	}, &statsd.NoOpClient{})
+	buff.resolveFunc = mock.Resolve
+	buff.Start()
+	defer buff.Stop()
+
+	resultCh := make(chan []string, 1)
+
+	var calledOnce atomic.Int64
+	onResolution := func(ctags []string, _ error, _ *DebugInfo) {
+		calledOnce.Add(1)
+		resultCh <- ctags
+	}
+	pending := buff.AsyncEnrichment("c-delayed", onResolution, 100)
+
+	assert.True(t, pending)
+
+	select {
+	case <-resultCh:
+		t.Fatal("Should have blocked waiting for kube tags")
+	case <-time.After(200 * time.Millisecond):
+		// it's blocked
+	}
+
+	mock.setTags([]string{"short_image:nginx", "kube_pod_name:app"}, true)
+
+	select {
+	case tags := <-resultCh:
+		assert.Contains(t, tags, "kube_pod_name:app", "Should have received the new tags")
+	case <-time.After(10 * time.Second):
+		t.Fatal("Timed out waiting for buffer to resolve")
+	}
+	assert.Equal(t, calledOnce.Load(), int64(1))
+}
+
+func TestIsEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		running  bool
+		expected bool
+	}{
+		{"Running", true, true},
+		{"Not running", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := &config.AgentConfig{}
+			ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+
+			if tt.running {
+				ctb.Start()
+			}
+
+			assert.Equal(t, tt.expected, ctb.IsEnabled())
+			ctb.Stop()
+		})
+	}
+}
+
+func TestMaxSizeNoLimit(t *testing.T) {
+	conf := &config.AgentConfig{}
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	assert.Equal(t, ctb.maxSize, maxSizeForNoLimit)
+}
+
+func TestAsyncEnrichment_DeniedContainer(t *testing.T) {
+	conf := &config.AgentConfig{
+		MaxMemory:           1000,
+		ContainerTagsBuffer: true,
+		ContainerTagsWithCompleteness: func(string) ([]string, bool, error) {
+			return []string{"image:only"}, false, nil
+		},
+	}
+
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.Start()
+	defer ctb.Stop()
+
+	cid := "bad-container"
+
+	// Pre-deny the container
+	ctb.deniedContainers.deny(time.Now(), cid)
+
+	called := false
+	var debugResult *DebugInfo
+	cb := func(_ []string, _ error, d *DebugInfo) { called = true; debugResult = d }
+
+	pending := ctb.AsyncEnrichment(cid, cb, 50)
+
+	assert.False(t, pending, "Denied container should not be pending")
+	assert.True(t, called, "Callback should be called immediately")
+	assert.Equal(t, "denied", debugResult.BufferEvictionReason, "Should report buffer denied")
+	assert.Equal(t, int64(0), ctb.memoryUsage.Load(), "Should not consume buffer memory")
+}
+
+func TestAsyncEnrichment_MemoryLimit(t *testing.T) {
+	synctest.Test(t, syncTestAsyncEnrichmentMemoryLimit)
+}
+
+func syncTestAsyncEnrichmentMemoryLimit(t *testing.T) {
+	mock := &mockResolver{tags: []string{"short_image:java"}}
+	conf := &config.AgentConfig{
+		MaxMemory:                     100, // Max size will be 10 (10%)
+		ContainerTagsBuffer:           true,
+		ContainerTagsWithCompleteness: mock.Resolve,
+	}
+
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.Start()
+	defer ctb.Stop()
+
+	// 1. Fill memory (Payload 10 fills the 10 limit)
+	resolved := make(chan struct{})
+	onResolution := func([]string, error, *DebugInfo) { close(resolved) }
+	ctb.AsyncEnrichment("container-1", onResolution, 10)
+
+	// Memory usage is updated before AsyncEnrichment returns, no polling needed
+	assert.Equal(t, int64(10), ctb.memoryUsage.Load())
+
+	// 2. Try to add another container
+	called := false
+	var debugResult *DebugInfo
+	cb := func(_ []string, _ error, d *DebugInfo) { called = true; debugResult = d }
+
+	pending := ctb.AsyncEnrichment("container-2", cb, 1)
+
+	assert.False(t, pending, "Should be rejected due to memory limit")
+	assert.True(t, called, "Callback should be called immediately on rejection")
+	assert.Equal(t, "max_size", debugResult.BufferEvictionReason, "Should report buffer max size")
+	assert.Equal(t, int64(10), ctb.memoryUsage.Load())
+
+	// 3. memory cleaned post resolution
+	mock.setTags([]string{"kube_t:a"}, true)
+	select {
+	case <-resolved:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for container-1 resolution")
+	}
+	synctest.Wait()
+	assert.Zero(t, ctb.memoryUsage.Load())
+}
+
+func TestAsyncEnrichment_ImmediateResolution(t *testing.T) {
+	conf := &config.AgentConfig{
+		MaxMemory:           10000,
+		ContainerTagsBuffer: true,
+		ContainerTagsWithCompleteness: func(string) ([]string, bool, error) {
+			return []string{"kube_pod_name:abc", "image:123"}, true, nil
+		},
+	}
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.Start()
+	defer ctb.Stop()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	callback := func(tags []string, err error, _ *DebugInfo) {
+		assert.Contains(t, tags, "kube_pod_name:abc")
+		assert.NoError(t, err)
+		wg.Done()
+	}
+
+	pending := ctb.AsyncEnrichment("container-1", callback, 100)
+	assert.False(t, pending, "Should return false as tags were resolved immediately")
+	wg.Wait()
+}
+
+func TestAsyncEnrichment_CompleteWithoutKubeTagsDoesNotBuffer(t *testing.T) {
+	conf := &config.AgentConfig{
+		MaxMemory:           10000,
+		ContainerTagsBuffer: true,
+		ContainerTagsWithCompleteness: func(string) ([]string, bool, error) {
+			return []string{"image:only"}, true, nil
+		},
+	}
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.Start()
+	defer ctb.Stop()
+
+	called := false
+	callback := func(tags []string, err error, debug *DebugInfo) {
+		called = true
+		assert.Equal(t, []string{"image:only"}, tags)
+		assert.NoError(t, err)
+		assert.Nil(t, debug)
+	}
+
+	pending := ctb.AsyncEnrichment("container-complete", callback, 100)
+
+	assert.False(t, pending, "complete tagsets should not be buffered while waiting for kube_tags")
+	assert.True(t, called)
+	assert.Zero(t, ctb.memoryUsage.Load())
+}
+
+func TestAsyncEnrichment_Buffered_Expiration(t *testing.T) {
+	synctest.Test(t, syncTestAsyncEnrichmentBufferedExpiration)
+}
+
+func syncTestAsyncEnrichmentBufferedExpiration(t *testing.T) {
+	conf := &config.AgentConfig{
+		MaxMemory:           10000,
+		ContainerTagsBuffer: true,
+		ContainerTagsWithCompleteness: func(string) ([]string, bool, error) {
+			return []string{"image:only"}, false, nil
+		},
+	}
+
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.bufferDuration = 1 * time.Nanosecond
+	ctb.Start()
+	defer ctb.Stop()
+
+	resultChan := make(chan []string, 1)
+	callback := func(tags []string, _ error, _ *DebugInfo) {
+		resultChan <- tags
+	}
+
+	pending := ctb.AsyncEnrichment("container-expire", callback, 100)
+	assert.True(t, pending)
+
+	assert.Equal(t, ctb.memoryUsage.Load(), int64(100))
+	select {
+	case tags := <-resultChan:
+		assert.Contains(t, tags, "image:only")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for expiration flush")
+	}
+	// Memory is released via defer after the callback returns, so use synctest.Wait
+	// to let it run before the assertion
+	synctest.Wait()
+	assert.Zero(t, ctb.memoryUsage.Load(), "memory should be released after callback")
+
+	// container is now denied
+	assert.True(t, ctb.deniedContainers.shouldDeny(time.Now(), "container-expire"))
+}
+
+func TestAsyncEnrichment_Buffered_HardLimit(t *testing.T) {
+	synctest.Test(t, syncTestAsyncEnrichmentBufferedHardLimit)
+}
+
+func syncTestAsyncEnrichmentBufferedHardLimit(t *testing.T) {
+	conf := &config.AgentConfig{
+		MaxMemory:           10000,
+		ContainerTagsBuffer: true,
+		ContainerTagsWithCompleteness: func(string) ([]string, bool, error) {
+			return []string{"image:only"}, false, nil
+		},
+	}
+
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.hardTimeLimit = 100 * time.Millisecond
+	ctb.Start()
+	defer ctb.Stop()
+
+	resultChan := make(chan []string, 1)
+	callback := func(tags []string, _ error, _ *DebugInfo) {
+		resultChan <- tags
+	}
+
+	pending := ctb.AsyncEnrichment("container-expire", callback, 100)
+	assert.True(t, pending)
+
+	assert.Equal(t, ctb.memoryUsage.Load(), int64(100))
+	select {
+	case tags := <-resultChan:
+		assert.Contains(t, tags, "image:only")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for expiration flush")
+	}
+	// Memory is released via defer after the callback returns, so use synctest.Wait
+	// to let it run before the assertion
+	synctest.Wait()
+	assert.Zero(t, ctb.memoryUsage.Load(), "memory should be released after callback")
+
+	// container is now denied
+	assert.True(t, ctb.deniedContainers.shouldDeny(time.Now(), "container-expire"))
+}
+
+func TestAsyncEnrichment_Concurrent_MixedScenarios(t *testing.T) {
+	synctest.Test(t, syncTestAsyncEnrichmentConcurrentMixedScenarios)
+}
+
+func syncTestAsyncEnrichmentConcurrentMixedScenarios(t *testing.T) {
+	containerIDs := []string{"c-error", "c-to-resolve-1", "c-to-resolve-2", "c-will-expire1", "c-will-expire2"}
+
+	var shouldResolveContainers atomic.Bool
+
+	conf := &config.AgentConfig{
+		MaxMemory:           10 * 1024 * 1024,
+		ContainerTagsBuffer: true,
+		ContainerTagsWithCompleteness: func(cid string) ([]string, bool, error) {
+			if strings.Contains(cid, "c-error") {
+				return nil, false, errors.New("container not found")
+			}
+
+			if shouldResolveContainers.Load() {
+				return []string{"kube_image:" + cid}, true, nil
+			}
+			return []string{"tag:incomplete_tags"}, false, nil
+		},
+	}
+
+	ctb := newContainerTagsBuffer(conf, &statsd.NoOpClient{})
+	ctb.Start()
+
+	var wg sync.WaitGroup
+	var totalExecuted atomic.Int64
+	var totalAsyncCalls atomic.Int64
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				cid := containerIDs[rand.Intn(len(containerIDs))]
+
+				totalAsyncCalls.Add(1)
+				ctb.AsyncEnrichment(cid, func([]string, error, *DebugInfo) { totalExecuted.Add(1) }, 100)
+			}
+		}()
+	}
+
+	time.Sleep(maxBufferDuration + time.Second) // advance time to allow ticker fires and container expiration
+	shouldResolveContainers.Store(true)
+	t.Log("--- SWITCHING STATE: Containers should now resolve with kube_ tags ---")
+	time.Sleep(2 * time.Second) // advance time to allow resolution of buffered containers
+
+	wg.Wait()
+	ctb.Stop()
+	synctest.Wait()
+
+	// memory usage release happens in a deferred call inside the AsyncEnrichment goroutines.
+	assert.Zero(t, ctb.memoryUsage.Load(), "Memory usage should be 0")
+
+	assert.True(t, ctb.deniedContainers.shouldDeny(time.Now(), "c-error"))
+	assert.True(t, ctb.deniedContainers.shouldDeny(time.Now(), "c-will-expire1"))
+	assert.True(t, ctb.deniedContainers.shouldDeny(time.Now(), "c-will-expire2"))
+	assert.Equal(t, totalExecuted.Load(), totalAsyncCalls.Load())
+}

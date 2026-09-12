@@ -16,14 +16,15 @@ import (
 
 // Instance represents an Aurora or RDS instance
 type Instance struct {
-	ID         string
-	ClusterID  string
-	Endpoint   string
-	Port       int32
-	IamEnabled bool
-	Engine     string
-	DbName     string
-	DbmEnabled bool
+	ID           string
+	ClusterID    string
+	Endpoint     string
+	Port         int32
+	IamEnabled   bool
+	Engine       string
+	DbName       string
+	GlobalViewDb string
+	DbmEnabled   bool
 }
 
 // dbNameFromEngine returns the default database name for a given engine type
@@ -42,7 +43,7 @@ func dbNameFromEngine(engine string) (string, error) {
 	}
 }
 
-func makeInstance(db types.DBInstance, dbmTag string) (*Instance, error) {
+func makeInstance(db types.DBInstance, cluster *types.DBCluster, config Config) (*Instance, error) {
 	if db.Endpoint == nil || db.Endpoint.Address == nil {
 		return nil, fmt.Errorf("DBInstance %v missing endpoint", db)
 	}
@@ -87,6 +88,10 @@ func makeInstance(db types.DBInstance, dbmTag string) (*Instance, error) {
 			return nil, fmt.Errorf("engine is nil for instance %v", db)
 		}
 	}
+
+	// If the instance is part of a cluster, fallback to the cluster's tags for the global view db and dbm enabled
+	var instanceGlobalViewDb string
+	var instanceDbmEnabled bool
 	for _, tag := range db.TagList {
 		tagString := ""
 		if tag.Key != nil {
@@ -95,10 +100,43 @@ func makeInstance(db types.DBInstance, dbmTag string) (*Instance, error) {
 		if tag.Value != nil {
 			tagString += ":" + *tag.Value
 		}
-		if tagString == dbmTag {
-			instance.DbmEnabled = true
-			break
+		if tag.Key != nil && *tag.Key == config.GlobalViewDbTag && tag.Value != nil {
+			instanceGlobalViewDb = *tag.Value
+		}
+		if tagString == config.DbmTag {
+			instanceDbmEnabled = true
 		}
 	}
+	var clusterGlobalViewDb string
+	var clusterDbmEnabled bool
+	if cluster != nil {
+		for _, tag := range cluster.TagList {
+			tagString := ""
+			if tag.Key != nil {
+				tagString += *tag.Key
+			}
+			if tag.Value != nil {
+				tagString += ":" + *tag.Value
+			}
+			if tag.Key != nil && *tag.Key == config.GlobalViewDbTag && tag.Value != nil {
+				clusterGlobalViewDb = *tag.Value
+			}
+			if tagString == config.DbmTag {
+				clusterDbmEnabled = true
+			}
+		}
+	}
+
+	if instanceGlobalViewDb == "" {
+		instance.GlobalViewDb = clusterGlobalViewDb
+	} else {
+		instance.GlobalViewDb = instanceGlobalViewDb
+	}
+	if !instanceDbmEnabled {
+		instance.DbmEnabled = clusterDbmEnabled
+	} else {
+		instance.DbmEnabled = instanceDbmEnabled
+	}
+
 	return &instance, nil
 }

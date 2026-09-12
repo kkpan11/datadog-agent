@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
@@ -51,7 +51,7 @@ func Test_getScalarValueFromSymbol(t *testing.T) {
 			values:        mockValues,
 			symbol:        profiledefinition.SymbolConfig{OID: "1.2.3.99", Name: "mySymbol"},
 			expectedValue: valuestore.ResultValue{},
-			expectedError: "value for Scalar OID `1.2.3.99` not found in results",
+			expectedError: "OID 1.2.3.99 not found",
 		},
 		{
 			name:   "extract value pattern error",
@@ -64,6 +64,19 @@ func Test_getScalarValueFromSymbol(t *testing.T) {
 			},
 			expectedValue: valuestore.ResultValue{},
 			expectedError: "extract value extractValuePattern does not match (extractValuePattern=abc, srcValue=value1)",
+		},
+		{
+			name:   "OK match pattern with default replacement value",
+			values: mockValues,
+			symbol: profiledefinition.SymbolConfig{
+				OID:                  "1.2.3.4",
+				Name:                 "mySymbol",
+				MatchPatternCompiled: regexp.MustCompile(`[a-z]+(\d)`),
+			},
+			expectedValue: valuestore.ResultValue{
+				Value: "1",
+			},
+			expectedError: "",
 		},
 		{
 			name:   "OK match pattern without replace",
@@ -222,7 +235,7 @@ func Test_getColumnValueFromSymbol(t *testing.T) {
 			values:         mockValues,
 			symbol:         profiledefinition.SymbolConfig{OID: "1.2.3.99", Name: "mySymbol"},
 			expectedValues: nil,
-			expectedError:  "value for Column OID `1.2.3.99` not found in results",
+			expectedError:  "OID 1.2.3.99 not found",
 		},
 		{
 			name:   "invalid extract value pattern",
@@ -596,7 +609,7 @@ metric_tags:
 			},
 			expectedTags: []string(nil),
 			expectedLogs: []logCount{
-				{"[DEBUG] getTagsFromMetricTagConfigList: error getting column value: value for Column OID `1.2.3.4.8.1.2`", 1},
+				{"[DEBUG] getTagsFromMetricTagConfigList: missing OIDs: [1.2.3.4.8.1.2]", 1},
 			},
 		},
 		{
@@ -770,7 +783,7 @@ metric_tags:
 			var b bytes.Buffer
 			w := bufio.NewWriter(&b)
 
-			l, err := log.LoggerFromWriterWithMinLevelAndFormat(w, log.DebugLvl, "[%LEVEL] %FuncShort: %Msg")
+			l, err := log.LoggerFromWriterWithMinLevelAndLvlFuncMsgFormat(w, log.DebugLvl)
 			assert.Nil(t, err)
 			log.SetupLogger(l, "debug")
 
@@ -786,7 +799,7 @@ metric_tags:
 			logs := b.String()
 
 			for _, aLogCount := range tt.expectedLogs {
-				assert.Equal(t, aLogCount.count, strings.Count(logs, aLogCount.log), logs)
+				assert.Equal(t, aLogCount.count, strings.Count(logs, aLogCount.log), "%q\n%q", aLogCount.log, logs)
 			}
 		})
 	}
@@ -1074,7 +1087,7 @@ func Test_getContantMetricValues(t *testing.T) {
 			values:         &valuestore.ResultValueStore{},
 			expectedValues: map[string]valuestore.ResultValue{},
 			expectedLogs: []logCount{
-				{"error getting column value", 1},
+				{"missing OIDs: [1.2.3]", 1},
 			},
 		},
 		{
@@ -1089,7 +1102,7 @@ func Test_getContantMetricValues(t *testing.T) {
 			var b bytes.Buffer
 			w := bufio.NewWriter(&b)
 
-			l, err := log.LoggerFromWriterWithMinLevelAndFormat(w, log.DebugLvl, "[%LEVEL] %FuncShort: %Msg")
+			l, err := log.LoggerFromWriterWithMinLevelAndLvlFuncMsgFormat(w, log.DebugLvl)
 			assert.Nil(t, err)
 			log.SetupLogger(l, "debug")
 

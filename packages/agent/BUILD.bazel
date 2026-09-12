@@ -1,0 +1,130 @@
+# Agent packages
+
+load("@bazel_skylib//lib:selects.bzl", "selects")
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+package(default_visibility = ["//visibility:public"])
+
+string_flag(
+    name = "flavor",
+    build_setting_default = "base",
+    # These values match omnibus.
+    values = [
+        "base",
+        "fips",
+        "heroku",
+        "iot",
+    ],
+)
+
+alias(
+    name = "default_flavor",
+    actual = ":base_flavor",
+)
+
+config_setting(
+    name = "base_flavor",
+    flag_values = {"@@//packages/agent:flavor": "base"},  # buildifier: disable=canonical-repository
+)
+
+config_setting(
+    name = "fips_flavor",
+    flag_values = {"@@//packages/agent:flavor": "fips"},  # buildifier: disable=canonical-repository
+)
+
+config_setting(
+    name = "heroku_flavor",
+    flag_values = {"@@//packages/agent:flavor": "heroku"},  # buildifier: disable=canonical-repository
+)
+
+config_setting(
+    name = "iot_flavor",
+    flag_values = {"@@//packages/agent:flavor": "iot"},  # buildifier: disable=canonical-repository
+)
+
+selects.config_setting_group(
+    name = "linux_default",
+    match_all = [
+        ":base_flavor",
+        "@platforms//os:linux",
+    ],
+)
+
+selects.config_setting_group(
+    name = "linux_fips",
+    match_all = [
+        ":fips_flavor",
+        "@platforms//os:linux",
+    ],
+)
+
+selects.config_setting_group(
+    name = "linux_heroku",
+    match_all = [
+        ":heroku_flavor",
+        "@platforms//os:linux",
+    ],
+)
+
+selects.config_setting_group(
+    name = "macos_x86_64_base",
+    match_all = [
+        ":base_flavor",
+        "//:macos_x86_64",
+    ],
+)
+
+selects.config_setting_group(
+    name = "macos_arm64_base",
+    match_all = [
+        ":base_flavor",
+        "//:macos_arm64",
+    ],
+)
+
+config_setting(
+    name = "linux_x86_64_fips",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    flag_values = {"@@//packages/agent:flavor": "fips"},  # buildifier: disable=canonical-repository
+)
+
+config_setting(
+    name = "linux_arm64_fips",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:arm64",
+    ],
+    flag_values = {"@@//packages/agent:flavor": "fips"},  # buildifier: disable=canonical-repository
+)
+
+config_setting(
+    name = "windows_x86_64_fips",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+    flag_values = {"@@//packages/agent:flavor": "fips"},  # buildifier: disable=canonical-repository
+)
+
+string_flag(
+    name = "host_distribution",
+    build_setting_default = "debian",
+)
+
+config_setting(
+    name = "distribution_debian",
+    flag_values = {"//packages/agent:host_distribution": "debian"},
+)
+
+config_setting(
+    name = "distribution_redhat",
+    flag_values = {"//packages/agent:host_distribution": "redhat"},
+)
+
+config_setting(
+    name = "distribution_suse",
+    flag_values = {"//packages/agent:host_distribution": "suse"},
+)

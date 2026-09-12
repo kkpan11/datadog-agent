@@ -18,30 +18,103 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/system"
+	"github.com/DataDog/datadog-agent/pkg/util/system/socket"
 )
 
 type ipcClient struct {
-	http.Client
-	authToken string
-	config    pkgconfigmodel.Reader
+	innerClient http.Client
+	authToken   string
+	config      pkgconfigmodel.Reader
+}
+
+func ipcTLSHandshakeTimeout(config pkgconfigmodel.Reader, serverTimeout time.Duration) time.Duration {
+	timeout := config.GetDuration("tls_handshake_timeout")
+	if serverTimeout > 0 && (timeout <= 0 || timeout > serverTimeout) {
+		return serverTimeout
+	}
+	return timeout
 }
 
 // NewClient creates a new secure client
 func NewClient(authToken string, clientTLSConfig *tls.Config, config pkgconfigmodel.Reader) ipc.HTTPClient {
+	serverTimeout := config.GetDuration("server_timeout") * time.Second
+	dialer := &net.Dialer{Timeout: serverTimeout}
 	tr := &http.Transport{
-		TLSClientConfig: clientTLSConfig,
+		DialContext:         dialer.DialContext,
+		TLSClientConfig:     clientTLSConfig,
+		TLSHandshakeTimeout: ipcTLSHandshakeTimeout(config, serverTimeout),
+	}
+
+	if vsockAddr := config.GetString("vsock_addr"); vsockAddr != "" {
+		tr.DialContext = func(ctx context.Context, _ string, address string) (net.Conn, error) {
+			if serverTimeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, serverTimeout)
+				defer cancel()
+			}
+
+			_, sPort, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+
+			port, err := strconv.ParseUint(sPort, 10, 16)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port for vsock listener: %v", err)
+			}
+
+			cid, err := socket.ParseVSockAddress(vsockAddr)
+			if err != nil {
+				return nil, err
+			}
+
+			return dialVSockContext(ctx, cid, uint32(port))
+		}
+	} else {
+		clone := tr.Clone()
+		clone.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", config.GetString("agent_ipc.socket_path"))
+		}
+		udsRoundTripper := roundTripAdapter(clone)
+
+		tr.RegisterProtocol("https+unix", udsRoundTripper)
 	}
 
 	return &ipcClient{
-		Client:    http.Client{Transport: tr},
-		authToken: authToken,
-		config:    config,
+		innerClient: http.Client{Transport: tr},
+		authToken:   authToken,
+		config:      config,
 	}
+}
+
+type roundTripWrapper (func(req *http.Request) (*http.Response, error))
+
+func (f roundTripWrapper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func roundTripAdapter(next http.RoundTripper) http.RoundTripper {
+	return roundTripWrapper(func(req *http.Request) (*http.Response, error) {
+		if req.URL == nil {
+			return nil, errors.New("ipc client: unix socket: no request URL")
+		}
+
+		scheme, found := strings.CutSuffix(req.URL.Scheme, "+unix")
+		if !found {
+			return nil, fmt.Errorf("ipc client: unix socket: : missing '+unix' suffix in scheme %s", req.URL.Scheme)
+		}
+
+		req = req.Clone(req.Context())
+		req.URL.Scheme = scheme
+
+		return next.RoundTrip(req)
+	})
 }
 
 func (s *ipcClient) Get(url string, opts ...ipc.RequestOption) (resp []byte, err error) {
@@ -90,16 +163,33 @@ func (s *ipcClient) PostForm(url string, data url.Values, opts ...ipc.RequestOpt
 }
 
 func (s *ipcClient) do(req *http.Request, contentType string, onChunk func([]byte), opts ...ipc.RequestOption) (resp []byte, err error) {
-
 	// Apply all options to the request
+	params := ipc.RequestParams{
+		Request: req,
+		Timeout: s.innerClient.Timeout,
+	}
 	for _, opt := range opts {
-		req = opt(req)
+		opt(&params)
 	}
 
-	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+s.authToken)
+	// Some options replace the request pointer, so we need to make a shallow copy
+	req = params.Request
 
-	r, err := s.Client.Do(req)
+	// Create a shallow copy of the client to avoid modifying the original client's timeout.
+	// This is efficient since http.Client is lightweight and only the Transport field (which is the heavy part)
+	// is shared between copies. This approach enables per-request timeout customization.
+	client := s.innerClient
+	client.Timeout = params.Timeout
+
+	req.Header.Set("Content-Type", contentType)
+	if params.NoAuthToken {
+		// Ensure no Authorization is sent, even if the caller pre-set the header.
+		req.Header.Del("Authorization")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+s.authToken)
+	}
+
+	r, err := client.Do(req)
 
 	if err != nil {
 		return resp, err
@@ -131,7 +221,7 @@ func (s *ipcClient) do(req *http.Request, contentType string, onChunk func([]byt
 	}
 
 	if r.StatusCode >= 400 {
-		return body, errors.New(string(body))
+		return body, fmt.Errorf("status code: %d, body: %s", r.StatusCode, string(body))
 	}
 	return body, nil
 }
@@ -202,29 +292,38 @@ func (end *IPCEndpoint) DoGet(options ...ipc.RequestOption) ([]byte, error) {
 }
 
 // WithCloseConnection is a request option that closes the connection after the request
-func WithCloseConnection(req *http.Request) *http.Request {
+func WithCloseConnection(req *ipc.RequestParams) {
 	req.Close = true
-	return req
 }
 
 // WithLeaveConnectionOpen is a request option that leaves the connection open after the request
-func WithLeaveConnectionOpen(req *http.Request) *http.Request {
+func WithLeaveConnectionOpen(req *ipc.RequestParams) {
 	req.Close = false
-	return req
+}
+
+// WithoutAuthToken skips attaching the IPC bearer token to the request.
+// Use for unauthenticated endpoints (expvar, pprof, /telemetry) that do not verify the token.
+func WithoutAuthToken(req *ipc.RequestParams) {
+	req.NoAuthToken = true
 }
 
 // WithContext is a request option that sets the context for the request
 func WithContext(ctx context.Context) ipc.RequestOption {
-	return func(req *http.Request) *http.Request {
-		req = req.WithContext(ctx)
-		return req
+	return func(params *ipc.RequestParams) {
+		params.Request = params.Request.WithContext(ctx)
+	}
+}
+
+// WithTimeout is a request option that sets the timeout for the request
+func WithTimeout(timeout time.Duration) ipc.RequestOption {
+	return func(params *ipc.RequestParams) {
+		params.Timeout = timeout
 	}
 }
 
 // WithValues is a request option that sets the values for the request
 func WithValues(values url.Values) ipc.RequestOption {
-	return func(req *http.Request) *http.Request {
-		req.URL.RawQuery = values.Encode()
-		return req
+	return func(params *ipc.RequestParams) {
+		params.Request.URL.RawQuery = values.Encode()
 	}
 }

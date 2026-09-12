@@ -3,16 +3,15 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2024-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package tracer
 
 import (
 	"fmt"
 	"io"
+	"maps"
 	"slices"
-
-	"golang.org/x/exp/maps"
 
 	"github.com/DataDog/datadog-agent/pkg/network/netlink"
 )
@@ -38,7 +37,7 @@ func (table *DebugConntrackTable) WriteTo(w io.Writer, maxEntries int) error {
 		return err
 	}
 
-	namespaces := maps.Keys(table.Entries)
+	namespaces := slices.Collect(maps.Keys(table.Entries))
 	slices.Sort(namespaces)
 
 	totalEntries := 0

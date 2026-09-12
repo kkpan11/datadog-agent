@@ -6,13 +6,17 @@
 package workloadmetaimpl
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-
-	"github.com/samber/lo"
+	"path/filepath"
+	"regexp"
 
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
-	wmdef "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
+	"github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/sbomutil"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 /*
@@ -23,21 +27,58 @@ with workloadmeta to dump its state.
 
 // sbomFlareProvider will add the SBOMs of all the images in the flare archive.
 // Note that the generated file uncompressed can be very large
-func (w *workloadmeta) sbomFlareProvider(fb flaretypes.FlareBuilder) error {
+func (w *workloadmeta) sbomFlareProvider(_ context.Context, fb flaretypes.FlareBuilder) error {
 	images := w.ListImages()
+	names := make(map[string]int)
 
-	fields := lo.SliceToMap(images, func(image *wmdef.ContainerImageMetadata) (string, *wmdef.SBOM) {
-		return image.ID, image.SBOM
-	})
+	for _, image := range images {
+		sbom, err := sbomutil.UncompressSBOM(image.SBOM)
+		if err != nil {
+			log.Errorf("Failed to uncompress SBOM for image %s: %v", image.ID, err)
+			continue
+		}
 
-	// Using indent or splitting the file is necessary. Otherwise the scrubber will understand
-	// the file as a single very large token and it will exceed the max buffer size.
-	content, err := json.MarshalIndent(fields, "", "    ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal results to JSON: %v", err)
+		content, err := json.MarshalIndent(sbom, "", "    ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal results to JSON: %v", err)
+		}
+
+		name := idToFileSafe(image.ID)
+
+		// just in case multiple images have the same ID, let's make the name unique
+		counter := names[name]
+		if counter != 0 {
+			name = fmt.Sprintf("%s_%d", name, counter)
+		}
+		names[name]++
+
+		_ = fb.AddFileWithoutScrubbing(filepath.Join("sbom", name+".json"), content)
 	}
 
-	_ = fb.AddFile("sbom.json", content)
-
 	return nil
+}
+
+var invalidChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+func idToFileSafe(id string) string {
+	// replace invalid characters with underscores
+	return invalidChars.ReplaceAllString(id, "_")
+}
+
+func (w *workloadmeta) workloadListFlareProvider(_ context.Context, fb flaretypes.FlareBuilder) error {
+	dump := w.Dump(true)
+	var buf bytes.Buffer
+	dump.Write(&buf)
+	return fb.AddFile("workload-list.log", buf.Bytes())
+}
+
+// fillFlare collects workloadmeta data for the flare archive.
+func (w *workloadmeta) fillFlare(ctx context.Context, fb flaretypes.FlareBuilder) error {
+	// workloadListFlareProvider runs first: it is fast (in-memory dump) and
+	// must not be starved by sbomFlareProvider, which can be slow when many
+	// or large image SBOMs are present and may exhaust the provider timeout.
+	return errors.Join(
+		w.workloadListFlareProvider(ctx, fb),
+		w.sbomFlareProvider(ctx, fb),
+	)
 }

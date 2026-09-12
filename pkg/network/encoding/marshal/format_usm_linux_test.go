@@ -8,6 +8,7 @@
 package marshal
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,7 @@ import (
 	model "github.com/DataDog/agent-payload/v5/process"
 
 	"github.com/DataDog/datadog-agent/pkg/network/protocols"
-	"github.com/DataDog/datadog-agent/pkg/network/protocols/http"
+	"github.com/DataDog/datadog-agent/pkg/network/protocols/tls"
 )
 
 func TestFormatTLSProtocols(t *testing.T) {
@@ -28,7 +29,7 @@ func TestFormatTLSProtocols(t *testing.T) {
 		{
 			name:       "GnuTLS - unknown protocol",
 			protocol:   protocols.Stack{Application: protocols.Unknown},
-			staticTags: http.TLS | http.GnuTLS,
+			staticTags: tls.TLS | tls.GnuTLS,
 			want: &model.ProtocolStack{
 				Stack: []model.ProtocolType{
 					model.ProtocolType_protocolTLS,
@@ -38,7 +39,7 @@ func TestFormatTLSProtocols(t *testing.T) {
 		{
 			name:       "OpenSSL - HTTP protocol",
 			protocol:   protocols.Stack{Application: protocols.HTTP},
-			staticTags: http.TLS | http.OpenSSL,
+			staticTags: tls.TLS | tls.OpenSSL,
 			want: &model.ProtocolStack{
 				Stack: []model.ProtocolType{
 					model.ProtocolType_protocolTLS,
@@ -49,7 +50,7 @@ func TestFormatTLSProtocols(t *testing.T) {
 		{
 			name:       "GoTLS - MySQL protocol",
 			protocol:   protocols.Stack{Application: protocols.MySQL},
-			staticTags: http.TLS | http.Go,
+			staticTags: tls.TLS | tls.Go,
 			want: &model.ProtocolStack{
 				Stack: []model.ProtocolType{
 					model.ProtocolType_protocolTLS,
@@ -70,7 +71,7 @@ func TestFormatTLSProtocols(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equalf(t, tt.want, FormatProtocolStack(tt.protocol, tt.staticTags), "formatProtocol(%v)", tt.protocol)
+			assert.Equalf(t, tt.want, &model.ProtocolStack{Stack: slices.Collect(FormatProtocolStack(tt.protocol, tt.staticTags))}, "formatProtocol(%v)", tt.protocol)
 		})
 	}
 }

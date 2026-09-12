@@ -11,13 +11,12 @@ package apm
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"time"
 
 	"go.uber.org/atomic"
-	yaml "gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	diagnose "github.com/DataDog/datadog-agent/comp/core/diagnose/def"
@@ -51,6 +50,7 @@ type APMCheck struct {
 	stop           chan struct{}
 	stopDone       chan struct{}
 	source         string
+	provider       string
 	telemetry      bool
 	initConfig     string
 	instanceConfig string
@@ -69,6 +69,11 @@ func (c *APMCheck) Version() string {
 // ConfigSource displays the command's source
 func (c *APMCheck) ConfigSource() string {
 	return c.source
+}
+
+// ConfigProvider returns the name of the config provider that issued the check config
+func (c *APMCheck) ConfigProvider() string {
+	return c.provider
 }
 
 // Loader returns the check loader
@@ -103,10 +108,10 @@ func (c *APMCheck) run() error {
 	hname, _ := hostname.Get(context.TODO())
 
 	env := os.Environ()
-	env = append(env, fmt.Sprintf("DD_API_KEY=%s", utils.SanitizeAPIKey(pkgconfigsetup.Datadog().GetString("api_key"))))
-	env = append(env, fmt.Sprintf("DD_HOSTNAME=%s", hname))
-	env = append(env, fmt.Sprintf("DD_DOGSTATSD_PORT=%s", pkgconfigsetup.Datadog().GetString("dogstatsd_port")))
-	env = append(env, fmt.Sprintf("DD_LOG_LEVEL=%s", pkgconfigsetup.Datadog().GetString("log_level")))
+	env = append(env, "DD_API_KEY="+utils.SanitizeAPIKey(pkgconfigsetup.Datadog().GetString("api_key")))
+	env = append(env, "DD_HOSTNAME="+hname)
+	env = append(env, "DD_DOGSTATSD_PORT="+pkgconfigsetup.Datadog().GetString("dogstatsd_port"))
+	env = append(env, "DD_LOG_LEVEL="+pkgconfigsetup.Datadog().GetString("log_level"))
 	cmd.Env = env
 
 	// forward the standard output to the Agent logger
@@ -159,7 +164,7 @@ func (c *APMCheck) run() error {
 }
 
 // Configure configures the APM check with the provided configuration
-func (c *APMCheck) Configure(_ sender.SenderManager, _ uint64, data integration.Data, initConfig integration.Data, source string) error {
+func (c *APMCheck) Configure(_ sender.SenderManager, _ uint64, data integration.Data, initConfig integration.Data, source string, provider string) error {
 	var checkConf apmCheckConf
 	if err := yaml.Unmarshal(data, &checkConf); err != nil {
 		return err
@@ -189,10 +194,11 @@ func (c *APMCheck) Configure(_ sender.SenderManager, _ uint64, data integration.
 
 	// explicitly provide to the trace-agent the agent configuration file
 	if _, err := os.Stat(configFile); !os.IsNotExist(err) {
-		c.commandOpts = append(c.commandOpts, fmt.Sprintf("-config=%s", configFile))
+		c.commandOpts = append(c.commandOpts, "-config="+configFile)
 	}
 
 	c.source = source
+	c.provider = provider
 	c.telemetry = utils.IsCheckTelemetryEnabled("apm", pkgconfigsetup.Datadog())
 	c.initConfig = string(initConfig)
 	c.instanceConfig = string(data)

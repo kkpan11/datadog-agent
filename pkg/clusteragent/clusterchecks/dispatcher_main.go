@@ -9,22 +9,39 @@ package clusterchecks
 
 import (
 	"context"
-	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/tags"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	cctypes "github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
 	"github.com/DataDog/datadog-agent/pkg/util/clusteragent"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/hostname"
 	le "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/leaderelection/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/clustername"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
+
+// toSet builds a lookup set from a config-provided string slice, returning
+// nil for an empty slice instead of allocating an empty map.
+func toSet(items []string) map[string]struct{} {
+	if len(items) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		set[item] = struct{}{}
+	}
+	return set
+}
 
 // dispatcher holds the management logic for cluster-checks
 type dispatcher struct {
@@ -33,15 +50,18 @@ type dispatcher struct {
 	unscheduledCheckThresholdSeconds int64
 	extraTags                        []string
 	clcRunnersClient                 clusteragent.CLCRunnerClientInterface
-	advancedDispatching              bool
+	advancedDispatching              atomic.Bool
 	excludedChecks                   map[string]struct{}
 	excludedChecksFromDispatching    map[string]struct{}
 	rebalancingPeriod                time.Duration
+	shardingStrategies               []shardingStrategy
+	shards                           *shardTracker
 }
 
 func newDispatcher(tagger tagger.Component) *dispatcher {
 	d := &dispatcher{
-		store: newClusterStore(),
+		store:  newClusterStore(),
+		shards: newShardTracker(),
 	}
 	d.nodeExpirationSeconds = pkgconfigsetup.Datadog().GetInt64("cluster_checks.node_expiration_timeout")
 	d.unscheduledCheckThresholdSeconds = pkgconfigsetup.Datadog().GetInt64("cluster_checks.unscheduled_check_threshold")
@@ -61,52 +81,58 @@ func newDispatcher(tagger tagger.Component) *dispatcher {
 		log.Debugf("Adding global tags to cluster check dispatcher: %v", d.extraTags)
 	}
 
-	excludedChecks := pkgconfigsetup.Datadog().GetStringSlice("cluster_checks.exclude_checks")
-	// This option will almost always be empty
-	if len(excludedChecks) > 0 {
-		d.excludedChecks = make(map[string]struct{}, len(excludedChecks))
-		for _, checkName := range excludedChecks {
-			d.excludedChecks[checkName] = struct{}{}
-		}
-	}
-
-	excludedChecksFromDispatching := pkgconfigsetup.Datadog().GetStringSlice("cluster_checks.exclude_checks_from_dispatching")
-	// This option will almost always be empty
-	if len(excludedChecksFromDispatching) > 0 {
-		d.excludedChecksFromDispatching = make(map[string]struct{}, len(excludedChecksFromDispatching))
-		for _, checkName := range excludedChecksFromDispatching {
-			d.excludedChecksFromDispatching[checkName] = struct{}{}
-		}
-	}
-
-	d.rebalancingPeriod = pkgconfigsetup.Datadog().GetDuration("cluster_checks.rebalance_period")
-
 	hname, _ := hostname.Get(context.TODO())
 	clusterTagValue := clustername.GetClusterName(context.TODO(), hname)
 	clusterTagName := pkgconfigsetup.Datadog().GetString("cluster_checks.cluster_tag_name")
 	if clusterTagValue != "" {
 		if clusterTagName != "" && !pkgconfigsetup.Datadog().GetBool("disable_cluster_name_tag_key") {
-			d.extraTags = append(d.extraTags, fmt.Sprintf("%s:%s", clusterTagName, clusterTagValue))
+			d.extraTags = append(d.extraTags, clusterTagName+":"+clusterTagValue)
 			log.Info("Adding both tags cluster_name and kube_cluster_name. You can use 'disable_cluster_name_tag_key' in the Agent config to keep the kube_cluster_name tag only")
 		}
 		d.extraTags = append(d.extraTags, tags.KubeClusterName+":"+clusterTagValue)
 	}
 
-	clusterIDTagValue, _ := clustername.GetClusterID()
+	clusterIDTagValue, err := clustername.GetClusterID()
+	if err != nil {
+		log.Warnf("Failed to get cluster ID: %v", err)
+	}
 	if clusterIDTagValue != "" {
 		d.extraTags = append(d.extraTags, tags.OrchClusterID+":"+clusterIDTagValue)
 	}
 
-	d.advancedDispatching = pkgconfigsetup.Datadog().GetBool("cluster_checks.advanced_dispatching_enabled")
-	if !d.advancedDispatching {
+	// These options will almost always be empty
+	d.excludedChecks = toSet(pkgconfigsetup.Datadog().GetStringSlice("cluster_checks.exclude_checks"))
+	d.excludedChecksFromDispatching = toSet(pkgconfigsetup.Datadog().GetStringSlice("cluster_checks.exclude_checks_from_dispatching"))
+
+	ksmShardingEnabled := pkgconfigsetup.Datadog().GetBool("cluster_checks.ksm_sharding_enabled")
+	if ksmShardingEnabled {
+		// KSM sharding configuration notes:
+		// - Namespace labels/annotations as tags require GLOBAL config (kubernetes_resources_labels_as_tags)
+		// - Check-specific labels_as_tags in KSM config is NOT supported with sharding
+		// - Sharding also breaks check-specific label_joins across different resource types
+		log.Info("KSM resource sharding enabled. For namespace labels/annotations as tags, check-specific config (labels_as_tags in KSM config) is not supported with sharding - use global kubernetes_resources_labels_as_tags instead.")
+	}
+	ksmSharding := newKSMShardingManager(ksmShardingEnabled)
+
+	instanceShardingEnabled := pkgconfigsetup.Datadog().GetBool("cluster_checks.instance_sharding_enabled")
+	excludedInstanceShardingChecks := toSet(pkgconfigsetup.Datadog().GetStringSlice("cluster_checks.instance_sharding_exclude_checks"))
+	instanceSharding := newInstanceShardingManager(instanceShardingEnabled, excludedInstanceShardingChecks)
+
+	d.shardingStrategies = []shardingStrategy{ksmSharding, instanceSharding}
+
+	d.rebalancingPeriod = pkgconfigsetup.Datadog().GetDuration("cluster_checks.rebalance_period")
+	advancedDispatchingEnabled := pkgconfigsetup.Datadog().GetBool("cluster_checks.advanced_dispatching_enabled")
+	if !advancedDispatchingEnabled {
 		return d
 	}
 
 	d.clcRunnersClient, err = clusteragent.GetCLCRunnerClient()
 	if err != nil {
 		log.Warnf("Cannot create CLC runners client, advanced dispatching will be disabled: %v", err)
-		d.advancedDispatching = false
+	} else {
+		d.advancedDispatching.Store(true)
 	}
+
 	return d
 }
 
@@ -117,9 +143,29 @@ func (d *dispatcher) Stop() {
 
 // Schedule implements the scheduler.Scheduler interface
 func (d *dispatcher) Schedule(configs []integration.Config) {
+	var failedConfigs, excludedConfigs int
+	span := tracer.StartSpan("cluster_checks.dispatcher.schedule",
+		tracer.ResourceName("scheduleConfigs"),
+		tracer.SpanType("worker"))
+	span.SetTag("config_count", len(configs))
+	checkNames := make([]string, 0, len(configs))
+	for _, c := range configs {
+		checkNames = append(checkNames, c.Name)
+	}
+	span.SetTag("check_names", strings.Join(checkNames, ","))
+	defer func() {
+		span.SetTag("excluded_configs", excludedConfigs)
+		span.SetTag("failed_configs", failedConfigs)
+		if failedConfigs > 0 {
+			span.SetTag("error", true)
+		}
+		span.Finish()
+	}()
+
 	for _, c := range configs {
 		if _, found := d.excludedChecks[c.Name]; found {
 			log.Infof("Excluding check due to config: %s", c.Name)
+			excludedConfigs++
 			continue
 		}
 
@@ -127,7 +173,7 @@ func (d *dispatcher) Schedule(configs []integration.Config) {
 			continue // Ignore non cluster-check configs
 		}
 
-		if c.HasFilter(containers.MetricsFilter) || c.HasFilter(containers.GlobalFilter) {
+		if c.HasFilter(workloadfilter.MetricsFilter) || c.HasFilter(workloadfilter.GlobalFilter) {
 			log.Debugf("Config %s is filtered out for metrics collection, ignoring it", c.Name)
 			continue
 		}
@@ -137,14 +183,24 @@ func (d *dispatcher) Schedule(configs []integration.Config) {
 			patched, err := d.patchEndpointsConfiguration(c)
 			if err != nil {
 				log.Warnf("Cannot patch endpoint configuration %s: %s", c.Digest(), err)
+				failedConfigs++
 				continue
 			}
 			d.addEndpointConfig(patched, c.NodeName)
 			continue
 		}
+
+		if shards, handled := d.prepareShardSchedule(c); handled {
+			for _, patched := range shards {
+				d.add(patched)
+			}
+			continue
+		}
+
 		patched, err := d.patchConfiguration(c)
 		if err != nil {
 			log.Warnf("Cannot patch configuration %s: %s", c.Digest(), err)
+			failedConfigs++
 			continue
 		}
 		d.add(patched)
@@ -153,25 +209,49 @@ func (d *dispatcher) Schedule(configs []integration.Config) {
 
 // Unschedule implements the scheduler.Scheduler interface
 func (d *dispatcher) Unschedule(configs []integration.Config) {
+	var failedConfigs int
+	span := tracer.StartSpan("cluster_checks.dispatcher.unschedule",
+		tracer.ResourceName("unscheduleConfigs"),
+		tracer.SpanType("worker"))
+	span.SetTag("config_count", len(configs))
+	defer func() {
+		span.SetTag("failed_configs", failedConfigs)
+		if failedConfigs > 0 {
+			span.SetTag("error", true)
+		}
+		span.Finish()
+	}()
+
 	for _, c := range configs {
 		if !c.ClusterCheck {
 			continue // Ignore non cluster-check configs
 		}
+
 		if c.NodeName != "" {
 			patched, err := d.patchEndpointsConfiguration(c)
 			if err != nil {
 				log.Warnf("Cannot patch endpoint configuration %s: %s", c.Digest(), err)
+				failedConfigs++
 				continue
 			}
 			d.removeEndpointConfig(patched, c.NodeName)
 			continue
 		}
+
+		if digests, handled := d.prepareShardUnschedule(c); handled {
+			for _, digest := range digests {
+				d.removeConfig(digest)
+			}
+			continue
+		}
+
 		patched, err := d.patchConfiguration(c)
 		if err != nil {
 			log.Warnf("Cannot patch configuration %s: %s", c.Digest(), err)
+			failedConfigs++
 			continue
 		}
-		d.remove(patched)
+		d.removeConfig(patched.Digest())
 	}
 }
 
@@ -200,15 +280,12 @@ func (d *dispatcher) add(config integration.Config) bool {
 	return d.addConfig(config, target)
 }
 
-// remove deletes a given configuration
-func (d *dispatcher) remove(config integration.Config) {
-	digest := config.Digest()
-	log.Debugf("Removing configuration %s:%s", config.Name, digest)
-	d.removeConfig(digest)
-}
-
 // reset empties the store and resets all states
 func (d *dispatcher) reset() {
+	// clean up shards because if this pod becomes a leader again
+	// it should reschedule the check
+	d.shards.reset()
+
 	d.store.Lock()
 	defer d.store.Unlock()
 	d.store.reset()
@@ -226,6 +303,61 @@ func (d *dispatcher) scanUnscheduledChecks() {
 			c.unscheduledCheck = true
 			unscheduledCheck.Inc(le.JoinLeaderValue, c.config.Name, c.config.Source)
 		}
+	}
+}
+
+// logWarmupSummary logs the nodes seen by the leader at the end of the warmup phase.
+func (d *dispatcher) logWarmupSummary() {
+	d.store.RLock()
+	defer d.store.RUnlock()
+
+	clcCount, nodeAgentCount := 0, 0
+	for _, node := range d.store.nodes {
+		node.RLock()
+		nodetype := node.nodetype
+		node.RUnlock()
+		switch nodetype {
+		case cctypes.NodeTypeCLCRunner:
+			clcCount++
+		case cctypes.NodeTypeNodeAgent:
+			nodeAgentCount++
+		}
+	}
+	log.Infof("Warmup summary: %d nodes registered (%d CLC runners, %d node agents)",
+		len(d.store.nodes), clcCount, nodeAgentCount)
+}
+
+// UpdateAdvancedDispatchingMode checks if any node agents are in the pool
+// and disables advanced dispatching if found
+func (d *dispatcher) UpdateAdvancedDispatchingMode() {
+	if !d.advancedDispatching.Load() {
+		return
+	}
+
+	d.store.RLock()
+	defer d.store.RUnlock()
+
+	// Check if any node agents are in the pool
+	hasNodeAgent := false
+	for _, node := range d.store.nodes {
+		node.RLock()
+		nodetype := node.nodetype
+		node.RUnlock()
+		if nodetype == cctypes.NodeTypeNodeAgent {
+			hasNodeAgent = true
+			break
+		}
+	}
+
+	if hasNodeAgent {
+		d.disableAdvancedDispatching()
+	}
+}
+
+// disableAdvancedDispatching disables advanced dispatching mode
+func (d *dispatcher) disableAdvancedDispatching() {
+	if d.advancedDispatching.CompareAndSwap(true, false) {
+		log.Info("Node agents detected in cluster check pool, disabling advanced dispatching")
 	}
 }
 
@@ -269,7 +401,7 @@ func (d *dispatcher) run(ctx context.Context) {
 			// Check for configs that have been dangling longer than expected
 			d.scanUnscheduledChecks()
 		case <-rebalanceTicker.C:
-			if d.advancedDispatching {
+			if d.advancedDispatching.Load() {
 				d.rebalance(false)
 			}
 		}

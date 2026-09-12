@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:generate go run golang.org/x/tools/cmd/stringer@latest -output event_common_string.go -type=ConnectionType,ConnectionFamily,ConnectionDirection,EphemeralPortType -linecomment
+//go:generate go run golang.org/x/tools/cmd/stringer -output event_common_string.go -type=ConnectionType,ConnectionFamily,ConnectionDirection,EphemeralPortType -linecomment
 
 package network
 
@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+	"unique"
 
 	"github.com/dustin/go-humanize"
 	"go4.org/intern"
@@ -22,6 +23,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/network/protocols"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/tls"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
+	utilintern "github.com/DataDog/datadog-agent/pkg/util/intern"
 )
 
 const (
@@ -44,6 +46,12 @@ const (
 	// UDP connection type
 	UDP ConnectionType = 1
 )
+
+// ConnectionTypeFromString is a map from a lowercase string to ConnectionType
+var ConnectionTypeFromString = map[string]ConnectionType{
+	"tcp": TCP,
+	"udp": UDP,
+}
 
 var (
 	tcpLabels = map[string]string{"ip_proto": TCP.String()}
@@ -113,10 +121,17 @@ type BufferedData struct {
 	buffer *ClientBuffer
 }
 
+// ContainerID uniquely represents a container. Nil represents the host.
+type ContainerID = *intern.Value
+
+// ResolvConf is an interned string representing the contents of resolv.conf
+type ResolvConf = *utilintern.StringValue
+
 // Connections wraps a collection of ConnectionStats
 type Connections struct {
 	BufferedData
 	DNS                         map[util.Address][]dns.Hostname
+	ResolvConfs                 map[ContainerID]ResolvConf
 	ConnTelemetry               map[ConnTelemetryType]int64
 	CompilationTelemetryByAsset map[string]RuntimeCompilationTelemetry
 	KernelHeaderFetchResult     int32
@@ -209,6 +224,14 @@ type StatCounters struct {
 	//   are established with the same tuple between two agent checks;
 	TCPEstablished uint16
 	TCPClosed      uint16
+
+	// TCP congestion signals
+	TCPRTOCount      uint32 // RTO loss events (tcp_enter_loss invocations)
+	TCPRecoveryCount uint32 // fast-recovery events (tcp_enter_recovery invocations)
+	TCPReordSeen     uint32 // reordering events detected (4.19+)
+	TCPRcvOOOPack    uint32 // out-of-order packets received (5.4+)
+	TCPDeliveredCE   uint32 // segments delivered with ECN CE mark (4.19+)
+	TCPProbe0Count   uint32 // zero-window probe events (tcp_send_probe0 invocations)
 }
 
 // IsZero returns whether all the stat counter values are zeroes
@@ -257,6 +280,7 @@ type ConnectionStats struct {
 	ContainerID   struct {
 		Source, Dest *intern.Value
 	}
+	CertInfo unique.Handle[CertInfo]
 	DNSStats map[dns.Hostname]map[dns.QueryType]dns.Stats
 	// TCPFailures stores the number of failures for a POSIX error code
 	TCPFailures map[uint16]uint32
@@ -271,6 +295,7 @@ type ConnectionStats struct {
 	Duration        time.Duration
 	RTT             uint32 // Stored in µs
 	RTTVar          uint32
+	InterfaceIndex  uint32 // transient: Windows interface index from WFP, not serialized
 	StaticTags      uint64
 	ProtocolStack   protocols.Stack
 	TLSTags         tls.Tags
@@ -280,6 +305,7 @@ type ConnectionStats struct {
 	IntraHost        bool
 	IsAssured        bool
 	IsClosed         bool
+	TCPECNNegotiated bool // true if ECN was negotiated on this connection (CO-RE/runtime only; false on prebuilt)
 }
 
 // Via has info about the routing decision for a flow
@@ -300,7 +326,7 @@ type IPTranslation struct {
 }
 
 func (c ConnectionStats) String() string {
-	return ConnectionSummary(&c, nil)
+	return connectionSummary(&c, nil)
 }
 
 // IsExpired returns whether the connection is expired according to the provided time and timeout.
@@ -317,6 +343,11 @@ func (c ConnectionStats) IsEmpty() bool {
 		c.Monotonic.SentPackets == 0 &&
 		c.Monotonic.Retransmits == 0 &&
 		len(c.TCPFailures) == 0
+}
+
+// HasCertInfo returns whether the connection has a TLS cert associated
+func (c ConnectionStats) HasCertInfo() bool {
+	return c.CertInfo != unique.Handle[CertInfo]{}
 }
 
 // ByteKey returns a unique key for this connection represented as a byte slice
@@ -382,8 +413,8 @@ func BeautifyKey(key string) string {
 	return fmt.Sprintf(keyFmt, pid, source, sport, dest, dport, family, typ)
 }
 
-// ConnectionSummary returns a string summarizing a connection
-func ConnectionSummary(c *ConnectionStats, names map[util.Address][]dns.Hostname) string {
+// connectionSummary returns a string summarizing a connection
+func connectionSummary(c *ConnectionStats, names map[util.Address][]dns.Hostname) string {
 	str := fmt.Sprintf(
 		"[%s%s] [PID: %d] [%v:%d ⇄ %v:%d] ",
 		c.Type,
@@ -472,26 +503,38 @@ func generateConnectionKey(c ConnectionStats, buf []byte, useNAT bool) []byte {
 // Add returns s+other
 func (s StatCounters) Add(other StatCounters) StatCounters {
 	return StatCounters{
-		RecvBytes:      s.RecvBytes + other.RecvBytes,
-		RecvPackets:    s.RecvPackets + other.RecvPackets,
-		Retransmits:    s.Retransmits + other.Retransmits,
-		SentBytes:      s.SentBytes + other.SentBytes,
-		SentPackets:    s.SentPackets + other.SentPackets,
-		TCPClosed:      s.TCPClosed + other.TCPClosed,
-		TCPEstablished: s.TCPEstablished + other.TCPEstablished,
+		RecvBytes:        s.RecvBytes + other.RecvBytes,
+		RecvPackets:      s.RecvPackets + other.RecvPackets,
+		Retransmits:      s.Retransmits + other.Retransmits,
+		SentBytes:        s.SentBytes + other.SentBytes,
+		SentPackets:      s.SentPackets + other.SentPackets,
+		TCPClosed:        s.TCPClosed + other.TCPClosed,
+		TCPEstablished:   s.TCPEstablished + other.TCPEstablished,
+		TCPRTOCount:      s.TCPRTOCount + other.TCPRTOCount,
+		TCPRecoveryCount: s.TCPRecoveryCount + other.TCPRecoveryCount,
+		TCPReordSeen:     s.TCPReordSeen + other.TCPReordSeen,
+		TCPRcvOOOPack:    s.TCPRcvOOOPack + other.TCPRcvOOOPack,
+		TCPDeliveredCE:   s.TCPDeliveredCE + other.TCPDeliveredCE,
+		TCPProbe0Count:   s.TCPProbe0Count + other.TCPProbe0Count,
 	}
 }
 
 // Max returns max(s, other)
 func (s StatCounters) Max(other StatCounters) StatCounters {
 	return StatCounters{
-		RecvBytes:      max(s.RecvBytes, other.RecvBytes),
-		RecvPackets:    max(s.RecvPackets, other.RecvPackets),
-		Retransmits:    max(s.Retransmits, other.Retransmits),
-		SentBytes:      max(s.SentBytes, other.SentBytes),
-		SentPackets:    max(s.SentPackets, other.SentPackets),
-		TCPClosed:      max(s.TCPClosed, other.TCPClosed),
-		TCPEstablished: max(s.TCPEstablished, other.TCPEstablished),
+		RecvBytes:        max(s.RecvBytes, other.RecvBytes),
+		RecvPackets:      max(s.RecvPackets, other.RecvPackets),
+		Retransmits:      max(s.Retransmits, other.Retransmits),
+		SentBytes:        max(s.SentBytes, other.SentBytes),
+		SentPackets:      max(s.SentPackets, other.SentPackets),
+		TCPClosed:        max(s.TCPClosed, other.TCPClosed),
+		TCPEstablished:   max(s.TCPEstablished, other.TCPEstablished),
+		TCPRTOCount:      max(s.TCPRTOCount, other.TCPRTOCount),
+		TCPRecoveryCount: max(s.TCPRecoveryCount, other.TCPRecoveryCount),
+		TCPReordSeen:     max(s.TCPReordSeen, other.TCPReordSeen),
+		TCPRcvOOOPack:    max(s.TCPRcvOOOPack, other.TCPRcvOOOPack),
+		TCPDeliveredCE:   max(s.TCPDeliveredCE, other.TCPDeliveredCE),
+		TCPProbe0Count:   max(s.TCPProbe0Count, other.TCPProbe0Count),
 	}
 }
 

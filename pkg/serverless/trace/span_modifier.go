@@ -3,63 +3,74 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+// Package trace provides trace collection and processing for serverless environments.
 package trace
 
 import (
+	"go.uber.org/atomic"
+
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
-	"github.com/DataDog/datadog-agent/pkg/serverless/trace/inferredspan"
+	"github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace/idx"
 	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
-	functionNameEnvVar = "AWS_LAMBDA_FUNCTION_NAME"
-	ddOriginTagName    = "_dd.origin"
-	ddOriginTagValue   = "lambda"
+	ddOriginTagName = "_dd.origin"
 )
 
 type spanModifier struct {
-	tags           map[string]string
-	lambdaSpanChan chan<- *pb.Span
-	//nolint:revive // TODO(SERV) Fix revive linter
-	coldStartSpanId uint64
-	ddOrigin        string
+	tags     atomic.Pointer[map[string]string]
+	ddOrigin string
 }
 
 // ModifySpan applies extra logic to the given span
-func (s *spanModifier) ModifySpan(_ *pb.TraceChunk, span *pb.Span) {
-	if span.Service == "aws.lambda" {
-		// service name could be incorrectly set to 'aws.lambda' in datadog lambda libraries
-		if s.tags["service"] != "" {
-			span.Service = s.tags["service"]
-		}
-		if s.lambdaSpanChan != nil && span.Name == "aws.lambda" {
-			s.lambdaSpanChan <- span
-		}
-	}
-
+func (s *spanModifier) ModifySpan(chunk *pb.TraceChunk, span *pb.Span) {
 	// ensure all spans have tag _dd.origin in addition to span.Origin
 	if origin := span.Meta[ddOriginTagName]; origin == "" {
 		traceutil.SetMeta(span, ddOriginTagName, s.ddOrigin)
 	}
-
-	if span.Name == "aws.lambda.load" {
-		span.ParentID = s.coldStartSpanId
+	// Origin is canonically a chunk-level attribute (and stats aggregation reads
+	// it from the chunk). The serverless cloud origin is only known to the agent,
+	// not the tracer, so populate the chunk origin here when it is not already
+	// set. Guarded so a tracer-provided origin is never overwritten.
+	if chunk != nil && chunk.Origin == "" {
+		chunk.Origin = s.ddOrigin
 	}
+	if tags := s.tags.Load(); tags != nil {
+		for k, v := range *tags {
+			if k == ddOriginTagName {
+				continue
+			}
+			traceutil.SetMeta(span, k, v)
+		}
+	}
+}
 
-	if inferredspan.CheckIsInferredSpan(span) {
-		log.Debug("Detected a managed service span, filtering out function tags")
-
-		// filter out existing function tags inside span metadata
-		spanMetadataTags := span.Meta
-		if spanMetadataTags != nil {
-			spanMetadataTags = inferredspan.FilterFunctionTags(spanMetadataTags)
-			span.Meta = spanMetadataTags
+// ModifySpanV1 is the V1 (idx) equivalent of ModifySpan.
+func (s *spanModifier) ModifySpanV1(chunk *idx.InternalTraceChunk, span *idx.InternalSpan) {
+	// ensure all spans have tag _dd.origin in addition to span.Origin
+	if origin, ok := span.GetAttributeAsString(ddOriginTagName); !ok || origin == "" {
+		span.SetStringAttribute(ddOriginTagName, s.ddOrigin)
+	}
+	// Origin is canonically a chunk-level attribute in the v1 representation (and
+	// stats aggregation reads it from the chunk). The serverless cloud origin is
+	// only known to the agent, not the tracer, so populate the chunk origin here
+	// when it is not already set. Guarded so a tracer-provided origin is never
+	// overwritten.
+	if chunk != nil && chunk.Origin() == "" {
+		chunk.SetOrigin(s.ddOrigin)
+	}
+	if tags := s.tags.Load(); tags != nil {
+		for k, v := range *tags {
+			if k == ddOriginTagName {
+				continue
+			}
+			span.SetStringAttribute(k, v)
 		}
 	}
 }
 
 // SetTags sets the tags to be used by the span modifier.
 func (s *spanModifier) SetTags(tags map[string]string) {
-	s.tags = tags
+	s.tags.Store(&tags)
 }

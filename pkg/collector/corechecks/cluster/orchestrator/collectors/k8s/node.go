@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewNodeCollectorVersions builds the group of collector versions.
-func NewNodeCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewNodeCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewNodeCollector(metadataAsTags),
+		NewNodeCollector(tagger),
 	)
 }
 
@@ -37,11 +38,7 @@ type NodeCollector struct {
 }
 
 // NewNodeCollector creates a new collector for the Kubernetes Node resource.
-func NewNodeCollector(metadataAsTags utils.MetadataAsTags) *NodeCollector {
-	resourceType := getResourceType(nodeName, nodeVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewNodeCollector(tagger tagger.Component) *NodeCollector {
 	return &NodeCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -49,15 +46,14 @@ func NewNodeCollector(metadataAsTags utils.MetadataAsTags) *NodeCollector {
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 nodeName,
+			Name:                                 utilTypes.NodeName,
 			Kind:                                 kubernetes.NodeKind,
 			NodeType:                             orchestrator.K8sNode,
-			Version:                              nodeVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.NodeGroup,
+			Version:                              utilTypes.NodeVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.NodeHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewNodeHandlers(tagger)),
 	}
 }
 

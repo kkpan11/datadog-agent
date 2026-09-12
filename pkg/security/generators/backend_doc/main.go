@@ -28,7 +28,7 @@ type CWSEvent struct {
 	serializers.EventSerializer `json:",inline"`
 }
 
-func generateBackendJSON(output string) error {
+func generateBackendJSON(output, serializersDir string) error {
 	reflector := jsonschema.Reflector{
 		ExpandedStruct: true,
 		DoNotReference: false,
@@ -36,7 +36,7 @@ func generateBackendJSON(output string) error {
 		Namer:          jsonTypeNamer,
 	}
 
-	if err := reflector.AddGoComments("github.com/DataDog/datadog-agent/pkg/security/serializers", "./"); err != nil {
+	if err := reflector.AddGoComments("github.com/DataDog/datadog-agent/pkg/security/serializers", serializersDir); err != nil {
 		return err
 	}
 	reflector.CommentMap = cleanupEasyjson(reflector.CommentMap)
@@ -75,8 +75,8 @@ func jsonTypeNamer(ty reflect.Type) string {
 	const selinuxPrefix = "selinux"
 
 	base := strings.TrimSuffix(ty.Name(), "Serializer")
-	if strings.HasPrefix(base, selinuxPrefix) {
-		return "SELinux" + strings.TrimPrefix(base, selinuxPrefix)
+	if after, ok := strings.CutPrefix(base, selinuxPrefix); ok {
+		return "SELinux" + after
 	}
 
 	return base
@@ -84,13 +84,15 @@ func jsonTypeNamer(ty reflect.Type) string {
 
 func main() {
 	var (
-		output string
+		output         string
+		serializersDir string
 	)
 
 	flag.StringVar(&output, "output", "", "Backend JSON schema generated file")
+	flag.StringVar(&serializersDir, "serializers-dir", ".", "Directory containing serializer .go source files")
 	flag.Parse()
 
-	if err := generateBackendJSON(output); err != nil {
+	if err := generateBackendJSON(output, serializersDir); err != nil {
 		panic(err)
 	}
 }

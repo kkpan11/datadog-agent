@@ -3,12 +3,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//nolint:revive // TODO(AML) Fix revive linter
+// Package message provides log message data structures and utilities
 package message
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
+	"strconv"
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/logs/sources"
@@ -40,6 +41,7 @@ type Payload struct {
 	UnencodedSize int
 }
 
+// NewPayload creates a new payload with the given message metadata, encoded content, encoding type and unencoded size
 func NewPayload(messageMetas []*MessageMetadata, encoded []byte, encoding string, unencodedSize int) *Payload {
 	return &Payload{
 		MessageMetas:  messageMetas,
@@ -56,7 +58,7 @@ func (m *Payload) Count() int64 {
 
 // Size returns the size of the message.
 func (m *Payload) Size() int64 {
-	var size int64 = 0
+	var size int64
 	for _, m := range m.MessageMetas {
 		size += m.Size()
 	}
@@ -69,18 +71,29 @@ type Message struct {
 	MessageMetadata
 }
 
+// MessageMetadata contains metadata information about a log message
+//
+//nolint:revive // exported: ignore package name struct conflict
 type MessageMetadata struct {
 	Hostname           string
 	Origin             *Origin
 	Status             string
-	IngestionTimestamp int64
+	IngestionTimestamp int64 // In nanoseconds
 	// RawDataLen tracks the original size of the message content before any trimming/transformation.
 	// This is used when calculating the tailer offset - so this will NOT always be equal to `len(Content)`
 	// This is also used to track the original content size before the message is processed and encoded later
 	// in the pipeline.
 	RawDataLen int
-	// Tags added on processing
-	ProcessingTags []string
+	// checkpointRawDataLen is the number of source bytes that may be included
+	// when advancing a file tailer's checkpoint after this message. It differs
+	// from RawDataLen when partial records from multiple streams are interleaved:
+	// a completed message can be sent while an earlier record remains buffered,
+	// but it must not move the restart position past that record.
+	//
+	// The companion boolean distinguishes the default behavior (use RawDataLen)
+	// from an explicit zero that holds the checkpoint at its prior value.
+	checkpointRawDataLen    int
+	hasCheckpointRawDataLen bool
 	// Extra information from the parsers
 	ParsingExtra
 	// Extra information for Serverless Logs messages
@@ -137,6 +150,59 @@ const (
 	// StateEncoded means the MessageContent passed through the encoder (e.g. json encoder, proto encoder, ...)
 	StateEncoded
 )
+
+// HasContent reports whether the message carries meaningful data.
+// For structured messages, content lives in metadata fields (e.g. "siem",
+// "journald"), so the message has content even when the "message" key is empty.
+// For unstructured messages, content is present only when the raw bytes are
+// non-empty.
+func (m *MessageContent) HasContent() bool {
+	if m.State == StateStructured {
+		return m.structuredContent != nil
+	}
+	return len(m.content) > 0
+}
+
+// GetStructuredAttribute retrieves a dot-delimited attribute from structured
+// content. For example, "siem.device_vendor" walks Data["siem"] ->
+// map["device_vendor"]. Returns the string value and true if found.
+// Non-string leaf types (int, float64, bool) are converted via strconv.
+func (m *MessageContent) GetStructuredAttribute(path string) (string, bool) {
+	if m.State != StateStructured {
+		return "", false
+	}
+	return m.structuredContent.GetAttribute(path)
+}
+
+// splitEscapedPath splits a dot-delimited attribute path while respecting
+// backslash escapes: \. represents a literal dot, \\ represents a literal
+// backslash. Segments are unescaped after splitting.
+func splitEscapedPath(s string) []string {
+	var parts []string
+	var seg []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '.':
+				seg = append(seg, '.')
+			case '\\':
+				seg = append(seg, '\\')
+			default:
+				seg = append(seg, '\\', s[i+1])
+			}
+			i++
+			continue
+		}
+		if s[i] == '.' {
+			parts = append(parts, string(seg))
+			seg = seg[:0]
+			continue
+		}
+		seg = append(seg, s[i])
+	}
+	parts = append(parts, string(seg))
+	return parts
+}
 
 // GetContent returns the bytes array containing only the message content
 // E.g. from a structured log:
@@ -197,33 +263,41 @@ func (m *MessageContent) SetEncoded(content []byte) {
 // E.g. Timestamp is used by the docker parsers to transmit a tailing offset.
 type ParsingExtra struct {
 	// Used by docker parsers to transmit an offset.
-	Timestamp   string
+	Timestamp string
+	// Stream identifies the container output stream used to reassemble partial lines.
+	Stream      string
 	IsPartial   bool
 	IsTruncated bool
 	IsMultiLine bool
+	IsMRFAllow  bool
 	Tags        []string
 }
+
+const (
+	// StreamStdout identifies a container log record emitted on stdout.
+	StreamStdout = "stdout"
+	// StreamStderr identifies a container log record emitted on stderr.
+	StreamStderr = "stderr"
+)
 
 // ServerlessExtra ships extra information from logs processing in serverless envs.
 type ServerlessExtra struct {
 	// Optional. Must be UTC. If not provided, time.Now().UTC() will be used
 	// Used in the Serverless Agent
 	Timestamp time.Time
-	// Optional.
-	// Used in the Serverless Agent
-	Lambda *Lambda
-}
-
-// Lambda is a struct storing information about the Lambda function and function execution.
-type Lambda struct {
-	ARN       string
-	RequestID string
 }
 
 // NewMessageWithSource constructs an unstructured message
 // with content, status and a log source.
 func NewMessageWithSource(content []byte, status string, source *sources.LogSource, ingestionTimestamp int64) *Message {
 	return NewMessage(content, NewOrigin(source), status, ingestionTimestamp)
+}
+
+// NewMessageWithSourceWithParsingExtra adds isTruncated to the parsingExtra tag for a new unstructured message with content, status, source and ingestionTimestamp
+func NewMessageWithSourceWithParsingExtra(content []byte, status string, source *sources.LogSource, ingestionTimestamp int64, isTruncated bool) *Message {
+	msg := NewMessageWithSource(content, status, source, ingestionTimestamp)
+	msg.ParsingExtra.IsTruncated = isTruncated
+	return msg
 }
 
 // NewMessage constructs an unstructured message with content,
@@ -241,6 +315,13 @@ func NewMessage(content []byte, origin *Origin, status string, ingestionTimestam
 			IngestionTimestamp: ingestionTimestamp,
 		},
 	}
+}
+
+// NewMessageWithParsingExtra adds parsingExtra data to a new message
+func NewMessageWithParsingExtra(content []byte, origin *Origin, status string, ingestionTimestamp int64, parsingExtra ParsingExtra) *Message {
+	msg := NewMessage(content, origin, status, ingestionTimestamp)
+	msg.ParsingExtra = parsingExtra
+	return msg
 }
 
 // NewStructuredMessage creates a new message that had some structure the moment
@@ -263,6 +344,13 @@ func NewStructuredMessage(content StructuredContent, origin *Origin, status stri
 	}
 }
 
+// NewStructuredMessageWithParsingExtra adds isTruncated to the parsingExtra tag for a new structured message with content, status, origin and ingestionTimestamp
+func NewStructuredMessageWithParsingExtra(content StructuredContent, origin *Origin, status string, ingestionTimestamp int64, isTruncated bool) *Message {
+	msg := NewStructuredMessage(content, origin, status, ingestionTimestamp)
+	msg.ParsingExtra.IsTruncated = isTruncated
+	return msg
+}
+
 // Render renders the message.
 // The only state in which this call is changing the content for a StateStructured message.
 func (m *Message) Render() ([]byte, error) {
@@ -278,10 +366,22 @@ func (m *Message) Render() ([]byte, error) {
 	case StateRendered:
 		return m.content, nil
 	case StateEncoded:
-		return m.content, fmt.Errorf("render call on an encoded message")
+		return m.content, errors.New("render call on an encoded message")
 	default:
-		return m.content, fmt.Errorf("unknown message state for rendering")
+		return m.content, errors.New("unknown message state for rendering")
 	}
+}
+
+// Methods implementing observer.LogView for read-only observation.
+
+// GetHostname returns the message hostname.
+func (m *Message) GetHostname() string {
+	return m.Hostname
+}
+
+// GetTimestampUnixMilli returns the message ingestion timestamp in Unix milliseconds.
+func (m *Message) GetTimestampUnixMilli() int64 {
+	return m.IngestionTimestamp / 1000000
 }
 
 // StructuredContent stores enough information from a tailer to manipulate a
@@ -291,6 +391,9 @@ type StructuredContent interface {
 	Render() ([]byte, error)
 	GetContent() []byte
 	SetContent([]byte)
+	// GetAttribute retrieves a dot-delimited attribute (e.g. "syslog.hostname").
+	// Returns the string value and true if found, or ("", false) otherwise.
+	GetAttribute(path string) (string, bool)
 }
 
 // BasicStructuredContent is used by tailers creating structured logs
@@ -324,26 +427,32 @@ func (m *BasicStructuredContent) SetContent(content []byte) {
 	m.Data["message"] = string(content)
 }
 
-// NewMessageFromLambda construts a message with content, status, origin and with
-// the given timestamp and Lambda metadata.
-func NewMessageFromLambda(content []byte, origin *Origin, status string, utcTime time.Time, ARN, reqID string, ingestionTimestamp int64) *Message {
-	return &Message{
-		MessageContent: MessageContent{
-			content: content,
-			State:   StateUnstructured,
-		},
-		MessageMetadata: MessageMetadata{
-			Origin:             origin,
-			Status:             status,
-			IngestionTimestamp: ingestionTimestamp,
-			ServerlessExtra: ServerlessExtra{
-				Timestamp: utcTime,
-				Lambda: &Lambda{
-					ARN:       ARN,
-					RequestID: reqID,
-				},
-			},
-		},
+// GetAttribute walks a dot-delimited path through the nested Data map.
+// Non-string leaf types (int, float64, bool) are converted to strings.
+func (m *BasicStructuredContent) GetAttribute(path string) (string, bool) {
+	parts := splitEscapedPath(path)
+	var current interface{} = m.Data
+	for _, key := range parts {
+		obj, ok := current.(map[string]interface{})
+		if !ok {
+			return "", false
+		}
+		current, ok = obj[key]
+		if !ok {
+			return "", false
+		}
+	}
+	switch v := current.(type) {
+	case string:
+		return v, true
+	case int:
+		return strconv.Itoa(v), true
+	case float64:
+		return strconv.FormatFloat(v, 'g', -1, 64), true
+	case bool:
+		return strconv.FormatBool(v), true
+	default:
+		return "", false
 	}
 }
 
@@ -351,7 +460,7 @@ func NewMessageFromLambda(content []byte, origin *Origin, status string, utcTime
 // if status is not set, StatusInfo will be returned.
 func (m *MessageMetadata) GetStatus() string {
 	if m.Status == "" {
-		m.Status = StatusInfo
+		return StatusInfo
 	}
 	return m.Status
 }
@@ -361,14 +470,14 @@ func (m *MessageMetadata) GetLatency() int64 {
 	return time.Now().UnixNano() - m.IngestionTimestamp
 }
 
-// Message returns all tags that this message is attached with.
+// Tags returns all tags that this message is attached with.
 func (m *MessageMetadata) Tags() []string {
-	return m.Origin.Tags(m.ProcessingTags)
+	return m.Origin.Tags()
 }
 
-// Message returns all tags that this message is attached with, as a string.
+// TagsToString returns all tags that this message is attached with, as a string.
 func (m *MessageMetadata) TagsToString() string {
-	return m.Origin.TagsToString(m.ProcessingTags)
+	return m.Origin.TagsToString()
 }
 
 // Count returns the number of messages
@@ -381,12 +490,56 @@ func (m *MessageMetadata) Size() int64 {
 	return int64(m.RawDataLen)
 }
 
+// RawDataLenForCheckpoint returns the number of source bytes that a file
+// tailer may safely include when advancing its checkpoint for this message.
+func (m *MessageMetadata) RawDataLenForCheckpoint() int {
+	if !m.hasCheckpointRawDataLen {
+		return m.RawDataLen
+	}
+	return m.checkpointRawDataLen
+}
+
+// SetRawDataLenForCheckpoint overrides the source byte count used to advance a
+// file tailer's checkpoint. Passing zero explicitly holds the prior checkpoint.
+func (m *MessageMetadata) SetRawDataLenForCheckpoint(rawDataLen int) {
+	m.checkpointRawDataLen = rawDataLen
+	m.hasCheckpointRawDataLen = true
+}
+
+// RecordProcessingRule records the application of a processing rule to a message.
+func (m *MessageMetadata) RecordProcessingRule(ruleType string, ruleName string) {
+	if m.Origin != nil && m.Origin.LogSource != nil {
+		m.Origin.LogSource.ProcessingInfo.Inc(ruleType + ":" + ruleName)
+	} else {
+		nilSource := "LogSource"
+		if m.Origin == nil {
+			nilSource = "Origin"
+		}
+		log.Debugf("Unable to record processing rule: %s is nil", nilSource)
+	}
+}
+
 // TruncatedReasonTag returns a tag with the reason for truncation.
 func TruncatedReasonTag(reason string) string {
-	return fmt.Sprintf("truncated:%s", reason)
+	return "truncated:" + reason
 }
 
 // MultiLineSourceTag returns a tag for multiline logs.
 func MultiLineSourceTag(source string) string {
-	return fmt.Sprintf("multiline:%s", source)
+	return "multiline:" + source
+}
+
+// LogSourceTag returns a tag indicating the stream a container log line came from.
+// Example values: "logsource:stdout", "logsource:stderr".
+func LogSourceTag(stream string) string {
+	return "logsource:" + stream
+}
+
+// IsMRF returns true if the payload should be sent to MRF endpoints.
+func (m *Payload) IsMRF() bool {
+	if len(m.MessageMetas) == 0 {
+		return false
+	}
+	// all messages in a payload are either all MRF or not
+	return m.MessageMetas[0].IsMRFAllow
 }

@@ -1,35 +1,37 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//go:generate mdatagen metadata.yaml
-
-package datadogconnector // import "github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/connector/datadogconnector"
+package datadogconnector
 
 import (
 	"context"
-	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	"github.com/DataDog/datadog-agent/pkg/util/option"
 	"time"
 
+	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
 	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/metricsclient"
-	datadogconfig "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog/config"
+	"github.com/DataDog/datadog-agent/pkg/trace/stats"
+	"github.com/DataDog/datadog-agent/pkg/util/option"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
 	"go.opentelemetry.io/collector/consumer"
+
+	datadogconfig "github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/datadogconfig"
 )
 
 type factory struct {
-	tagger   types.TaggerClient
-	hostname option.Option[string]
+	tagger       types.TaggerClient
+	concentrator *stats.Concentrator
+	hostname     option.Option[string]
 }
 
 // SourceProviderFunc is a function that returns the source of the host.
 type SourceProviderFunc func(context.Context) (string, error)
 
-// NewFactoryForAgent creates a factory for datadog connector for use in OTel agent
-func NewFactoryForAgent(tagger types.TaggerClient, hostGetter SourceProviderFunc) connector.Factory {
+// NewConnectorFactory creates a factory for datadog connector for use in OTel agent
+func NewConnectorFactory(componentType component.Type, metricsStability, traceStability component.StabilityLevel, tagger types.TaggerClient, hostGetter SourceProviderFunc, concentrator *stats.Concentrator) connector.Factory {
 	f := &factory{
-		tagger: tagger,
+		tagger:       tagger,
+		concentrator: concentrator,
 	}
 
 	if hostGetter != nil {
@@ -40,24 +42,17 @@ func NewFactoryForAgent(tagger types.TaggerClient, hostGetter SourceProviderFunc
 
 	//  OTel connector factory to make a factory for connectors
 	return connector.NewFactory(
-		Type,
+		componentType,
 		createDefaultConfig,
-		connector.WithTracesToMetrics(f.createTracesToMetricsConnector, TracesToMetricsStability),
-		connector.WithTracesToTraces(f.createTracesToTracesConnector, TracesToTracesStability))
-}
-
-// NewFactory creates a factory for datadog connector.
-func NewFactory() connector.Factory {
-	//  OTel connector factory to make a factory for connectors
-	return NewFactoryForAgent(nil, nil)
+		connector.WithTracesToMetrics(f.createTracesToMetricsConnector, metricsStability),
+		connector.WithTracesToTraces(createTracesToTracesConnector, traceStability))
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{
+	return &datadogconfig.ConnectorComponentConfig{
 		Traces: datadogconfig.TracesConnectorConfig{
 			TracesConfig: datadogconfig.TracesConfig{
 				IgnoreResources:        []string{},
-				PeerServiceAggregation: true,
 				PeerTagsAggregation:    true,
 				ComputeStatsBySpanKind: true,
 			},
@@ -75,15 +70,13 @@ func (f *factory) createTracesToMetricsConnector(_ context.Context, params conne
 	if err != nil {
 		return nil, err
 	}
-
-	c, err = newTraceToMetricConnector(params.TelemetrySettings, cfg, nextConsumer, metricsClient, f.tagger, f.hostname)
-
+	c, err = newTraceToMetricConnector(params.TelemetrySettings, cfg, nextConsumer, metricsClient, f.concentrator, f.tagger, f.hostname)
 	if err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-func (f *factory) createTracesToTracesConnector(_ context.Context, params connector.Settings, _ component.Config, nextConsumer consumer.Traces) (connector.Traces, error) {
+func createTracesToTracesConnector(_ context.Context, params connector.Settings, _ component.Config, nextConsumer consumer.Traces) (connector.Traces, error) {
 	return newTraceToTraceConnector(params.Logger, nextConsumer), nil
 }

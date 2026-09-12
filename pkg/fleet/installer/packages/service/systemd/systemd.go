@@ -15,46 +15,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
+
+	"go.uber.org/multierr"
 
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
-	userUnitsPath = "/etc/systemd/system"
+	// UserUnitsPath is the directory where systemd user unit files are stored
+	UserUnitsPath = "/etc/systemd/system"
 )
 
-// StopUnits stops multiple systemd units
-func StopUnits(ctx context.Context, units ...string) error {
-	for _, unit := range units {
-		err := StopUnit(ctx, unit)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// StopUnit starts a systemd unit
-func StopUnit(ctx context.Context, unit string, args ...string) error {
-	args = append([]string{"stop", unit}, args...)
-	err := telemetry.CommandContext(ctx, "systemctl", args...).Run()
-	exitErr := &exec.ExitError{}
-	if !errors.As(err, &exitErr) {
-		return err
-	}
-	// exit code 5 means the unit is not loaded, we can continue
-	if exitErr.ExitCode() == 5 {
-		return nil
-	}
-	return err
-}
-
-// StartUnit starts a systemd unit
-func StartUnit(ctx context.Context, unit string, args ...string) error {
-	args = append([]string{"start", unit}, args...)
-	err := telemetry.CommandContext(ctx, "systemctl", args...).Run()
+func handleSystemdSelfStops(err error) error {
 	exitErr := &exec.ExitError{}
 	if !errors.As(err, &exitErr) {
 		return err
@@ -69,37 +45,116 @@ func StartUnit(ctx context.Context, unit string, args ...string) error {
 	return err
 }
 
+// StopUnits stops multiple systemd units
+func StopUnits(ctx context.Context, units ...string) error {
+	var errs error
+	for _, unit := range units {
+		err := StopUnit(ctx, unit)
+		errs = multierr.Append(errs, err)
+	}
+	return errs
+}
+
+// StopUnit starts a systemd unit
+func StopUnit(ctx context.Context, unit string, args ...string) error {
+	args = append([]string{"stop", unit}, args...)
+	err := telemetry.CommandContext(ctx, "systemctl", args...).
+		WithExpectedExitCodes(
+			5,   // unit not loaded — https://github.com/systemd/systemd/issues/25708
+			143, // self-stop via SIGTERM (128+15), see handleSystemdSelfStops
+			// Note: signal-killed processes (ExitCode -1) are not registered here;
+			// handleSystemdSelfStops filters SIGTERM-specifically via WaitStatus.
+		).Run()
+	exitErr := &exec.ExitError{}
+	if !errors.As(err, &exitErr) {
+		return err
+	}
+	// exit code 5 means the unit is not loaded, we can continue
+	if exitErr.ExitCode() == 5 {
+		return nil
+	}
+	return handleSystemdSelfStops(err)
+}
+
+// StartUnit starts a systemd unit
+func StartUnit(ctx context.Context, unit string, args ...string) error {
+	running, err := IsRunning()
+	if err != nil {
+		return err
+	}
+	if !running {
+		log.Infof("Installer: systemd not running, skipping start of %s", unit)
+		return nil
+	}
+	args = append([]string{"start", unit}, args...)
+	err = telemetry.CommandContext(ctx, "systemctl", args...).
+		WithExpectedExitCodes(
+			143, // self-stop via SIGTERM (128+15), see handleSystemdSelfStops
+			// Note: signal-killed processes (ExitCode -1) are not registered here;
+			// handleSystemdSelfStops filters SIGTERM-specifically via WaitStatus.
+		).Run()
+	return handleSystemdSelfStops(err)
+}
+
 // RestartUnit restarts a systemd unit
 func RestartUnit(ctx context.Context, unit string, args ...string) error {
+	running, err := IsRunning()
+	if err != nil {
+		return err
+	}
+	if !running {
+		log.Infof("Installer: systemd not running, skipping restart of %s", unit)
+		return nil
+	}
 	args = append([]string{"restart", unit}, args...)
-	return telemetry.CommandContext(ctx, "systemctl", args...).Run()
+	err = telemetry.CommandContext(ctx, "systemctl", args...).
+		WithExpectedExitCodes(
+			143, // self-stop via SIGTERM (128+15), see handleSystemdSelfStops
+			// Note: signal-killed processes (ExitCode -1) are not registered here;
+			// handleSystemdSelfStops filters SIGTERM-specifically via WaitStatus.
+		).Run()
+	return handleSystemdSelfStops(err)
 }
 
 // EnableUnit enables a systemd unit
 func EnableUnit(ctx context.Context, unit string) error {
+	running, err := IsRunning()
+	if err != nil {
+		return err
+	}
+	if !running {
+		log.Infof("Installer: systemd not running, skipping enable of %s", unit)
+		return nil
+	}
 	return telemetry.CommandContext(ctx, "systemctl", "enable", unit).Run()
 }
 
 // DisableUnits disables multiple systemd units
 func DisableUnits(ctx context.Context, units ...string) error {
+	var errs error
 	for _, unit := range units {
 		err := DisableUnit(ctx, unit)
-		if err != nil {
-			return err
-		}
+		errs = multierr.Append(errs, err)
 	}
-	return nil
+	return errs
 }
 
 // DisableUnit disables a systemd unit
 func DisableUnit(ctx context.Context, unit string) error {
-	enabledErr := telemetry.CommandContext(ctx, "systemctl", "is-enabled", "--quiet", unit).Run()
+	enabledErr := telemetry.CommandContext(ctx, "systemctl", "is-enabled", "--quiet", unit).
+		WithExpectedExitCodes(
+			1, // unit is not enabled (disabled, masked, static, etc.) — https://man7.org/linux/man-pages/man1/systemctl.1.html
+			4, // no such unit file — https://man7.org/linux/man-pages/man1/systemctl.1.html
+		).Run()
 	if enabledErr != nil {
 		// unit is already disabled or doesn't exist, we can return fast
 		return nil
 	}
 
-	err := telemetry.CommandContext(ctx, "systemctl", "disable", unit).Run()
+	err := telemetry.CommandContext(ctx, "systemctl", "disable", "--force", unit).
+		WithExpectedExitCodes(
+			5, // unit not loaded — https://github.com/systemd/systemd/issues/25708
+		).Run()
 	exitErr := &exec.ExitError{}
 	if !errors.As(err, &exitErr) {
 		return err
@@ -117,21 +172,35 @@ func WriteUnitOverride(ctx context.Context, unit string, name string, content st
 	defer func() { span.Finish(err) }()
 	span.SetTag("unit", unit)
 	span.SetTag("name", name)
-	err = os.MkdirAll(filepath.Join(userUnitsPath, unit+".d"), 0755)
+	err = os.MkdirAll(filepath.Join(UserUnitsPath, unit+".d"), 0755)
 	if err != nil {
 		return fmt.Errorf("error creating systemd directory: %w", err)
 	}
-	overridePath := filepath.Join(userUnitsPath, unit+".d", fmt.Sprintf("%s.conf", name))
+	overridePath := filepath.Join(UserUnitsPath, unit+".d", name+".conf")
 	return os.WriteFile(overridePath, []byte(content), 0644)
 }
 
 // Reload reloads the systemd daemon
 func Reload(ctx context.Context) (err error) {
+	running, runningErr := IsRunning()
+	if runningErr != nil {
+		return runningErr
+	}
+	if !running {
+		log.Infof("Installer: systemd not running, skipping daemon-reload")
+		return nil
+	}
 	return telemetry.CommandContext(ctx, "systemctl", "daemon-reload").Run()
 }
 
-// IsRunning checks if systemd is running using the documented way
-// https://www.freedesktop.org/software/systemd/man/latest/sd_booted.html#Notes
+// IsRunning checks if systemd is running as PID 1.
+// It first checks the documented sd_booted() sentinel directory
+// (https://www.freedesktop.org/software/systemd/man/latest/sd_booted.html#Notes),
+// then confirms via /proc/1/comm that systemd is actually the init process.
+// The second check guards against container environments where
+// /run/systemd/system exists but systemd is not PID 1, which causes
+// systemctl to fail with "System has not been booted with systemd as init
+// system (PID 1). Can't operate."
 func IsRunning() (running bool, err error) {
 	_, err = os.Stat("/run/systemd/system")
 	if os.IsNotExist(err) {
@@ -140,5 +209,26 @@ func IsRunning() (running bool, err error) {
 	} else if err != nil {
 		return false, err
 	}
+	comm, readErr := os.ReadFile("/proc/1/comm")
+	if readErr != nil {
+		// Cannot confirm PID 1 is systemd — treat as not running to avoid
+		// systemctl calls failing with "not booted with systemd as init system".
+		log.Infof("Installer: cannot read /proc/1/comm (%v), assuming systemd is not PID 1", readErr)
+		return false, nil
+	}
+	if strings.TrimSpace(string(comm)) != "systemd" {
+		log.Infof("Installer: /run/systemd/system exists but PID 1 is %q (not systemd), skip unit setup", strings.TrimSpace(string(comm)))
+		return false, nil
+	}
 	return true, nil
+}
+
+// JournaldLogs returns the logs for a given unit since a given time
+func JournaldLogs(ctx context.Context, unit string, since time.Time) (string, error) {
+	journalctlCmd := telemetry.CommandContext(ctx, "journalctl", "_COMM=systemd", "--unit", unit, "-e", "--no-pager", "--since", since.Format(time.RFC3339))
+	stdout, err := journalctlCmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(stdout), nil
 }

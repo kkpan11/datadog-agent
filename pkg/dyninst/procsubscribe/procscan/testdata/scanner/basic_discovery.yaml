@@ -1,0 +1,69 @@
+# Basic discovery: a process that has published its tracer metadata is
+# discovered on the first scan that sees it, and is not looked at again after
+# that.
+- !initialize
+  current_time: 0
+  backoff_base: 10
+  backoff_cap: 100
+- !advance-time {to: 30}
+- !scan {}
+- !create-process
+  pid: 1001
+  start_time: 50
+  tracer_metadata:
+    language: "go"
+    service: "my-service"
+    version: "1.0.0"
+    env: "production"
+- !advance-time {to: 55}
+- !scan {}
+- !advance-time {to: 60}
+- !scan {}
+# The process is instrumented, so it costs nothing on later scans.
+- !advance-time {to: 70}
+- !scan {}
+---
+command: !initialize
+  current_time: 0
+  backoff_base: 10
+  backoff_cap: 100
+---
+command: !advance-time {to: 30}
+---
+command: !scan {}
+state:
+  current_time: 30
+---
+command: !create-process
+  pid: 1001
+  start_time: 50
+  tracer_metadata:
+    language: "go"
+    service: "my-service"
+    version: "1.0.0"
+    env: "production"
+---
+command: !advance-time {to: 55}
+---
+command: !scan {}
+new: [{pid: 1001, start_time: 50}]
+state:
+  current_time: 55
+  live: [{pid: 1001, start_time: 50}]
+  processes_in_procfs: [1001]
+---
+command: !advance-time {to: 60}
+---
+command: !scan {}
+state:
+  current_time: 60
+  live: [{pid: 1001, start_time: 50}]
+  processes_in_procfs: [1001]
+---
+command: !advance-time {to: 70}
+---
+command: !scan {}
+state:
+  current_time: 70
+  live: [{pid: 1001, start_time: 50}]
+  processes_in_procfs: [1001]

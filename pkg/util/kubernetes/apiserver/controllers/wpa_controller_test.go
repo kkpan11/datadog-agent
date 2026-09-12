@@ -3,13 +3,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build !race && kubeapiserver
-// +build !race,kubeapiserver
+//go:build kubeapiserver
 
 package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/DataDog/watermarkpodautoscaler/apis/datadoghq/v1alpha1"
-	"github.com/cenkalti/backoff"
+	"github.com/cenkalti/backoff/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/zorkian/go-datadog-api.v2"
@@ -40,7 +40,7 @@ import (
 	datadogclientmock "github.com/DataDog/datadog-agent/comp/autoscaling/datadogclient/mock"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/custommetrics"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
-	"github.com/DataDog/datadog-agent/pkg/errors"
+	pkgerrors "github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/autoscalers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -57,7 +57,7 @@ func init() {
 // TestupdateExternalMetrics checks the reconciliation between the local cache and the global store logic
 func TestUpdateWPA(t *testing.T) {
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("kube_resources_namespace", "nsfoo")
+	mockConfig.SetInTest("kube_resources_namespace", "nsfoo")
 
 	name := custommetrics.GetConfigmapName()
 	store, client := newFakeConfigMapStore(t, "nsfoo", name, nil)
@@ -230,7 +230,7 @@ func TestWPAController(t *testing.T) {
 	wpaName := "wpa_1"
 
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("kube_resources_namespace", "nsfoo")
+	mockConfig.SetInTest("kube_resources_namespace", "nsfoo")
 
 	penTime := (int(time.Now().Unix()) - int(maxAge.Seconds()/2)) * 1000
 	name := custommetrics.GetConfigmapName()
@@ -244,15 +244,6 @@ func TestWPAController(t *testing.T) {
 				makePoints(0, 25.12),
 			},
 			Scope: pointer.Ptr("foo:bar"),
-		},
-		{
-			Metric: &metricName,
-			Points: []datadog.DataPoint{
-				makePoints(1531492452000, 12.34),
-				makePoints(penTime, 1.01),
-				makePoints(0, 0.902),
-			},
-			Scope: pointer.Ptr("dcos_version:2.1.9"),
 		},
 	}
 
@@ -320,16 +311,13 @@ func TestWPAController(t *testing.T) {
 	hctrl.updateExternalMetrics()
 
 	// Test that the Global store contains the correct data
-	testutil.RequireTrueBeforeTimeout(t, frequency, timeout, func() bool {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		storedExternal, err := store.ListAllExternalMetricValues()
 		require.NoError(t, err)
-		if len(storedExternal.External) == 0 {
-			return false
-		}
+		require.NotEmpty(t, storedExternal.External)
 		require.Equal(t, storedExternal.External[0].Value, float64(14.123))
 		require.Equal(t, storedExternal.External[0].Labels, map[string]string{"foo": "bar"})
-		return true
-	})
+	}, timeout, frequency)
 
 	retrier := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		resWPA, errWPA := wpaClient.Resource(gvrWPA).Namespace(namespace).Get(context.TODO(), wpaName, metav1.GetOptions{})
@@ -399,48 +387,39 @@ func TestWPAController(t *testing.T) {
 	key := custommetrics.ExternalMetricValueKeyFunc(ExtVal[0])
 
 	// Process and submit to the Global Store
-	testutil.RequireTrueBeforeTimeout(t, frequency, timeout, func() bool {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		hctrl.toStore.m.Lock()
 		defer hctrl.toStore.m.Unlock()
 		st := hctrl.toStore.data
-		if len(st) == 0 {
-			return false
-		}
+		require.NotEmpty(t, st)
 		require.Len(t, st, 1)
 		// Not comparing timestamps to avoid flakyness.
 		require.Equal(t, ExtVal[0].Ref, st[key].Ref)
 		require.Equal(t, ExtVal[0].MetricName, st[key].MetricName)
 		require.Equal(t, ExtVal[0].Labels, st[key].Labels)
-		return true
-	})
+	}, timeout, frequency)
 
 	hctrl.updateExternalMetrics()
 
-	testutil.RequireTrueBeforeTimeout(t, frequency, timeout, func() bool {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		storedExternal, err := store.ListAllExternalMetricValues()
 		require.NoError(t, err)
-		if len(storedExternal.External) == 0 {
-			return false
-		}
+		require.NotEmpty(t, storedExternal.External)
 		require.Equal(t, float64(1.01), storedExternal.External[0].Value)
 		require.Equal(t, map[string]string{"dcos_version": "2.1.9"}, storedExternal.External[0].Labels)
-		return true
-	})
+	}, timeout, frequency)
 
 	// Verify that a Delete removes the Data from the Global Store
 	err = wpaClient.Resource(gvrWPA).Namespace(namespace).Delete(context.TODO(), wpaName, metav1.DeleteOptions{})
 	require.NoError(t, err)
-	testutil.RequireTrueBeforeTimeout(t, frequency, timeout, func() bool {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		storedExternal, err := store.ListAllExternalMetricValues()
 		require.NoError(t, err)
-		if len(storedExternal.External) != 0 {
-			return false
-		}
+		require.Empty(t, storedExternal.External)
 		hctrl.toStore.m.Lock()
 		defer hctrl.toStore.m.Unlock()
 		require.Len(t, hctrl.toStore.data, 0)
-		return true
-	})
+	}, timeout, frequency)
 }
 
 // TestWPASync tests the sync loop of the informer cache and the processing of the object
@@ -466,7 +445,7 @@ func TestWPASync(t *testing.T) {
 
 	fakeKey := "default/prometheus"
 	err = hctrl.syncWPA(fakeKey)
-	require.Error(t, err, errors.IsNotFound)
+	require.Error(t, err, pkgerrors.IsNotFound)
 }
 
 // TestWPAGC tests the GC process of of the controller
@@ -577,7 +556,7 @@ func TestUnstructuredIntoWPA(t *testing.T) {
 			caseName:    "obj corrupted",
 			obj:         map[string]interface{}{},
 			expectedWpa: nil,
-			error:       fmt.Errorf("could not cast Unstructured object: map[]"),
+			error:       errors.New("could not cast Unstructured object: map[]"),
 		},
 		{
 			caseName: "All good",
@@ -623,7 +602,7 @@ func TestWPACRDCheck(t *testing.T) {
 		Group:    "datadoghq.com",
 		Resource: "watermarkpodautoscalers",
 	}, "")
-	nonRetryableError := fmt.Errorf("unexpectedError")
+	nonRetryableError := errors.New("unexpectedError")
 	testCases := []struct {
 		caseName      string
 		checkError    error

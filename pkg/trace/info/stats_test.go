@@ -246,7 +246,7 @@ func TestReceiverStats(t *testing.T) {
 	})
 
 	t.Run("update", func(t *testing.T) {
-		stats := NewReceiverStats()
+		stats := NewReceiverStats(false)
 		newstats := testStats()
 		stats.Acc(newstats)
 		assert.EqualValues(t, stats, newstats)
@@ -270,13 +270,48 @@ func TestReceiverStats(t *testing.T) {
 	})
 }
 
+func TestReceiverStatsZeroValueStatsNotPublished(t *testing.T) {
+	statsclient := &teststatsd.Client{}
+	tags := Tags{
+		Lang:            "go",
+		LangVersion:     "1.12",
+		LangVendor:      "gov",
+		Interpreter:     "gcc",
+		TracerVersion:   "1.33",
+		EndpointVersion: "v0.4",
+		Service:         "service",
+	}
+	testStats := func() *ReceiverStats {
+		stats := NewStats()
+		stats.TracesReceived.Store(1)
+		stats.TracesFiltered.Store(8)
+		return &ReceiverStats{
+			Stats: map[Tags]*TagStats{
+				tags: {
+					Tags:  tags,
+					Stats: stats,
+				},
+			},
+			SendAllStats: false,
+		}
+	}
+
+	t.Run("PublishAndReset", func(t *testing.T) {
+		rs := testStats()
+		rs.PublishAndReset(statsclient)
+		// Non-zero stats for some fields aren't published so only 9 here
+		assert.EqualValues(t, 9, len(statsclient.CountCalls))
+		assertStatsAreReset(t, rs)
+	})
+}
+
 func assertStatsAreReset(t *testing.T, rs *ReceiverStats) {
 	for _, tagstats := range rs.Stats {
 		stats := tagstats.Stats
 		all := reflect.ValueOf(stats)
 		for i := 0; i < all.NumField(); i++ {
 			v := all.Field(i)
-			if v.Kind() == reflect.Ptr {
+			if v.Kind() == reflect.Pointer {
 				v = v.Elem()
 			}
 			assert.True(t, v.IsZero(), fmt.Sprintf("field %q not reset", all.Type().Field(i).Name))

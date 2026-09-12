@@ -21,11 +21,13 @@ import (
 	"go.opentelemetry.io/collector/extension/extensioncapabilities"
 	"go.opentelemetry.io/collector/otelcol"
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	extensionDef "github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/def"
 	"github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/impl/internal/metadata"
 	extensionTypes "github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/types"
+	"github.com/DataDog/datadog-agent/pkg/util/option"
 	"github.com/DataDog/datadog-agent/pkg/version"
 )
 
@@ -50,11 +52,11 @@ type ddExtension struct {
 var _ extensioncapabilities.ConfigWatcher = (*ddExtension)(nil)
 
 func extensionType(s string) string {
-	index := strings.Index(s, "/")
-	if index == -1 {
+	before, _, ok := strings.Cut(s, "/")
+	if !ok {
 		return s
 	}
-	return s[:index]
+	return before
 }
 
 // NotifyConfig implements the ConfigWatcher interface, which allows this extension
@@ -141,8 +143,8 @@ func (ext *ddExtension) NotifyConfig(_ context.Context, conf *confmap.Conf) erro
 	return nil
 }
 
-// NewExtension creates a new instance of the extension.
-func NewExtension(ctx context.Context, cfg *Config, telemetry component.TelemetrySettings, info component.BuildInfo, providedConfigSupported bool, byoc bool) (extensionDef.Component, error) {
+// NewComponent creates a new instance of the extension.
+func NewComponent(ctx context.Context, cfg *Config, telemetry component.TelemetrySettings, info component.BuildInfo, ipcComp option.Option[ipc.Component], providedConfigSupported bool, byoc bool) (extensionDef.Component, error) {
 	ext := &ddExtension{
 		cfg:         cfg,
 		telemetry:   telemetry,
@@ -182,9 +184,7 @@ func NewExtension(ctx context.Context, cfg *Config, telemetry component.Telemetr
 		}
 	}
 
-	// auth = providedConfigSupported; if value true, component was likely built by Agent and has
-	// bearer auth token, if false, component was likely built by OCB and has no auth token
-	ext.server, err = newServer(cfg.HTTPConfig.Endpoint, ext, providedConfigSupported)
+	ext.server, err = newServer(cfg.HTTPConfig.NetAddr.Endpoint, ext, ipcComp)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +193,7 @@ func NewExtension(ctx context.Context, cfg *Config, telemetry component.Telemetr
 
 // Start is called when the extension is started.
 func (ext *ddExtension) Start(_ context.Context, host component.Host) error {
-	ext.telemetry.Logger.Info("Starting DD Extension HTTP server", zap.String("url", ext.cfg.HTTPConfig.Endpoint))
+	ext.telemetry.Logger.Info("Starting DD Extension HTTP server", zap.String("url", ext.cfg.HTTPConfig.NetAddr.Endpoint))
 
 	go func() {
 		if err := ext.server.start(); err != nil && err != http.ErrServerClosed {

@@ -12,16 +12,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"strconv"
+	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	statusComponent "github.com/DataDog/datadog-agent/comp/core/status"
 	ddflareextensiontypes "github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/types"
 	status "github.com/DataDog/datadog-agent/comp/otelcol/status/def"
-	apiutil "github.com/DataDog/datadog-agent/pkg/api/util"
+	"github.com/DataDog/datadog-agent/pkg/util/hostport"
 	"github.com/DataDog/datadog-agent/pkg/util/prometheus"
 )
 
@@ -31,7 +33,7 @@ var templatesFS embed.FS
 // Requires defines the dependencies of the status component.
 type Requires struct {
 	Config config.Component
-	IPC    ipc.Component
+	Client ipc.HTTPClient
 }
 
 // Provides contains components provided by status constructor.
@@ -42,8 +44,7 @@ type Provides struct {
 
 type statusProvider struct {
 	Config         config.Component
-	client         *http.Client
-	ipc            ipc.Component
+	client         ipc.HTTPClient
 	receiverStatus map[string]interface{}
 	exporterStatus map[string]interface{}
 }
@@ -69,10 +70,10 @@ type prometheusRuntimeConfig struct {
 
 // NewComponent creates a new status component.
 func NewComponent(reqs Requires) Provides {
+
 	comp := statusProvider{
 		Config: reqs.Config,
-		client: apiutil.GetClient(),
-		ipc:    reqs.IPC,
+		client: reqs.Client,
 		receiverStatus: map[string]interface{}{
 			"spans":           0.0,
 			"metrics":         0.0,
@@ -141,11 +142,11 @@ func getPrometheusURL(extensionResp ddflareextensiontypes.Response) (string, err
 			break
 		}
 	}
-	return fmt.Sprintf("http://%v:%d/metrics", prometheusHost, prometheusPort), nil
+	return fmt.Sprintf("http://%s/metrics", hostport.Join(prometheusHost, strconv.Itoa(prometheusPort))), nil
 }
 
 func (s statusProvider) populatePrometheusStatus(prometheusURL string) error {
-	resp, err := apiutil.DoGet(s.client, prometheusURL, apiutil.CloseConnection)
+	resp, err := s.client.Get(prometheusURL, ipchttp.WithCloseConnection)
 	if err != nil {
 		return err
 	}
@@ -195,12 +196,7 @@ func (s statusProvider) populateStatus() map[string]interface{} {
 		}
 	}
 
-	auth := s.ipc.GetAuthToken()
-	options := apiutil.ReqOptions{
-		Conn:      apiutil.CloseConnection,
-		Authtoken: auth,
-	}
-	resp, err := apiutil.DoGetWithOptions(s.client, extensionURL, &options)
+	resp, err := s.client.Get(extensionURL, ipchttp.WithCloseConnection)
 	if err != nil {
 		return map[string]interface{}{
 			"url":   extensionURL,
@@ -228,12 +224,16 @@ func (s statusProvider) populateStatus() map[string]interface{} {
 			"error": err.Error(),
 		}
 	}
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"agentVersion":     extensionResp.AgentVersion,
 		"collectorVersion": extensionResp.ExtensionVersion,
 		"receiver":         s.receiverStatus,
 		"exporter":         s.exporterStatus,
 	}
+	if warnings := checkConfigWarnings(extensionResp.RuntimeConfig, s.Config); len(warnings) > 0 {
+		result["warnings"] = warnings
+	}
+	return result
 }
 
 // JSON populates the status map
@@ -253,4 +253,41 @@ func (s statusProvider) Text(_ bool, buffer io.Writer) error {
 // HTML renders the html output
 func (s statusProvider) HTML(_ bool, buffer io.Writer) error {
 	return statusComponent.RenderHTML(templatesFS, "otelagentHTML.tmpl", buffer, s.getStatusInfo())
+}
+
+// checkConfigWarnings inspects the runtime OTel config and agent config for
+// problematic configurations and returns a list of human-readable warnings.
+func checkConfigWarnings(runtimeConfigYAML string, cfg config.Component) []string {
+	var warnings []string
+
+	if cfg.GetBool("otel_standalone") {
+		return warnings
+	}
+
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal([]byte(runtimeConfigYAML), &parsed); err != nil {
+		return warnings
+	}
+	receivers, ok := parsed["receivers"]
+	if !ok {
+		return warnings
+	}
+	receiversMap, ok := receivers.(map[string]interface{})
+	if !ok {
+		return warnings
+	}
+	for name := range receiversMap {
+		baseName := name
+		if idx := strings.IndexByte(name, '/'); idx >= 0 {
+			baseName = name[:idx]
+		}
+		if baseName == "hostmetrics" {
+			warnings = append(warnings, "The hostmetrics receiver is enabled in connected mode. "+
+				"The core Datadog Agent already collects host metrics. "+
+				"Use standalone mode (DD_OTEL_STANDALONE=true) to avoid metric conflicts.")
+			break
+		}
+	}
+
+	return warnings
 }

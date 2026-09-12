@@ -8,11 +8,12 @@ package common
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -29,11 +30,9 @@ import (
 const (
 	commandTimeoutDuration = 10 * time.Second
 	configDir              = "/etc/datadog-agent"
-)
 
-var (
-	// ErrNoAPIKey is returned when no API key is provided.
-	ErrNoAPIKey = errors.New("no API key provided")
+	parDefaultAllowlistNix     = "com.datadoghq.script.runPredefinedScript"
+	parDefaultAllowlistWindows = "com.datadoghq.script.runPredefinedPowershellScript"
 )
 
 // Setup allows setup scripts to define packages and configurations to install.
@@ -43,13 +42,33 @@ type Setup struct {
 	start     time.Time
 	flavor    string
 
-	Out                     *Output
-	Env                     *env.Env
-	Ctx                     context.Context
-	Span                    *telemetry.Span
-	Packages                Packages
-	Config                  config.Config
-	DdAgentAdditionalGroups []string
+	Out                       *Output
+	Env                       *env.Env
+	Ctx                       context.Context
+	Span                      *telemetry.Span
+	Packages                  Packages
+	Config                    config.Config
+	DdAgentAdditionalGroups   []string
+	DelayedAgentRestartConfig config.DelayedAgentRestartConfig
+	NoConfig                  bool
+}
+
+// parActionsAllowlist returns the PAR actions allowlist to use.
+//   - If envValue is non-empty it is split on commas and used as-is.
+//   - If envValue is empty and freshInstall is true, an OS-appropriate default is returned.
+//   - If envValue is empty and freshInstall is false (upgrade/reinstall), nil is returned so
+//     WriteConfigs does not overwrite a user-customised allowlist already on disk.
+func parActionsAllowlist(envValue, goos string, freshInstall bool) []string {
+	if envValue != "" {
+		return strings.Split(envValue, ",")
+	}
+	if !freshInstall {
+		return nil
+	}
+	if goos == "windows" {
+		return []string{parDefaultAllowlistWindows}
+	}
+	return []string{parDefaultAllowlistNix}
 }
 
 // NewSetup creates a new Setup structure with some default values.
@@ -60,18 +79,17 @@ Running the %s installation script (https://github.com/DataDog/datadog-agent/tre
 	start := time.Now()
 	output := &Output{tty: logOutput}
 	output.WriteString(fmt.Sprintf(header, version.AgentVersion, flavor, version.Commit, flavorPath, start.Format(time.RFC3339)))
-	if env.APIKey == "" {
-		return nil, ErrNoAPIKey
-	}
-	installer, err := installer.NewInstaller(env)
+	installer, err := installer.NewInstaller(ctx, env)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create installer: %w", err)
 	}
 	var proxyNoProxy []string
 	if os.Getenv("DD_PROXY_NO_PROXY") != "" {
-		proxyNoProxy = strings.Split(os.Getenv("DD_PROXY_NO_PROXY"), ",")
+		proxyNoProxy = strings.FieldsFunc(os.Getenv("DD_PROXY_NO_PROXY"), func(r rune) bool {
+			return r == ',' || r == ' '
+		}) // comma and space-separated list, consistent with viper and documentation
 	}
-	span, ctx := telemetry.StartSpanFromContext(ctx, fmt.Sprintf("setup.%s", flavor))
+	span, ctx := telemetry.StartSpanFromContext(ctx, "setup."+flavor)
 	s := &Setup{
 		configDir: paths.DatadogDataDir,
 		installer: installer,
@@ -83,15 +101,17 @@ Running the %s installation script (https://github.com/DataDog/datadog-agent/tre
 		Span:      span,
 		Config: config.Config{
 			DatadogYAML: config.DatadogConfig{
-				APIKey:   env.APIKey,
+				APIKey:   os.Getenv("DD_API_KEY"),
 				Hostname: os.Getenv("DD_HOSTNAME"),
-				Site:     env.Site,
+				Site:     os.Getenv("DD_SITE"),
+				LogLevel: os.Getenv("DD_LOG_LEVEL"),
 				Proxy: config.DatadogConfigProxy{
 					HTTP:    os.Getenv("DD_PROXY_HTTP"),
 					HTTPS:   os.Getenv("DD_PROXY_HTTPS"),
 					NoProxy: proxyNoProxy,
 				},
-				Env: os.Getenv("DD_ENV"),
+				Env:                os.Getenv("DD_ENV"),
+				InfrastructureMode: os.Getenv("DD_INFRASTRUCTURE_MODE"),
 			},
 			IntegrationConfigs: make(map[string]config.IntegrationConfig),
 		},
@@ -99,58 +119,225 @@ Running the %s installation script (https://github.com/DataDog/datadog-agent/tre
 			install: make(map[string]packageWithVersion),
 		},
 	}
+
+	// Map DD_LOGS_ENABLED env var into datadog.yaml
+	if logsEnabledEnv := os.Getenv("DD_LOGS_ENABLED"); logsEnabledEnv != "" {
+		logsEnabled := strings.EqualFold(logsEnabledEnv, "true") || logsEnabledEnv == "1"
+		s.Config.DatadogYAML.LogsEnabled = config.BoolToPtr(logsEnabled)
+	}
+
+	// Map DD_PRIVATE_ACTION_RUNNER_ENABLED env var into datadog.yaml
+	if parEnabledEnv := os.Getenv("DD_PRIVATE_ACTION_RUNNER_ENABLED"); strings.EqualFold(parEnabledEnv, "true") {
+		if appKey := os.Getenv("DD_APP_KEY"); appKey != "" {
+			s.Config.DatadogYAML.AppKey = appKey
+		}
+		s.Config.DatadogYAML.PrivateActionRunner.Enabled = config.BoolToPtr(true)
+		s.Config.DatadogYAML.PrivateActionRunner.SelfEnroll = config.BoolToPtr(true)
+		_, statErr := os.Stat(filepath.Join(paths.DatadogDataDir, "datadog.yaml"))
+		freshInstall := os.IsNotExist(statErr)
+		s.Config.DatadogYAML.PrivateActionRunner.ActionsAllowlist = parActionsAllowlist(
+			os.Getenv("DD_PRIVATE_ACTION_RUNNER_ACTIONS_ALLOWLIST"),
+			runtime.GOOS,
+			freshInstall,
+		)
+	}
+
 	return s, nil
 }
 
 // Run installs the packages and writes the configurations
 func (s *Setup) Run() (err error) {
+	// TODO: go idiom is to get ctx from parameter not a struct
+	//       s.Ctx is tied to s.Span, many files would need to be refactored
+	ctx := s.Ctx
+
 	defer func() { s.Span.Finish(err) }()
-	s.Out.WriteString("Applying configurations...\n")
-	err = config.WriteConfigs(s.Config, s.configDir)
-	if err != nil {
-		return fmt.Errorf("failed to write configuration: %w", err)
-	}
+
 	packages := resolvePackages(s.Env, s.Packages)
 	s.Out.WriteString("The following packages will be installed:\n")
 	for _, p := range packages {
 		s.Out.WriteString(fmt.Sprintf("  - %s / %s\n", p.name, p.version))
 	}
-	// TODO(WINA-1431): This is being overwritten by the MSI on Windows
-	err = installinfo.WriteInstallInfo(fmt.Sprintf("install-script-%s", s.flavor))
+	s.Out.WriteString("Stopping Datadog Agent services...\n")
+	err = s.stopServices(ctx, packages)
+	if err != nil {
+		return fmt.Errorf("failed to stop services: %w", err)
+	}
+	s.Out.WriteString("Applying configurations...\n")
+	// ensure config root is created with correct permissions
+	err = paths.SetupInstallerDataDir()
+	if err != nil {
+		return fmt.Errorf("could not create config directory: %w", err)
+	}
+	// Record which config files don't exist yet (fresh install).
+	// After package installation we backfill template comments into these files.
+	freshConfigs := s.detectFreshConfigs()
+	if !s.NoConfig {
+		err = config.WriteConfigs(s.Config, s.configDir)
+		if err != nil {
+			return fmt.Errorf("failed to write configuration: %w", err)
+		}
+	}
+	err = installinfo.WriteInstallInfo(ctx, "install-script-"+s.flavor)
 	if err != nil {
 		return fmt.Errorf("failed to write install info: %w", err)
 	}
-	if err = s.preInstallPackages(); err != nil {
-		return fmt.Errorf("failed during pre-package installation: %w", err)
+	// Lay down the SSI installer copy before installing packages so that
+	// package post-install hooks (notably datadog-apm-inject's, which renders
+	// the systemd unit's ExecStart/ExecStop to point at a concrete installer
+	// binary) can resolve to it.
+	if s.Packages.copyInstallerSSI {
+		if err := copyInstallerSSI(); err != nil {
+			return err
+		}
+	}
+	// Evaluate compatibility only after refreshing the SSI installer copy. The
+	// existing copy may be newer than the Agent being installed and would make a
+	// stale tmpfs preload entry appear compatible until it is overwritten here.
+	apmInjectorReinstall, err := s.prepareAPMInjectorReinstall(ctx, packages)
+	if err != nil {
+		return fmt.Errorf("failed to prepare APM injector reinstallation: %w", err)
 	}
 	for _, p := range packages {
+		if p.name == DatadogAPMInjectPackage {
+			p.forceInstall = apmInjectorReinstall
+		}
 		url := oci.PackageURL(s.Env, p.name, p.version)
-		err = s.installPackage(p.name, url)
+		err = s.installPackage(p, url)
 		if err != nil {
 			return fmt.Errorf("failed to install package %s: %w", url, err)
 		}
 	}
-	err = s.restartServices(packages)
+	if err = s.postInstallPackages(); err != nil {
+		return fmt.Errorf("failed during post-package installation: %w", err)
+	}
+	if !s.NoConfig && runtime.GOOS == "windows" && len(freshConfigs) > 0 {
+		s.backfillConfigTemplates(freshConfigs)
+	}
+	err = s.restartServices(ctx, packages)
 	if err != nil {
 		return fmt.Errorf("failed to restart services: %w", err)
+	}
+	if s.DelayedAgentRestartConfig.Scheduled {
+		ScheduleDelayedAgentRestart(s, s.DelayedAgentRestartConfig.Delay, s.DelayedAgentRestartConfig.LogFile)
 	}
 	s.Out.WriteString(fmt.Sprintf("Successfully ran the %s install script in %s!\n", s.flavor, time.Since(s.start).Round(time.Second)))
 	return nil
 }
 
+// prepareAPMInjectorReinstall reports whether an already-installed injector
+// must have its post-install hook replayed. This decision is made before the
+// normal Agent Install: once that call returns, the stable link no longer tells
+// us whether the requested Agent was already current.
+func (s *Setup) prepareAPMInjectorReinstall(ctx context.Context, packages []packageWithVersion) (bool, error) {
+	var requestedAgent packageWithVersion
+	installingAgent := false
+	installingInjector := false
+	for _, pkg := range packages {
+		switch pkg.name {
+		case DatadogAgentPackage:
+			requestedAgent = pkg
+			installingAgent = true
+		case DatadogAPMInjectPackage:
+			installingInjector = true
+		}
+	}
+	if !installingInjector {
+		return false, nil
+	}
+
+	installed, err := s.installer.IsInstalled(ctx, DatadogAPMInjectPackage)
+	if err != nil {
+		return false, fmt.Errorf("could not determine whether %s is installed: %w", DatadogAPMInjectPackage, err)
+	}
+	if !installed {
+		return false, nil
+	}
+	if !installingAgent {
+		// The public Agent install script installs its DEB/RPM first and then
+		// invokes the standalone APM SSI setup flavor. That flavor does not
+		// request an Agent OCI package, so detect the stale old-installer/tmpfs
+		// combination from the injector state itself.
+		return detectAPMInjectorReinstall(), nil
+	}
+
+	agentState, err := s.installer.State(ctx, DatadogAgentPackage)
+	if err != nil {
+		return false, fmt.Errorf("could not determine the installed %s version: %w", DatadogAgentPackage, err)
+	}
+	return !samePackageVersion(requestedAgent.version, agentState.Stable), nil
+}
+
+var detectAPMInjectorReinstall = apmInjectorRequiresReinstall
+
+// samePackageVersion tolerates the Debian revision suffix used by setup package
+// requests but not by OCI repository links. All other tag content remains part
+// of the comparison so distinct prerelease and pipeline builds are not folded
+// together.
+func samePackageVersion(requested, installed string) bool {
+	return strings.TrimSuffix(requested, "-1") == strings.TrimSuffix(installed, "-1")
+}
+
+// configTemplates maps config files to their .example template counterparts.
+var configTemplates = map[string]string{
+	"datadog.yaml":        "datadog.yaml.example",
+	"security-agent.yaml": "security-agent.yaml.example",
+	"system-probe.yaml":   "system-probe.yaml.example",
+}
+
+// detectFreshConfigs returns the list of config files that don't exist yet.
+// Must be called before WriteConfigs so we know which files are fresh.
+func (s *Setup) detectFreshConfigs() []string {
+	var fresh []string
+	for configFile := range configTemplates {
+		if !fileExists(filepath.Join(s.configDir, configFile)) {
+			fresh = append(fresh, configFile)
+		}
+	}
+	return fresh
+}
+
+// backfillConfigTemplates merges .example template content into the config files
+// so that customers get the rich commented-out example options alongside their
+// fleet-configured values.
+//
+// Setup writes the configs before the Agent package/MSI writes the template files,
+// also, some packages/extensions read/modify the config, too, so we can't just strictly write the config
+// after package installation.
+func (s *Setup) backfillConfigTemplates(freshConfigs []string) {
+	for _, configFile := range freshConfigs {
+		templateFile := configTemplates[configFile]
+		configPath := filepath.Join(s.configDir, configFile)
+		templatePath := filepath.Join(s.configDir, templateFile)
+		if err := config.BackfillFromTemplate(configPath, templatePath, 0640); err != nil {
+			s.Out.WriteString(fmt.Sprintf("Warning: could not backfill %s from template: %v\n", configFile, err))
+		}
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // installPackage mimicks the telemetry of calling the install package command
-func (s *Setup) installPackage(name string, url string) (err error) {
+func (s *Setup) installPackage(pkg packageWithVersion, url string) (err error) {
 	span, ctx := telemetry.StartSpanFromContext(s.Ctx, "install")
 	defer func() { span.Finish(err) }()
 	span.SetTag("url", url)
 	span.SetTopLevel()
 
-	s.Out.WriteString(fmt.Sprintf("Installing %s...\n", name))
-	err = s.installer.Install(ctx, url, nil)
+	s.Out.WriteString(fmt.Sprintf("Installing %s...\n", pkg.name))
+	if pkg.forceInstall || runtime.GOOS == "windows" && pkg.name == DatadogAgentPackage {
+		// TODO(WINA-2018): Add support for skipping the installation of the core Agent if it is already installed
+		err = s.installer.ForceInstall(ctx, url, nil)
+	} else {
+		err = s.installer.Install(ctx, url, nil)
+	}
 	if err != nil {
 		return err
 	}
-	s.Out.WriteString(fmt.Sprintf("Successfully installed %s\n", name))
+	s.Out.WriteString(fmt.Sprintf("Successfully installed %s\n", pkg.name))
 	return nil
 }
 
@@ -175,4 +362,13 @@ var ExecuteCommandWithTimeout = func(s *Setup, command string, args ...string) (
 		return nil, err
 	}
 	return output, nil
+}
+
+// ScheduleDelayedAgentRestart schedules an agent restart after the specified delay
+func ScheduleDelayedAgentRestart(s *Setup, delay time.Duration, logFile string) {
+	s.Out.WriteString(fmt.Sprintf("Scheduling agent restart in %v for GPU monitoring\n", delay))
+	cmd := exec.Command("nohup", "bash", "-c", fmt.Sprintf("echo \"[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] Waiting %v...\" >> %[2]s.log && sleep %d && echo \"[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] Restarting agent...\" >> %[2]s.log && systemctl restart datadog-agent >> %[2]s.log 2>&1", delay, logFile, int(delay.Seconds())))
+	if err := cmd.Start(); err != nil {
+		s.Out.WriteString(fmt.Sprintf("Failed to schedule restart: %v\n", err))
+	}
 }

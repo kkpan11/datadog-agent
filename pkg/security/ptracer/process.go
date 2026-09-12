@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/DataDog/datadog-agent/pkg/security/proto/ebpfless"
+	"github.com/DataDog/datadog-agent/pkg/security/secl/containerutils"
 	"golang.org/x/sys/unix"
 )
 
@@ -58,16 +59,20 @@ type SocketInfo struct {
 	AddressFamily uint16
 	Protocol      uint16
 	BoundToPort   uint16
+	SocketType    uint16
 }
 
 // Process represents a process context
 type Process struct {
-	Pid        int
-	Tgid       int
-	Nr         map[int]*ebpfless.SyscallMsg
-	FdRes      *FdResources
-	FsRes      *FSResources
-	FdToSocket map[int32]SocketInfo
+	Pid                      int
+	Tgid                     int
+	CGroupID                 containerutils.CGroupID
+	ContainerID              containerutils.ContainerID
+	containerContextResolved bool
+	Nr                       map[int]*ebpfless.SyscallMsg
+	FdRes                    *FdResources
+	FsRes                    *FSResources
+	FdToSocket               map[int32]SocketInfo
 }
 
 // NewProcess returns a new process
@@ -129,7 +134,6 @@ func (p *Process) getFilenameFromFdRaw(fd int32) (string, error) {
 type ProcessCache struct {
 	pid2Process map[int]*Process
 	tgid2Pid    map[int][]int
-	tgid2Span   map[int]*SpanTLS
 }
 
 // NewProcessCache returns a new thread cache
@@ -137,7 +141,6 @@ func NewProcessCache() *ProcessCache {
 	return &ProcessCache{
 		pid2Process: make(map[int]*Process),
 		tgid2Pid:    make(map[int][]int),
-		tgid2Span:   make(map[int]*SpanTLS),
 	}
 }
 
@@ -161,6 +164,8 @@ func (tc *ProcessCache) shareResources(process *Process, ppid int, cloneFlags ui
 	if cloneFlags&unix.CLONE_THREAD != 0 {
 		process.Tgid = parent.Tgid
 	}
+	process.CGroupID = parent.CGroupID
+	process.ContainerID = parent.ContainerID
 
 	if cloneFlags&unix.CLONE_FILES != 0 {
 		process.FdRes = parent.FdRes
@@ -204,19 +209,4 @@ func (tc *ProcessCache) Remove(process *Process) {
 // Get return the process entry for the given pid
 func (tc *ProcessCache) Get(pid int) *Process {
 	return tc.pid2Process[pid]
-}
-
-// GetSpan returns the span TLS entry for the given pid
-func (tc *ProcessCache) GetSpan(tgid int) *SpanTLS {
-	return tc.tgid2Span[tgid]
-}
-
-// SetSpanTLS sets the span TLS entry for the given pid
-func (tc *ProcessCache) SetSpanTLS(tgid int, span *SpanTLS) {
-	tc.tgid2Span[tgid] = span
-}
-
-// UnsetSpan unsets the span TLS entry for the given pid
-func (tc *ProcessCache) UnsetSpan(tgid int) {
-	delete(tc.tgid2Span, tgid)
 }

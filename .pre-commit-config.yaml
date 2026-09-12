@@ -7,45 +7,24 @@ default_stages:
   - pre-commit
 
 repos:
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.11.9
-  hooks:
-    - id: ruff
-      args: [ --fix ]
-    - id: ruff-format
-- repo: https://github.com/jendrikseipp/vulture
-  rev: e454d2ef39fc23e72549ff23a1a14e31c3a75605 # v2.14
-  hooks:
-    - id: vulture
-      args: ["--ignore-decorators", "@task", "--ignore-names", "test_*,Test*", "tasks"]
-- repo: https://github.com/pre-commit/mirrors-mypy
-  rev: e5ea6670624c24f8321f6328ef3176dbba76db46  # 1.10.0
-  hooks:
-    - id: mypy
-      # Keep in sync with the build image, there's no good way to centralize this.
-      additional_dependencies:
-        - types-pyyaml==6.0.12.20240311
-        - types-requests==2.30.0
-        - types-tabulate==0.9.0.20240106
-        - types-toml==0.10.8.20240310
 - repo: https://github.com/jumanjihouse/pre-commit-hooks
-  rev: 7cc5848088fd8412905ab79feea6c8edc3ac76c6 # 2.1.5
+  rev: 38980559e3a605691d6579f96222c30778e5a69e # frozen: 3.0.0
   hooks:
     - id: shellcheck
       args: ["--severity=info", "-e", "SC2059", "-e", "SC2028"]
 - repo: https://github.com/tekwizely/pre-commit-golang
-  rev: bd69b816c43306f28bad4d7b303d981b0ecd2fd5 # v1.0.0-beta.5
+  rev: bd69b816c43306f28bad4d7b303d981b0ecd2fd5 # frozen: v1.0.0-beta.5
   hooks:
     - id: go-fmt
       args: [ "-w", "-s" ]
       exclude: ^.*.(pb.go|_gen.go)$
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
     hooks:
       - id: end-of-file-fixer
         files: release.json
 - repo: https://github.com/rhysd/actionlint
-  rev: v1.7.7
+  rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # frozen: v1.7.12
   hooks:
     - id: actionlint
       args: [ "-ignore", "shellcheck" ]
@@ -65,6 +44,22 @@ repos:
       language: system
       require_serial: true
       files: \.go$
+      pass_filenames: false
+    - id: python-linter
+      name: python-linter
+      description: run python linter (ruff)
+      entry: dda inv linter.python
+      language: system
+      require_serial: true
+      files: \.py$
+      pass_filenames: false
+    - id: docs-links
+      name: docs-links
+      description: checks that developer docs link to the repository through the `repo` macro
+      entry: 'dda inv linter.docs-links'
+      language: system
+      require_serial: true
+      files: ^docs/public/.*\.md$
       pass_filenames: false
     - id: win-clang-format
       name: win-clang-format
@@ -88,6 +83,15 @@ repos:
       language: system
       require_serial: true
       files: (\.go|^go\.mod|^go\.sum)$
+      pass_filenames: false
+      stages: [pre-push]
+    - id: go-mod-replace
+      name: go-mod-replace
+      description: check that all go.mod files contain replace directives from modules.yml
+      entry: bash -c 'GOTOOLCHAIN=go$(cat .go-version) dda inv modules.check-all-replace'
+      language: system
+      require_serial: true
+      files: (\.go|^go\.mod$|^go\.sum$|^modules\.yml$)
       pass_filenames: false
       stages: [pre-push]
     - id: go-test
@@ -118,21 +122,13 @@ repos:
       pass_filenames: false
     - id: gitlab-configuration
       name: gitlab-configuration
-      description: test the gitlab configuration on main
-      entry: 'dda inv linter.gitlab-ci -t main'
+      description: Lint and test GitLab CI configuration files
+      entry: "dda inv linter.full-gitlab-ci -t main --pre-push-linters --fail-fast"
       language: system
       require_serial: true
       files: .*gitlab.*\.yml$
       pass_filenames: false
       stages: [pre-push]
-    - id: gitlab-lint-jobs-codeowners
-      name: gitlab-lint-jobs-codeowners
-      description: lint the gitlab configuration to verify jobs codeowners
-      entry: 'dda inv linter.gitlab-ci-jobs-codeowners'
-      language: system
-      require_serial: true
-      files: .*gitlab.*\.yml$
-      pass_filenames: false
     - id: update-go
       name: update-go
       description: test formatting of files will allow go update
@@ -152,7 +148,15 @@ repos:
       entry: 'dda inv protobuf.generate --pre-commit'
       language: system
       pass_filenames: false
-      files: (.*go\.mod|modules\.yml|.*gomodules\.py|.*modules\.py|.*.proto|.protoc-version|.*protobuf\.py)$
+      files: (.*go\.mod|modules\.yml|.*gomodules\.py|.*modules\.py|.*\.proto|.*protobuf\.py)$
+    - id: cws-go-generate
+      name: validate-cws-generated-files
+      description: Validate that the generated CWS files (SECL accessors, BPF map names, docs, ...) are up to date
+      entry: 'dda inv security-agent.cws-go-generate'
+      language: system
+      pass_filenames: false
+      stages: [pre-push]
+      files: ^(pkg/security/.*|docs/cloud-workload-security/.*|bazel/rules/cws_codegen/.*)$
     - id: experiment-systemd-units
       name: validate-experiment-systemd-units
       description: Validate that the generated systemd experimrent units are up to date
@@ -160,3 +164,17 @@ repos:
       language: system
       pass_filenames: false
       files: ^pkg/fleet/installer/packages/embedded/.*\.service$
+    - id: rst-releasenotes
+      name: rst-releasenotes
+      description: Check release notes for RST formatting issues (Markdown syntax detected)
+      entry: bash -c 'dda inv linter.rst-releasenotes --files="$(echo "$@" | tr " " ",")"' --
+      language: system
+      files: ^releasenotes(-dca)?/notes/.*\.yaml$
+      pass_filenames: true
+    - id: releasenote-unique-ids
+      name: releasenote-unique-ids
+      description: Check that release note UIDs are unique (prevents MQ collisions)
+      entry: bash -c 'dda inv linter.releasenote-unique-ids --files="$(echo "$@" | tr " " ",")"' --
+      language: system
+      files: ^releasenotes(-dca)?/notes/.*\.yaml$
+      pass_filenames: true

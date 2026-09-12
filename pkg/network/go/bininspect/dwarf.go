@@ -9,6 +9,7 @@ package bininspect
 
 import (
 	"debug/dwarf"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -197,13 +198,13 @@ func (d dwarfInspector) inspectSingleFunctionUsingDWARF(entry *dwarf.Entry) (Fun
 func (d dwarfInspector) getParameterLocationAtPC(parameterDIE *dwarf.Entry, pc uint64) (ParameterMetadata, error) {
 	typeOffset, ok := parameterDIE.Val(dwarf.AttrType).(dwarf.Offset)
 	if !ok {
-		return ParameterMetadata{}, fmt.Errorf("no type offset attribute in parameter entry")
+		return ParameterMetadata{}, errors.New("no type offset attribute in parameter entry")
 	}
 
 	// Find the location field on the entry
 	locationField := parameterDIE.AttrField(dwarf.AttrLocation)
 	if locationField == nil {
-		return ParameterMetadata{}, fmt.Errorf("no location field in parameter entry")
+		return ParameterMetadata{}, errors.New("no location field in parameter entry")
 	}
 
 	typ, err := dwarfutils.NewTypeFinder(d.dwarfData).FindTypeByOffset(typeOffset)
@@ -313,7 +314,10 @@ func (d dwarfInspector) getLoclistEntry(offset int64, pc uint64) (*loclist.Entry
 
 	var loclist loclist.Reader = loclist2
 	var debugAddr *godwarf.DebugAddr
-	if compileUnit != nil && compileUnit.Version >= 5 && loclist5 != nil {
+
+	// Use DWARF5 if available and either version >= 5 or fallback needed (Go 1.25rc1)
+	if loclist5 != nil && compileUnit != nil &&
+		(compileUnit.Version >= 5 || (loclist2.Empty() && !loclist5.Empty())) {
 		loclist = loclist5
 		if addrBase, ok := compileUnit.Entry.Val(dwarf.AttrAddrBase).(int64); ok {
 			debugAddr = debugAddrSection.GetSubsection(uint64(addrBase))
@@ -321,7 +325,7 @@ func (d dwarfInspector) getLoclistEntry(offset int64, pc uint64) (*loclist.Entry
 	}
 
 	if loclist.Empty() {
-		return nil, fmt.Errorf("no loclist found for the given program counter")
+		return nil, errors.New("no loclist found for the given program counter")
 	}
 
 	// Use 0x0 as the static base
@@ -334,5 +338,5 @@ func (d dwarfInspector) getLoclistEntry(offset int64, pc uint64) (*loclist.Entry
 		return entry, nil
 	}
 
-	return nil, fmt.Errorf("no loclist entry found")
+	return nil, errors.New("no loclist entry found")
 }

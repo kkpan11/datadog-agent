@@ -22,33 +22,32 @@ import (
 // KubeUtilInterface defines the interface for kubelet api
 // and includes extra functions for the orchestrator build flag
 type KubeUtilInterface interface {
-	GetNodeInfo(ctx context.Context) (string, string, error)
 	GetNodename(ctx context.Context) (string, error)
 	GetLocalPodList(ctx context.Context) ([]*Pod, error)
 	GetLocalPodListWithMetadata(ctx context.Context) (*PodList, error)
-	ForceGetLocalPodList(ctx context.Context) (*PodList, error)
-	GetPodForContainerID(ctx context.Context, containerID string) (*Pod, error)
 	QueryKubelet(ctx context.Context, path string) ([]byte, int, error)
 	GetRawConnectionInfo() map[string]string
 	GetRawMetrics(ctx context.Context) ([]byte, error)
 	GetRawLocalPodList(ctx context.Context) ([]*v1.Pod, error)
 	GetLocalStatsSummary(ctx context.Context) (*kubeletv1alpha1.Summary, error)
 	StreamLogs(ctx context.Context, podNamespace, podName, containerName string, logOptions *StreamLogOptions) (io.ReadCloser, error)
+	GetConfig(ctx context.Context) ([]byte, *ConfigDocument, error)
+	GetDevicesList(ctx context.Context) ([]*Device, error)
 }
 
 // GetRawLocalPodList returns the unfiltered pod list from the kubelet
 func (ku *KubeUtil) GetRawLocalPodList(ctx context.Context) ([]*v1.Pod, error) {
 	data, code, err := ku.QueryKubelet(ctx, kubeletPodPath)
 	if err != nil {
-		return nil, fmt.Errorf("error performing kubelet query %s%s: %s", ku.kubeletClient.kubeletURL, kubeletPodPath, err)
+		return nil, fmt.Errorf("error performing kubelet query %s%s: %w", ku.getKubeletClient().kubeletURL, kubeletPodPath, err)
 	}
 	if code != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code %d on %s%s: %s", code, ku.kubeletClient.kubeletURL, kubeletPodPath, string(data))
+		return nil, fmt.Errorf("unexpected status code %d on %s%s: %s", code, ku.getKubeletClient().kubeletURL, kubeletPodPath, string(data))
 	}
 
 	podListData, err := runtime.Decode(clientsetscheme.Codecs.UniversalDecoder(v1.SchemeGroupVersion), data)
 	if err != nil {
-		return nil, fmt.Errorf("unable to decode the pod list: %s", err)
+		return nil, fmt.Errorf("unable to decode the pod list: %w", err)
 	}
 	podList, ok := podListData.(*v1.PodList)
 	if !ok {

@@ -16,7 +16,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core/tagger/utils"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
-	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl/hosttags"
+	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/impl/hosttags"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/cloudproviders/cloudfoundry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -166,7 +166,7 @@ func updateTagsInContainer(container garden.Container, tags []string) (int, erro
 		Path: shell_path,
 		Args: []string{"/home/vcap/app/.datadog/scripts/update_agent_config.sh"},
 		User: "vcap",
-		Env:  []string{fmt.Sprintf("DD_NODE_AGENT_TAGS=%s", strings.Join(tags, ","))},
+		Env:  []string{"DD_NODE_AGENT_TAGS=" + strings.Join(tags, ",")},
 	}, garden.ProcessIO{})
 	if err != nil {
 		return -1, err

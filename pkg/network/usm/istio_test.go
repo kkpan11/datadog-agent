@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package usm
 
@@ -18,8 +18,8 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/ebpf/uprobes"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
-	usmconfig "github.com/DataDog/datadog-agent/pkg/network/usm/config"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/utils"
+	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 )
 
 const (
@@ -27,10 +27,8 @@ const (
 )
 
 func TestIsIstioBinary(t *testing.T) {
-	if !usmconfig.TLSSupported(utils.NewUSMEmptyConfig()) {
-		t.Skip("TLS not supported")
-	}
-	procRoot := uprobes.CreateFakeProcFS(t, []uprobes.FakeProcFSEntry{})
+	utils.SkipIfTLSUnsupported(t, NewUSMEmptyConfig())
+	procRoot := kernel.CreateFakeProcFS(t, []kernel.FakeProcFSEntry{})
 	m := newIstioTestMonitor(t, procRoot)
 
 	t.Run("an actual envoy process", func(t *testing.T) {
@@ -42,10 +40,8 @@ func TestIsIstioBinary(t *testing.T) {
 }
 
 func TestGetEnvoyPathWithConfig(t *testing.T) {
-	if !usmconfig.TLSSupported(utils.NewUSMEmptyConfig()) {
-		t.Skip("TLS not supported")
-	}
-	cfg := utils.NewUSMEmptyConfig()
+	utils.SkipIfTLSUnsupported(t, NewUSMEmptyConfig())
+	cfg := NewUSMEmptyConfig()
 	cfg.EnableIstioMonitoring = true
 	cfg.EnvoyPath = "/test/envoy"
 	monitor := newIstioTestMonitorWithCFG(t, cfg)
@@ -55,11 +51,9 @@ func TestGetEnvoyPathWithConfig(t *testing.T) {
 }
 
 func TestIstioSync(t *testing.T) {
-	if !usmconfig.TLSSupported(utils.NewUSMEmptyConfig()) {
-		t.Skip("TLS not supported")
-	}
+	utils.SkipIfTLSUnsupported(t, NewUSMEmptyConfig())
 	t.Run("calling sync for the first time", func(tt *testing.T) {
-		procRoot := uprobes.CreateFakeProcFS(tt, []uprobes.FakeProcFSEntry{
+		procRoot := kernel.CreateFakeProcFS(tt, []kernel.FakeProcFSEntry{
 			{Pid: 1, Exe: defaultEnvoyName},
 			{Pid: 2, Exe: "/bin/bash"},
 			{Pid: 3, Exe: defaultEnvoyName},
@@ -79,7 +73,7 @@ func TestIstioSync(t *testing.T) {
 	})
 
 	t.Run("detecting a dangling process", func(tt *testing.T) {
-		procRoot := uprobes.CreateFakeProcFS(tt, []uprobes.FakeProcFSEntry{
+		procRoot := kernel.CreateFakeProcFS(tt, []kernel.FakeProcFSEntry{
 			{Pid: 1, Exe: defaultEnvoyName},
 			{Pid: 2, Exe: "/bin/bash"},
 			{Pid: 3, Exe: defaultEnvoyName},
@@ -122,7 +116,7 @@ func TestIstioSync(t *testing.T) {
 }
 
 func newIstioTestMonitor(t *testing.T, procRoot string) *istioMonitor {
-	cfg := utils.NewUSMEmptyConfig()
+	cfg := NewUSMEmptyConfig()
 	cfg.EnableIstioMonitoring = true
 	cfg.ProcRoot = procRoot
 

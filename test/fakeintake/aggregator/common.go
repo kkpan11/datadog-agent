@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -62,6 +63,14 @@ func newAggregator[P PayloadItem](parse parseFunc[P]) Aggregator[P] {
 		parse:          parse,
 		mutex:          sync.RWMutex{},
 	}
+}
+
+// MarshalJSON implements json.Marshaler so that the unexported payloadsByName
+// map is included in JSON output (e.g. from the fakeintake CLI client).
+func (agg *Aggregator[P]) MarshalJSON() ([]byte, error) {
+	agg.mutex.RLock()
+	defer agg.mutex.RUnlock()
+	return json.Marshal(agg.payloadsByName)
 }
 
 // UnmarshallPayloads parses a list of payloads and stores them in the aggregator
@@ -155,6 +164,12 @@ func inflate(payload []byte, encoding string) (inflated []byte, err error) {
 		return nil, err
 	}
 	return inflated, nil
+}
+
+// Inflate decompresses a payload according to its encoding. It is exported for
+// callers that read raw payloads from routes without a typed aggregator.
+func Inflate(payload []byte, encoding string) ([]byte, error) {
+	return inflate(payload, encoding)
 }
 
 func getReadCloserForEncoding(payload []byte, encoding string) (rc io.ReadCloser, err error) {

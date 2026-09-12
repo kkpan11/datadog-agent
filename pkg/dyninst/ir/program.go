@@ -3,11 +3,16 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package ir
 
-import "github.com/DataDog/datadog-agent/pkg/network/go/dwarfutils/locexpr"
+import (
+	"fmt"
+
+	"github.com/DataDog/datadog-agent/pkg/dyninst/exprlang"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/redaction"
+)
 
 // ProgramID is a ID corresponding to an instance of a Program.  It is used to
 // identify messages from this program as they are communicated over the ring
@@ -16,10 +21,6 @@ type ProgramID uint32
 
 // TypeID is a ID corresponding to a type in a program.
 type TypeID uint32
-
-// EventID is a ID corresponding to an event output by the program.  It is used
-// to identify events as they are communicated over the ring buffer.
-type EventID uint32
 
 // SubprogramID is a ID corresponding to a subprogram in a program.
 type SubprogramID uint32
@@ -40,6 +41,81 @@ type Program struct {
 	Types map[TypeID]Type
 	// MaxTypeID is the maximum type ID that has been assigned.
 	MaxTypeID TypeID
+	// Issues is a list of probes that could not be created.
+	Issues []ProbeIssue
+	// GoModuledataInfo is used to resolve types from interfaces.
+	GoModuledataInfo GoModuledataInfo
+	// GoMapHashInfo holds addresses of runtime hash secrets needed for
+	// swiss table map lookups. Zero values indicate the symbols were not
+	// found in DWARF (map index expressions will be unsupported).
+	GoMapHashInfo GoMapHashInfo
+	// CommonTypes store references to common types.
+	CommonTypes CommonTypes
+	// IsARM64 is true when the target binary is arm64. This determines which
+	// AES instruction semantics (x86 AESENC vs arm64 AESE+AESMC) the BPF
+	// hash emulation uses for swiss table map lookups.
+	IsARM64 bool
+	// Redaction is the policy for scrubbing sensitive captured values. It is
+	// nil when no policy is configured, in which case nothing is redacted.
+	Redaction *redaction.Config `json:"-"`
+}
+
+// GoModuledataInfo is information about the runtime-internal structure used to
+// translate type pointer addresses to Go runtime type IDs. This information is
+// used in the generated program to resolve type information for interface
+// values.
+type GoModuledataInfo struct {
+	// FirstModuledataAddr is the virtual memory address of the firstmoduledata
+	// variable.
+	//
+	// See https://github.com/golang/go/blob/5a56d884/src/runtime/symtab.go#L483
+	FirstModuledataAddr uint64
+	// TypesOffset is the offset in the runtime.moduledata type of
+	// the types field.
+	//
+	// See https://github.com/golang/go/blob/5a56d884/src/runtime/symtab.go#L414
+	TypesOffset uint32
+}
+
+// GoMapHashInfo holds the addresses of runtime hash-related globals needed to
+// perform swiss table map lookups from BPF. These addresses are extracted from
+// DWARF during irgen and used by the loader to read the per-process hash
+// secrets at program load time.
+//
+// See pkg/dyninst/irgen/go_swiss_maps.md for details on the hash algorithms.
+type GoMapHashInfo struct {
+	// UseAeshashAddr is the address of runtime.useAeshash (bool).
+	// Determines whether the process uses AES-NI or wyhash for map hashing.
+	UseAeshashAddr uint64
+	// AeskeyschedAddr is the address of runtime.aeskeysched (uint8[128]).
+	// The per-process AES round key schedule, used when useAeshash is true.
+	AeskeyschedAddr uint64
+}
+
+// CommonTypes stores references to common types.
+type CommonTypes struct {
+	// G corresponds to runtime.g, non-nil
+	G *StructureType
+	// M corresponds to runtime.m, non-nil
+	M *StructureType
+	// Panic corresponds to runtime._panic. Nil if the type wasn't found
+	// in the binary's DWARF (e.g. stripped runtime, exotic toolchain).
+	// Loader treats absence as a signal to not attach the runtime.recovery
+	// probe; the rest of dyninst keeps working without panic-unwind
+	// handling.
+	Panic *StructureType
+}
+
+// InlinePCRanges represent the pc ranges for a single instance of an inlined subprogram.
+// Ranges correspond to the inlined instance itself. RootRanges correspond to the pc ranges
+// of a subprogram at the root of the tree formed by inlined subroutines. E.g. if this is a
+// subprogram A, that has been inlined into subprogram B, and subprogram B has been inlined
+// to a subprogram C, and C is not inlined, then these are pc ranges of C.
+type InlinePCRanges struct {
+	// Non-overlapping and sorted.
+	Ranges []PCRange
+	// Non-overlapping and sorted.
+	RootRanges []PCRange
 }
 
 // Subprogram represents a function or method in the program.
@@ -49,28 +125,60 @@ type Subprogram struct {
 	// Name is the name of the subprogram.
 	Name string
 	// OutOfLinePCRanges are the ranges of PC values that will be probed for the
-	// out-of-line-instances of the subprogram. These are sorted by start PC.
-	//
-	// What does this mean for inlined subprograms?
+	// out-of-line instance of the subprogram. These are sorted by start PC.
+	// Some functions may be inlined only in certain callers, in which case
+	// both OutOfLinePCRanges and InlinedPCRanges will be non-empty.
 	OutOfLinePCRanges []PCRange
 	// InlinePCRanges are the ranges of PC values that will be probed for the
 	// inlined instances of the subprogram. These are sorted by start PC.
-	InlinePCRanges [][]PCRange
+	InlinePCRanges []InlinePCRanges
 	// Variables are the variables that are used in the subprogram.
 	Variables []*Variable
-	// Lines are the lines of the subprogram.
-	Lines []SubprogramLine
+	// DictRegister is the ABI register number holding the dictionary pointer
+	// for shape-instantiated generic functions. Nil for non-generic functions.
+	// See pkg/dyninst/irgen/go_generics.md for details.
+	DictRegister *uint8
 }
 
-// SubprogramLine represents a line in the subprogram.
-type SubprogramLine struct {
-	PC              uint64
-	File            string
-	Line            uint32
-	Column          uint32
-	IsStatement     bool
-	IsPrologueEnd   bool
-	IsEpilogueStart bool
+// VariableRole is the role of a variable within a subprogram.
+type VariableRole uint8
+
+// VariableRole values.
+const (
+	_ VariableRole = iota
+	VariableRoleParameter
+	VariableRoleReturn
+	VariableRoleLocal
+	// VariableRoleDuration is a synthetic variable that resolves at
+	// BPF evaluation time to the nanoseconds elapsed between the entry
+	// event and the return event for the invocation. Only available on
+	// subprograms that have a return event.
+	VariableRoleDuration
+	// VariableRoleLoopIt is a synthetic variable representing the
+	// current element (`@it`) of an any/all loop. Its bytes live at
+	// sm->offset in the loop's scratch slot, written by the loop's
+	// Begin/End ops before each body iteration. The compiler treats a
+	// LocationOp with this role as a no-op (the bytes are already at
+	// sm->offset); GetMemberExpr-driven offset and ByteSize adjustments
+	// on the LocationOp narrow to the desired field within @it.
+	VariableRoleLoopIt
+)
+
+func (vr VariableRole) String() string {
+	switch vr {
+	case VariableRoleParameter:
+		return "Parameter"
+	case VariableRoleReturn:
+		return "Return"
+	case VariableRoleLocal:
+		return "Local"
+	case VariableRoleDuration:
+		return "Duration"
+	case VariableRoleLoopIt:
+		return "LoopIt"
+	default:
+		return fmt.Sprintf("VariableRole(%d)", vr)
+	}
 }
 
 // Variable represents a variable or parameter in the subprogram.
@@ -80,53 +188,134 @@ type Variable struct {
 	// Type is the type of the variable.
 	Type Type
 	// Locations are the locations of the variable in the subprogram.
+	// Sorted by low limit of their ranges. Note the ranges might overlap,
+	// in case of variables inlined multiple times in the same parent subprogram.
 	Locations []Location
-	// IsParameter is true if the variable is a parameter.
-	IsParameter bool
-	// IsReturn is true if this variable is a return value.
-	IsReturn bool
-}
-
-// Location is the location of a parameter or variable in the subprogram.
-type Location struct {
-	// PCRange is the range of PC values that will be probed.
-	Range PCRange
-	// The locations of the pieces of the parameter or variable.
-	Pieces []locexpr.LocationPiece
+	// Role is the role of the variable within the subprogram.
+	Role VariableRole
+	// DictIndex is the index into the runtime dictionary where the concrete
+	// *runtime._type for this variable's shape type can be found. -1 means
+	// no dict resolution is needed (the variable is not a generic shape type).
+	// See pkg/dyninst/irgen/go_generics.md for details.
+	DictIndex int
+	// LoopBaseOffset is the byte offset of this variable's bytes inside the
+	// any/all loop's per-iteration scratch slot. Only meaningful when Role is
+	// VariableRoleLoopIt. For slice/array iteration and the map @it (key),
+	// this is 0. For the map @value, this is the 8-byte-aligned value offset
+	// the loop runtime writes alongside the key.
+	LoopBaseOffset uint32
 }
 
 // PCRange is the range of PC values that will be probed.
 type PCRange = [2]uint64
 
+// Template represents the concrete template structure for a probe.
+type Template struct {
+	// TemplateString is the complete template string.
+	TemplateString string
+	// Segments are the ordered parts of the template.
+	Segments []TemplateSegment
+}
+
+// TemplateSegment represents a concrete part of the template.
+type TemplateSegment interface {
+	templateSegment() // marker method
+}
+
+// StringSegment is a string literal in the template.
+type StringSegment string
+
+func (s StringSegment) templateSegment() {}
+
+// JSONSegment is an expression segment in the template.
+type JSONSegment struct {
+	// JSON is the AST of the DSL segment.
+	JSON exprlang.Expr
+	// DSL is the raw expression language segment.
+	DSL string
+	// EventKind is the kind of the event within the probe that corresponds to this segment (i.e. entry, return, line).
+	EventKind EventKind
+	// EventExpressionIndex is the index of the expression within the event.
+	EventExpressionIndex int
+}
+
+func (s *JSONSegment) templateSegment() {}
+
+// InvalidSegment is a segment that represents an issue with the template.
+type InvalidSegment struct {
+	// Error is the error that occurred while parsing the segment.
+	Error string
+	DSL   string
+}
+
+func (s InvalidSegment) templateSegment() {}
+
 // Probe represents a probe from the config as it applies to the program.
+// A single probe may target multiple subprograms (e.g. different shape
+// instantiations of a generic function), each represented as a
+// ProbeInstance. Throttling is shared across all instances.
 type Probe struct {
-	// The config UUID of the probe.
-	ID string
-	// The kind of the probe.
-	Kind ProbeKind
-	// The version of the probe.
-	Version int
-	// Tags that are passed through the probe.
-	Tags []string
-	// The subprogram to which the probe is attached.
+	ProbeDefinition
+	// Instances are the per-subprogram instances of this probe. There is
+	// one instance per matching subprogram (shape function). For
+	// non-generic probes there is exactly one instance.
+	Instances []ProbeInstance
+}
+
+// ProbeInstance represents a single subprogram targeted by a probe. Each
+// instance has its own events and template because expression indices may
+// differ across shape instantiations.
+type ProbeInstance struct {
+	// Subprogram is the subprogram targeted by this instance.
 	Subprogram *Subprogram
-	// The events that trigger the probe.
+	// Events are the events that trigger this instance.
 	Events []*Event
-	// Whether the probe should capture a snapshot of the state of the program.
-	Snapshot bool
-	// TODO: Add template support:
-	//	TemplateSegments []TemplateSegment
+	// Template contains the concrete template structure for this instance.
+	// The template string is the same across all instances of a probe, but
+	// the JSONSegment.EventExpressionIndex values may differ because
+	// expression resolution can produce different results per shape.
+	Template *Template
 }
 
 // Event corresponds to an action that will occur when a PC is hit.
 type Event struct {
-	// ID of the event. This is used to identify data produced by the event over
-	// the ring buffer.
-	ID EventID
+	// Kind is the kind of event.
+	Kind EventKind
+	// SourceLine for line events, empty otherwise.
+	SourceLine string `json:"-"`
 	// The datatype of the event.
 	Type *EventRootType
-	// The PC values at which the event should be injected.
-	InjectionPCs []uint64
+	// The PC values at which the event should be injected. Sorted by PC.
+	InjectionPoints []InjectionPoint
 	// The condition that must be met for the event to be injected.
 	Condition *Expression
 }
+
+// InjectionPoint is a point at which an event should be injected.
+type InjectionPoint struct {
+	// The PC value at which the event should be injected.
+	PC uint64
+	// Whether the function at that PC is frameless.
+	Frameless bool
+	// HasAssociatedReturn is true if there is going to be a return associated
+	// with this call.
+	HasAssociatedReturn bool `json:"-"`
+	// NoReturnReason is the reason why there is no return associated with this
+	// call. Only set if HasAssociatedReturn is false.
+	NoReturnReason NoReturnReason `json:"-"`
+	// TopPCOffset is the offset of the top PC from the entry PC.
+	TopPCOffset int8 `json:"-"`
+}
+
+// This must be kept in sync with the no_return_reason enum in the ebpf/types.h
+// file.
+type NoReturnReason uint8
+
+const (
+	NoReturnReasonNone            NoReturnReason = 0
+	NoReturnReasonReturnsDisabled NoReturnReason = 1
+	NoReturnReasonLineProbe       NoReturnReason = 2
+	NoReturnReasonInlined         NoReturnReason = 3
+	NoReturnReasonNoBody          NoReturnReason = 4
+	NoReturnReasonIsReturn        NoReturnReason = 5
+)

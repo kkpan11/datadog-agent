@@ -37,12 +37,12 @@ func defaultMetricNamesMapper() map[string]string {
 		"kube_deployment_status_condition":                                                         "deployment.condition",
 		"kube_daemonset_status_number_unavailable":                                                 "daemonset.daemons_unavailable",
 		"kube_daemonset_status_number_available":                                                   "daemonset.daemons_available",
-		"kube_endpoint_address_available":                                                          "endpoint.address_available",
-		"kube_endpoint_address_not_ready":                                                          "endpoint.address_not_ready",
 		"kube_pod_container_status_terminated":                                                     "container.terminated",
 		"kube_pod_container_status_waiting":                                                        "container.waiting",
 		"kube_pod_init_container_status_waiting":                                                   "initcontainer.waiting",
 		"kube_pod_init_container_status_restarts_total":                                            "initcontainer.restarts",
+		"kube_pod_init_container_status_ready":                                                     "initcontainer.ready",
+		"kube_pod_init_container_status_running":                                                   "initcontainer.running",
 		"kube_persistentvolumeclaim_status_phase":                                                  "persistentvolumeclaim.status",
 		"kube_persistentvolumeclaim_access_mode":                                                   "persistentvolumeclaim.access_mode",
 		"kube_persistentvolumeclaim_resource_requests_storage_bytes":                               "persistentvolumeclaim.request_storage",
@@ -110,6 +110,7 @@ func defaultLabelsMapper() map[string]string {
 		"container_id":                        tags.ContainerID,
 		"image":                               tags.ImageName,
 		"endpoint":                            "kube_endpoint",
+		"endpointslice":                       "kube_endpointslice",
 		"label_topology_kubernetes_io_region": "kube_region",
 		"label_topology_kubernetes_io_zone":   "kube_zone",
 		"label_failure_domain_beta_kubernetes_io_region": "kube_region",
@@ -153,6 +154,8 @@ func defaultLabelJoins() map[string]*JoinsConfigWithoutLabelsMapping {
 		// Standard Helm labels
 		"label_helm_sh_chart",
 	}
+	defaultPodLabels := append([]string{}, defaultStandardLabels...)
+	defaultPodLabels = append(defaultPodLabels, argoRolloutLabelName)
 
 	return map[string]*JoinsConfigWithoutLabelsMapping{
 		"kube_pod_status_phase": {
@@ -173,7 +176,7 @@ func defaultLabelJoins() map[string]*JoinsConfigWithoutLabelsMapping {
 		},
 		"kube_pod_labels": {
 			LabelsToMatch: getLabelToMatchForKind("pod"),
-			LabelsToGet:   defaultStandardLabels,
+			LabelsToGet:   defaultPodLabels,
 		},
 		"kube_pod_status_reason": {
 			LabelsToMatch: getLabelToMatchForKind("pod"),
@@ -236,6 +239,8 @@ func getLabelToMatchForKind(kind string) []string {
 		return []string{"node"}
 	case "persistentvolume": // persistent volumes are not namespaced
 		return []string{"persistentvolume"}
+	case "namespace": // the `namespace` label already matches on its own, no need to duplicate it
+		return []string{"namespace"}
 	default:
 		return []string{kind, "namespace"}
 	}

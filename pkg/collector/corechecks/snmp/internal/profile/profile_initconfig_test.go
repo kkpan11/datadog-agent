@@ -6,9 +6,11 @@
 package profile
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-agent/pkg/networkdevice/profile/profiledefinition"
 )
@@ -17,9 +19,9 @@ func Test_loadInitConfigProfiles_legacyProfiles(t *testing.T) {
 	SetConfdPathAndCleanProfiles()
 
 	tests := []struct {
-		name                      string
-		metrics                   []profiledefinition.MetricsConfig
-		expectedHaveLegacyProfile bool
+		name                   string
+		metrics                []profiledefinition.MetricsConfig
+		expectedLegacyProfiles []string
 	}{
 		{
 			name: "ok profile",
@@ -57,7 +59,7 @@ func Test_loadInitConfigProfiles_legacyProfiles(t *testing.T) {
 					},
 				},
 			},
-			expectedHaveLegacyProfile: false,
+			expectedLegacyProfiles: nil,
 		},
 		{
 			name: "legacy profile because no OID",
@@ -67,7 +69,7 @@ func Test_loadInitConfigProfiles_legacyProfiles(t *testing.T) {
 					Name: "fooName",
 				},
 			},
-			expectedHaveLegacyProfile: true,
+			expectedLegacyProfiles: []string{"my-init-config-profile"},
 		},
 		{
 			name: "legacy profile because no Symbol.OID",
@@ -79,7 +81,7 @@ func Test_loadInitConfigProfiles_legacyProfiles(t *testing.T) {
 					},
 				},
 			},
-			expectedHaveLegacyProfile: true,
+			expectedLegacyProfiles: []string{"my-init-config-profile"},
 		},
 		{
 			name: "legacy profile because no Symbols[...].OID",
@@ -101,13 +103,13 @@ func Test_loadInitConfigProfiles_legacyProfiles(t *testing.T) {
 					},
 				},
 			},
-			expectedHaveLegacyProfile: true,
+			expectedLegacyProfiles: []string{"my-init-config-profile"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, haveLegacyProfile, err := loadInitConfigProfiles(ProfileConfigMap{
+			_, legacyProfiles, err := loadInitConfigProfiles(ProfileConfigMap{
 				"my-init-config-profile": {
 					Definition: profiledefinition.ProfileDefinition{
 						Metrics: tt.metrics,
@@ -115,7 +117,23 @@ func Test_loadInitConfigProfiles_legacyProfiles(t *testing.T) {
 				},
 			})
 			assert.NoError(t, err)
-			assert.Equal(t, tt.expectedHaveLegacyProfile, haveLegacyProfile)
+			assert.Equal(t, tt.expectedLegacyProfiles, legacyProfiles)
 		})
 	}
+}
+
+func Test_loadInitConfigProfiles_invalidDefinitionFile(t *testing.T) {
+	SetConfdPathAndCleanProfiles()
+
+	invalidFile, _ := filepath.Abs(filepath.Join("..", "test", "test_profiles", "invalid_yaml_file.yaml"))
+	_, _, err := loadInitConfigProfiles(ProfileConfigMap{
+		"bad-profile": {
+			DefinitionFile: invalidFile,
+		},
+	})
+	require.NoError(t, err)
+
+	expVarEntry := profileExpVar.Get("bad-profile")
+	require.NotNil(t, expVarEntry, "expected bad-profile error in snmpProfileErrors expvar")
+	assert.Contains(t, expVarEntry.String(), "parse error")
 }

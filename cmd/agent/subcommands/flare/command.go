@@ -25,12 +25,10 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
 	"github.com/DataDog/datadog-agent/cmd/agent/common"
 	"github.com/DataDog/datadog-agent/cmd/agent/subcommands/streamlogs"
-	"github.com/DataDog/datadog-agent/comp/aggregator/diagnosesendermanager"
-	"github.com/DataDog/datadog-agent/comp/aggregator/diagnosesendermanager/diagnosesendermanagerimpl"
-	"github.com/DataDog/datadog-agent/comp/collector/collector"
+	collector "github.com/DataDog/datadog-agent/comp/collector/collector/def"
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/autodiscoveryimpl"
+	autodiscovery "github.com/DataDog/datadog-agent/comp/core/autodiscovery/def"
+	adfx "github.com/DataDog/datadog-agent/comp/core/autodiscovery/fx"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	diagnose "github.com/DataDog/datadog-agent/comp/core/diagnose/def"
 	"github.com/DataDog/datadog-agent/comp/core/diagnose/format"
@@ -39,32 +37,37 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/flare"
 	"github.com/DataDog/datadog-agent/comp/core/flare/helpers"
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
 	flareprofilerdef "github.com/DataDog/datadog-agent/comp/core/profiler/def"
 	flareprofilerfx "github.com/DataDog/datadog-agent/comp/core/profiler/fx"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	coresettings "github.com/DataDog/datadog-agent/comp/core/settings"
-	"github.com/DataDog/datadog-agent/comp/core/settings/settingsimpl"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/sysprobeconfigimpl"
+	coresettings "github.com/DataDog/datadog-agent/comp/core/settings/def"
+	settingsfx "github.com/DataDog/datadog-agent/comp/core/settings/fx"
+	sysprobeconfig "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
+	sysprobeconfigimpl "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/impl"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	localTaggerfx "github.com/DataDog/datadog-agent/comp/core/tagger/fx"
-	wmcatalog "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/catalog"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadfilterfx "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx"
+	wmcatalog "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/catalog-core"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafx "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx"
+	workloadmetainit "github.com/DataDog/datadog-agent/comp/core/workloadmeta/init"
 	haagentfx "github.com/DataDog/datadog-agent/comp/haagent/fx"
+	healthplatform "github.com/DataDog/datadog-agent/comp/healthplatform"
 	haagentmetadatafx "github.com/DataDog/datadog-agent/comp/metadata/haagent/fx"
-	"github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl"
-	"github.com/DataDog/datadog-agent/comp/metadata/inventoryagent/inventoryagentimpl"
-	"github.com/DataDog/datadog-agent/comp/metadata/inventoryhost/inventoryhostimpl"
-	"github.com/DataDog/datadog-agent/comp/metadata/inventoryotel/inventoryotelimpl"
-	"github.com/DataDog/datadog-agent/comp/metadata/resources/resourcesimpl"
+	hostfx "github.com/DataDog/datadog-agent/comp/metadata/host/fx"
+	inventoryagentfx "github.com/DataDog/datadog-agent/comp/metadata/inventoryagent/fx"
+	inventoryhostfx "github.com/DataDog/datadog-agent/comp/metadata/inventoryhost/fx"
+	resourcesfx "github.com/DataDog/datadog-agent/comp/metadata/resources/fx"
 	logscompressorfx "github.com/DataDog/datadog-agent/comp/serializer/logscompression/fx"
 	metricscompressorfx "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/fx"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	"github.com/DataDog/datadog-agent/pkg/config/settings"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
@@ -83,6 +86,7 @@ type cliParams struct {
 
 	customerEmail        string
 	autoconfirm          bool
+	keepArchive          bool
 	forceLocal           bool
 	profiling            int
 	profileMutex         bool
@@ -108,7 +112,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 			cliParams.args = args
 			c := config.NewAgentParams(globalParams.ConfFilePath,
 				config.WithSecurityAgentConfigFilePaths([]string{
-					path.Join(defaultpaths.ConfPath, "security-agent.yaml"),
+					path.Join(defaultpaths.GetDefaultConfPath(), "security-agent.yaml"),
 				}),
 				config.WithConfigLoadSecurityAgent(true),
 				config.WithIgnoreErrors(true),
@@ -116,28 +120,29 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 				config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath),
 			)
 
+			flareParams := flare.NewLocalParams(
+				defaultpaths.GetDistPath(),
+				defaultpaths.GetDefaultPyChecksPath(),
+				defaultpaths.GetDefaultLogFile(),
+				defaultpaths.GetDefaultJmxLogFile(),
+				defaultpaths.GetDefaultDogstatsDProtocolLogFile(),
+				defaultpaths.GetDefaultStreamlogsLogFile(),
+			)
+			flareParams.KeepArchiveAfterSend = cliParams.keepArchive
 			return fxutil.OneShot(makeFlare,
 				fx.Supply(cliParams),
 				fx.Supply(core.BundleParams{
 					ConfigParams:         c,
-					SecretParams:         secrets.NewEnabledParams(),
 					SysprobeConfigParams: sysprobeconfigimpl.NewParams(sysprobeconfigimpl.WithSysProbeConfFilePath(globalParams.SysProbeConfFilePath), sysprobeconfigimpl.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
 					LogParams:            log.ForOneShot(command.LoggerName, cliParams.logLevelDefaultOff.Value(), false),
 				}),
-				flare.Module(flare.NewLocalParams(
-					defaultpaths.GetDistPath(),
-					defaultpaths.PyChecksPath,
-					defaultpaths.LogFile,
-					defaultpaths.JmxLogFile,
-					defaultpaths.DogstatsDLogFile,
-					defaultpaths.StreamlogsLogFile,
-				)),
+				flare.Module(flareParams),
 				flareprofilerfx.Module(),
 				// workloadmeta setup
 				wmcatalog.GetCatalog(),
 				workloadmetafx.Module(workloadmeta.Params{
 					AgentType:  workloadmeta.NodeAgent,
-					InitHelper: common.GetWorkloadmetaInit(),
+					InitHelper: workloadmetainit.GetWorkloadmetaInit(),
 				}),
 				fx.Provide(func(config config.Component) coresettings.Params {
 					return coresettings.Params{
@@ -148,24 +153,28 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 						Config:   config,
 					}
 				}),
-				settingsimpl.Module(),
+				settingsfx.Module(),
 				localTaggerfx.Module(),
-				autodiscoveryimpl.Module(),
+				workloadfilterfx.Module(),
+				fx.Invoke(func(wmeta workloadmeta.Component, tagger tagger.Component, filterStore workloadfilter.Component) {
+					proccontainers.InitSharedContainerProvider(wmeta, tagger, filterStore)
+				}),
+				adfx.Module(),
 				fx.Supply(option.None[collector.Component]()),
-				diagnosesendermanagerimpl.Module(),
+				healthplatform.Bundle(),
 				// We need inventoryagent to fill the status page generated by the flare.
-				inventoryagentimpl.Module(),
-				hostimpl.Module(),
-				inventoryhostimpl.Module(),
-				inventoryotelimpl.Module(),
+				inventoryagentfx.Module(),
+				hostfx.Module(),
+				inventoryhostfx.Module(),
 				haagentmetadatafx.Module(),
-				resourcesimpl.Module(),
+				resourcesfx.Module(),
 				// inventoryagent require a serializer. Since we're not actually sending the payload to
 				// the backend a nil will work.
 				fx.Provide(func() serializer.MetricSerializer {
 					return nil
 				}),
-				core.Bundle(),
+				core.Bundle(core.WithSecrets()),
+				hostnameimpl.Module(),
 				haagentfx.Module(),
 				logscompressorfx.Module(),
 				metricscompressorfx.Module(),
@@ -178,6 +187,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 
 	flareCmd.Flags().StringVarP(&cliParams.customerEmail, "email", "e", "", "Your email")
 	flareCmd.Flags().BoolVarP(&cliParams.autoconfirm, "send", "s", false, "Automatically send flare (don't prompt for confirmation)")
+	flareCmd.Flags().BoolVar(&cliParams.keepArchive, "keep-archive", false, "Keep the flare archive file after a successful upload")
 	flareCmd.Flags().BoolVarP(&cliParams.forceLocal, "local", "l", false, "Force the creation of the flare by the command line instead of the agent process (useful when running in a containerized env)")
 	flareCmd.Flags().IntVarP(&cliParams.profiling, "profile", "p", -1, "Add performance profiling data to the flare. It will collect a heap profile and a CPU profile for the amount of seconds passed to the flag, with a minimum of 30s")
 	flareCmd.Flags().BoolVarP(&cliParams.profileMutex, "profile-mutex", "M", false, "Add mutex profile to the performance data in the flare")
@@ -199,10 +209,9 @@ func makeFlare(flareComp flare.Component,
 	_ option.Option[workloadmeta.Component],
 	tagger tagger.Component,
 	flareprofiler flareprofilerdef.Component,
-	senderManager diagnosesendermanager.Component,
-	wmeta option.Option[workloadmeta.Component],
+	client ipc.HTTPClient,
+	filterStore workloadfilter.Component,
 	ac autodiscovery.Component,
-	secretResolver secrets.Component,
 	diagnoseComponent diagnose.Component,
 ) error {
 	var (
@@ -211,7 +220,7 @@ func makeFlare(flareComp flare.Component,
 	)
 
 	streamLogParams := streamlogs.CliParams{
-		FilePath: defaultpaths.StreamlogsLogFile,
+		FilePath: defaultpaths.GetDefaultStreamlogsLogFile(),
 		Duration: cliParams.withStreamLogs,
 		Quiet:    true,
 	}
@@ -224,8 +233,8 @@ func makeFlare(flareComp flare.Component,
 	fmt.Fprintln(color.Output, color.BlueString("See https://docs.datadoghq.com/agent/troubleshooting/send_a_flare/?tab=agentv6v7#send-a-flare-from-the-datadog-site for more info."))
 
 	warnings := config.Warnings()
-	if warnings != nil && warnings.Errors != nil {
-		fmt.Fprintln(color.Error, color.YellowString("Config parsing warning: %v", warnings.Errors))
+	if len(warnings) != 0 {
+		fmt.Fprintln(color.Error, color.YellowString("Config parsing warning: %v", warnings))
 	}
 	caseID := ""
 	if len(cliParams.args) > 0 {
@@ -242,7 +251,7 @@ func makeFlare(flareComp flare.Component,
 	}
 
 	if cliParams.profiling >= 30 {
-		c, err := common.NewSettingsClient()
+		c, err := common.NewSettingsClient(client)
 		if err != nil {
 			return fmt.Errorf("failed to initialize settings client: %w", err)
 		}
@@ -274,7 +283,7 @@ func makeFlare(flareComp flare.Component,
 
 	if streamLogParams.Duration > 0 {
 		fmt.Fprintln(color.Output, color.GreenString((fmt.Sprintf("Asking the agent to stream logs for %s", streamLogParams.Duration))))
-		err := streamlogs.StreamLogs(lc, config, &streamLogParams)
+		err := streamlogs.StreamLogs(lc, config, client, &streamLogParams)
 		if err != nil {
 			fmt.Fprintln(color.Output, color.RedString(fmt.Sprintf("Error streaming logs: %s", err)))
 		}
@@ -283,12 +292,12 @@ func makeFlare(flareComp flare.Component,
 	var filePath string
 
 	if cliParams.forceLocal {
-		diagnoseresult := runLocalDiagnose(diagnoseComponent, diagnose.Config{Verbose: true}, lc, senderManager, wmeta, ac, secretResolver, tagger, config)
+		diagnoseresult := runLocalDiagnose(diagnoseComponent, diagnose.Config{Verbose: true}, lc, filterStore, ac, tagger, config)
 		filePath, err = createArchive(flareComp, profile, cliParams.providerTimeout, nil, diagnoseresult)
 	} else {
-		filePath, err = requestArchive(profile, cliParams.providerTimeout)
+		filePath, err = requestArchive(profile, client, cliParams.providerTimeout)
 		if err != nil {
-			diagnoseresult := runLocalDiagnose(diagnoseComponent, diagnose.Config{Verbose: true}, lc, senderManager, wmeta, ac, secretResolver, tagger, config)
+			diagnoseresult := runLocalDiagnose(diagnoseComponent, diagnose.Config{Verbose: true}, lc, filterStore, ac, tagger, config)
 			filePath, err = createArchive(flareComp, profile, cliParams.providerTimeout, err, diagnoseresult)
 		}
 	}
@@ -314,16 +323,12 @@ func makeFlare(flareComp flare.Component,
 
 	response, e := flareComp.Send(filePath, caseID, customerEmail, helpers.NewLocalFlareSource())
 	fmt.Println(response)
-	if e != nil {
-		return e
-	}
-	return nil
+	return e
 }
 
-func requestArchive(pdata flaretypes.ProfileData, providerTimeout time.Duration) (string, error) {
+func requestArchive(pdata flaretypes.ProfileData, client ipc.HTTPClient, providerTimeout time.Duration) (string, error) {
 	fmt.Fprintln(color.Output, color.BlueString("Asking the agent to build the flare archive."))
-	c := util.GetClient()
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		fmt.Fprintln(color.Output, color.RedString(fmt.Sprintf("Error getting IPC address for the agent: %s", err)))
 		return "", err
@@ -343,19 +348,13 @@ func requestArchive(pdata flaretypes.ProfileData, providerTimeout time.Duration)
 
 	urlstr := url.String()
 
-	// Set session token
-	if err = util.SetAuthToken(pkgconfigsetup.Datadog()); err != nil {
-		fmt.Fprintln(color.Output, color.RedString(fmt.Sprintf("Error: %s", err)))
-		return "", err
-	}
-
 	p, err := json.Marshal(pdata)
 	if err != nil {
 		fmt.Fprintln(color.Output, color.RedString(fmt.Sprintf("Error while encoding profile: %s", err)))
 		return "", err
 	}
 
-	r, err := util.DoPost(c, urlstr, "application/json", bytes.NewBuffer(p))
+	r, err := client.Post(urlstr, "application/json", bytes.NewBuffer(p))
 	if err != nil {
 		if r != nil && string(r) != "" {
 			fmt.Fprintf(color.Output, "The agent ran into an error while making the flare: %s\n", color.RedString(string(r)))
@@ -381,18 +380,44 @@ func createArchive(flareComp flare.Component, pdata flaretypes.ProfileData, prov
 	return filePath, nil
 }
 
+// localDiagnoseTimeout caps how long runLocalDiagnose may block. The diagnose
+// step can hang indefinitely when Python check initialization stalls in CGo
+// (GIL acquisition), so we bound it to keep flare creation from blocking forever.
+// The goroutine is intentionally leaked on timeout; the flare CLI is short-lived.
+const localDiagnoseTimeout = 60 * time.Second
+
 func runLocalDiagnose(
 	diagnoseComponent diagnose.Component,
 	diagnoseConfig diagnose.Config,
 	log log.Component,
-	senderManager diagnosesendermanager.Component,
-	wmeta option.Option[workloadmeta.Component],
+	filterStore workloadfilter.Component,
 	ac autodiscovery.Component,
-	secretResolver secrets.Component,
 	tagger tagger.Component,
 	config config.Component) []byte {
 
-	result, err := diagnoseLocal.Run(diagnoseComponent, diagnose.Config{Verbose: true}, log, senderManager, wmeta, ac, secretResolver, tagger, config)
+	ch := make(chan []byte, 1)
+	go func() {
+		ch <- runLocalDiagnoseInner(diagnoseComponent, diagnoseConfig, log, filterStore, ac, tagger, config)
+	}()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(localDiagnoseTimeout):
+		fmt.Fprint(color.Output, color.YellowString("Local diagnose timed out after %s, proceeding with flare creation\n", localDiagnoseTimeout))
+		return []byte(fmt.Sprintf("local diagnose timed out after %s", localDiagnoseTimeout))
+	}
+}
+
+func runLocalDiagnoseInner(
+	diagnoseComponent diagnose.Component,
+	diagnoseConfig diagnose.Config,
+	log log.Component,
+	filterStore workloadfilter.Component,
+	ac autodiscovery.Component,
+	tagger tagger.Component,
+	config config.Component) []byte {
+
+	result, err := diagnoseLocal.Run(diagnoseComponent, diagnose.Config{Verbose: true}, log, filterStore, ac, tagger, config)
 
 	if err != nil {
 		return []byte(color.RedString(fmt.Sprintf("Error running diagnose: %s", err)))

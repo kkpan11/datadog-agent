@@ -7,13 +7,14 @@ package hostname
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/DataDog/datadog-agent/pkg/config/env"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/util/ec2"
 	"github.com/DataDog/datadog-agent/pkg/util/fargate"
@@ -23,7 +24,7 @@ import (
 
 func TestFromConfig(t *testing.T) {
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("hostname", "test-hostname")
+	cfg.SetInTest("hostname", "test-hostname")
 
 	hostname, err := fromConfig(context.TODO(), "")
 	require.NoError(t, err)
@@ -32,7 +33,7 @@ func TestFromConfig(t *testing.T) {
 
 func TestFromConfigInvalid(t *testing.T) {
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("hostname", "hostname_with_underscore")
+	cfg.SetInTest("hostname", "hostname_with_underscore")
 
 	_, err := fromConfig(context.TODO(), "")
 	assert.Error(t, err)
@@ -49,7 +50,7 @@ func setupHostnameFile(t *testing.T, content string) {
 	require.NoError(t, err, "Could not write to tmp file %s: %s", destFile.Name(), err)
 
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("hostname_file", destFile.Name())
+	cfg.SetInTest("hostname_file", destFile.Name())
 
 	destFile.Close()
 }
@@ -72,7 +73,7 @@ func TestFromHostnameFileWhitespaceTrim(t *testing.T) {
 
 func TestFromHostnameFileNoFileName(t *testing.T) {
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("hostname_file", "")
+	cfg.SetInTest("hostname_file", "")
 
 	_, err := fromHostnameFile(context.TODO(), "")
 	assert.NotNil(t, err)
@@ -88,14 +89,14 @@ func TestFromHostnameFileInvalid(t *testing.T) {
 // fromFargate
 
 func TestFromFargate(t *testing.T) {
-	defer func() { isFargateInstance = fargate.IsFargateInstance }()
+	defer func() { isSidecar = fargate.IsSidecar }()
 
-	isFargateInstance = func() bool { return true }
+	isSidecar = func() bool { return true }
 	hostname, err := fromFargate(context.TODO(), "")
 	require.NoError(t, err)
 	assert.Equal(t, "", hostname)
 
-	isFargateInstance = func() bool { return false }
+	isSidecar = func() bool { return false }
 	_, err = fromFargate(context.TODO(), "")
 	assert.Error(t, err)
 }
@@ -112,12 +113,12 @@ func TestFromFQDN(t *testing.T) {
 	fqdnHostname = func() (string, error) { return "fqdn-hostname", nil }
 
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("hostname_fqdn", false)
+	cfg.SetInTest("hostname_fqdn", false)
 
 	_, err := fromFQDN(context.TODO(), "")
 	assert.Error(t, err)
 
-	cfg.SetWithoutSource("hostname_fqdn", true)
+	cfg.SetInTest("hostname_fqdn", true)
 
 	hostname, err := fromFQDN(context.TODO(), "")
 	assert.NoError(t, err)
@@ -149,7 +150,7 @@ func TestFromEc2DefaultHostname(t *testing.T) {
 	defer func() { ec2GetInstanceID = ec2.GetInstanceID }()
 
 	// make AWS provider return an error
-	ec2GetInstanceID = func(context.Context) (string, error) { return "", fmt.Errorf("some error") }
+	ec2GetInstanceID = func(context.Context) (string, error) { return "", errors.New("some error") }
 
 	_, err := fromEC2(context.Background(), "ip-hostname")
 	assert.Error(t, err)
@@ -166,10 +167,10 @@ func TestFromEc2Prioritize(t *testing.T) {
 	// to true we use the instance ID
 	defer func() { ec2GetInstanceID = ec2.GetInstanceID }()
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("ec2_prioritize_instance_id_as_hostname", true)
+	cfg.SetInTest("ec2_prioritize_instance_id_as_hostname", true)
 
 	// make AWS provider return an error
-	ec2GetInstanceID = func(context.Context) (string, error) { return "", fmt.Errorf("some error") }
+	ec2GetInstanceID = func(context.Context) (string, error) { return "", errors.New("some error") }
 
 	_, err := fromEC2(context.Background(), "non-default-hostname")
 	assert.Error(t, err)
@@ -179,4 +180,45 @@ func TestFromEc2Prioritize(t *testing.T) {
 	hostname, err := fromEC2(context.Background(), "non-default-hostname")
 	assert.NoError(t, err)
 	assert.Equal(t, "someHostname", hostname)
+}
+
+func TestFromEc2ECSManagedInstancesDaemon(t *testing.T) {
+	// In daemon mode on ECS Managed Instances, fromOS and fromFQDN are blocked by the UTS namespace
+	// check, so currentHostname is empty and IsDefaultHostname never matches. The fix adds an explicit
+	// ECSManagedInstances (daemon) check so IMDS is still consulted.
+	defer func() { ec2GetInstanceID = ec2.GetInstanceID }()
+
+	t.Setenv("AWS_EXECUTION_ENV", "AWS_ECS_MANAGED_INSTANCES") // so IsECSSidecarMode reads config
+	env.SetFeatures(t, env.ECSManagedInstances)
+	cfg := configmock.New(t)
+	cfg.SetInTest("ecs_deployment_mode", "daemon")
+
+	ec2GetInstanceID = func(context.Context) (string, error) { return "", errors.New("imds error") }
+	_, err := fromEC2(context.Background(), "")
+	assert.Error(t, err)
+
+	ec2GetInstanceID = func(context.Context) (string, error) { return "i-0abc123", nil }
+	hostname, err := fromEC2(context.Background(), "")
+	assert.NoError(t, err)
+	assert.Equal(t, "i-0abc123", hostname)
+}
+
+func TestFromEc2ECSManagedInstancesSidecarSkipsIMDS(t *testing.T) {
+	// In sidecar mode, fromFargate already stops the hostname chain; fromEC2 should not
+	// call IMDS even though ECSManagedInstances is set.
+	defer func() { ec2GetInstanceID = ec2.GetInstanceID }()
+
+	t.Setenv("AWS_EXECUTION_ENV", "AWS_ECS_MANAGED_INSTANCES") // so IsECSSidecarMode reads config
+	env.SetFeatures(t, env.ECSManagedInstances)
+	cfg := configmock.New(t)
+	cfg.SetInTest("ecs_deployment_mode", "sidecar")
+
+	called := false
+	ec2GetInstanceID = func(context.Context) (string, error) {
+		called = true
+		return "i-0abc123", nil
+	}
+	_, err := fromEC2(context.Background(), "")
+	assert.Error(t, err)
+	assert.False(t, called, "IMDS should not be called in sidecar mode")
 }

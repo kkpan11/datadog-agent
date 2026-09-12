@@ -15,6 +15,8 @@ import (
 	"github.com/google/gopacket/layers"
 	"golang.org/x/sys/unix"
 
+	"slices"
+
 	"github.com/DataDog/datadog-agent/pkg/security/secl/compiler/eval"
 )
 
@@ -28,7 +30,7 @@ func (e *RawPacketEvent) UnmarshalBinary(data []byte) (int, error) {
 
 	e.Size = binary.NativeEndian.Uint32(data)
 	data = data[4:]
-	e.Data = data
+	e.Data = slices.Clone(data)
 	e.CaptureInfo.InterfaceIndex = int(e.NetworkContext.Device.IfIndex)
 	e.CaptureInfo.Length = int(e.NetworkContext.Size)
 	e.CaptureInfo.CaptureLength = len(data)
@@ -41,7 +43,7 @@ func (e *RawPacketEvent) UnmarshalBinary(data []byte) (int, error) {
 			e.Destination.IPNet = *eval.IPNetFromIP(rl.DstIP)
 		}
 	} else if layer := packet.Layer(layers.LayerTypeIPv6); layer != nil {
-		if rl, ok := layer.(*layers.IPv4); ok {
+		if rl, ok := layer.(*layers.IPv6); ok {
 			e.L3Protocol = unix.ETH_P_IPV6
 			e.Source.IPNet = *eval.IPNetFromIP(rl.SrcIP)
 			e.Destination.IPNet = *eval.IPNetFromIP(rl.DstIP)
@@ -59,6 +61,16 @@ func (e *RawPacketEvent) UnmarshalBinary(data []byte) (int, error) {
 			e.L4Protocol = unix.IPPROTO_TCP
 			e.Source.Port = uint16(rl.SrcPort)
 			e.Destination.Port = uint16(rl.DstPort)
+		}
+	} else if layer := packet.Layer(layers.LayerTypeICMPv4); layer != nil {
+		if rl, ok := layer.(*layers.ICMPv4); ok {
+			e.L4Protocol = unix.IPPROTO_ICMP
+			e.Type = uint32(rl.TypeCode.Type())
+		}
+	} else if layer := packet.Layer(layers.LayerTypeICMPv6); layer != nil {
+		if rl, ok := layer.(*layers.ICMPv6); ok {
+			e.L4Protocol = unix.IPPROTO_ICMPV6
+			e.Type = uint32(rl.TypeCode.Type())
 		}
 	}
 

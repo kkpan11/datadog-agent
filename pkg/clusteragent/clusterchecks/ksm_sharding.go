@@ -1,0 +1,416 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+//go:build clusterchecks
+
+package clusterchecks
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+
+	"go.yaml.in/yaml/v2"
+	"k8s.io/kube-state-metrics/v2/pkg/options"
+
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+)
+
+// resourceGroup represents a logical grouping of KSM collectors
+type resourceGroup struct {
+	Name        string   // Human-readable name (pods, nodes, others)
+	Collectors  []string // KSM collector names
+	Description string   // Why these are grouped together
+}
+
+// ksmShardingManager handles the sharding logic for KSM checks by resource type
+type ksmShardingManager struct {
+	enabled bool
+}
+
+// newKSMShardingManager creates a new KSM sharding manager
+func newKSMShardingManager(enabled bool) *ksmShardingManager {
+	return &ksmShardingManager{
+		enabled: enabled,
+	}
+}
+
+// isEnabled returns whether KSM sharding is enabled
+func (m *ksmShardingManager) isEnabled() bool {
+	return m.enabled
+}
+
+// label satisfies shardingStrategy.
+func (m *ksmShardingManager) label() string {
+	return "resource-sharded KSM"
+}
+
+// shouldShard satisfies shardingStrategy; see shouldShardKSMCheck.
+func (m *ksmShardingManager) shouldShard(config integration.Config) bool {
+	return m.shouldShardKSMCheck(config)
+}
+
+// createShardedConfigs satisfies shardingStrategy; see createShardedKSMConfigs.
+func (m *ksmShardingManager) createShardedConfigs(config integration.Config) ([]integration.Config, error) {
+	return m.createShardedKSMConfigs(config)
+}
+
+// isKSMCheck returns true if the config is a KSM check
+// Only kubernetes_state_core (Go implementation) is supported for sharding
+// The legacy kubernetes_state (Python) check doesn't support the "collectors" parameter
+func (m *ksmShardingManager) isKSMCheck(config integration.Config) bool {
+	return config.Name == "kubernetes_state_core"
+}
+
+// defaultKSMCollectors returns the KSM default resource collectors with
+// "endpoints" added back for backward compatibility (upstream KSM v2.18
+// replaced "endpoints" with "endpointslices" in its defaults).
+func defaultKSMCollectors() []string {
+	collectors := options.DefaultResources.AsSlice()
+	if _, found := options.DefaultResources["endpoints"]; !found {
+		collectors = append(collectors, "endpoints")
+	}
+	return collectors
+}
+
+// analyzeKSMConfig groups the shardable instance's collectors by resource type.
+// Simple strategy: {pods}, {nodes}, {everything else}. The caller classifies
+// once and passes the shardable instance in, so this doesn't re-parse the config.
+func (m *ksmShardingManager) analyzeKSMConfig(shardable integration.Data) ([]resourceGroup, error) {
+	// Parse the KSM configuration
+	type ksmInstance struct {
+		Collectors []string `yaml:"collectors"`
+	}
+
+	var instance ksmInstance
+	if err := yaml.Unmarshal(shardable, &instance); err != nil {
+		return nil, fmt.Errorf("failed to parse shardable KSM instance: %w", err)
+	}
+
+	// If no collectors specified, KSM defaults to collecting all resources (options.DefaultResources)
+	// See kubernetes_state.go:Configure for the same fallback logic
+	// We use the same defaults for sharding to provide a seamless experience
+	var collectorsToShard []string
+	if len(instance.Collectors) == 0 {
+		defaultCollectors := defaultKSMCollectors()
+		log.Infof("KSM config has no collectors specified. Using default collectors for sharding: %v", defaultCollectors)
+		collectorsToShard = defaultCollectors
+	} else {
+		collectorsToShard = instance.Collectors
+	}
+
+	// Categorize collectors: pods, nodes, everything else
+	var hasPods bool
+	var hasNodes bool
+	var otherCollectors []string
+
+	for _, collector := range collectorsToShard {
+		switch collector {
+		case "pods":
+			hasPods = true
+		case "nodes":
+			hasNodes = true
+		default:
+			otherCollectors = append(otherCollectors, collector)
+		}
+	}
+
+	// Build resource groups only for collectors that are present
+	var groups []resourceGroup
+
+	if hasPods {
+		groups = append(groups, resourceGroup{
+			Name:        "pods",
+			Collectors:  []string{"pods"},
+			Description: "Pod metrics (highest cardinality)",
+		})
+	}
+
+	if hasNodes {
+		groups = append(groups, resourceGroup{
+			Name:        "nodes",
+			Collectors:  []string{"nodes"},
+			Description: "Node metrics (high cardinality)",
+		})
+	}
+
+	if len(otherCollectors) > 0 {
+		groups = append(groups, resourceGroup{
+			Name:        "others",
+			Collectors:  otherCollectors,
+			Description: "All other resource types",
+		})
+	}
+
+	if len(groups) == 0 {
+		return nil, errors.New("no collectors found after parsing")
+	}
+
+	return groups, nil
+}
+
+// pod_collection_mode values. Duplicated as literals to avoid importing the ksm
+// check package, which is not built with the clusterchecks tag.
+const (
+	clusterAggregatesOnlyMode = "cluster_aggregates_only"
+	clusterUnassignedMode     = "cluster_unassigned"
+)
+
+// classifyKSMInstances splits instances into the single shardable one and any
+// cluster_aggregates_only instances, which do a full-pod watch and so are
+// dispatched as-is instead of being sharded.
+func classifyKSMInstances(config integration.Config) (integration.Data, []integration.Data, error) {
+	type modeOnly struct {
+		PodCollectionMode string `yaml:"pod_collection_mode"`
+	}
+
+	var shardables, passthrough []integration.Data
+	for _, data := range config.Instances {
+		var mo modeOnly
+		if err := yaml.Unmarshal(data, &mo); err != nil {
+			log.Warnf("Failed to parse KSM instance config: %v", err)
+			continue
+		}
+		if mo.PodCollectionMode == clusterAggregatesOnlyMode {
+			passthrough = append(passthrough, data)
+			continue
+		}
+		shardables = append(shardables, data)
+	}
+
+	if len(shardables) == 0 {
+		return nil, nil, errors.New("no shardable KSM instance found")
+	}
+	if len(shardables) > 1 {
+		return nil, nil, fmt.Errorf("KSM sharding supports a single shardable instance, got %d (excluding %s)", len(shardables), clusterAggregatesOnlyMode)
+	}
+	return shardables[0], passthrough, nil
+}
+
+// shardableSuppressesTotal reports whether the shardable instance suppresses its
+// own .total family, which it must when a cluster_aggregates_only instance is
+// also configured. The observed values are returned for the diagnostic message;
+// an unparseable instance reports not-suppressing.
+func shardableSuppressesTotal(shardable integration.Data) (mode string, flag bool, ok bool) {
+	var s struct {
+		PodCollectionMode        string `yaml:"pod_collection_mode"`
+		ClusterAggregatesEnabled bool   `yaml:"cluster_aggregates_enabled"`
+	}
+	_ = yaml.Unmarshal(shardable, &s)
+	return s.PodCollectionMode, s.ClusterAggregatesEnabled,
+		s.PodCollectionMode == clusterUnassignedMode && s.ClusterAggregatesEnabled
+}
+
+// suppressionDiagnostic reports what to log, if anything, about the shardable
+// instance failing to suppress its own .total when a cluster_aggregates_only
+// instance is also configured. ok is true when there's nothing to report
+// (the shardable suppresses fine). Pure and directly testable, so tests don't
+// need to capture actual log output.
+func suppressionDiagnostic(shardable integration.Data, groups []resourceGroup) (message string, isError bool, ok bool) {
+	mode, flag, suppresses := shardableSuppressesTotal(shardable)
+	if suppresses {
+		return "", false, true
+	}
+
+	hasPodsGroup := false
+	for _, group := range groups {
+		if group.Name == "pods" {
+			hasPodsGroup = true
+			break
+		}
+	}
+
+	// Without a pods group, non-suppression isn't a certain double-count — but
+	// it's not certainly safe either. A shard's collectors can be filtered
+	// against what the live API server exposes and fall back to full defaults
+	// (including "pods"; see kubernetes_state.go Configure()), which this
+	// static analysis can't see. ERROR when certain, WARN when not.
+	if hasPodsGroup {
+		return fmt.Sprintf("KSM sharding: a %s instance is configured, but the shardable instance (pod_collection_mode=%q, cluster_aggregates_enabled=%v) will not suppress its own .total — this double-counts the .total family. Set pod_collection_mode: cluster_unassigned and cluster_aggregates_enabled: true on the shardable instance.", clusterAggregatesOnlyMode, mode, flag), true, false
+	}
+	return fmt.Sprintf("KSM sharding: a %s instance is configured, but the shardable instance (pod_collection_mode=%q, cluster_aggregates_enabled=%v) will not suppress its own .total. None of its shards statically include a pods collector, but if any shard's collectors are unavailable on this cluster it falls back to defaults (including pods) and may already be double-counting. Set pod_collection_mode: cluster_unassigned and cluster_aggregates_enabled: true on the shardable instance.", clusterAggregatesOnlyMode, mode, flag), false, false
+}
+
+// shouldShardKSMCheck determines if a KSM check should be sharded
+func (m *ksmShardingManager) shouldShardKSMCheck(config integration.Config) bool {
+	if !m.enabled || !m.isKSMCheck(config) {
+		return false
+	}
+	// Sharding only makes sense for cluster checks (dispatched to CLC runners)
+	// If ClusterCheck is false, the check runs locally on the DCA and doesn't need sharding
+	if !config.ClusterCheck {
+		log.Warnf("KSM sharding requires cluster_check: true, but got cluster_check: false")
+		return false
+	}
+
+	shardable, _, err := classifyKSMInstances(config)
+	if err != nil {
+		log.Warnf("KSM sharding disabled: %v", err)
+		return false
+	}
+
+	groups, err := m.analyzeKSMConfig(shardable)
+	if err != nil {
+		log.Warnf("KSM sharding disabled: %v", err)
+		return false
+	}
+
+	// Only shard if we have more than 1 group
+	// (otherwise there's no benefit to sharding)
+	if len(groups) <= 1 {
+		log.Debugf("KSM check has only %d resource group(s), sharding not beneficial", len(groups))
+		return false
+	}
+
+	// Log the sharding decision
+	log.Infof("KSM resource sharding enabled: will create %d sharded checks", len(groups))
+
+	for _, group := range groups {
+		log.Infof("  - Group '%s': %d collector(s) - %v", group.Name, len(group.Collectors), group.Collectors)
+	}
+
+	return true
+}
+
+// createShardedKSMConfigs creates sharded KSM configurations based on resource groups
+// Creates one shard per resource group present in the config:
+// - If config has pods collectors: creates pods shard
+// - If config has nodes collectors: creates nodes shard
+// - If config has other collectors: creates others shard
+// Number of shards is independent of runner count - rebalancing handles distribution
+func (m *ksmShardingManager) createShardedKSMConfigs(
+	baseConfig integration.Config,
+) ([]integration.Config, error) {
+
+	shardable, passthrough, err := classifyKSMInstances(baseConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	groups, err := m.analyzeKSMConfig(shardable)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(groups) == 0 {
+		return nil, errors.New("no resource groups to shard")
+	}
+
+	// Misconfigurations below are still dispatched, so the cluster keeps reporting
+	// inflated .total values until an operator fixes the config: data corruption
+	// rather than a degraded-but-correct fallback, hence ERROR.
+	if len(passthrough) > 0 {
+		if len(passthrough) > 1 {
+			log.Errorf("KSM sharding: %d %s instances configured; each does a full-pod watch and emits the .total family, which double-counts. Configure exactly one.", len(passthrough), clusterAggregatesOnlyMode)
+		}
+		if message, isError, ok := suppressionDiagnostic(shardable, groups); !ok {
+			if isError {
+				log.Error(message)
+			} else {
+				log.Warn(message)
+			}
+		}
+	}
+
+	// Force skip_leader_election since these run on a CLC runner, same as the shards.
+	aggregateInstances := make([]integration.Data, 0, len(passthrough))
+	for _, inst := range passthrough {
+		var mm map[string]interface{}
+		if err := yaml.Unmarshal(inst, &mm); err != nil {
+			log.Warnf("Failed to unmarshal %s instance: %v", clusterAggregatesOnlyMode, err)
+			mm = make(map[string]interface{})
+		}
+		mm["skip_leader_election"] = true
+		data, _ := yaml.Marshal(mm)
+		aggregateInstances = append(aggregateInstances, integration.Data(data))
+	}
+
+	// Always create shards (pods, nodes, others) regardless of runner count
+	// Rebalancing will handle optimal distribution as runners scale up/down
+	var shardedConfigs []integration.Config
+	aggregatesAttached := false
+
+	// Create a config for each resource group
+	for _, group := range groups {
+		shardConfig := m.createKSMConfigForResourceGroup(baseConfig, shardable, group)
+		// Co-locate the aggregates with the pods shard so one runner carries all
+		// pod-related watches, keeping nodes/others free for other runners.
+		if group.Name == "pods" && len(aggregateInstances) > 0 {
+			shardConfig.Instances = append(shardConfig.Instances, aggregateInstances...)
+			aggregatesAttached = true
+		}
+		shardedConfigs = append(shardedConfigs, shardConfig)
+	}
+
+	// No pods group to attach to: dispatch the aggregates standalone so they are
+	// not dropped.
+	if !aggregatesAttached && len(aggregateInstances) > 0 {
+		aggConfig := baseConfig
+		aggConfig.Instances = aggregateInstances
+		shardedConfigs = append(shardedConfigs, aggConfig)
+	}
+
+	log.Infof("Created %d resource-sharded KSM configs", len(shardedConfigs))
+
+	return shardedConfigs, nil
+}
+
+// createKSMConfigForResourceGroup creates a KSM config for a specific resource group
+func (m *ksmShardingManager) createKSMConfigForResourceGroup(
+	baseConfig integration.Config,
+	shardableInstance integration.Data,
+	group resourceGroup,
+) integration.Config {
+	// Deliberately not a full struct copy: CELSelector/Discovery are omitted,
+	// or the shard's IsTemplate() would flip true on the runner and it would
+	// wait to match a service instead of being scheduled directly.
+	//
+	// PodNamespace/ImageName ARE copied: configmgr.go's secret resolution reads
+	// them for its namespace/image ACL checks, which would otherwise fail open.
+	config := integration.Config{
+		Name:                    baseConfig.Name,
+		InitConfig:              baseConfig.InitConfig,
+		MetricConfig:            baseConfig.MetricConfig,
+		LogsConfig:              baseConfig.LogsConfig,
+		ADIdentifiers:           baseConfig.ADIdentifiers,
+		AdvancedADIdentifiers:   baseConfig.AdvancedADIdentifiers,
+		Provider:                baseConfig.Provider,
+		ServiceID:               baseConfig.ServiceID,
+		TaggerEntity:            baseConfig.TaggerEntity,
+		ClusterCheck:            baseConfig.ClusterCheck,
+		NodeName:                baseConfig.NodeName,
+		Source:                  baseConfig.Source,
+		IgnoreAutodiscoveryTags: baseConfig.IgnoreAutodiscoveryTags,
+		MetricsExcluded:         baseConfig.MetricsExcluded,
+		LogsExcluded:            baseConfig.LogsExcluded,
+		PodNamespace:            baseConfig.PodNamespace,
+		ImageName:               baseConfig.ImageName,
+	}
+
+	// Parse the shardable instance config (not necessarily Instances[0])
+	var instance map[string]interface{}
+	if err := yaml.Unmarshal(shardableInstance, &instance); err != nil {
+		log.Warnf("Failed to unmarshal shardable KSM instance config: %v", err)
+		instance = make(map[string]interface{})
+	}
+
+	// Sort collectors for consistent ordering
+	collectors := make([]string, len(group.Collectors))
+	copy(collectors, group.Collectors)
+	sort.Strings(collectors)
+
+	// Set collectors for this group
+	instance["collectors"] = collectors
+
+	// Enable skip_leader_election for cluster checks running on CLC runners
+	instance["skip_leader_election"] = true
+
+	// Serialize back to YAML
+	data, _ := yaml.Marshal(instance)
+	config.Instances = []integration.Data{integration.Data(data)}
+
+	return config
+}

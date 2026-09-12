@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/inframetadata"
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -21,11 +19,14 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.uber.org/zap"
 
-	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog/featuregates"
+
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/inframetadata"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
+	otlpmetrics "github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/metrics"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/util/otel"
-	otlpmetrics "github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/metrics"
-	pkgdatadog "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog"
 )
 
 const (
@@ -36,7 +37,6 @@ const (
 
 type factory struct {
 	s            serializer.MetricSerializer
-	enricher     tagenricher
 	hostProvider SourceProviderFunc
 
 	statsIn chan []byte
@@ -47,57 +47,94 @@ type factory struct {
 	onceReporter sync.Once
 	reporter     *inframetadata.Reporter
 	gatewayUsage otel.GatewayUsage
+
+	ipath ingestionPath
+	store TelemetryStore
 }
 
-type tagenricher interface {
-	SetCardinality(cardinality string) error
-	Enrich(ctx context.Context, extraTags []string, dimensions *otlpmetrics.Dimensions) []string
+// TelemetryStore stores the internal COAT (cross-org agent telemetry) metrics in DDOT
+type TelemetryStore struct {
+	// OTLPIngestMetrics tracks hosts running OTLP ingest on metrics
+	OTLPIngestMetrics telemetry.Gauge
+	// DDOTMetrics tracks hosts running DDOT and ingest metrics
+	DDOTMetrics telemetry.Gauge
+	// DDOTTraces tracks hosts running DDOT and ingest traces
+	DDOTTraces telemetry.Gauge
+	// DDOTGWUsage tracks hosts running DDOT in GW mode
+	DDOTGWUsage telemetry.Gauge
 }
 
-type defaultTagEnricher struct{}
-
-func (d *defaultTagEnricher) SetCardinality(_ string) error {
-	return nil
-}
-
-func (d *defaultTagEnricher) Enrich(_ context.Context, extraTags []string, dimensions *otlpmetrics.Dimensions) []string {
-	enrichedTags := make([]string, 0, len(extraTags)+len(dimensions.Tags()))
-	enrichedTags = append(enrichedTags, extraTags...)
-	enrichedTags = append(enrichedTags, dimensions.Tags()...)
-	return enrichedTags
-}
-
-type createConsumerFunc func(enricher tagenricher, extraTags []string, apmReceiverAddr string, buildInfo component.BuildInfo) SerializerConsumer
+type createConsumerFunc func(extraTags []string, apmReceiverAddr string, buildInfo component.BuildInfo) SerializerConsumer
 
 // NewFactoryForAgent creates a new serializer exporter factory for Agent OTLP ingestion.
 // Serializer exporter should never receive APM stats in Agent OTLP ingestion.
-func NewFactoryForAgent(s serializer.MetricSerializer, enricher tagenricher, hostGetter SourceProviderFunc) exp.Factory {
+func NewFactoryForAgent(s serializer.MetricSerializer, hostGetter SourceProviderFunc, store TelemetryStore) exp.Factory {
 	cfgType := component.MustNewType(TypeStr)
-	return newFactoryForAgentWithType(s, enricher, hostGetter, nil, cfgType, otel.NewDisabledGatewayUsage())
+	return newFactoryForAgentWithType(s, hostGetter, nil, cfgType, otel.NewDisabledGatewayUsage(), store, nil, agentOTLPIngest)
 }
 
 // NewFactoryForOTelAgent creates a new serializer exporter factory for the embedded collector.
-func NewFactoryForOTelAgent(s serializer.MetricSerializer, enricher tagenricher, hostGetter SourceProviderFunc, statsIn chan []byte, gatewayusage otel.GatewayUsage) exp.Factory {
+func NewFactoryForOTelAgent(
+	s serializer.MetricSerializer,
+	hostGetter SourceProviderFunc,
+	statsIn chan []byte,
+	gatewayusage otel.GatewayUsage,
+	store TelemetryStore,
+	reporter *inframetadata.Reporter,
+) exp.Factory {
 	cfgType := component.MustNewType("datadog") // this is called in datadog exporter (NOT serializer exporter) in embedded collector
-	return newFactoryForAgentWithType(s, enricher, hostGetter, statsIn, cfgType, gatewayusage)
+	return newFactoryForAgentWithType(s, hostGetter, statsIn, cfgType, gatewayusage, store, reporter, ddot)
 }
 
-func newFactoryForAgentWithType(s serializer.MetricSerializer, enricher tagenricher, hostGetter SourceProviderFunc, statsIn chan []byte, typ component.Type, gatewayUsage otel.GatewayUsage) exp.Factory {
+func newFactoryForAgentWithType(
+	s serializer.MetricSerializer,
+	hostGetter SourceProviderFunc,
+	statsIn chan []byte,
+	typ component.Type,
+	gatewayUsage otel.GatewayUsage,
+	store TelemetryStore,
+	reporter *inframetadata.Reporter,
+	ipath ingestionPath,
+) exp.Factory {
 	var options []otlpmetrics.TranslatorOption
-	if !pkgdatadog.MetricRemappingDisabledFeatureGate.IsEnabled() {
+	if featuregates.DisableMetricRemappingFeatureGate.IsEnabled() {
+		options = append(options, otlpmetrics.WithoutRuntimeMetricMappings())
+	} else {
 		options = append(options, otlpmetrics.WithOTelPrefix())
+	}
+
+	if featuregates.InferIntervalDeltaFeatureGate.IsEnabled() {
+		options = append(options, otlpmetrics.WithInferDeltaInterval())
+	}
+
+	if featuregates.AddUnitsFeatureGate.IsEnabled() {
+		options = append(options, otlpmetrics.WithUnits())
 	}
 
 	f := &factory{
 		s:            s,
-		enricher:     enricher,
 		hostProvider: hostGetter,
 		statsIn:      statsIn,
-		createConsumer: func(enricher tagenricher, extraTags []string, apmReceiverAddr string, _ component.BuildInfo) SerializerConsumer {
-			return &serializerConsumer{enricher: enricher, extraTags: extraTags, apmReceiverAddr: apmReceiverAddr}
+		createConsumer: func(extraTags []string, apmReceiverAddr string, _ component.BuildInfo) SerializerConsumer {
+			return &serializerConsumer{
+				extraTags:       extraTags,
+				apmReceiverAddr: apmReceiverAddr,
+				ipath:           ipath,
+				hosts:           make(map[string]struct{}),
+				ecsFargateTags:  make(map[string]struct{}),
+			}
 		},
 		options:      options,
 		gatewayUsage: gatewayUsage,
+		ipath:        ipath,
+		store:        store,
+	}
+
+	if reporter != nil {
+		// reporter is initialized in datadogexporter.NewFactory in DDOT, no need to initialize it again
+		f.onceReporter.Do(func() {
+			f.reporter = reporter
+		})
 	}
 
 	return exp.NewFactory(
@@ -108,19 +145,30 @@ func newFactoryForAgentWithType(s serializer.MetricSerializer, enricher tagenric
 }
 
 // NewFactoryForOSSExporter creates a new serializer exporter factory for the OSS Datadog exporter.
+// This function is part of the public API consumed by opentelemetry-collector-contrib's datadogexporter.
+// Do not remove or change its signature without coordinating with the upstream repository.
 func NewFactoryForOSSExporter(typ component.Type, statsIn chan []byte) exp.Factory {
 	var options []otlpmetrics.TranslatorOption
-	if !pkgdatadog.MetricRemappingDisabledFeatureGate.IsEnabled() {
+	if featuregates.DisableMetricRemappingFeatureGate.IsEnabled() {
+		options = append(options, otlpmetrics.WithoutRuntimeMetricMappings())
+	} else {
 		options = append(options, otlpmetrics.WithRemapping())
 	}
 
+	if featuregates.InferIntervalDeltaFeatureGate.IsEnabled() {
+		options = append(options, otlpmetrics.WithInferDeltaInterval())
+	}
+
+	if featuregates.AddUnitsFeatureGate.IsEnabled() {
+		options = append(options, otlpmetrics.WithUnits())
+	}
+
 	f := &factory{
-		enricher: &defaultTagEnricher{},
 		// hostProvider is a no-op function that returns an empty host.
 		// In OSS collector, the host is overridden via the HostProvider field in the config.
 		hostProvider: func(_ context.Context) (string, error) { return "", nil },
-		createConsumer: func(enricher tagenricher, extraTags []string, apmReceiverAddr string, buildInfo component.BuildInfo) SerializerConsumer {
-			s := &serializerConsumer{enricher: enricher, extraTags: extraTags, apmReceiverAddr: apmReceiverAddr}
+		createConsumer: func(extraTags []string, apmReceiverAddr string, buildInfo component.BuildInfo) SerializerConsumer {
+			s := &serializerConsumer{extraTags: extraTags, apmReceiverAddr: apmReceiverAddr, ipath: ossCollector}
 			return &collectorConsumer{
 				serializerConsumer: s,
 				seenHosts:          make(map[string]struct{}),
@@ -131,6 +179,7 @@ func NewFactoryForOSSExporter(typ component.Type, statsIn chan []byte) exp.Facto
 		},
 		options: options,
 		statsIn: statsIn,
+		ipath:   ossCollector,
 	}
 	return exp.NewFactory(
 		typ,
@@ -139,17 +188,11 @@ func NewFactoryForOSSExporter(typ component.Type, statsIn chan []byte) exp.Facto
 	)
 }
 
-// NewFactory implements the required func to be used in OCB. This interface does not work with APM stats. Do not change the func signature or OCB will fail.
-func NewFactory() exp.Factory {
-	return NewFactoryForOSSExporter(component.MustNewType(TypeStr), nil)
-}
-
 // Reporter builds and returns an *inframetadata.Reporter.
-func (f *factory) Reporter(params exp.Settings, forwarder defaultforwarder.Forwarder, reporterPeriod time.Duration) (*inframetadata.Reporter, error) {
+func (f *factory) Reporter(params exp.Settings, s serializer.MetricSerializer, reporterPeriod time.Duration) (*inframetadata.Reporter, error) {
 	var reporterErr error
 	f.onceReporter.Do(func() {
-		pusher := &hostMetadataPusher{forwarder: forwarder}
-		f.reporter, reporterErr = inframetadata.NewReporter(params.Logger, pusher, reporterPeriod)
+		f.reporter, reporterErr = inframetadata.NewReporter(params.Logger, NewPusher(s), reporterPeriod)
 		if reporterErr == nil {
 			params.Logger.Info("Starting host metadata reporter")
 			go func() {
@@ -179,18 +222,24 @@ func (f *factory) createMetricExporter(ctx context.Context, params exp.Settings,
 	if err != nil {
 		return nil, err
 	}
-	var forwarder *defaultforwarder.DefaultForwarder
+	var ownedForwarder stoppableForwarder
 	if f.s == nil {
-		f.s, forwarder, err = initSerializer(params.Logger, cfg, f.hostProvider)
+		// f.s is nil only for the OSS Datadog exporter (opentelemetry-collector-contrib),
+		// which owns its own serializer lifecycle. DDOT and Agent OTLP ingestion always
+		// inject a non-nil serializer from their Fx graphs, so this block is never
+		// reached in those paths.
+		var fw stoppableForwarder
+		f.s, fw, err = initSerializerInternal(params.Logger, cfg, f.hostProvider)
 		if err != nil {
 			return nil, err
 		}
+		ownedForwarder = fw
 		params.Logger.Info("starting forwarder")
-		err := forwarder.Start()
-		if err != nil {
+		if err := fw.Start(); err != nil {
 			params.Logger.Error("failed to start forwarder", zap.Error(err))
 		}
 	}
+	s := f.s
 
 	// TODO: Ideally the attributes translator would be created once and reused
 	// across all signals. This would need unifying the logsagent and serializer
@@ -211,12 +260,20 @@ func (f *factory) createMetricExporter(ctx context.Context, params exp.Settings,
 
 	var reporter *inframetadata.Reporter
 	if cfg.HostMetadata.Enabled {
-		reporter, err = f.Reporter(params, forwarder, cfg.HostMetadata.ReporterPeriod)
+		reporter, err = f.Reporter(params, s, cfg.HostMetadata.ReporterPeriod)
 		if err != nil {
 			return nil, err
 		}
 	}
-	newExp, err := NewExporter(f.s, cfg, f.enricher, hostGetter, f.createConsumer, tr, params, reporter, f.gatewayUsage)
+
+	var usageMetric telemetry.Gauge
+	if f.ipath == agentOTLPIngest {
+		usageMetric = f.store.OTLPIngestMetrics
+	} else if f.ipath == ddot {
+		usageMetric = f.store.DDOTMetrics
+	}
+
+	newExp, err := NewExporter(s, cfg, hostGetter, f.createConsumer, tr, params, reporter, f.gatewayUsage, usageMetric, f.store.DDOTGWUsage, f.ipath)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +281,7 @@ func (f *factory) createMetricExporter(ctx context.Context, params exp.Settings,
 	exporter, err := exporterhelper.NewMetrics(ctx, params, cfg, newExp.ConsumeMetrics,
 		exporterhelper.WithQueue(cfg.QueueBatchConfig),
 		exporterhelper.WithTimeout(cfg.TimeoutConfig),
+		exporterhelper.WithRetry(cfg.RetryConfig),
 		// the metrics remapping code mutates data
 		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}),
 		exporterhelper.WithShutdown(func(ctx context.Context) error {
@@ -233,8 +291,8 @@ func (f *factory) createMetricExporter(ctx context.Context, params exp.Settings,
 					return err
 				}
 			}
-			if forwarder != nil {
-				forwarder.Stop()
+			if ownedForwarder != nil {
+				ownedForwarder.Stop()
 			}
 			return nil
 		}),

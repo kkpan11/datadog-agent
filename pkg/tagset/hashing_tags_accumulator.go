@@ -19,6 +19,25 @@ type HashingTagsAccumulator struct {
 	hashedTags
 }
 
+// RetainFunc keeps tags if `keep` returns true, otherwise the tag and associated
+// hash removed.
+// Return value: the number of tags removed.
+func (h *HashingTagsAccumulator) RetainFunc(keep func(tag string) bool) int {
+	idx := 0
+	oldLen := len(h.data)
+	for arridx, tag := range h.data {
+		if keep(tag) {
+			h.data[idx] = h.data[arridx]
+			h.hash[idx] = h.hash[arridx]
+			idx++
+		}
+	}
+	h.data = h.data[0:idx]
+	h.hash = h.hash[0:idx]
+
+	return oldLen - idx
+}
+
 // NewHashingTagsAccumulator returns a new empty HashingTagsAccumulator
 func NewHashingTagsAccumulator() *HashingTagsAccumulator {
 	return &HashingTagsAccumulator{
@@ -139,9 +158,9 @@ func (h *HashingTagsAccumulator) removeSorted(o *HashingTagsAccumulator) {
 			h.data[i] = holeData
 			h.hash[i] = holeHash
 			i++
-		case h.hash[i] < o.hash[j]:
+		case h.hash[i] < o.hash[j] || (h.hash[i] == o.hash[j] && h.data[i] < o.data[j]):
 			i++
-		case h.hash[i] > o.hash[j]:
+		default:
 			j++
 		}
 	}

@@ -53,6 +53,10 @@ func getComponentName() string {
 	if len(components) >= 5 && components[len(components)-5] == "comp" {
 		return fmt.Sprintf("comp/%s/%s", components[len(components)-4], components[len(components)-3])
 	}
+	// Handle components nested one level deeper, e.g. comp/<bundle>/<group>/<comp>/<impl>/file.go
+	if len(components) >= 6 && components[len(components)-6] == "comp" {
+		return fmt.Sprintf("comp/%s/%s/%s", components[len(components)-5], components[len(components)-4], components[len(components)-3])
+	}
 
 	panic("must be called from a component (comp/<bundle>/<comp>/component.go)")
 }
@@ -88,7 +92,7 @@ func getBundleName() string {
 	filename = filepath.ToSlash(filename)
 	components := strings.Split(filename, "/")
 	if len(components) >= 3 && components[len(components)-3] == "comp" {
-		return fmt.Sprintf("comp/%s", components[len(components)-2])
+		return "comp/" + components[len(components)-2]
 	}
 	panic("must be called from a bundle (comp/<bundle>/bundle.go)")
 }

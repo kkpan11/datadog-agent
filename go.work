@@ -1,4 +1,4 @@
-go 1.24.3
+go 1.26.7
 
 // Disable new post-quantum key exchange mechanism X25519MLKEM768
 // See https://github.com/DataDog/datadog-agent/issues/34323 for historical context.
@@ -7,12 +7,23 @@ godebug tlsmlkem=0
 
 use (
 	.
+	comp/anomalydetection/observer/def
+	comp/anomalydetection/recorder/def
+	comp/anomalydetection/severityevents/def
 	comp/api/api/def
+	comp/core/agenttelemetry/def
+	comp/core/agenttelemetry/fx
+	comp/core/agenttelemetry/impl
 	comp/core/config
+	comp/core/configstreamconsumer/def
 	comp/core/configsync
+	comp/core/delegatedauth
+	comp/core/delegatedauth/api/cloudauth/aws
 	comp/core/flare/builder
 	comp/core/flare/types
 	comp/core/hostname/hostnameinterface
+	comp/core/hostname/hostnameinterface/def
+	comp/core/hostname/hostnameinterface/mock
 	comp/core/ipc/def
 	comp/core/ipc/httphelpers
 	comp/core/ipc/impl
@@ -22,7 +33,12 @@ use (
 	comp/core/log/impl
 	comp/core/log/impl-trace
 	comp/core/log/mock
-	comp/core/secrets
+	comp/core/secrets/def
+	comp/core/secrets/fx
+	comp/core/secrets/impl
+	comp/core/secrets/mock
+	comp/core/secrets/noop-impl
+	comp/core/secrets/utils
 	comp/core/status
 	comp/core/status/statusimpl
 	comp/core/tagger/def
@@ -39,6 +55,7 @@ use (
 	comp/def
 	comp/forwarder/defaultforwarder
 	comp/forwarder/orchestrator/orchestratorinterface
+	comp/logs-library
 	comp/logs/agent/config
 	comp/netflow/payload
 	comp/otelcol/collector-contrib/def
@@ -53,12 +70,12 @@ use (
 	comp/otelcol/logsagentpipeline
 	comp/otelcol/logsagentpipeline/logsagentpipelineimpl
 	comp/otelcol/otlp/components/connector/datadogconnector
+	comp/otelcol/otlp/components/datadogconfig
 	comp/otelcol/otlp/components/exporter/datadogexporter
 	comp/otelcol/otlp/components/exporter/logsagentexporter
 	comp/otelcol/otlp/components/exporter/serializerexporter
 	comp/otelcol/otlp/components/metricsclient
 	comp/otelcol/otlp/components/processor/infraattributesprocessor
-	comp/otelcol/otlp/components/statsprocessor
 	comp/otelcol/otlp/testutil
 	comp/otelcol/status/def
 	comp/otelcol/status/impl
@@ -68,45 +85,43 @@ use (
 	comp/trace/compression/def
 	comp/trace/compression/impl-gzip
 	comp/trace/compression/impl-zstd
+	internal/qbranch/anomalydetection-scorer
+	internal/qbranch/anomalydetection-testbench
 	internal/tools
+	internal/tools/gotest-custom
 	internal/tools/independent-lint
 	internal/tools/modformatter
 	internal/tools/modparser
-	internal/tools/proto
 	internal/tools/worksynchronizer
 	pkg/aggregator/ckey
 	pkg/api
 	pkg/collector/check/defaults
+	pkg/config/basic
 	pkg/config/create
 	pkg/config/env
+	pkg/config/helper
 	pkg/config/mock
 	pkg/config/model
 	pkg/config/nodetreemodel
 	pkg/config/remote
+	pkg/config/schema
 	pkg/config/setup
+	pkg/config/setup/constants
 	pkg/config/structure
-	pkg/config/teeconfig
 	pkg/config/utils
-	pkg/config/viperconfig
+	pkg/discovery/tracermetadata/model
 	pkg/errors
 	pkg/fips
 	pkg/fleet/installer
 	pkg/gohai
-	pkg/linters/components/pkgconfigusage
-	pkg/logs/auditor
-	pkg/logs/client
-	pkg/logs/diagnostic
 	pkg/logs/message
-	pkg/logs/metrics
-	pkg/logs/pipeline
-	pkg/logs/processor
-	pkg/logs/sds
-	pkg/logs/sender
 	pkg/logs/sources
 	pkg/logs/status/statusinterface
 	pkg/logs/status/utils
+	pkg/logs/types
 	pkg/logs/util/testutils
 	pkg/metrics
+	pkg/network/driver
 	pkg/network/payload
 	pkg/networkdevice/profile
 	pkg/networkpath/payload
@@ -116,26 +131,33 @@ use (
 	pkg/opentelemetry-mapping-go/otlp/attributes
 	pkg/opentelemetry-mapping-go/otlp/logs
 	pkg/opentelemetry-mapping-go/otlp/metrics
+	pkg/opentelemetry-mapping-go/otlp/rum
 	pkg/orchestrator/model
+	pkg/orchestrator/util
 	pkg/process/util/api
 	pkg/proto
 	pkg/remoteconfig/state
 	pkg/security/secl
 	pkg/security/seclwin
 	pkg/serializer
+	pkg/ssi/testutils
 	pkg/status/health
 	pkg/tagger/types
 	pkg/tagset
-	pkg/telemetry
 	pkg/template
 	pkg/trace
-	pkg/trace/stats/oteltest
+	pkg/trace/log
+	pkg/trace/otel
+	pkg/trace/stats
+	pkg/trace/traceutil
+	pkg/util/aws/creds
 	pkg/util/backoff
 	pkg/util/buf
 	pkg/util/cache
 	pkg/util/cgroups
 	pkg/util/common
 	pkg/util/compression
+	pkg/util/confmaputils
 	pkg/util/containers/image
 	pkg/util/defaultpaths
 	pkg/util/executable
@@ -143,9 +165,13 @@ use (
 	pkg/util/flavor
 	pkg/util/fxutil
 	pkg/util/grpc
+	pkg/util/hostinfo
 	pkg/util/hostname/validate
+	pkg/util/hostport
 	pkg/util/http
 	pkg/util/json
+	pkg/util/jsonquery
+	pkg/util/kubernetes/apiserver/common/namespace
 	pkg/util/log
 	pkg/util/log/setup
 	pkg/util/option
@@ -159,14 +185,15 @@ use (
 	pkg/util/startstop
 	pkg/util/statstracker
 	pkg/util/system
-	pkg/util/system/socket
 	pkg/util/testutil
 	pkg/util/utilizationtracker
 	pkg/util/uuid
 	pkg/util/winutil
 	pkg/version
+	test/e2e-framework
 	test/fakeintake
 	test/new-e2e
 	test/otel
+	tools/build-ddot-byoc
 	tools/retry_file_dump
 )

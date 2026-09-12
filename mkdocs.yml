@@ -11,6 +11,7 @@ docs_dir: docs/public
 site_dir: site
 theme:
   name: material
+  variant: classic
   language: en
   font:
     text: Roboto
@@ -48,13 +49,63 @@ theme:
 nav:
 - Home:
   - About: index.md
-  - Setup: setup.md
+  - Setup:
+    - Required: setup/required.md
+    - Optional: setup/optional.md
+    - Manual: setup/manual.md
+- How-to:
+  - Build:
+    - Standalone agents: how-to/build/standalone.md
+    - Distribution packages: how-to/build/distributions.md
+  - Test:
+    - Unit tests: how-to/test/unit.md
+    - Static analysis: how-to/test/static-analysis.md
+    - End-to-end tests:
+      - how-to/test/e2e/index.md
+      - Running tests: how-to/test/e2e/running.md
+      - Writing tests: how-to/test/e2e/writing.md
+      - Test dependencies: how-to/test/e2e/dependencies.md
+      - Custom AMIs: how-to/test/e2e/custom-amis.md
+    - Manual QA: 
+      - how-to/test/manual-qa/index.md
+      - AWS: 
+        - VM: how-to/test/manual-qa/aws-vm.md 
+        - Docker: how-to/test/manual-qa/aws-docker.md
+        - EKS: how-to/test/manual-qa/aws-eks.md
+        - ECS: how-to/test/manual-qa/aws-ecs.md
+        - Kind: how-to/test/manual-qa/aws-kind.md
+      - Azure: 
+        - VM: how-to/test/manual-qa/azure-vm.md
+      - GCP: 
+        - VM: how-to/test/manual-qa/gcp-vm.md
+      
+  - Go:
+    - Add nested modules: how-to/go/modules.md
+  - Debug agents:
+    - how-to/debug-agents/index.md
+    - Linux: how-to/debug-agents/linux.md
+    - Windows: how-to/debug-agents/windows.md
+  - Memory profiling:
+    - Overview: how-to/memory-profiling/overview.md
+    - Go: how-to/memory-profiling/go.md
+    - Python: how-to/memory-profiling/python.md
+    - C++: how-to/memory-profiling/c++.md
+- Tutorials:
+  - Develop:
+    - Environment usage: tutorials/dev/env.md
+    - Lab environments:
+      - tutorials/dev/lab/index.md
+      - Kind: tutorials/dev/lab/kind.md
 - Guidelines:
   - Contributing: guidelines/contributing.md
   - Documentation: guidelines/docs.md
-- How-to:
-  - Go:
-    - Add module: how-to/go/add-module.md
+  - Languages:
+    - Go: guidelines/languages/go.md
+    - Rust: guidelines/languages/RUST.md
+  - Testing:
+    - Test categories: guidelines/testing/test-categories.md
+  - Conventions:
+    - Logging: guidelines/conventions/logging.md
 - Components:
   - Overview: components/overview.md
   - Components:
@@ -73,17 +124,26 @@ nav:
   #     - TODO workloadmeta: components/shared_features/workloadmeta.md
   #     - TODO more ?: TMP
   # - Fx overview: components/fx.md
+  # - JMXFetch overview: components/jmxfetch.md
   # - FAQ: components/faq.md
+- Agent Schema:
+  - Introduction: agent-schema/index.md
+  - Keyword Reference: agent-schema/keywords.md
+  - Examples: agent-schema/examples.md
+  - CLI Commands: agent-schema/cli.md
+  - FAQ: agent-schema/faq.md
 - Architecture:
   - DogStatsD:
     - Internals: architecture/dogstatsd/internals.md
+- Reference:
+  - Images:
+    - Developer environment: reference/images/dev.md
+    - Builders: reference/images/builders.md
+  - Agent buildables:
+    - Agent components: reference/builds/components.md
 
 watch:
 - .go-version
-
-hooks:
-- docs/public/.hooks/plugin_register.py
-- docs/public/.hooks/title_from_content.py
 
 plugins:
   # Enable for bug reports
@@ -92,14 +152,22 @@ plugins:
   search: {}
   # Extra
   glightbox: {}
-  minify:
-    minify_html: true
-  git-revision-date-localized:
-    type: date
-    strict: false
 
 markdown_extensions:
 # Built-in
+- zensical.extensions.macros:
+    module_name: docs/public/.hooks/inject_variables
+    on_error_fail: true
+    on_undefined: strict
+    # Macros are rendered before code blocks are extracted, so every delimiter must be a sequence
+    # that never appears in quoted code. Jinja's defaults collide with Go composite literals,
+    # GitHub Actions expressions and `attr_list` identifiers such as `{#custom-id}`.
+    j2_variable_start_string: "<<<"
+    j2_variable_end_string: ">>>"
+    j2_block_start_string: "<<%"
+    j2_block_end_string: "%>>"
+    j2_comment_start_string: "<<#"
+    j2_comment_end_string: "#>>"
 - markdown.extensions.abbr:
 - markdown.extensions.attr_list:
 - markdown.extensions.footnotes:
@@ -163,10 +231,10 @@ markdown_extensions:
 - pymdownx.critic:
 - pymdownx.details:
 - pymdownx.emoji:
-    # https://github.com/twitter/twemoji
-    # https://raw.githubusercontent.com/facelessuser/pymdown-extensions/master/pymdownx/twemoji_db.py
-    emoji_index: !!python/name:material.extensions.emoji.twemoji
-    emoji_generator: !!python/name:material.extensions.emoji.to_svg
+    # Zensical's helpers support inlining icons and emoji:
+    # https://zensical.org/docs/setup/extensions/python-markdown-extensions/#emoji
+    emoji_index: !!python/name:zensical.extensions.emoji.twemoji
+    emoji_generator: !!python/name:zensical.extensions.emoji.to_svg
 - pymdownx.highlight:
     anchor_linenums: true
     line_spans: __span
@@ -191,6 +259,9 @@ markdown_extensions:
     check_paths: true
     base_path:
     - docs/public/.snippets
+    # Repo root, so docs pages can embed a section of a normative in-repo file
+    # (e.g. a codereview_guideline.md) rather than restating it.
+    - .
     auto_append:
     - links.txt
     - abbrs.txt

@@ -15,14 +15,19 @@ import (
 
 const memfdPrefix = "memfd:"
 
-// IsKThread returns whether given pids are from kthreads
-func IsKThread(ppid, pid uint32) bool {
+// IsKworker returns whether given pids are from kworker/kthread
+func IsKworker(ppid, pid uint32) bool {
 	return ppid == 2 || pid == 2
 }
 
 // IsBusybox returns true if the pathname matches busybox
 func IsBusybox(pathname string) bool {
 	return pathname == "/bin/busybox" || pathname == "/usr/bin/busybox"
+}
+
+// IsThroughSymLink returns true if the process is accessing a file through a symlink
+func IsThroughSymLink(entry *model.ProcessCacheEntry) bool {
+	return entry.Process.IsThroughSymLink
 }
 
 func setPathname(fileEvent *model.FileEvent, pathnameStr string) {

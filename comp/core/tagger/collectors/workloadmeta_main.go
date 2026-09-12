@@ -7,10 +7,13 @@ package collectors
 
 import (
 	"context"
-	"github.com/gobwas/glob"
+	"maps"
 	"strings"
 
+	"github.com/gobwas/glob"
+
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	taggerdef "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	k8smetadata "github.com/DataDog/datadog-agent/comp/core/tagger/k8s_metadata"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/taglist"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/tags"
@@ -27,15 +30,21 @@ import (
 const (
 	workloadmetaCollectorName = "workloadmeta"
 
-	staticSource         = workloadmetaCollectorName + "-static"
-	podSource            = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesPod)
-	taskSource           = workloadmetaCollectorName + "-" + string(workloadmeta.KindECSTask)
-	containerSource      = workloadmetaCollectorName + "-" + string(workloadmeta.KindContainer)
-	containerImageSource = workloadmetaCollectorName + "-" + string(workloadmeta.KindContainerImageMetadata)
-	processSource        = workloadmetaCollectorName + "-" + string(workloadmeta.KindProcess)
-	kubeMetadataSource   = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesMetadata)
-	deploymentSource     = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesDeployment)
-	gpuSource            = workloadmetaCollectorName + "-" + string(workloadmeta.KindGPU)
+	staticSource              = workloadmetaCollectorName + "-static"
+	podSource                 = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesPod)
+	taskSource                = workloadmetaCollectorName + "-" + string(workloadmeta.KindECSTask)
+	containerSource           = workloadmetaCollectorName + "-" + string(workloadmeta.KindContainer)
+	containerImageSource      = workloadmetaCollectorName + "-" + string(workloadmeta.KindContainerImageMetadata)
+	processSource             = workloadmetaCollectorName + "-" + string(workloadmeta.KindProcess)
+	kubeMetadataSource        = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesMetadata)
+	nodeSource                = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesNode)
+	deploymentSource          = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesDeployment)
+	kueueQueueSource          = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesKueueQueue)
+	kueueResourceFlavorSource = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesKueueResourceFlavor)
+	kueueWorkloadSource       = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubernetesKueueWorkload)
+	gpuSource                 = workloadmetaCollectorName + "-" + string(workloadmeta.KindGPU)
+	crdSource                 = workloadmetaCollectorName + "-" + string(workloadmeta.KindCRD)
+	kubeCapabilitiesSource    = workloadmetaCollectorName + "-" + string(workloadmeta.KindKubeCapabilities)
 
 	clusterTagNamePrefix = tags.KubeClusterName
 )
@@ -43,35 +52,48 @@ const (
 // CollectorPriorities holds collector priorities
 var CollectorPriorities = make(map[string]types.CollectorPriority)
 
-type processor interface {
-	ProcessTagInfo([]*types.TagInfo)
-}
-
 // WorkloadMetaCollector collects tags from the metadata in the workloadmeta
 // store.
 type WorkloadMetaCollector struct {
 	store        workloadmeta.Component
+	cfg          config.Component
 	children     map[types.EntityID]map[types.EntityID]struct{}
-	tagProcessor processor
+	tagProcessor taggerdef.Processor
 
-	containerEnvAsTags    map[string]string
-	containerLabelsAsTags map[string]string
+	containerEnvAsTags              map[string]string
+	containerLabelsAsTags           map[string]string
+	containerImageAnnotationsAsTags map[string]string
 
-	staticTags                    map[string][]string // for ECS and EKS Fargate
+	staticTags                    map[string][]string // for ECS, EKS Fargate, and DCA
 	k8sResourcesAnnotationsAsTags map[string]map[string]string
 	k8sResourcesLabelsAsTags      map[string]map[string]string
 	globContainerLabels           map[string]glob.Glob
 	globContainerEnvLabels        map[string]glob.Glob
+	globContainerImageAnnotations map[string]glob.Glob
 	globK8sResourcesAnnotations   map[string]map[string]glob.Glob
 	globK8sResourcesLabels        map[string]map[string]glob.Glob
 
 	collectEC2ResourceTags            bool
 	collectPersistentVolumeClaimsTags bool
+
+	// entityCompleteness tracks raw per-entity completeness from workloadmeta
+	// events. This is the completeness of the entity itself, without
+	// considering cross-entity dependencies (for example, a container's pod).
+	entityCompleteness map[workloadmeta.EntityID]bool
+
+	// refreshCh routes tag refresh requests through the stream goroutine, avoiding races with staticTags reads in processEvents.
+	refreshCh chan refreshRequest
 }
 
-func (c *WorkloadMetaCollector) initContainerMetaAsTags(labelsAsTags, envAsTags map[string]string) {
+// refreshRequest asks the stream goroutine to recompute static global tags, signaling done once it has.
+type refreshRequest struct {
+	done chan struct{}
+}
+
+func (c *WorkloadMetaCollector) initContainerMetaAsTags(labelsAsTags, envAsTags, imageAnnotationsAsTags map[string]string) {
 	c.containerLabelsAsTags, c.globContainerLabels = k8smetadata.InitMetadataAsTags(labelsAsTags)
 	c.containerEnvAsTags, c.globContainerEnvLabels = k8smetadata.InitMetadataAsTags(envAsTags)
+	c.containerImageAnnotationsAsTags, c.globContainerImageAnnotations = k8smetadata.InitMetadataAsTags(imageAnnotationsAsTags)
 }
 
 func (c *WorkloadMetaCollector) initK8sResourcesMetaAsTags(resourcesLabelsAsTags, resourcesAnnotationsAsTags map[string]map[string]string) {
@@ -91,29 +113,27 @@ func (c *WorkloadMetaCollector) initK8sResourcesMetaAsTags(resourcesLabelsAsTags
 
 // Run runs the continuous event watching loop and sends new tags to the
 // tagger based on the events sent by the workloadmeta.
-func (c *WorkloadMetaCollector) Run(ctx context.Context, datadogConfig config.Component) {
-	c.collectStaticGlobalTags(ctx, datadogConfig)
+func (c *WorkloadMetaCollector) Run(ctx context.Context) {
 	c.stream(ctx)
 }
 
 func (c *WorkloadMetaCollector) collectStaticGlobalTags(ctx context.Context, datadogConfig config.Component) {
-	c.staticTags = tagutil.GetStaticTags(ctx, datadogConfig)
+	staticTags := tagutil.GetStaticTags(ctx, datadogConfig)
+	// staticTags could be nil if no static tags are configured so we copy to
+	// existing non-nil map. That simplifies code down below.
+	maps.Copy(c.staticTags, staticTags)
+
 	if _, exists := c.staticTags[clusterTagNamePrefix]; flavor.GetFlavor() == flavor.ClusterAgent && !exists {
 		// If we are running the cluster agent, we want to set the kube_cluster_name tag as a global tag if we are able
 		// to read it, for the instances where we are running in an environment where hostname cannot be detected.
 		if cluster := clustername.GetClusterNameTagValue(ctx, ""); cluster != "" {
-			if c.staticTags == nil {
-				c.staticTags = make(map[string][]string, 1)
-			}
-			if _, exists := c.staticTags[clusterTagNamePrefix]; !exists {
-				c.staticTags[clusterTagNamePrefix] = []string{}
-			}
-			c.staticTags[clusterTagNamePrefix] = append(c.staticTags[clusterTagNamePrefix], cluster)
+			c.staticTags[clusterTagNamePrefix] = []string{cluster}
 		}
 	}
+
 	// These are the global tags that should only be applied to the internal global entity on DCA.
 	// Whereas the static tags are applied to containers and pods directly as well.
-	globalEnvTags := tagutil.GetGlobalEnvTags(datadogConfig)
+	globalEnvTags := tagutil.GetClusterAgentStaticTags(ctx, datadogConfig)
 
 	tagList := taglist.NewTagList()
 
@@ -134,8 +154,24 @@ func (c *WorkloadMetaCollector) collectStaticGlobalTags(ctx context.Context, dat
 			OrchestratorCardTags: orch,
 			LowCardTags:          low,
 			StandardTags:         standard,
+			IsComplete:           true,
 		},
 	})
+}
+
+// RefreshGlobalTags recomputes and republishes global static tags on the stream goroutine, blocking until done or ctx is done.
+func (c *WorkloadMetaCollector) RefreshGlobalTags(ctx context.Context) {
+	done := make(chan struct{})
+	select {
+	case c.refreshCh <- refreshRequest{done: done}:
+	case <-ctx.Done():
+		return
+	}
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 func (c *WorkloadMetaCollector) stream(ctx context.Context) {
@@ -162,6 +198,12 @@ func (c *WorkloadMetaCollector) stream(ctx context.Context) {
 
 			c.processEvents(evBundle)
 
+		// Receives RefreshGlobalTags requests here.
+		// The caller blocks until close(req.done) below.
+		case req := <-c.refreshCh:
+			c.collectStaticGlobalTags(ctx, c.cfg)
+			close(req.done)
+
 		case <-health.C:
 
 		case <-ctx.Done():
@@ -173,13 +215,17 @@ func (c *WorkloadMetaCollector) stream(ctx context.Context) {
 }
 
 // NewWorkloadMetaCollector returns a new WorkloadMetaCollector.
-func NewWorkloadMetaCollector(_ context.Context, cfg config.Component, store workloadmeta.Component, p processor) *WorkloadMetaCollector {
+func NewWorkloadMetaCollector(ctx context.Context, cfg config.Component, store workloadmeta.Component, p taggerdef.Processor) *WorkloadMetaCollector {
 	c := &WorkloadMetaCollector{
 		tagProcessor:                      p,
 		store:                             store,
+		cfg:                               cfg,
 		children:                          make(map[types.EntityID]map[types.EntityID]struct{}),
+		staticTags:                        make(map[string][]string),
 		collectEC2ResourceTags:            cfg.GetBool("ecs_collect_resource_tags_ec2"),
 		collectPersistentVolumeClaimsTags: cfg.GetBool("kubernetes_persistent_volume_claims_as_tags"),
+		entityCompleteness:                make(map[workloadmeta.EntityID]bool),
+		refreshCh:                         make(chan refreshRequest),
 	}
 
 	containerLabelsAsTags := mergeMaps(
@@ -191,11 +237,17 @@ func NewWorkloadMetaCollector(_ context.Context, cfg config.Component, store wor
 		retrieveMappingFromConfig(cfg, "docker_env_as_tags"),
 		retrieveMappingFromConfig(cfg, "container_env_as_tags"),
 	)
-	c.initContainerMetaAsTags(containerLabelsAsTags, containerEnvAsTags)
+	containerImageAnnotationsAsTags := retrieveMappingFromConfig(cfg, "container_image_annotations_as_tags")
+	c.initContainerMetaAsTags(containerLabelsAsTags, containerEnvAsTags, containerImageAnnotationsAsTags)
 
 	// kubernetes resources metadata as tags
 	metadataAsTags := configutils.GetMetadataAsTags(cfg)
 	c.initK8sResourcesMetaAsTags(metadataAsTags.GetResourcesLabelsAsTags(), metadataAsTags.GetResourcesAnnotationsAsTags())
+
+	// initialize static global tags
+	if p != nil {
+		c.collectStaticGlobalTags(ctx, cfg)
+	}
 
 	return c
 }

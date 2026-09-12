@@ -10,26 +10,25 @@
 // will return the same results as that package.  This is to support migration
 // to a component architecture.  When no code still uses pkg/config, that
 // package will be removed.
-//
-// The mock component does nothing at startup, beginning with an empty config.
-// It also overwrites the pkg/config.Datadog for the duration of the test.
 package config
 
 import (
+	"time"
+
 	"go.uber.org/fx"
 
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
-// team: agent-configuration
+// team: fleet-automation
 
 // Component is the component type.
 type Component interface {
 	pkgconfigmodel.ReaderWriter
 
-	// Warnings returns config warnings collected during setup.
-	Warnings() *pkgconfigmodel.Warnings
+	// StartTime returns the time at which the agent process started.
+	StartTime() time.Time
 }
 
 // Module defines the fx options for this component.

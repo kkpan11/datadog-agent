@@ -1,0 +1,44 @@
+load("@rules_go//go:def.bzl", "go_library")
+load("//bazel/rules/go:go_binary.bzl", "dd_agent_go_binary")
+load("//tasks:build_tags.bzl", "CWS_INSTRUMENTATION_TAGS")
+
+go_library(
+    name = "cws-instrumentation_lib",
+    srcs = [
+        "main_linux.go",
+        "main_windows.go",
+    ],
+    importpath = "github.com/DataDog/datadog-agent/cmd/cws-instrumentation",
+    visibility = ["//visibility:private"],
+    deps = select({
+        "@rules_go//go/platform:android": [
+            "//cmd/cws-instrumentation/command",
+            "//cmd/cws-instrumentation/subcommands",
+        ],
+        "@rules_go//go/platform:linux": [
+            "//cmd/cws-instrumentation/command",
+            "//cmd/cws-instrumentation/subcommands",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+dd_agent_go_binary(
+    name = "cws-instrumentation",
+    embed = [":cws-instrumentation_lib"],
+    gotags = CWS_INSTRUMENTATION_TAGS,
+    # keep - This has a main_windows, but is really not implemented.
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+)
+
+# The cws_instrumentation_injector_only gotag strips everything but the injector subcommand.
+# This is a legacy from the invoke task. It does not appear to be used in the build.
+dd_agent_go_binary(
+    name = "cws-instrumentation-injector_only",
+    embed = [":cws-instrumentation_lib"],
+    gotags = CWS_INSTRUMENTATION_TAGS | set(["cws_instrumentation_injector_only"]),
+    # keep - This has a main_windows, but is really not implemented.
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+)

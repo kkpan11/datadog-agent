@@ -155,6 +155,24 @@ func GetNTPHosts(ctx context.Context) []string {
 	return nil
 }
 
+var instanceTypeFetcher = cachedfetch.Fetcher{
+	Name: "EC2 Instance Type",
+	Attempt: func(ctx context.Context) (interface{}, error) {
+		return ec2internal.GetMetadataItemWithMaxLength(ctx, "/instance-type", ec2internal.UseIMDSv2(), false)
+	},
+}
+
+// GetInstanceType returns the AWS instance type as reported by EC2 IMDS.
+// On ECS Fargate there is no EC2 IMDS endpoint, so this returns an empty
+// string without querying IMDS (avoids recurring connect errors / INFO noise).
+func GetInstanceType(ctx context.Context) (string, error) {
+	if env.IsFeaturePresent(env.ECSFargate) {
+		log.Debugf("Skipping EC2 instance type lookup: no IMDS on ECS Fargate")
+		return "", nil
+	}
+	return instanceTypeFetcher.FetchString(ctx)
+}
+
 // IsDefaultHostname returns whether the given hostname is a default one for EC2
 func IsDefaultHostname(hostname string) bool {
 	return isDefaultHostname(hostname, pkgconfigsetup.Datadog().GetBool("ec2_use_windows_prefix_detection"))

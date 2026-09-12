@@ -6,30 +6,35 @@
 // Package ddprofilingextensionimpl defines the OpenTelemetry Extension implementation.
 package ddprofilingextensionimpl
 
-import "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog/config"
-
 // Config contains the config of the profiler.
 type Config struct {
-	// API contains the configuration for the api for the case of agentless uploads.
-	// api site is used in non agentless upload setups as well.
-	// Not setting API section leads to upload to an agent with.
-	API             config.APIConfig `mapstructure:"api"`
-	ProfilerOptions ProfilerOptions  `mapstructure:"profiler_options"`
-	// Endpoint reports the endpoint used for profiles.
-	// Default: BuildInfo.Version (e.g. v0.117.0)
+	ProfilerOptions ProfilerOptions `mapstructure:"profiler_options"`
+	AgentAddr       string          `mapstructure:"agent_addr"`
+	// Endpoint is the local port the profiling HTTP server listens on; used as "localhost:<endpoint>".
+	// Default: "7501"
 	Endpoint string `mapstructure:"endpoint"`
+	// UnixSocket sends profiles straight to a trace agent listening on this unix
+	// socket, bypassing the local forwarding server. Every other agent process
+	// already supports this via <component>.internal_profiling.unix_socket; without
+	// it the otel-agent is the only one that cannot be profiled in environments
+	// that expose a socket rather than HTTP egress (the SMP regression sandbox,
+	// for one).
+	// Ignored on Windows, where the Agent serves no APM unix socket: profiles
+	// are sent over HTTP there as if this were unset.
+	// Default: DD_OTELCOLLECTOR_INTERNAL_PROFILING_UNIX_SOCKET, then unset.
+	UnixSocket string `mapstructure:"unix_socket"`
 }
 
 // ProfilerOptions defines settings relevant to the profiler.
 type ProfilerOptions struct {
 	// Service the profiler will report with.
-	// Default: BuildInfo.Command (e.g. otel-agent)
+	// Default: DD_SERVICE, then BuildInfo.Command (e.g. otel-agent)
 	Service string `mapstructure:"service"`
 	// Env the profiler will report with.
-	// Default: none
+	// Default: DD_ENV, then none
 	Env string `mapstructure:"env"`
 	// Version the profiler will report with.
-	// Default: BuildInfo.Version (e.g. v0.117.0)
+	// Default: DD_VERSION, then BuildInfo.Version (e.g. v0.117.0)
 	Version string `mapstructure:"version"`
 	// Period in seconds the profiler will report with.
 	// Default: 60s

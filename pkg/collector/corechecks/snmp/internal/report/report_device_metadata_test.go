@@ -32,7 +32,7 @@ import (
 func Test_metricSender_reportNetworkDeviceMetadata_withoutInterfaces(t *testing.T) {
 	var b bytes.Buffer
 	w := bufio.NewWriter(&b)
-	l, err := log.LoggerFromWriterWithMinLevelAndFormat(w, log.TraceLvl, "[%LEVEL] %FuncShort: %Msg")
+	l, err := log.LoggerFromWriterWithMinLevelAndLvlFuncMsgFormat(w, log.TraceLvl)
 	assert.Nil(t, err)
 	log.SetupLogger(l, "debug")
 
@@ -51,7 +51,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_withoutInterfaces(t *testing.
 		ColumnValues: valuestore.ColumnResultValuesType{},
 	}
 
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
 		sender: sender,
@@ -189,7 +189,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_profileDeviceVendorFallback(t
 		ColumnValues: valuestore.ColumnResultValuesType{},
 	}
 
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
 		sender: sender,
@@ -282,7 +282,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_withDeviceInterfacesAndDiagno
 			},
 		},
 	}
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	sender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
@@ -448,7 +448,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_fallbackOnFieldValue(t *testi
 		ColumnValues: valuestore.ColumnResultValuesType{},
 	}
 
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
 		sender: sender,
@@ -526,7 +526,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_pingCanConnect_Nil(t *testing
 		ColumnValues: valuestore.ColumnResultValuesType{},
 	}
 
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
 		sender: sender,
@@ -600,7 +600,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_pingCanConnect_True(t *testin
 		ColumnValues: valuestore.ColumnResultValuesType{},
 	}
 
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
 		sender: sender,
@@ -675,7 +675,7 @@ func Test_metricSender_reportNetworkDeviceMetadata_pingCanConnect_False(t *testi
 		ColumnValues: valuestore.ColumnResultValuesType{},
 	}
 
-	sender := mocksender.NewMockSender("testID") // required to initiate aggregator
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
 	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
 	ms := &MetricSender{
 		sender: sender,
@@ -733,6 +733,333 @@ func Test_metricSender_reportNetworkDeviceMetadata_pingCanConnect_False(t *testi
             "subnet": "127.0.0.0/29",
 			"integration": "snmp",
 			"device_type": "other"
+        }
+    ],
+    "collect_timestamp":1415792726
+}
+`)
+	compactEvent := new(bytes.Buffer)
+	err = json.Compact(compactEvent, event)
+	assert.NoError(t, err)
+
+	sender.AssertEventPlatformEvent(t, compactEvent.Bytes(), "network-devices-metadata")
+}
+
+func Test_metricSender_reportNetworkDeviceMetadata_vpnTunnels(t *testing.T) {
+	var store = &valuestore.ResultValueStore{
+		ColumnValues: valuestore.ColumnResultValuesType{
+			// Outside IPs
+			"1.3.6.1.4.1.9.9.171.1.3.2.1.4": {
+				"1": valuestore.ResultValue{
+					Value: []byte{0x0A, 0x00, 0x00, 0x01}, // 10.0.0.1
+				},
+				"2": valuestore.ResultValue{
+					Value: []byte{0x1E, 0x00, 0x00, 0x01}, // 30.0.0.1
+				},
+				"3": valuestore.ResultValue{
+					Value: []byte{0x32, 0x00, 0x00, 0x01}, // 50.0.0.1
+				},
+			},
+			"1.3.6.1.4.1.9.9.171.1.3.2.1.5": {
+				"1": valuestore.ResultValue{
+					Value: []byte{0x14, 0x00, 0x00, 0x01}, // 20.0.0.1
+				},
+				"2": valuestore.ResultValue{
+					Value: []byte{0x28, 0x00, 0x00, 0x01}, // 40.0.0.1
+				},
+				"3": valuestore.ResultValue{
+					Value: []byte{0x3C, 0x00, 0x00, 0x01}, // 60.0.0.1
+				},
+			},
+
+			"1.3.6.1.4.1.9.9.171.1.3.2.1.51": { // Status
+				"1": valuestore.ResultValue{
+					Value: "1",
+				},
+				"2": valuestore.ResultValue{
+					Value: "2",
+				},
+				"3": valuestore.ResultValue{
+					Value: "3",
+				},
+			},
+
+			"1.3.6.1.4.1.9.9.171.1.3.2.1.8": { // Life Size
+				"1": valuestore.ResultValue{
+					Value: "4608000",
+				},
+				"2": valuestore.ResultValue{
+					Value: "123456",
+				},
+				"3": valuestore.ResultValue{
+					Value: "654321",
+				},
+			},
+			"1.3.6.1.4.1.9.9.171.1.3.2.1.9": { // Life Time
+				"1": valuestore.ResultValue{
+					Value: "3600",
+				},
+				"2": valuestore.ResultValue{
+					Value: "7200",
+				},
+				"3": valuestore.ResultValue{
+					Value: "1800",
+				},
+			},
+
+			// Route Table (Current)
+			"1.3.6.1.2.1.4.24.7.1.7": { // Interface Index
+				"1.4.100.0.0.0.16.2.0.0.0.0": valuestore.ResultValue{
+					Value: "2",
+				},
+				"1.4.110.0.0.0.24.2.0.0.1.4.40.0.0.1": valuestore.ResultValue{
+					Value: "4",
+				},
+				"1.4.120.0.0.0.24.2.0.0.0.0": valuestore.ResultValue{
+					Value: "6",
+				},
+			},
+			"1.3.6.1.2.1.4.24.7.1.17": { // Status
+				"1.4.100.0.0.0.16.2.0.0.0.0": valuestore.ResultValue{
+					Value: "1",
+				},
+				"1.4.110.0.0.0.24.2.0.0.1.4.40.0.0.1": valuestore.ResultValue{
+					Value: "1",
+				},
+				"1.4.120.0.0.0.24.2.0.0.0.0": valuestore.ResultValue{
+					Value: "1",
+				},
+			},
+			// Route Table (Deprecated)
+			"1.3.6.1.2.1.4.24.4.1.5": { // Interface Index
+				"100.1.0.0.255.255.0.0.0.0.0.0.0": valuestore.ResultValue{
+					Value: "2",
+				},
+				"110.0.0.0.255.255.255.0.0.40.0.0.1": valuestore.ResultValue{
+					Value: "4",
+				},
+				"110.1.0.0.255.255.255.0.0.40.0.0.1": valuestore.ResultValue{
+					Value: "4",
+				},
+				"120.0.0.0.255.255.0.0.0.0.0.0.0": valuestore.ResultValue{
+					Value: "6",
+				},
+			},
+			"1.3.6.1.2.1.4.24.4.1.16": { // Status
+				"100.1.0.0.255.255.0.0.0.0.0.0.0": valuestore.ResultValue{
+					Value: "1",
+				},
+				"110.0.0.0.255.255.255.0.0.40.0.0.1": valuestore.ResultValue{
+					Value: "1",
+				},
+				"110.1.0.0.255.255.255.0.0.40.0.0.1": valuestore.ResultValue{
+					Value: "1",
+				},
+				"120.0.0.0.255.255.0.0.0.0.0.0.0": valuestore.ResultValue{
+					Value: "1",
+				},
+			},
+
+			// Tunnels (Current)
+			"1.3.6.1.2.1.10.131.1.1.3.1.6": { // Interface Index
+				"1.4.10.0.0.1.4.20.0.0.1.1.1": valuestore.ResultValue{
+					Value: "2",
+				},
+				"1.4.50.0.0.1.4.60.0.0.1.1.2": valuestore.ResultValue{
+					Value: "6",
+				},
+			},
+			// Tunnels (Deprecated)
+			"1.3.6.1.2.1.10.131.1.1.2.1.5": { // Interface Index
+				"10.0.0.1.20.0.0.1.1.1": valuestore.ResultValue{
+					Value: "2",
+				},
+			},
+		},
+	}
+
+	sender := mocksender.NewMockSender(t, "testID") // required to initiate aggregator
+	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
+	ms := &MetricSender{
+		sender: sender,
+	}
+
+	config := &checkconfig.CheckConfig{
+		IPAddress:          "1.2.3.4",
+		DeviceID:           "1234",
+		ResolvedSubnetName: "127.0.0.0/29",
+		Namespace:          "my-ns",
+	}
+	layout := "2006-01-02 15:04:05"
+	str := "2014-11-12 11:45:26"
+	collectTime, err := time.Parse(layout, str)
+	require.NoError(t, err)
+
+	profile := profiledefinition.ProfileDefinition{
+		Metadata: profiledefinition.MetadataConfig{
+			"cisco_ipsec_tunnel": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"local_outside_ip": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.4.1.9.9.171.1.3.2.1.4",
+							Name: "cipSecTunLocalAddr",
+						},
+					},
+					"remote_outside_ip": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.4.1.9.9.171.1.3.2.1.5",
+							Name: "cipSecTunRemoteAddr",
+						},
+					},
+					"status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.4.1.9.9.171.1.3.2.1.51",
+							Name: "cipSecTunStatus",
+						},
+					},
+					"life_size": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.4.1.9.9.171.1.3.2.1.8",
+							Name: "cipSecTunLifeSize",
+						},
+					},
+					"life_time": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.4.1.9.9.171.1.3.2.1.9",
+							Name: "cipSecTunLifeTime",
+						},
+					},
+				},
+			},
+			"ipforward_deprecated": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"if_index": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.4.24.4.1.5",
+							Name: "ipCidrRouteIfIndex",
+						},
+					},
+					"route_status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.4.24.4.1.16",
+							Name: "ipCidrRouteStatus",
+						},
+					},
+				},
+			},
+			"ipforward": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"if_index": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.4.24.7.1.7",
+							Name: "inetCidrRouteIfIndex",
+						},
+					},
+					"route_status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.4.24.7.1.17",
+							Name: "inetCidrRouteStatus",
+						},
+					},
+				},
+			},
+			"tunnel_config_deprecated": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"if_index": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.10.131.1.1.2.1.5",
+							Name: "tunnelConfigIfIndex",
+						},
+					},
+				},
+			},
+			"tunnel_config": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"if_index": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.10.131.1.1.3.1.6",
+							Name: "tunnelInetConfigIfIndex",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ms.ReportNetworkDeviceMetadata(config, profile, store, nil, nil, collectTime, metadata.DeviceStatusReachable, metadata.DeviceStatusReachable, nil)
+
+	// language=json
+	event := []byte(`
+{
+    "subnet": "127.0.0.0/29",
+    "namespace": "my-ns",
+    "integration": "snmp",
+    "devices": [
+        {
+            "id": "1234",
+            "id_tags": null,
+            "tags": [],
+            "ip_address": "1.2.3.4",
+            "status": 1,
+            "ping_status": 1,
+            "subnet": "127.0.0.0/29",
+            "integration": "snmp",
+            "device_type": "other"
+        }
+    ],
+    "vpn_tunnels": [
+        {
+            "device_id": "1234",
+            "interface_id": "1234:2",
+            "local_outside_ip": "10.0.0.1",
+            "remote_outside_ip": "20.0.0.1",
+            "status": "active",
+            "protocol": "ipsec",
+            "route_addresses": [
+                "100.0.0.0/16",
+                "100.1.0.0/16"
+            ],
+            "options": {
+                "ipsec_options": {
+                    "life_size": 4608000,
+                    "life_time": 3600
+                }
+            }
+        },
+        {
+            "device_id": "1234",
+            "local_outside_ip": "30.0.0.1",
+            "remote_outside_ip": "40.0.0.1",
+            "status": "destroy",
+            "protocol": "ipsec",
+            "route_addresses": [
+                "110.0.0.0/24",
+                "110.1.0.0/24"
+            ],
+            "options": {
+                "ipsec_options": {
+                    "life_size": 123456,
+                    "life_time": 7200
+                }
+            }
+        },
+        {
+            "device_id": "1234",
+            "interface_id": "1234:6",
+            "local_outside_ip": "50.0.0.1",
+            "remote_outside_ip": "60.0.0.1",
+            "status": "unknown",
+            "protocol": "ipsec",
+            "route_addresses": [
+                "120.0.0.0/16",
+                "120.0.0.0/24"
+            ],
+            "options": {
+                "ipsec_options": {
+                    "life_size": 654321,
+                    "life_time": 1800
+                }
+            }
         }
     ],
     "collect_timestamp":1415792726
@@ -804,7 +1131,48 @@ func TestComputeInterfaceStatus(t *testing.T) {
 	}
 }
 
-func Test_getRemManIPAddrByLLDPRemIndex(t *testing.T) {
+func Test_buildLLDPRemoteKey(t *testing.T) {
+	tests := []struct {
+		name         string
+		localPortNum string
+		lldpRemIndex string
+		expectedKey  string
+	}{
+		{
+			name:         "basic case",
+			localPortNum: "102",
+			lldpRemIndex: "2",
+			expectedKey:  "102.2",
+		},
+		{
+			name:         "different values",
+			localPortNum: "99",
+			lldpRemIndex: "5",
+			expectedKey:  "99.5",
+		},
+		{
+			name:         "single digit values",
+			localPortNum: "1",
+			lldpRemIndex: "1",
+			expectedKey:  "1.1",
+		},
+		{
+			name:         "large values",
+			localPortNum: "10000",
+			lldpRemIndex: "99999",
+			expectedKey:  "10000.99999",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := buildLLDPRemoteKey(tt.localPortNum, tt.lldpRemIndex)
+			assert.Equal(t, tt.expectedKey, result)
+		})
+	}
+}
+
+func Test_getRemManIPAddrByLLDPRemIndexAndLLDPRemLocalPortNum(t *testing.T) {
 	indexes := []string{
 		// IPv4
 		"0.102.2.1.4.10.250.0.7",
@@ -816,36 +1184,36 @@ func Test_getRemManIPAddrByLLDPRemIndex(t *testing.T) {
 		// Invalid
 		"0.102.2.1.4.10.250", // too short, ignored
 	}
-	remManIPAddrByLLDPRemIndex := getRemManIPAddrByLLDPRemIndex(indexes)
+	remManIPAddrByLLDPRemIndex := getRemManIPAddrByLLDPRemIndexAndLLDPRemLocalPortNum(indexes)
 	expectedResult := map[string]string{
-		"2":  "10.250.0.7",
-		"99": "10.250.0.8",
+		"102.2":  "10.250.0.7",
+		"102.99": "10.250.0.8",
 	}
 	assert.Equal(t, expectedResult, remManIPAddrByLLDPRemIndex)
 }
 
 func Test_resolveLocalInterface(t *testing.T) {
-	interfaceIndexByIDType := map[string]map[string][]int32{
+	interfaceIndexByIDType := map[string]map[string][]interfaceCandidate{
 		"mac_address": {
-			"00:00:00:00:00:01": []int32{1},
-			"00:00:00:00:00:02": []int32{2},
-			"00:00:00:00:00:03": []int32{3, 4},
+			"00:00:00:00:00:01": {{ifIndex: 1}},
+			"00:00:00:00:00:02": {{ifIndex: 2}},
+			"00:00:00:00:00:03": {{ifIndex: 3}, {ifIndex: 4}},
 		},
 		"interface_name": {
-			"eth1": []int32{1},
-			"eth2": []int32{2},
-			"eth3": []int32{3}, // eth3 is both a name and alias, and reference the same interface
-			"eth4": []int32{4}, // eth4 is both a name and alias, and reference two different interfaces
+			"eth1": {{ifIndex: 1}},
+			"eth2": {{ifIndex: 2}},
+			"eth3": {{ifIndex: 3}}, // eth3 is both a name and alias, and reference the same interface
+			"eth4": {{ifIndex: 4}}, // eth4 is both a name and alias, and reference two different interfaces
 		},
 		"interface_alias": {
-			"alias1": []int32{1},
-			"alias2": []int32{2},
-			"eth3":   []int32{3},
-			"eth4":   []int32{44},
+			"alias1": {{ifIndex: 1}},
+			"alias2": {{ifIndex: 2}},
+			"eth3":   {{ifIndex: 3}},
+			"eth4":   {{ifIndex: 44}},
 		},
 		"interface_index": {
-			"1": []int32{1},
-			"2": []int32{2},
+			"1": {{ifIndex: 1}},
+			"2": {{ifIndex: 2}},
 		},
 	}
 	deviceID := "default:1.2.3.4"
@@ -938,6 +1306,8 @@ func Test_resolveLocalInterface(t *testing.T) {
 
 func Test_buildInterfaceIndexByIDType(t *testing.T) {
 	// Arrange
+	truePtr := true
+	falsePtr := false
 	interfaces := []metadata.InterfaceMetadata{
 		{
 			DeviceID:   "default:1.2.3.4",
@@ -945,6 +1315,7 @@ func Test_buildInterfaceIndexByIDType(t *testing.T) {
 			MacAddress: "00:00:00:00:00:01",
 			Name:       "eth1",
 			Alias:      "alias1",
+			IsPhysical: &truePtr,
 		},
 		{
 			DeviceID:   "default:1.2.3.4",
@@ -952,13 +1323,24 @@ func Test_buildInterfaceIndexByIDType(t *testing.T) {
 			MacAddress: "00:00:00:00:00:02",
 			Name:       "eth2",
 			Alias:      "alias2",
+			IsPhysical: &truePtr,
 		},
 		{
+			// Virtual sub-interface sharing a MAC with ifIndex 2.
 			DeviceID:   "default:1.2.3.4",
 			Index:      3,
 			MacAddress: "00:00:00:00:00:02",
 			Name:       "eth3",
 			Alias:      "alias3",
+			IsPhysical: &falsePtr,
+		},
+		{
+			// IsPhysical nil → treated as non-physical by the tiebreaker.
+			DeviceID:   "default:1.2.3.4",
+			Index:      4,
+			MacAddress: "00:00:00:00:00:04",
+			Name:       "eth4",
+			Alias:      "alias4",
 		},
 	}
 
@@ -966,26 +1348,493 @@ func Test_buildInterfaceIndexByIDType(t *testing.T) {
 	interfaceIndexByIDType := buildInterfaceIndexByIDType(interfaces)
 
 	// Assert
-	expectedInterfaceIndexByIDType := map[string]map[string][]int32{
+	expectedInterfaceIndexByIDType := map[string]map[string][]interfaceCandidate{
 		"mac_address": {
-			"00:00:00:00:00:01": []int32{1},
-			"00:00:00:00:00:02": []int32{2, 3},
+			"00:00:00:00:00:01": {{ifIndex: 1, isPhysical: true, macAddress: "00:00:00:00:00:01"}},
+			"00:00:00:00:00:02": {{ifIndex: 2, isPhysical: true, macAddress: "00:00:00:00:00:02"}, {ifIndex: 3, isPhysical: false, macAddress: "00:00:00:00:00:02"}},
+			"00:00:00:00:00:04": {{ifIndex: 4, isPhysical: false, macAddress: "00:00:00:00:00:04"}},
 		},
 		"interface_name": {
-			"eth1": []int32{1},
-			"eth2": []int32{2},
-			"eth3": []int32{3},
+			"eth1": {{ifIndex: 1, isPhysical: true, macAddress: "00:00:00:00:00:01"}},
+			"eth2": {{ifIndex: 2, isPhysical: true, macAddress: "00:00:00:00:00:02"}},
+			"eth3": {{ifIndex: 3, isPhysical: false, macAddress: "00:00:00:00:00:02"}},
+			"eth4": {{ifIndex: 4, isPhysical: false, macAddress: "00:00:00:00:00:04"}},
 		},
 		"interface_alias": {
-			"alias1": []int32{1},
-			"alias2": []int32{2},
-			"alias3": []int32{3},
+			"alias1": {{ifIndex: 1, isPhysical: true, macAddress: "00:00:00:00:00:01"}},
+			"alias2": {{ifIndex: 2, isPhysical: true, macAddress: "00:00:00:00:00:02"}},
+			"alias3": {{ifIndex: 3, isPhysical: false, macAddress: "00:00:00:00:00:02"}},
+			"alias4": {{ifIndex: 4, isPhysical: false, macAddress: "00:00:00:00:00:04"}},
 		},
 		"interface_index": {
-			"1": []int32{1},
-			"2": []int32{2},
-			"3": []int32{3},
+			"1": {{ifIndex: 1, isPhysical: true, macAddress: "00:00:00:00:00:01"}},
+			"2": {{ifIndex: 2, isPhysical: true, macAddress: "00:00:00:00:00:02"}},
+			"3": {{ifIndex: 3, isPhysical: false, macAddress: "00:00:00:00:00:02"}},
+			"4": {{ifIndex: 4, isPhysical: false, macAddress: "00:00:00:00:00:04"}},
 		},
 	}
 	assert.Equal(t, expectedInterfaceIndexByIDType, interfaceIndexByIDType)
+}
+
+func Test_resolveLocalInterface_physicalPreferenceTiebreaker(t *testing.T) {
+	deviceID := "default:1.2.3.4"
+
+	macPhysicalPlusVirtuals := "aa:bb:cc:00:00:10"
+	macAllVirtual := "aa:bb:cc:00:00:30"
+	macTwoPhysical := "aa:bb:cc:00:00:20"
+	macSingle := "aa:bb:cc:00:00:99"
+
+	macSharedByName := "aa:bb:cc:00:00:50"
+
+	interfaceIndexByIDType := map[string]map[string][]interfaceCandidate{
+		"mac_address": {
+			macPhysicalPlusVirtuals: {
+				{ifIndex: 10, isPhysical: true, macAddress: macPhysicalPlusVirtuals},
+				{ifIndex: 11, isPhysical: false, macAddress: macPhysicalPlusVirtuals},
+				{ifIndex: 12, isPhysical: false, macAddress: macPhysicalPlusVirtuals},
+			},
+			macAllVirtual: {
+				{ifIndex: 30, isPhysical: false, macAddress: macAllVirtual},
+				{ifIndex: 31, isPhysical: false, macAddress: macAllVirtual},
+			},
+			macTwoPhysical: {
+				{ifIndex: 20, isPhysical: true, macAddress: macTwoPhysical},
+				{ifIndex: 21, isPhysical: true, macAddress: macTwoPhysical},
+			},
+			macSingle: {
+				{ifIndex: 99, isPhysical: true, macAddress: macSingle},
+			},
+		},
+		"interface_name": {
+			// Same-name collision with NO shared MAC — must not tiebreak.
+			"GigabitEthernet1/0/1": {
+				{ifIndex: 10, isPhysical: true},
+				{ifIndex: 11, isPhysical: false},
+			},
+			// Same-name collision where candidates share a MAC — must tiebreak.
+			"Ten1/0/1-shared": {
+				{ifIndex: 50, isPhysical: true, macAddress: macSharedByName},
+				{ifIndex: 51, isPhysical: false, macAddress: macSharedByName},
+			},
+			// One candidate carries a MAC, the other does not — must not tiebreak.
+			"Mixed1/0/1": {
+				{ifIndex: 60, isPhysical: true, macAddress: macSharedByName},
+				{ifIndex: 61, isPhysical: false},
+			},
+		},
+		"interface_alias": {},
+		"interface_index": {},
+	}
+
+	tests := []struct {
+		name        string
+		localIDType string
+		localID     string
+		expectedID  string
+	}{
+		{
+			name:        "one physical + virtuals on same MAC resolves to physical",
+			localIDType: "mac_address",
+			localID:     macPhysicalPlusVirtuals,
+			expectedID:  "default:1.2.3.4:10",
+		},
+		{
+			name:        "one physical + virtuals via smart resolution resolves to physical",
+			localIDType: "",
+			localID:     macPhysicalPlusVirtuals,
+			expectedID:  "default:1.2.3.4:10",
+		},
+		{
+			name:        "all-virtual collision stays unresolved",
+			localIDType: "mac_address",
+			localID:     macAllVirtual,
+			expectedID:  "",
+		},
+		{
+			name:        "multi-physical collision stays unresolved",
+			localIDType: "mac_address",
+			localID:     macTwoPhysical,
+			expectedID:  "",
+		},
+		{
+			name:        "multi-physical collision via smart resolution stays unresolved",
+			localIDType: "",
+			localID:     macTwoPhysical,
+			expectedID:  "",
+		},
+		{
+			name:        "single-match happy path unchanged",
+			localIDType: "mac_address",
+			localID:     macSingle,
+			expectedID:  "default:1.2.3.4:99",
+		},
+		{
+			name:        "interface_name multi-match without shared MAC stays unresolved",
+			localIDType: "interface_name",
+			localID:     "GigabitEthernet1/0/1",
+			expectedID:  "",
+		},
+		{
+			name:        "interface_name multi-match with shared MAC resolves to physical",
+			localIDType: "interface_name",
+			localID:     "Ten1/0/1-shared",
+			expectedID:  "default:1.2.3.4:50",
+		},
+		{
+			name:        "interface_name multi-match with one empty MAC stays unresolved",
+			localIDType: "interface_name",
+			localID:     "Mixed1/0/1",
+			expectedID:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedID, resolveLocalInterface(deviceID, interfaceIndexByIDType, tt.localIDType, tt.localID))
+		})
+	}
+}
+
+func Test_metricSender_reportNetworkDeviceMetadata_withInterfaceTypeAndIsPhysical(t *testing.T) {
+	// Test various ifType values and their corresponding is_physical values
+	// Physical types: 6 (ethernetCsmacd), 62 (fastEther), 69 (fastEtherFX), 117 (gigabitEthernet)
+	// Non-physical type: 24 (softwareLoopback)
+	// Type 0 (not collected) should have is_physical = nil
+	var storeWithIfType = &valuestore.ResultValueStore{
+		ColumnValues: valuestore.ColumnResultValuesType{
+			"1.3.6.1.2.1.31.1.1.1.1": { // ifName
+				"1": valuestore.ResultValue{Value: "eth0"},
+				"2": valuestore.ResultValue{Value: "eth1"},
+				"3": valuestore.ResultValue{Value: "lo"},
+				"4": valuestore.ResultValue{Value: "eth2"},
+			},
+			"1.3.6.1.2.1.2.2.1.3": { // ifType
+				"1": valuestore.ResultValue{Value: float64(6)},   // ethernetCsmacd - physical
+				"2": valuestore.ResultValue{Value: float64(62)},  // fastEther - physical
+				"3": valuestore.ResultValue{Value: float64(24)},  // softwareLoopback - not physical
+				"4": valuestore.ResultValue{Value: float64(117)}, // gigabitEthernet - physical
+			},
+			"1.3.6.1.2.1.2.2.1.7": { // ifAdminStatus
+				"1": valuestore.ResultValue{Value: float64(1)},
+				"2": valuestore.ResultValue{Value: float64(1)},
+				"3": valuestore.ResultValue{Value: float64(1)},
+				"4": valuestore.ResultValue{Value: float64(1)},
+			},
+			"1.3.6.1.2.1.2.2.1.8": { // ifOperStatus
+				"1": valuestore.ResultValue{Value: float64(1)},
+				"2": valuestore.ResultValue{Value: float64(1)},
+				"3": valuestore.ResultValue{Value: float64(1)},
+				"4": valuestore.ResultValue{Value: float64(1)},
+			},
+		},
+	}
+	sender := mocksender.NewMockSender(t, "testID")
+	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
+	sender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+	ms := &MetricSender{
+		hostname: "test",
+		sender:   sender,
+	}
+
+	config := &checkconfig.CheckConfig{
+		IPAddress:          "1.2.3.4",
+		DeviceID:           "1234",
+		DeviceIDTags:       []string{"device_name:127.0.0.1"},
+		ResolvedSubnetName: "127.0.0.0/29",
+		Namespace:          "my-ns",
+	}
+	profile := profiledefinition.ProfileDefinition{
+		Metadata: profiledefinition.MetadataConfig{
+			"device": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"type": {
+						Value: "switch",
+					},
+				},
+			},
+			"interface": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"name": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.31.1.1.1.1",
+							Name: "ifName",
+						},
+					},
+					"type": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.2.2.1.3",
+							Name: "ifType",
+						},
+					},
+					"admin_status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.2.2.1.7",
+							Name: "ifAdminStatus",
+						},
+					},
+					"oper_status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.2.2.1.8",
+							Name: "ifOperStatus",
+						},
+					},
+				},
+				IDTags: profiledefinition.MetricTagConfigList{
+					profiledefinition.MetricTagConfig{
+						Symbol: profiledefinition.SymbolConfigCompat{
+							OID:  "1.3.6.1.2.1.31.1.1.1.1",
+							Name: "interface",
+						},
+						Tag: "interface",
+					},
+				},
+			},
+		},
+	}
+
+	layout := "2006-01-02 15:04:05"
+	str := "2014-11-12 11:45:26"
+	collectTime, err := time.Parse(layout, str)
+	assert.NoError(t, err)
+	ms.ReportNetworkDeviceMetadata(config, profile, storeWithIfType, []string{"tag1", "tag2"}, []string{"tag1", "tag2"}, collectTime, metadata.DeviceStatusReachable, metadata.DeviceStatusReachable, nil)
+
+	// language=json
+	event := []byte(`
+{
+    "subnet": "127.0.0.0/29",
+    "namespace": "my-ns",
+	"integration": "snmp",
+    "devices": [
+        {
+            "id": "1234",
+            "id_tags": [
+                "device_name:127.0.0.1"
+            ],
+            "tags": [
+                "tag1",
+                "tag2"
+            ],
+            "ip_address": "1.2.3.4",
+            "status":1,
+			"ping_status":1,
+            "subnet": "127.0.0.0/29",
+			"integration": "snmp",
+			"device_type": "switch"
+        }
+    ],
+    "interfaces": [
+        {
+            "device_id": "1234",
+            "id_tags": [
+                "interface:eth0"
+            ],
+            "index": 1,
+			"name": "eth0",
+			"admin_status": 1,
+			"oper_status": 1,
+			"type": 6,
+			"is_physical": true
+        },
+        {
+            "device_id": "1234",
+            "id_tags": [
+                "interface:eth1"
+            ],
+            "index": 2,
+            "name": "eth1",
+			"admin_status": 1,
+			"oper_status": 1,
+			"type": 62,
+			"is_physical": true
+        },
+        {
+            "device_id": "1234",
+            "id_tags": [
+                "interface:lo"
+            ],
+            "index": 3,
+            "name": "lo",
+			"admin_status": 1,
+			"oper_status": 1,
+			"type": 24,
+			"is_physical": false
+        },
+        {
+            "device_id": "1234",
+            "id_tags": [
+                "interface:eth2"
+            ],
+            "index": 4,
+            "name": "eth2",
+			"admin_status": 1,
+			"oper_status": 1,
+			"type": 117,
+			"is_physical": true
+        }
+    ],
+    "collect_timestamp":1415792726
+}
+`)
+	compactEvent := new(bytes.Buffer)
+	err = json.Compact(compactEvent, event)
+	assert.NoError(t, err)
+
+	sender.AssertEventPlatformEvent(t, compactEvent.Bytes(), "network-devices-metadata")
+}
+
+func Test_metricSender_reportNetworkDeviceMetadata_withInterfaceTypeZero(t *testing.T) {
+	// Test case when ifType is not collected (0) - is_physical should be nil (omitted from JSON)
+	var storeWithoutIfType = &valuestore.ResultValueStore{
+		ColumnValues: valuestore.ColumnResultValuesType{
+			"1.3.6.1.2.1.31.1.1.1.1": { // ifName
+				"1": valuestore.ResultValue{Value: "eth0"},
+			},
+			// No ifType values - simulating when type is not collected
+			"1.3.6.1.2.1.2.2.1.7": { // ifAdminStatus
+				"1": valuestore.ResultValue{Value: float64(1)},
+			},
+			"1.3.6.1.2.1.2.2.1.8": { // ifOperStatus
+				"1": valuestore.ResultValue{Value: float64(1)},
+			},
+		},
+	}
+	sender := mocksender.NewMockSender(t, "testID")
+	sender.On("EventPlatformEvent", mock.Anything, mock.Anything).Return()
+	sender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+	ms := &MetricSender{
+		hostname: "test",
+		sender:   sender,
+	}
+
+	config := &checkconfig.CheckConfig{
+		IPAddress:          "1.2.3.4",
+		DeviceID:           "1234",
+		DeviceIDTags:       []string{"device_name:127.0.0.1"},
+		ResolvedSubnetName: "127.0.0.0/29",
+		Namespace:          "my-ns",
+	}
+	profile := profiledefinition.ProfileDefinition{
+		Metadata: profiledefinition.MetadataConfig{
+			"device": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"type": {
+						Value: "switch",
+					},
+				},
+			},
+			"interface": {
+				Fields: map[string]profiledefinition.MetadataField{
+					"name": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.31.1.1.1.1",
+							Name: "ifName",
+						},
+					},
+					"admin_status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.2.2.1.7",
+							Name: "ifAdminStatus",
+						},
+					},
+					"oper_status": {
+						Symbol: profiledefinition.SymbolConfig{
+							OID:  "1.3.6.1.2.1.2.2.1.8",
+							Name: "ifOperStatus",
+						},
+					},
+				},
+				IDTags: profiledefinition.MetricTagConfigList{
+					profiledefinition.MetricTagConfig{
+						Symbol: profiledefinition.SymbolConfigCompat{
+							OID:  "1.3.6.1.2.1.31.1.1.1.1",
+							Name: "interface",
+						},
+						Tag: "interface",
+					},
+				},
+			},
+		},
+	}
+
+	layout := "2006-01-02 15:04:05"
+	str := "2014-11-12 11:45:26"
+	collectTime, err := time.Parse(layout, str)
+	assert.NoError(t, err)
+	ms.ReportNetworkDeviceMetadata(config, profile, storeWithoutIfType, []string{"tag1", "tag2"}, []string{"tag1", "tag2"}, collectTime, metadata.DeviceStatusReachable, metadata.DeviceStatusReachable, nil)
+
+	// language=json
+	// Note: type and is_physical should be omitted when ifType is 0
+	event := []byte(`
+{
+    "subnet": "127.0.0.0/29",
+    "namespace": "my-ns",
+	"integration": "snmp",
+    "devices": [
+        {
+            "id": "1234",
+            "id_tags": [
+                "device_name:127.0.0.1"
+            ],
+            "tags": [
+                "tag1",
+                "tag2"
+            ],
+            "ip_address": "1.2.3.4",
+            "status":1,
+			"ping_status":1,
+            "subnet": "127.0.0.0/29",
+			"integration": "snmp",
+			"device_type": "switch"
+        }
+    ],
+    "interfaces": [
+        {
+            "device_id": "1234",
+            "id_tags": [
+                "interface:eth0"
+            ],
+            "index": 1,
+			"name": "eth0",
+			"admin_status": 1,
+			"oper_status": 1
+        }
+    ],
+    "collect_timestamp":1415792726
+}
+`)
+	compactEvent := new(bytes.Buffer)
+	err = json.Compact(compactEvent, event)
+	assert.NoError(t, err)
+
+	sender.AssertEventPlatformEvent(t, compactEvent.Bytes(), "network-devices-metadata")
+}
+
+func Test_buildMetadataStore_scalar_skipsEmptyStringForNextSymbol(t *testing.T) {
+	meta := profiledefinition.MetadataConfig{
+		"device": {
+			Fields: map[string]profiledefinition.MetadataField{
+				"serial_number": {
+					Symbols: []profiledefinition.SymbolConfig{
+						{OID: "1.3.6.1.4.1.9.5.1.2.19.0", Name: "chassisSerialNumberString"},
+						{OID: "1.3.6.1.2.1.47.1.1.1.1.11.1000", Name: "entPhysicalSerialNum"},
+						{OID: "1.3.6.1.2.1.47.1.1.1.1.11.1", Name: "entPhysicalSerialNum"},
+					},
+				},
+			},
+		},
+	}
+	store := &valuestore.ResultValueStore{
+		ScalarValues: valuestore.ScalarResultValuesType{
+			"1.3.6.1.2.1.47.1.1.1.1.11.1000": {Value: ""},
+			"1.3.6.1.2.1.47.1.1.1.1.11.1":    {Value: "FOC2628YLVB.1"},
+		},
+	}
+	ms := buildMetadataStore(meta, store)
+	assert.Equal(t, "FOC2628YLVB.1", ms.GetScalarAsString("device.serial_number"))
+}
+
+func Test_isEmptyMetadataScalarValue(t *testing.T) {
+	assert.True(t, isEmptyMetadataScalarValue(valuestore.ResultValue{Value: ""}))
+	assert.True(t, isEmptyMetadataScalarValue(valuestore.ResultValue{Value: "   \t"}))
+	assert.True(t, isEmptyMetadataScalarValue(valuestore.ResultValue{Value: []byte{}}))
+	assert.False(t, isEmptyMetadataScalarValue(valuestore.ResultValue{Value: "x"}))
 }

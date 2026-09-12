@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"maps"
+	"math"
 	"sync"
 	"syscall"
 
@@ -24,7 +25,7 @@ const (
 
 	// MaxPathDepth defines the maximum depth of a path
 	// see pkg/security/ebpf/c/dentry_resolver.h: DR_MAX_TAIL_CALL * DR_MAX_ITERATION_DEPTH
-	MaxPathDepth = 1363
+	MaxPathDepth = 1160
 
 	// MaxBpfObjName defines the maximum length of a Bpf object name
 	MaxBpfObjName = 16
@@ -46,6 +47,8 @@ const (
 )
 
 const (
+	// the following flags have to be kept in sync with their kernel counterparts in pkg/security/ebpf/c/include/constants/enums.h
+
 	// EventFlagsAsync async event
 	EventFlagsAsync = 1 << iota
 
@@ -61,8 +64,16 @@ const (
 	// EventFlagsAnomalyDetectionEvent true if the event is marked as being an anomaly
 	EventFlagsAnomalyDetectionEvent
 
+	// EventFlagsInternal true if the event is an internal event used to keep caches & internal resources up-to-date
+	EventFlagsInternal
+
+	// non kernel flags
+
 	// EventFlagsHasActiveActivityDump true if the event has an active activity dump associated to it
 	EventFlagsHasActiveActivityDump
+
+	// EventFlagsFromReplay is true if the event is generated from a replay
+	EventFlagsFromReplay
 )
 
 const (
@@ -80,6 +91,18 @@ const (
 	IMDSIBMCloudProvider = "ibm"
 	// IMDSOracleCloudProvider is used to report that the IMDS event is for Oracle
 	IMDSOracleCloudProvider = "oracle"
+)
+
+// EventSource is the source of the event
+type EventSource = string
+
+const (
+	// EventSourceRuntime is used to report that the event is generated from a runtime
+	EventSourceRuntime EventSource = "runtime"
+	// EventSourceReplay is used to report that the event is generated from a replay
+	EventSourceReplay EventSource = "replay"
+	// EventSourceRelated is used to report that the event is generated from a related event
+	EventSourceRelated EventSource = "related"
 )
 
 var (
@@ -344,6 +367,23 @@ var (
 		"IP_PROTO_RAW":     IPProtoRAW,
 	}
 
+	// NetworkProtocolTypeConstants is the list of supported network protocol specific types
+	// generate_constants:Network Protocol Types,Types of specific network protocols.
+	NetworkProtocolTypeConstants = map[string]NetworkProtocolType{
+		"ICMP_ECHO_REQUEST":              ICMPTypeEchoRequest,
+		"ICMP_ECHO_REPLY":                ICMPTypeEchoReply,
+		"ICMP_ROUTER_SOLICITATION":       ICMPTypeRouterSolicitation,
+		"ICMP_ROUTER_ADVERTISEMENT":      ICMPTypeRouterAdvertisement,
+		"ICMP_NEIGHBOR_SOLICITATION":     ICMPTypeNeighborSolicitation,
+		"ICMP_NEIGHBOR_ADVERTISEMENT":    ICMPTypeNeighborAdvertisement,
+		"ICMP_V6_ECHO_REQUEST":           ICMPv6TypeEchoRequest,
+		"ICMP_V6_ECHO_REPLY":             ICMPv6TypeEchoReply,
+		"ICMP_V6_ROUTER_SOLICITATION":    ICMPv6TypeRouterSolicitation,
+		"ICMP_V6_ROUTER_ADVERTISEMENT":   ICMPv6TypeRouterAdvertisement,
+		"ICMP_V6_NEIGHBOR_SOLICITATION":  ICMPv6TypeNeighborSolicitation,
+		"ICMP_V6_NEIGHBOR_ADVERTISEMENT": ICMPv6TypeNeighborAdvertisement,
+	}
+
 	// NetworkDirectionConstants is the list of supported network directions
 	// generate_constants:Network directions,Network directions are the supported directions of network packets.
 	NetworkDirectionConstants = map[string]NetworkDirection{
@@ -366,17 +406,96 @@ var (
 		"TLS_1_2": 0x0303,
 		"TLS_1_3": 0x0304,
 	}
+
+	// ABIConstants defines ABI constants
+	// generate_constants:ABI,ABI used for binary compilation.
+	ABIConstants = map[string]ABI{
+		"BIT32":       Bit32,
+		"BIT64":       Bit64,
+		"UNKNOWN_ABI": UnknownABI,
+	}
+
+	// ArchitectureConstants defines architecture constants
+	// generate_constants:Architecture,Architecture of the binary.
+	ArchitectureConstants = map[string]Architecture{
+		"X86":                  X86,
+		"X86_64":               X8664,
+		"ARM":                  ARM,
+		"ARM64":                ARM64,
+		"UNKNOWN_ARCHITECTURE": UnknownArch,
+	}
+
+	// CompressionTypeConstants defines compression type constants
+	// generate_constants:CompressionType,Compression algorithm.
+	CompressionTypeConstants = map[string]CompressionType{
+		"NONE":  NoCompression,
+		"GZIP":  GZip,
+		"ZIP":   Zip,
+		"ZSTD":  Zstd,
+		"7Z":    SevenZip,
+		"BZIP2": BZip2,
+		"XZ":    XZ,
+	}
+
+	// FileTypeConstants defines file type constants
+	// generate_constants:FileType,File types.
+	FileTypeConstants = map[string]FileType{
+		"EMPTY":              Empty,
+		"SHELL_SCRIPT":       ShellScript,
+		"TEXT":               Text,
+		"COMPRESSED":         Compressed,
+		"ENCRYPTED":          Encrypted,
+		"BINARY":             Binary,
+		"LINUX_EXECUTABLE":   ELFExecutable,
+		"WINDOWS_EXECUTABLE": PEExecutable,
+		"MACOS_EXECUTABLE":   MachOExecutable,
+		"FILE_LESS":          FileLess,
+	}
+
+	// LinkageTypeConstants defines linkage type constants
+	// generate_constants:LinkageType,Linkage types.
+	LinkageTypeConstants = map[string]LinkageType{
+		"NONE":    None,
+		"STATIC":  Static,
+		"DYNAMIC": Dynamic,
+	}
+
+	// UserSessionTypes are the supported user session types
+	// generate_constants:UserSessionTypes,UserSessionTypes are the supported user session types.
+	UserSessionTypes = map[string]usersession.Type{
+		"unknown": usersession.UserSessionTypeUnknown,
+		"k8s":     usersession.UserSessionTypeK8S,
+		"ssh":     usersession.UserSessionTypeSSH,
+	}
+
+	// SSHAuthMethodConstants are the supported SSH authentication methods
+	// generate_constants:SSHAuthMethod,SSH authentication methods.
+	SSHAuthMethodConstants = map[string]usersession.AuthType{
+		"password":   usersession.SSHAuthMethodPassword,
+		"public_key": usersession.SSHAuthMethodPublicKey,
+		"unknown":    usersession.SSHAuthMethodUnknown,
+	}
 )
 
 var (
-	dnsQTypeStrings         = map[uint32]string{}
-	dnsQClassStrings        = map[uint32]string{}
-	dnsResponseCodeStrings  = map[uint32]string{}
-	l3ProtocolStrings       = map[L3Protocol]string{}
-	l4ProtocolStrings       = map[L4Protocol]string{}
-	networkDirectionStrings = map[NetworkDirection]string{}
-	addressFamilyStrings    = map[uint16]string{}
-	tlsVersionStrings       = map[uint16]string{}
+	dnsQTypeStrings            = map[uint32]string{}
+	dnsQClassStrings           = map[uint32]string{}
+	dnsResponseCodeStrings     = map[uint32]string{}
+	l3ProtocolStrings          = map[L3Protocol]string{}
+	l4ProtocolStrings          = map[L4Protocol]string{}
+	networkDirectionStrings    = map[NetworkDirection]string{}
+	networkProtocolTypeStrings = map[NetworkProtocolType]string{}
+	addressFamilyStrings       = map[uint16]string{}
+	tlsVersionStrings          = map[uint16]string{}
+	abiStrings                 = map[ABI]string{}
+	architectureStrings        = map[Architecture]string{}
+	compressionTypeStrings     = map[CompressionType]string{}
+	fileTypeStrings            = map[FileType]string{}
+	linkageTypeStrings         = map[LinkageType]string{}
+	// UserSessionTypeStrings are the supported user session types
+	userSessionTypeStrings = map[usersession.Type]string{}
+	// SSHAuthMethodStrings are the supported SSH authentication methods
+	sshAuthMethodStrings = map[usersession.AuthType]string{}
 )
 
 // File flags
@@ -388,6 +507,7 @@ const (
 // SyscallDriftEventReason describes why a syscall drift event was sent
 type SyscallDriftEventReason uint64
 
+// mirrors the SYSCALL_MONITOR_REASON_* constants of the eBPF side
 const (
 	// SyscallMonitorPeriodReason means that the event was sent because the syscall cache entry was dirty for longer than syscall_monitor.period
 	SyscallMonitorPeriodReason SyscallDriftEventReason = iota + 1
@@ -450,6 +570,13 @@ func initL4ProtocolConstants() {
 	}
 }
 
+func initNetworkProtocolTypeConstants() {
+	for k, v := range NetworkProtocolTypeConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		networkProtocolTypeStrings[v] = k
+	}
+}
+
 func initNetworkDirectionContants() {
 	for k, v := range NetworkDirectionConstants {
 		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
@@ -484,6 +611,55 @@ func initSSLVersionConstants() {
 	}
 }
 
+func initABIConstants() {
+	for k, v := range ABIConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		abiStrings[v] = k
+	}
+}
+
+func initArchitectureConstants() {
+	for k, v := range ArchitectureConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		architectureStrings[v] = k
+	}
+}
+
+func initCompressionTypeConstants() {
+	for k, v := range CompressionTypeConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		compressionTypeStrings[v] = k
+	}
+}
+
+func initFileTypeConstants() {
+	for k, v := range FileTypeConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		fileTypeStrings[v] = k
+	}
+}
+
+func initLinkageTypeConstants() {
+	for k, v := range LinkageTypeConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		linkageTypeStrings[v] = k
+	}
+}
+
+func initUserSessionTypes() {
+	for k, v := range UserSessionTypes {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		userSessionTypeStrings[v] = k
+	}
+}
+
+func initSSHAuthMethodConstants() {
+	for k, v := range SSHAuthMethodConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		sshAuthMethodStrings[v] = k
+	}
+}
+
 func initConstants() {
 	initBoolConstants()
 	initErrorConstants()
@@ -508,14 +684,33 @@ func initConstants() {
 	initDNSQTypeConstants()
 	initL3ProtocolConstants()
 	initL4ProtocolConstants()
+	initNetworkProtocolTypeConstants()
 	initNetworkDirectionContants()
 	initAddressFamilyConstants()
 	initExitCauseConstants()
 	initBPFMapNamesConstants()
 	initAUIDConstants()
-	usersession.InitUserSessionTypes()
 	initSSLVersionConstants()
 	initSysCtlActionConstants()
+	initSetSockOptLevelConstants()
+	initSetSockOptOptNameConstantsIP()
+	initSetSockOptOptNameConstantsSolSocket()
+	initSetSockOptOptNameConstantsTCP()
+	initSetSockOptOptNameConstantsIPv6()
+	initRlimitConstants()
+	initCloneFlagsConstants()
+	initABIConstants()
+	initArchitectureConstants()
+	initCompressionTypeConstants()
+	initFileTypeConstants()
+	initLinkageTypeConstants()
+	initSocketDomainConstants()
+	initSocketTypeConstants()
+	initSocketFamilyConstants()
+	initSocketProtocolConstants()
+	initPrCtlOptionConstants()
+	initUserSessionTypes()
+	initSSHAuthMethodConstants()
 }
 
 // RetValError represents a syscall return error value
@@ -828,6 +1023,44 @@ const (
 	IPProtoRAW L4Protocol = 255
 )
 
+// NetworkProtocolType is the type of the protocol of the network event
+type NetworkProtocolType uint16
+
+func (proto NetworkProtocolType) String() string {
+	return networkProtocolTypeStrings[proto]
+}
+
+const (
+	// UnspecType is the default type
+	UnspecType NetworkProtocolType = math.MaxUint16
+
+	// ICMPTypeEchoRequest is the type for ICMP echo requests
+	ICMPTypeEchoRequest NetworkProtocolType = 8
+	// ICMPTypeEchoReply is the type for ICMP echo replies
+	ICMPTypeEchoReply NetworkProtocolType = 0
+	// ICMPTypeRouterSolicitation is the type for ICMP router solicitation
+	ICMPTypeRouterSolicitation NetworkProtocolType = 9
+	// ICMPTypeRouterAdvertisement is the type for ICMP router advertisement
+	ICMPTypeRouterAdvertisement NetworkProtocolType = 10
+	// ICMPTypeNeighborSolicitation is the type for ICMP neighbor solicitation
+	ICMPTypeNeighborSolicitation NetworkProtocolType = 135
+	// ICMPTypeNeighborAdvertisement is the type for ICMP neighbor advertisement
+	ICMPTypeNeighborAdvertisement NetworkProtocolType = 136
+
+	// ICMPv6TypeEchoRequest is the type for ICMPv6 echo requests
+	ICMPv6TypeEchoRequest NetworkProtocolType = 128
+	// ICMPv6TypeEchoReply is the type for ICMPv6 echo replies
+	ICMPv6TypeEchoReply NetworkProtocolType = 129
+	// ICMPv6TypeRouterSolicitation is the type for ICMPv6 router solicitation
+	ICMPv6TypeRouterSolicitation NetworkProtocolType = 133
+	// ICMPv6TypeRouterAdvertisement is the type for ICMPv6 router advertisement
+	ICMPv6TypeRouterAdvertisement NetworkProtocolType = 134
+	// ICMPv6TypeNeighborSolicitation is the type for ICMPv6 neighbor solicitation
+	ICMPv6TypeNeighborSolicitation NetworkProtocolType = 137
+	// ICMPv6TypeNeighborAdvertisement is the type for ICMPv6 neighbor advertisement
+	ICMPv6TypeNeighborAdvertisement NetworkProtocolType = 138
+)
+
 // NetworkDirection is used to identify the network direction of a flow
 type NetworkDirection uint32
 
@@ -841,3 +1074,145 @@ const (
 	// Ingress is used to identify ingress traffic
 	Ingress
 )
+
+// ABI represents the Application Binary Interface type
+type ABI int
+
+const (
+	// UnknownABI when ABI is unknown
+	UnknownABI ABI = iota
+	// Bit32 represents 32 bits ABI
+	Bit32
+	// Bit64 represents 64 bits ABI
+	Bit64
+)
+
+func (a ABI) String() string {
+	if len(abiStrings) == 0 {
+		initABIConstants()
+	}
+	return abiStrings[a]
+}
+
+// Architecture represents the CPU architecture
+type Architecture int
+
+const (
+	// UnknownArch when arch is unknown
+	UnknownArch Architecture = iota
+	// X86 arch
+	X86
+	// X8664 represents X86_64 arch, but with a "nicer" naming to pass CI linters
+	X8664
+	// ARM arch
+	ARM
+	// ARM64 arch
+	ARM64
+)
+
+func (a Architecture) String() string {
+	if len(architectureStrings) == 0 {
+		initArchitectureConstants()
+	}
+	return architectureStrings[a]
+}
+
+// CompressionType represents the type of compression used
+type CompressionType int
+
+const (
+	// NoCompression When there is no compression
+	NoCompression CompressionType = iota
+	// GZip compression
+	GZip
+	// Zip compression
+	Zip
+	// Zstd compression
+	Zstd
+	// SevenZip compression
+	SevenZip
+	// BZip2 compression
+	BZip2
+	// XZ compression
+	XZ
+)
+
+func (ct CompressionType) String() string {
+	if len(compressionTypeStrings) == 0 {
+		initCompressionTypeConstants()
+	}
+	return compressionTypeStrings[ct]
+}
+
+// FileType represents the type of the analyzed file
+type FileType int
+
+const (
+	// Empty file
+	Empty FileType = iota
+	// ShellScript file
+	ShellScript
+	// Text file
+	Text
+	// Compressed file
+	Compressed
+	// Encrypted file
+	Encrypted
+	// Binary file
+	Binary
+	// ELFExecutable file
+	ELFExecutable
+	// PEExecutable file
+	PEExecutable
+	// MachOExecutable file
+	MachOExecutable
+	// FileLess file
+	FileLess
+)
+
+func (ft FileType) String() string {
+	if len(fileTypeStrings) == 0 {
+		initFileTypeConstants()
+	}
+	return fileTypeStrings[ft]
+}
+
+// LinkageType represents the type of linkage used in the binary
+type LinkageType int
+
+const (
+	// None when unknown or for non-binary files
+	None LinkageType = iota
+	// Static linked executables
+	Static
+	// Dynamic linked executables
+	Dynamic
+)
+
+func (l LinkageType) String() string {
+	if len(linkageTypeStrings) == 0 {
+		initLinkageTypeConstants()
+	}
+	return linkageTypeStrings[l]
+}
+
+// UserSessionTypeToString converts a usersession.Type to its string representation
+func UserSessionTypeToString(t usersession.Type) string {
+	// init constants if needed
+	SECLConstants()
+
+	if val, ok := userSessionTypeStrings[t]; ok {
+		return val
+	}
+	return ""
+}
+
+func SSHAuthMethodToString(t usersession.AuthType) string {
+	// init constants if needed
+	SECLConstants()
+
+	if val, ok := sshAuthMethodStrings[t]; ok {
+		return val
+	}
+	return ""
+}

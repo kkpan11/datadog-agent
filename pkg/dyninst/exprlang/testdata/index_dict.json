@@ -1,0 +1,17 @@
+{
+  "type": "index",
+  "operation": "",
+  "left": {
+    "type": "ref",
+    "ref": "dict",
+    "operation": "",
+    "error": ""
+  },
+  "right": {
+    "type": "literal",
+    "operation": "",
+    "value": "world",
+    "error": ""
+  },
+  "error": ""
+}

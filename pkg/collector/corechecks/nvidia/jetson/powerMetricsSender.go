@@ -9,7 +9,6 @@ package nvidia
 
 import (
 	"errors"
-	"fmt"
 	"regexp"
 	"strconv"
 
@@ -34,11 +33,11 @@ func (voltageMetricsSender *voltageMetricsSender) SendMetrics(sender sender.Send
 	r := voltageMetricsSender.regex
 	voltageFields := r.FindAllStringSubmatch(field, -1)
 	if len(voltageFields) <= 0 {
-		return errors.New("could not parse voltage fields")
+		return errors.New("nvidia.jetson.power: could not parse voltage fields")
 	}
 
 	for i := 0; i < len(voltageFields); i++ {
-		voltageProbeTags := []string{fmt.Sprintf("probe:%s", voltageFields[i][regexSubexpIndex(r, "voltageProbeName")])}
+		voltageProbeTags := []string{"probe:" + voltageFields[i][regexSubexpIndex(r, "voltageProbeName")]}
 		instantVoltage, err := strconv.ParseFloat(voltageFields[i][regexSubexpIndex(r, "currentVoltage")], 64)
 		if err != nil {
 			return err

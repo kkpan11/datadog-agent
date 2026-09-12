@@ -10,9 +10,9 @@ SEC("classifier/ingress")
 int classifier_ingress(struct __sk_buff *skb) {
     struct packet_t *pkt = parse_packet(skb, INGRESS);
     if (!pkt) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
-    resolve_pid(pkt);
+    resolve_pid(skb, pkt);
 
     return route_pkt(skb, pkt, INGRESS);
 };
@@ -21,19 +21,22 @@ SEC("classifier/egress")
 int classifier_egress(struct __sk_buff *skb) {
     struct packet_t *pkt = parse_packet(skb, EGRESS);
     if (!pkt) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
-    resolve_pid(pkt);
+    resolve_pid(skb, pkt);
 
     return route_pkt(skb, pkt, EGRESS);
 };
 
-__attribute__((always_inline)) int prepare_raw_packet_event(struct __sk_buff *skb) {
+__attribute__((always_inline)) int prepare_raw_packet_event(struct __sk_buff *skb, struct packet_t *pkt) {
     struct raw_packet_event_t *evt = get_raw_packet_event();
     if (evt == NULL) {
         // should never happen
-        return ACT_OK;
+        return 0;
     }
+
+    evt->process.pid = pkt->pid;
+    evt->cgroup.path_key.ino = pkt->cgroup_id;
 
     bpf_skb_pull_data(skb, 0);
 
@@ -44,14 +47,14 @@ __attribute__((always_inline)) int prepare_raw_packet_event(struct __sk_buff *sk
 
     if (len > 1) {
         if (bpf_skb_load_bytes(skb, 0, evt->data, len) < 0) {
-            return ACT_OK;
+            return 0;
         }
         evt->len = skb->len;
     } else {
         evt->len = 0;
     }
 
-    return ACT_OK;
+    return 1;
 }
 
 __attribute__((always_inline)) int is_raw_packet_enabled() {
@@ -60,62 +63,65 @@ __attribute__((always_inline)) int is_raw_packet_enabled() {
     return enabled && *enabled;
 }
 
-__attribute__((always_inline)) int is_raw_packet_allowed(struct packet_t *pkt) {
-    // do not handle tcp packet outside of SYN without process context
-    if (pkt->ns_flow.flow.l4_protocol == IPPROTO_TCP && !pkt->tcp.syn && pkt->pid <= 0) {
-        return 0;
-    }
-    return 1;
-}
-
 SEC("classifier/ingress")
 int classifier_raw_packet_ingress(struct __sk_buff *skb) {
     if (!is_raw_packet_enabled()) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
     struct packet_t *pkt = parse_packet(skb, INGRESS);
     if (!pkt) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
-    resolve_pid(pkt);
+    resolve_pid(skb, pkt);
 
     if (!is_raw_packet_allowed(pkt)) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
-    if (prepare_raw_packet_event(skb) != ACT_OK) {
-        return ACT_OK;
+    if (!prepare_raw_packet_event(skb, pkt)) {
+        return TC_ACT_UNSPEC;
     }
 
-    bpf_tail_call_compat(skb, &raw_packet_classifier_router, RAW_PACKET_FILTER);
+    tail_call_raw_packet_router(skb, RAW_PACKET_FILTER);
 
-    return ACT_OK;
+    return TC_ACT_UNSPEC;
 };
 
 SEC("classifier/egress")
 int classifier_raw_packet_egress(struct __sk_buff *skb) {
     if (!is_raw_packet_enabled()) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
     struct packet_t *pkt = parse_packet(skb, EGRESS);
     if (!pkt) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
-    resolve_pid(pkt);
+    resolve_pid(skb, pkt);
 
+    if (pkt->pid) {
+        pkt->cgroup_id = get_cgroup_id(pkt->pid);
+    }
+
+    if (!prepare_raw_packet_event(skb, pkt)) {
+        return TC_ACT_UNSPEC;
+    }
+
+    // call the drop action
+    if (pkt->pid > 0 || pkt->cgroup_id > 0) {
+        tail_call_raw_packet_router(skb, RAW_PACKET_DROP_ACTION);
+    }
+
+    // mostly a rate limiter
     if (!is_raw_packet_allowed(pkt)) {
-        return ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
-    if (prepare_raw_packet_event(skb) != ACT_OK) {
-        return ACT_OK;
-    }
+    // call regular filter
+    tail_call_raw_packet_router(skb, RAW_PACKET_FILTER);
 
-    bpf_tail_call_compat(skb, &raw_packet_classifier_router, RAW_PACKET_FILTER);
-
-    return ACT_OK;
+    return TC_ACT_UNSPEC;
 };
 
 #endif

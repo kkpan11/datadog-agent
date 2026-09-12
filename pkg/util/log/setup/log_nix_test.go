@@ -10,8 +10,10 @@ package logs
 import (
 	"testing"
 
-	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/stretchr/testify/assert"
+
+	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 func TestGetSyslogURI(t *testing.T) {
@@ -19,27 +21,27 @@ func TestGetSyslogURI(t *testing.T) {
 
 	mockConfig := configmock.New(t)
 
-	mockConfig.SetWithoutSource("log_to_syslog", true)
-	mockConfig.SetWithoutSource("syslog_uri", "")
+	mockConfig.SetInTest("log_to_syslog", true)
+	mockConfig.SetInTest("syslog_uri", "")
 
 	assert.Equal(GetSyslogURI(mockConfig), defaultSyslogURI)
 
-	mockConfig.SetWithoutSource("syslog_uri", "tcp://localhost:514")
+	mockConfig.SetInTest("syslog_uri", "tcp://localhost:514")
 	assert.Equal(GetSyslogURI(mockConfig), "tcp://localhost:514")
 
-	mockConfig.SetWithoutSource("log_to_syslog", false)
+	mockConfig.SetInTest("log_to_syslog", false)
 	assert.Equal(GetSyslogURI(mockConfig), "")
 
-	mockConfig.SetWithoutSource("syslog_uri", "")
+	mockConfig.SetInTest("syslog_uri", "")
 	assert.Equal(GetSyslogURI(mockConfig), "")
 }
 
 func TestSetupLoggingNowhere(t *testing.T) {
 	// setup logger so that it logs nowhere: i.e.  not to file, not to syslog, not to console
 	mockConfig := configmock.New(t)
-	seelogConfig, _ = buildLoggerConfig("agent", "info", "", "", false, false, false, mockConfig)
-	loggerInterface, err := GenerateLoggerInterface(seelogConfig)
+	loggerInterface, levelVar, err := buildLogger("agent", log.InfoLvl, "", "", false, false, false, mockConfig)
 
 	assert.Nil(t, loggerInterface)
+	assert.Nil(t, levelVar)
 	assert.NotNil(t, err)
 }

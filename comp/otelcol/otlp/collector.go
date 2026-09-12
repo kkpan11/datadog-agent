@@ -23,17 +23,16 @@ import (
 	"go.opentelemetry.io/collector/processor/batchprocessor"
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/otlpreceiver"
+	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 	"go.uber.org/atomic"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	otlpmetrics "github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/metrics"
-
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
-	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/exporter/logsagentexporter"
 	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/exporter/serializerexporter"
 	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/processor/infraattributesprocessor"
@@ -50,54 +49,20 @@ import (
 
 var pipelineError = atomic.NewError(nil)
 
-type tagEnricher struct {
-	cardinality types.TagCardinality
-	tagger      tagger.Component
-}
-
-func (t *tagEnricher) SetCardinality(cardinality string) (err error) {
-	t.cardinality, err = types.StringToTagCardinality(cardinality)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// enrichedTags of a given dimension.
-// In the OTLP pipeline, 'contexts' are kept within the translator and function differently than DogStatsD/check metrics.
-// TODO: we need to move this to TagEnricher processor
-func (t *tagEnricher) Enrich(_ context.Context, extraTags []string, dimensions *otlpmetrics.Dimensions) []string {
-	enrichedTags := make([]string, 0, len(extraTags)+len(dimensions.Tags()))
-	enrichedTags = append(enrichedTags, extraTags...)
-	enrichedTags = append(enrichedTags, dimensions.Tags()...)
-	prefix, id, err := types.ExtractPrefixAndID(dimensions.OriginID())
-	if err != nil {
-		log.Tracef("Cannot get tags for entity %s: %s", dimensions.OriginID(), err)
-	} else {
-		entityID := types.NewEntityID(prefix, id)
-		entityTags, err := t.tagger.Tag(entityID, t.cardinality)
-		if err != nil {
-			log.Tracef("Cannot get tags for entity %s: %s", dimensions.OriginID(), err)
-		} else {
-			enrichedTags = append(enrichedTags, entityTags...)
-		}
-	}
-
-	globalTags, err := t.tagger.GlobalTags(t.cardinality)
-	if err != nil {
-		log.Trace(err.Error())
-	} else {
-		enrichedTags = append(enrichedTags, globalTags...)
-	}
-
-	return enrichedTags
-}
-
-func getComponents(s serializer.MetricSerializer, logsAgentChannel chan *message.Message, tagger tagger.Component, hostname hostnameinterface.Component) (
+func getComponents(
+	s serializer.MetricSerializer,
+	logsAgentChannel chan *message.Message,
+	tagger tagger.Component,
+	hostname hostnameinterface.Component,
+	telemetry telemetry.Component,
+) (
 	otelcol.Factories,
 	error,
 ) {
 	var errs []error
+
+	serializerexporter.InitTelemetry(telemetry)
+	logsagentexporter.InitTelemetry(telemetry)
 
 	extensions, err := otelcol.MakeFactoryMap[extension.Factory]()
 	if err != nil {
@@ -111,9 +76,18 @@ func getComponents(s serializer.MetricSerializer, logsAgentChannel chan *message
 		errs = append(errs, err)
 	}
 
+	store := serializerexporter.TelemetryStore{}
+	if telemetry != nil {
+		store.OTLPIngestMetrics = telemetry.NewGauge(
+			"runtime",
+			"datadog_agent_otlp_ingest_metrics",
+			[]string{"version", "command", "host"},
+			"Usage metric of OTLP metrics in OTLP ingestion",
+		)
+	}
 	exporterFactories := []exporter.Factory{
 		otlpexporter.NewFactory(),
-		serializerexporter.NewFactoryForAgent(s, &tagEnricher{cardinality: types.LowCardinality, tagger: tagger}, hostname.Get),
+		serializerexporter.NewFactoryForAgent(s, hostname.Get, store),
 		debugexporter.NewFactory(),
 	}
 
@@ -140,6 +114,7 @@ func getComponents(s serializer.MetricSerializer, logsAgentChannel chan *message
 		Receivers:  receivers,
 		Processors: processors,
 		Exporters:  exporters,
+		Telemetry:  otelconftelemetry.NewFactory(),
 	}
 
 	return factories, multierr.Combine(errs...)
@@ -165,18 +140,42 @@ type PipelineConfig struct {
 	TracesEnabled bool
 	// LogsEnabled states whether OTLP logs support is enabled.
 	LogsEnabled bool
+	// Enable/disable InfraAttributes processor for Traces pipeline
+	TracesInfraAttributesEnabled bool
+	// TracesContainerTagPromotion controls how the InfraAttributes processor promotes
+	// custom container tags into `_dd.tags.container` for the Traces pipeline.
+	// Valid values: "off", "duplicate", "rename" (empty is treated as "off").
+	TracesContainerTagPromotion string
+	// LogsTagsAsDDTags controls whether the InfraAttributes processor writes custom
+	// tags (e.g. from kubernetesResourcesLabelsAsTags/AnnotationsAsTags) as a
+	// `ddtags` log record attribute (real Datadog log tags) instead of resource
+	// attributes (log attributes) for the Logs pipeline.
+	LogsTagsAsDDTags bool
+	// MetricsInfraAttrsAsTags controls whether the InfraAttributes processor promotes
+	// custom tags (e.g. from kubernetesResourcesLabelsAsTags/AnnotationsAsTags) so they
+	// survive the metrics translator's allowlist and become metric tags for the Metrics
+	// pipeline. Without it, custom tags that are not known DD/OTel conventions are dropped.
+	MetricsInfraAttrsAsTags bool
+	// Logs contains configuration options for the logs
+	Logs map[string]interface{}
 	// Debug contains debug configurations.
 	Debug map[string]interface{}
 	// Metrics contains configuration options for the serializer metrics exporter
 	Metrics map[string]interface{}
+	// MetricsBatch contains configuration options for the sending queue batch
+	MetricsBatch map[string]interface{}
 }
 
-// shouldSetLoggingSection returns whether debug logging is enabled.
-// Debug logging is enabled when verbosity is set to a valid value except for "none", or left unset.
+// shouldSetLoggingSection reports whether the debug exporter should be attached to
+// the OTLP ingest pipelines. FromAgentConfig populates Debug["verbosity"] whenever the
+// user configures the otlp_config.debug section (defaulting it when the section is
+// declared without a verbosity), so a missing verbosity here means the section was not
+// configured and the exporter is not attached. An explicit "none" also leaves it
+// detached. As a result, no per-batch debug logs are emitted unless the user opts in.
 func (p *PipelineConfig) shouldSetLoggingSection() bool {
 	v, ok := p.Debug["verbosity"]
 	if !ok {
-		return true
+		return false
 	}
 	s, ok := v.(string)
 	if !ok {
@@ -196,7 +195,14 @@ type Pipeline struct {
 type CollectorStatus = datatype.CollectorStatus
 
 // NewPipeline defines a new OTLP pipeline.
-func NewPipeline(cfg PipelineConfig, s serializer.MetricSerializer, logsAgentChannel chan *message.Message, tagger tagger.Component, hostname hostnameinterface.Component) (*Pipeline, error) {
+func NewPipeline(
+	cfg PipelineConfig,
+	s serializer.MetricSerializer,
+	logsAgentChannel chan *message.Message,
+	tagger tagger.Component,
+	hostname hostnameinterface.Component,
+	telemetry telemetry.Component,
+) (*Pipeline, error) {
 	buildInfo, err := getBuildInfo()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get build info: %w", err)
@@ -216,7 +222,7 @@ func NewPipeline(cfg PipelineConfig, s serializer.MetricSerializer, logsAgentCha
 
 	col, err := otelcol.NewCollector(otelcol.CollectorSettings{
 		Factories: func() (otelcol.Factories, error) {
-			return getComponents(s, logsAgentChannel, tagger, hostname)
+			return getComponents(s, logsAgentChannel, tagger, hostname, telemetry)
 		},
 		BuildInfo:               buildInfo,
 		DisableGracefulShutdown: true,
@@ -263,7 +269,14 @@ func (p *Pipeline) Stop() {
 
 // NewPipelineFromAgentConfig creates a new pipeline from the given agent configuration, metric serializer and logs channel. It returns
 // any potential failure.
-func NewPipelineFromAgentConfig(cfg config.Component, s serializer.MetricSerializer, logsAgentChannel chan *message.Message, tagger tagger.Component, hostname hostnameinterface.Component) (*Pipeline, error) {
+func NewPipelineFromAgentConfig(
+	cfg config.Component,
+	s serializer.MetricSerializer,
+	logsAgentChannel chan *message.Message,
+	tagger tagger.Component,
+	hostname hostnameinterface.Component,
+	telemetry telemetry.Component,
+) (*Pipeline, error) {
 	pcfg, err := FromAgentConfig(cfg)
 	if err != nil {
 		pipelineError.Store(fmt.Errorf("config error: %w", err))
@@ -272,7 +285,7 @@ func NewPipelineFromAgentConfig(cfg config.Component, s serializer.MetricSeriali
 	if err := checkAndUpdateCfg(cfg, pcfg, logsAgentChannel); err != nil {
 		return nil, err
 	}
-	p, err := NewPipeline(pcfg, s, logsAgentChannel, tagger, hostname)
+	p, err := NewPipeline(pcfg, s, logsAgentChannel, tagger, hostname, telemetry)
 	if err != nil {
 		pipelineError.Store(fmt.Errorf("failed to build pipeline: %w", err))
 		return nil, pipelineError.Load()

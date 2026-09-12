@@ -9,16 +9,24 @@ import (
 	"math"
 	"time"
 
+	observer "github.com/DataDog/datadog-agent/comp/anomalydetection/observer/def"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	filterlist "github.com/DataDog/datadog-agent/comp/filterlist/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/internal/tags"
+	"github.com/DataDog/datadog-agent/pkg/aggregator/internal/util"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	"github.com/DataDog/datadog-agent/pkg/util/metricname"
 )
 
 const checksSourceTypeName = "System"
+
+type bucketBounds struct {
+	lower, upper float64
+}
 
 // CheckSampler aggregates metrics from one Check instance
 type CheckSampler struct {
@@ -29,12 +37,25 @@ type CheckSampler struct {
 	metrics                metrics.CheckMetrics
 	sketchMap              sketchMap
 	lastBucketValue        map[ckey.ContextKey]int64
+	lastBucketValueByBound map[ckey.ContextKey]map[bucketBounds]int64
 	deregistered           bool
 	contextResolverMetrics bool
+	logThrottling          util.SimpleThrottler
+	allowSketchBucketReset bool
+	observerHandle         observer.Handle
 }
 
 // newCheckSampler returns a newly initialized CheckSampler
-func newCheckSampler(expirationCount int, expireMetrics bool, contextResolverMetrics bool, statefulTimeout time.Duration, cache *tags.Store, id checkid.ID, tagger tagger.Component) *CheckSampler {
+func newCheckSampler(
+	expirationCount int,
+	expireMetrics bool,
+	contextResolverMetrics bool,
+	statefulTimeout time.Duration,
+	allowSketchBucketReset bool,
+	cache *tags.Store,
+	id checkid.ID,
+	tagger tagger.Component,
+) *CheckSampler {
 	return &CheckSampler{
 		id:                     id,
 		series:                 make([]*metrics.Serie, 0),
@@ -44,12 +65,21 @@ func newCheckSampler(expirationCount int, expireMetrics bool, contextResolverMet
 		sketchMap:              make(sketchMap),
 		lastBucketValue:        make(map[ckey.ContextKey]int64),
 		contextResolverMetrics: contextResolverMetrics,
+		logThrottling:          util.NewSimpleThrottler(5, 5*time.Minute, ""),
+		allowSketchBucketReset: allowSketchBucketReset,
 	}
 }
 
-func (cs *CheckSampler) addSample(metricSample *metrics.MetricSample) {
-	contextKey := cs.contextResolver.trackContext(metricSample)
+// SetObserverHandle sets the observer handle for mirroring check samples.
+func (cs *CheckSampler) SetObserverHandle(h observer.Handle) {
+	cs.observerHandle = h
+}
 
+func (cs *CheckSampler) addSample(metricSample *metrics.MetricSample, tagFilterList filterlist.TagMatcher) {
+	contextKey := cs.contextResolver.trackContext(metricSample, tagFilterList)
+	if cs.observerHandle != nil {
+		cs.observerHandle.ObserveMetric(metricSample)
+	}
 	if metricSample.Mtype == metrics.DistributionType {
 		cs.sketchMap.insert(int64(metricSample.Timestamp), contextKey, metricSample.Value, metricSample.SampleRate)
 		return
@@ -61,22 +91,30 @@ func (cs *CheckSampler) addSample(metricSample *metrics.MetricSample) {
 }
 
 func (cs *CheckSampler) newSketchSeries(ck ckey.ContextKey, points []metrics.SketchPoint) *metrics.SketchSeries {
-	ctx, _ := cs.contextResolver.get(ck)
+	ctx, ok := cs.contextResolver.get(ck)
+	if !ok {
+		log.Errorf("Ignoring sketch on context key '%v': inconsistent context resolver state: the context is not tracked", ck)
+		return nil
+	}
 	ss := &metrics.SketchSeries{
-		Name: ctx.Name,
-		Tags: ctx.Tags(),
-		Host: ctx.Host,
-		// Interval: TODO: investigate
-		Points:     points,
-		ContextKey: ck,
+		DistributionMetadata: metrics.DistributionMetadata{
+			Name:   ctx.Name,
+			Tags:   ctx.Tags(),
+			Host:   ctx.Host,
+			Source: ctx.source,
+			// Interval: TODO: investigate
+		},
+		Points: points,
 	}
 
 	return ss
 }
 
-func (cs *CheckSampler) addBucket(bucket *metrics.HistogramBucket) {
+func (cs *CheckSampler) addBucket(bucket *metrics.HistogramBucket, tagFilterList filterlist.TagMatcher) {
 	if bucket.Value < 0 {
-		log.Warnf("Negative bucket value %d for metric %s discarding", bucket.Value, bucket.Name)
+		if !cs.logThrottling.ShouldThrottle() {
+			log.Warnf("Negative bucket value %d for metric %s discarding", bucket.Value, bucket.Name)
+		}
 		return
 	}
 	if bucket.Value == 0 {
@@ -86,34 +124,66 @@ func (cs *CheckSampler) addBucket(bucket *metrics.HistogramBucket) {
 
 	bucketRange := bucket.UpperBound - bucket.LowerBound
 	if bucketRange < 0 {
-		log.Warnf(
-			"Negative bucket range [%f-%f] for metric %s discarding",
-			bucket.LowerBound, bucket.UpperBound, bucket.Name,
-		)
+		if !cs.logThrottling.ShouldThrottle() {
+			log.Warnf(
+				"Negative bucket range [%f-%f] for metric %s discarding",
+				bucket.LowerBound, bucket.UpperBound, bucket.Name,
+			)
+		}
 		return
 	}
 
-	contextKey := cs.contextResolver.trackContext(bucket)
+	contextKey := cs.contextResolver.trackContext(bucket, tagFilterList)
 
 	// if the bucket is monotonic and we have already seen the bucket we only send the delta
 	if bucket.Monotonic {
-		lastBucketValue, bucketFound := cs.lastBucketValue[contextKey]
+		lastBucketValue := int64(0)
+		bucketFound := false
 		rawValue := bucket.Value
 
-		cs.lastBucketValue[contextKey] = rawValue
+		// Openmetrics checks can send lots of metrics with lots of
+		// buckets, but include bucket bounds in the tags and only have
+		// one bucket per context key. It pays to use a simpler map to
+		// track bucket values for such metrics.
+		if !bucket.MultipleBuckets {
+			lastBucketValue, bucketFound = cs.lastBucketValue[contextKey]
+			cs.lastBucketValue[contextKey] = rawValue
+		} else {
+			if cs.lastBucketValueByBound == nil {
+				cs.lastBucketValueByBound = make(map[ckey.ContextKey]map[bucketBounds]int64)
+			}
+			lastBucketValues := cs.lastBucketValueByBound[contextKey]
+			if lastBucketValues == nil {
+				lastBucketValues = make(map[bucketBounds]int64)
+				cs.lastBucketValueByBound[contextKey] = lastBucketValues
+			}
+			bucketBounds := bucketBoundsFor(bucket)
+			lastBucketValue, bucketFound = lastBucketValues[bucketBounds]
+			lastBucketValues[bucketBounds] = rawValue
+		}
 
 		// Return early so we don't report the first raw value instead of the delta which will cause spikes
 		if !bucketFound && !bucket.FlushFirstValue {
 			return
 		}
 
-		bucket.Value = rawValue - lastBucketValue
+		// Handle reset for monotonic buckets.
+		if rawValue < lastBucketValue && cs.allowSketchBucketReset {
+			if !bucket.FlushFirstValue {
+				return
+			}
+		} else {
+			bucket.Value = rawValue - lastBucketValue
+		}
 	}
 
 	if bucket.Value < 0 {
-		log.Warnf("Negative bucket delta %d for metric %s discarding", bucket.Value, bucket.Name)
+		if !cs.logThrottling.ShouldThrottle() {
+			log.Warnf("Negative bucket delta %d for metric %s discarding", bucket.Value, bucket.Name)
+		}
 		return
 	}
+
 	if bucket.Value == 0 {
 		// noop
 		return
@@ -132,14 +202,15 @@ func (cs *CheckSampler) addBucket(bucket *metrics.HistogramBucket) {
 	cs.sketchMap.insertInterp(int64(bucket.Timestamp), contextKey, bucket.LowerBound, bucket.UpperBound, uint(bucket.Value))
 }
 
-func (cs *CheckSampler) commitSeries(timestamp float64) {
+func (cs *CheckSampler) commitSeries(timestamp float64, filterList *metricname.Matcher) {
+
 	series, errors := cs.metrics.Flush(timestamp)
 	for ckey, err := range errors {
 		context, ok := cs.contextResolver.get(ckey)
 		if !ok {
 			log.Errorf("Can't resolve context of error '%s': inconsistent context resolver state: context with key '%v' is not tracked", err, ckey)
 		} else {
-			log.Infof("No value returned for check metric '%s' on host '%s' and tags '%s': %s", context.Name, context.Host, context.Tags().Join(", "), err)
+			log.Debugf("No value returned for check metric '%s' on host '%s' and tags '%s': %s", context.Name, context.Host, context.Tags().Join(", "), err)
 		}
 	}
 	for _, serie := range series {
@@ -149,7 +220,14 @@ func (cs *CheckSampler) commitSeries(timestamp float64) {
 			log.Errorf("Ignoring all metrics on context key '%v': inconsistent context resolver state: the context is not tracked", serie.ContextKey)
 			continue
 		}
-		serie.Name = context.Name + serie.NameSuffix
+
+		name := context.Name + serie.NameSuffix
+		// Filter the metrics
+		if filterList != nil && filterList.Test(name) {
+			tlmChecksFilteredMetrics.Inc()
+			continue
+		}
+		serie.Name = name
 		serie.Tags = context.Tags()
 		serie.Host = context.Host
 		serie.NoIndex = context.noIndex
@@ -160,7 +238,7 @@ func (cs *CheckSampler) commitSeries(timestamp float64) {
 	}
 }
 
-func (cs *CheckSampler) commitSketches(timestamp float64) {
+func (cs *CheckSampler) commitSketches(timestamp float64, filterList *metricname.Matcher) {
 	pointsByCtx := make(map[ckey.ContextKey][]metrics.SketchPoint)
 
 	cs.sketchMap.flushBefore(int64(timestamp), func(ck ckey.ContextKey, p metrics.SketchPoint) {
@@ -170,13 +248,22 @@ func (cs *CheckSampler) commitSketches(timestamp float64) {
 		pointsByCtx[ck] = append(pointsByCtx[ck], p)
 	})
 	for ck, points := range pointsByCtx {
-		cs.sketches = append(cs.sketches, cs.newSketchSeries(ck, points))
+		series := cs.newSketchSeries(ck, points)
+		if series == nil {
+			continue
+		}
+		// Filter the metrics
+		if filterList != nil && filterList.Test(series.Name) {
+			tlmChecksFilteredMetrics.Inc()
+			continue
+		}
+		cs.sketches = append(cs.sketches, series)
 	}
 }
 
-func (cs *CheckSampler) commit(timestamp float64) {
-	cs.commitSeries(timestamp)
-	cs.commitSketches(timestamp)
+func (cs *CheckSampler) commit(timestamp float64, filterList *metricname.Matcher) {
+	cs.commitSeries(timestamp, filterList)
+	cs.commitSketches(timestamp, filterList)
 
 	cs.metrics.RemoveExpired(timestamp)
 
@@ -185,6 +272,7 @@ func (cs *CheckSampler) commit(timestamp float64) {
 	// garbage collect unused buckets
 	for _, ctxKey := range expiredContextKeys {
 		delete(cs.lastBucketValue, ctxKey)
+		delete(cs.lastBucketValueByBound, ctxKey)
 	}
 
 	cs.metrics.Expire(expiredContextKeys, timestamp)
@@ -203,6 +291,10 @@ func (cs *CheckSampler) flush() (metrics.Series, metrics.SketchSeriesList) {
 	cs.updateMetrics()
 
 	return series, sketches
+}
+
+func (cs *CheckSampler) clearStripCache() {
+	cs.contextResolver.resolver.clearTagFilterCache()
 }
 
 func (cs *CheckSampler) release() {
@@ -232,4 +324,11 @@ func (cs *CheckSampler) updateMetrics() {
 
 	tlmChecksContexts.Set(float64(totalContexts), idString)
 	cs.contextResolver.updateMetrics(tlmChecksContextsByMtype, tlmChecksContextsBytesByMtype)
+}
+
+func bucketBoundsFor(bucket *metrics.HistogramBucket) bucketBounds {
+	return bucketBounds{
+		lower: bucket.LowerBound,
+		upper: bucket.UpperBound,
+	}
 }

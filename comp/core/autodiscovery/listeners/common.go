@@ -8,49 +8,24 @@
 package listeners
 
 import (
-	"fmt"
 	"hash/fnv"
 	"maps"
 	"strconv"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/types"
+	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
-	// Keys of standard tags
-	tagKeyEnv     = "env"
-	tagKeyVersion = "version"
-	tagKeyService = "service"
+	tolerateUnreadyAnnotation = "ad.datadoghq.com/tolerate-unready"
 )
-
-// containerFilters holds container filters for AD listeners
-type containerFilters struct {
-	global  *containers.Filter
-	metrics *containers.Filter
-	logs    *containers.Filter
-}
 
 // getStandardTags extract standard tags from labels of kubernetes services
 func getStandardTags(labels map[string]string) []string {
-	tags := []string{}
-	if labels == nil {
-		return tags
-	}
-	labelToTagKeys := map[string]string{
-		kubernetes.EnvTagLabelKey:     tagKeyEnv,
-		kubernetes.VersionTagLabelKey: tagKeyVersion,
-		kubernetes.ServiceTagLabelKey: tagKeyService,
-	}
-	for labelKey, tagKey := range labelToTagKeys {
-		if tagValue, found := labels[labelKey]; found {
-			tags = append(tags, fmt.Sprintf("%s:%s", tagKey, tagValue))
-		}
-	}
-	return tags
+	return kubernetes.GetStandardTags(labels)
 }
 
 // standardTagsDigest computes the hash of standard tags in a map
@@ -64,31 +39,6 @@ func standardTagsDigest(labels map[string]string) string {
 	_, _ = h.Write([]byte(labels[kubernetes.VersionTagLabelKey]))
 	_, _ = h.Write([]byte(labels[kubernetes.ServiceTagLabelKey]))
 	return strconv.FormatUint(h.Sum64(), 16)
-}
-
-// newContainerFilters instantiates the required container filters for AD listeners
-// The returned filter will never be nil
-func newContainerFilters() *containerFilters {
-	global := containers.NewAutodiscoveryFilter(containers.GlobalFilter)
-	metrics := containers.NewAutodiscoveryFilter(containers.MetricsFilter)
-	logs := containers.NewAutodiscoveryFilter(containers.LogsFilter)
-	return &containerFilters{
-		global:  global,
-		metrics: metrics,
-		logs:    logs,
-	}
-}
-
-func (f *containerFilters) IsExcluded(filter containers.FilterType, annotations map[string]string, name, image, ns string) bool {
-	switch filter {
-	case containers.GlobalFilter:
-		return f.global.IsExcluded(annotations, name, image, ns)
-	case containers.MetricsFilter:
-		return f.metrics.IsExcluded(annotations, name, image, ns)
-	case containers.LogsFilter:
-		return f.logs.IsExcluded(annotations, name, image, ns)
-	}
-	return false
 }
 
 // getPrometheusIncludeAnnotations returns the Prometheus AD include annotations based on the Prometheus config
@@ -119,4 +69,10 @@ func getPrometheusIncludeAnnotations() types.PrometheusAnnotations {
 		maps.Copy(annotations, check.AD.GetIncludeAnnotations())
 	}
 	return annotations
+}
+
+// shouldSkipPodReadiness checks if a pod should skip readiness checks based on its annotations
+func shouldSkipPodReadiness(pod *workloadmeta.KubernetesPod) bool {
+	tolerate, ok := pod.Annotations[tolerateUnreadyAnnotation]
+	return ok && tolerate == "true"
 }

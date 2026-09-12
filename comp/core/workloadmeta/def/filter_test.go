@@ -13,48 +13,52 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-func TestIsNodeMetadata(t *testing.T) {
-
+func TestIsNamespaceMetadata(t *testing.T) {
 	tests := []struct {
-		name                 string
-		metadataEntity       KubernetesMetadata
-		shouldBeNodeMetadata bool
+		name     string
+		metadata KubernetesMetadata
+		expected bool
 	}{
 		{
-			name: "node metadata",
-			metadataEntity: KubernetesMetadata{
+			name: "namespace metadata",
+			metadata: KubernetesMetadata{
 				GVR: &schema.GroupVersionResource{
 					Version:  "v1",
-					Resource: "nodes",
+					Resource: "namespaces",
 				},
 			},
-			shouldBeNodeMetadata: true,
+			expected: true,
 		},
-
 		{
-			name: "node metadata, but not native group",
-			metadataEntity: KubernetesMetadata{
+			name: "namespace metadata with custom group",
+			metadata: KubernetesMetadata{
 				GVR: &schema.GroupVersionResource{
 					Group:    "customgroup",
 					Version:  "v1",
+					Resource: "namespaces",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "node metadata is not namespace metadata",
+			metadata: KubernetesMetadata{
+				GVR: &schema.GroupVersionResource{
+					Version:  "v1",
 					Resource: "nodes",
 				},
 			},
-			shouldBeNodeMetadata: false,
+			expected: false,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(tt *testing.T) {
-			if test.shouldBeNodeMetadata {
-				assert.True(tt, IsNodeMetadata(&test.metadataEntity))
-			} else {
-				assert.False(tt, IsNodeMetadata(&test.metadataEntity))
-			}
+			assert.Equal(tt, test.expected, IsNamespaceMetadata(&test.metadata))
 		})
 	}
-
 }
+
 func TestFilterBuilder_Build(t *testing.T) {
 	dummyEntityFilterFunc := func(entity Entity) bool {
 		return len(entity.GetID().ID) == 5
@@ -357,9 +361,9 @@ func TestFilter_MatchEntity(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(tt *testing.T) {
 			if test.expectMatch {
-				assert.True(tt, test.filter.MatchEntity(&test.entity))
+				assert.True(tt, test.filter.MatchEntity(test.entity))
 			} else {
-				assert.False(tt, test.filter.MatchEntity(&test.entity))
+				assert.False(tt, test.filter.MatchEntity(test.entity))
 			}
 		})
 	}

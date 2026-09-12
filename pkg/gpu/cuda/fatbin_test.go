@@ -3,16 +3,16 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2024-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package cuda
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
-
-	"golang.org/x/exp/maps"
 
 	"github.com/stretchr/testify/require"
 
@@ -61,7 +61,7 @@ func TestParseFatbinFromPath(t *testing.T) {
 		}
 	}
 
-	require.ElementsMatch(t, testutil.SampleSMVersions, maps.Keys(seenSmVersionsAndKernels))
+	require.ElementsMatch(t, testutil.SampleSMVersions, slices.Collect(maps.Keys(seenSmVersionsAndKernels)))
 
 	// Check that all the kernels are present in each version
 	for version, kernelNames := range seenSmVersionsAndKernels {
@@ -141,7 +141,7 @@ func TestParseBigFatbinFromPath(t *testing.T) {
 		}
 	}
 
-	require.ElementsMatch(t, testutil.SampleSMVersions, maps.Keys(seenSmVersionsAndKernels))
+	require.ElementsMatch(t, testutil.SampleSMVersions, slices.Collect(maps.Keys(seenSmVersionsAndKernels)))
 
 	// Check that all the kernels are present in each version
 	for version, kernelNames := range seenSmVersionsAndKernels {

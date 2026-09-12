@@ -9,12 +9,19 @@
 package probe
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/security/config"
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers"
 	sprocess "github.com/DataDog/datadog-agent/pkg/security/resolvers/process"
+	"github.com/DataDog/datadog-agent/pkg/security/seclog"
+	"golang.org/x/net/bpf"
 
 	"github.com/DataDog/datadog-agent/pkg/security/secl/args"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/containerutils"
@@ -50,11 +57,17 @@ func (fh *EBPFLessFieldHandlers) ResolveProcessCacheEntry(ev *model.Event, _ fun
 	}
 
 	if ev.ProcessCacheEntry == nil {
-		ev.ProcessCacheEntry = model.GetPlaceholderProcessCacheEntry(ev.PIDContext.Pid, ev.PIDContext.Pid, false)
+		ev.ProcessCacheEntry = model.GetPlaceholderProcessCacheEntry(ev.PIDContext)
 		return ev.ProcessCacheEntry, false
 	}
 
 	return ev.ProcessCacheEntry, true
+}
+
+// ResolveProcessCacheEntryFromPID queries the ProcessResolver to retrieve the ProcessContext of the provided PID
+func (fh *EBPFLessFieldHandlers) ResolveProcessCacheEntryFromPID(_ uint32) *model.ProcessCacheEntry {
+	// not supported yet, we're missing NSID
+	return nil
 }
 
 // ResolveFilePath resolves the inode to a full path
@@ -134,19 +147,6 @@ func (fh *EBPFLessFieldHandlers) ResolveProcessIsThread(_ *model.Event, process 
 	return !process.IsExec
 }
 
-// GetProcessCacheEntry queries the ProcessResolver to retrieve the ProcessContext of the event
-func (fh *EBPFLessFieldHandlers) GetProcessCacheEntry(ev *model.Event) (*model.ProcessCacheEntry, bool) {
-	ev.ProcessCacheEntry = fh.resolvers.ProcessResolver.Resolve(sprocess.CacheResolverKey{
-		Pid:  ev.PIDContext.Pid,
-		NSID: ev.PIDContext.NSID,
-	})
-	if ev.ProcessCacheEntry == nil {
-		ev.ProcessCacheEntry = model.GetPlaceholderProcessCacheEntry(ev.PIDContext.Pid, ev.PIDContext.Pid, false)
-		return ev.ProcessCacheEntry, false
-	}
-	return ev.ProcessCacheEntry, true
-}
-
 // ResolveEventTime resolves the monolitic kernel event timestamp to an absolute time
 func (fh *EBPFLessFieldHandlers) ResolveEventTime(ev *model.Event, _ *model.BaseEvent) time.Time {
 	if ev.Timestamp.IsZero() {
@@ -165,26 +165,16 @@ func (fh *EBPFLessFieldHandlers) ResolveCGroupVersion(_ *model.Event, _ *model.C
 	return 0
 }
 
-// ResolveCGroupManager resolves the manager of the cgroup
-func (fh *EBPFLessFieldHandlers) ResolveCGroupManager(_ *model.Event, _ *model.CGroupContext) string {
-	return ""
-}
-
 // ResolveContainerContext retrieve the ContainerContext of the event
 func (fh *EBPFLessFieldHandlers) ResolveContainerContext(ev *model.Event) (*model.ContainerContext, bool) {
-	return ev.ContainerContext, ev.ContainerContext != nil
-}
-
-// ResolveContainerRuntime retrieves the container runtime managing the container
-func (fh *EBPFLessFieldHandlers) ResolveContainerRuntime(_ *model.Event, _ *model.ContainerContext) string {
-	return ""
+	return &ev.ProcessContext.ContainerContext, true
 }
 
 // ResolveContainerID resolves the container ID of the event
 func (fh *EBPFLessFieldHandlers) ResolveContainerID(ev *model.Event, e *model.ContainerContext) string {
 	if len(e.ContainerID) == 0 {
 		if entry, _ := fh.ResolveProcessCacheEntry(ev, nil); entry != nil {
-			e.ContainerID = containerutils.ContainerID(entry.ContainerID)
+			e.ContainerID = containerutils.ContainerID(entry.ProcessContext.Process.ContainerContext.ContainerID)
 		}
 	}
 	return string(e.ContainerID)
@@ -210,7 +200,7 @@ func (fh *EBPFLessFieldHandlers) ResolveContainerTags(_ *model.Event, e *model.C
 
 // ResolveProcessContainerID resolves the container ID of the event
 func (fh *EBPFLessFieldHandlers) ResolveProcessContainerID(ev *model.Event, _ *model.Process) string {
-	return fh.ResolveContainerID(ev, ev.ContainerContext)
+	return fh.ResolveContainerID(ev, &ev.ProcessContext.Process.ContainerContext)
 }
 
 // ResolveProcessCreatedAt resolves process creation time
@@ -256,18 +246,58 @@ func (fh *EBPFLessFieldHandlers) ResolveFileFilesystem(_ *model.Event, e *model.
 	return e.Filesystem
 }
 
+// ResolveFileMetadataSize resolves file metadata size
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataSize(_ *model.Event, _ *model.FileMetadata) int {
+	return 0
+}
+
+// ResolveFileMetadataType resolves file metadata type
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataType(_ *model.Event, _ *model.FileMetadata) int {
+	return 0
+}
+
+// ResolveFileMetadataIsExecutable resolves file metadata is_executable
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataIsExecutable(_ *model.Event, _ *model.FileMetadata) bool {
+	return false
+}
+
+// ResolveFileMetadataArchitecture resolves file metadata architecture
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataArchitecture(_ *model.Event, _ *model.FileMetadata) int {
+	return 0
+}
+
+// ResolveFileMetadataABI resolves file metadata ABI
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataABI(_ *model.Event, _ *model.FileMetadata) int {
+	return 0
+}
+
+// ResolveFileMetadataIsUPXPacked resolves file metadata is_upx_packed
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataIsUPXPacked(_ *model.Event, _ *model.FileMetadata) bool {
+	return false
+}
+
+// ResolveFileMetadataCompression resolves file metadata compression
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataCompression(_ *model.Event, _ *model.FileMetadata) int {
+	return 0
+}
+
+// ResolveFileMetadataIsGarbleObfuscated resolves file metadata is_garble_obfuscated
+func (fh *EBPFLessFieldHandlers) ResolveFileMetadataIsGarbleObfuscated(_ *model.Event, _ *model.FileMetadata) bool {
+	return false
+}
+
 // ResolveK8SGroups resolves the k8s groups of the event
-func (fh *EBPFLessFieldHandlers) ResolveK8SGroups(_ *model.Event, e *model.UserSessionContext) []string {
+func (fh *EBPFLessFieldHandlers) ResolveK8SGroups(_ *model.Event, e *model.K8SSessionContext) []string {
 	return e.K8SGroups
 }
 
 // ResolveK8SUID resolves the k8s UID of the event
-func (fh *EBPFLessFieldHandlers) ResolveK8SUID(_ *model.Event, e *model.UserSessionContext) string {
+func (fh *EBPFLessFieldHandlers) ResolveK8SUID(_ *model.Event, e *model.K8SSessionContext) string {
 	return e.K8SUID
 }
 
 // ResolveK8SUsername resolves the k8s username of the event
-func (fh *EBPFLessFieldHandlers) ResolveK8SUsername(_ *model.Event, e *model.UserSessionContext) string {
+func (fh *EBPFLessFieldHandlers) ResolveK8SUsername(_ *model.Event, e *model.K8SSessionContext) string {
 	return e.K8SUsername
 }
 
@@ -306,14 +336,34 @@ func (fh *EBPFLessFieldHandlers) ResolvePackageName(_ *model.Event, e *model.Fil
 	return e.PkgName
 }
 
+// ResolvePackageVersion resolves the version of the package providing this file
+func (fh *EBPFLessFieldHandlers) ResolvePackageVersion(_ *model.Event, e *model.FileEvent) string {
+	return e.PkgVersion
+}
+
+// ResolvePackageEpoch resolves the epoch of the package providing this file
+func (fh *EBPFLessFieldHandlers) ResolvePackageEpoch(_ *model.Event, e *model.FileEvent) int {
+	return e.PkgEpoch
+}
+
+// ResolvePackageRelease resolves the release of the package providing this file
+func (fh *EBPFLessFieldHandlers) ResolvePackageRelease(_ *model.Event, e *model.FileEvent) string {
+	return e.PkgRelease
+}
+
 // ResolvePackageSourceVersion resolves the version of the source package of the package providing this file
 func (fh *EBPFLessFieldHandlers) ResolvePackageSourceVersion(_ *model.Event, e *model.FileEvent) string {
 	return e.PkgSrcVersion
 }
 
-// ResolvePackageVersion resolves the version of the package providing this file
-func (fh *EBPFLessFieldHandlers) ResolvePackageVersion(_ *model.Event, e *model.FileEvent) string {
-	return e.PkgVersion
+// ResolvePackageSourceEpoch resolves the epoch of the source package of the package providing this file
+func (fh *EBPFLessFieldHandlers) ResolvePackageSourceEpoch(_ *model.Event, e *model.FileEvent) int {
+	return e.PkgSrcEpoch
+}
+
+// ResolvePackageSourceRelease resolves the release of the source package of the package providing this file
+func (fh *EBPFLessFieldHandlers) ResolvePackageSourceRelease(_ *model.Event, e *model.FileEvent) string {
+	return e.PkgSrcRelease
 }
 
 // ResolveRights resolves the rights of a file
@@ -368,16 +418,17 @@ func (fh *EBPFLessFieldHandlers) ResolveXAttrNamespace(_ *model.Event, e *model.
 
 // ResolveHashes resolves the hash of the provided file
 func (fh *EBPFLessFieldHandlers) ResolveHashes(eventType model.EventType, process *model.Process, file *model.FileEvent) []string {
-	return fh.resolvers.HashResolver.ComputeHashes(eventType, process, file)
+	return fh.resolvers.HashResolver.ComputeHashes(eventType, process, file, 0)
 }
 
 // ResolveHashesFromEvent resolves the hashes of the requested event
 func (fh *EBPFLessFieldHandlers) ResolveHashesFromEvent(ev *model.Event, f *model.FileEvent) []string {
-	return fh.resolvers.HashResolver.ComputeHashesFromEvent(ev, f)
+	return fh.resolvers.HashResolver.ComputeHashesFromEvent(ev, f, 0)
 }
 
-// ResolveUserSessionContext resolves and updates the provided user session context
-func (fh *EBPFLessFieldHandlers) ResolveUserSessionContext(_ *model.UserSessionContext) {}
+// ResolveK8SUserSessionContext resolves and updates the provided user session context
+func (fh *EBPFLessFieldHandlers) ResolveK8SUserSessionContext(_ *model.Event, _ *model.K8SSessionContext) {
+}
 
 // ResolveProcessCmdArgv resolves the command line
 func (fh *EBPFLessFieldHandlers) ResolveProcessCmdArgv(ev *model.Event, process *model.Process) []string {
@@ -386,13 +437,18 @@ func (fh *EBPFLessFieldHandlers) ResolveProcessCmdArgv(ev *model.Event, process 
 }
 
 // ResolveAWSSecurityCredentials resolves and updates the AWS security credentials of the input process entry
-func (fh *EBPFLessFieldHandlers) ResolveAWSSecurityCredentials(_ *model.Event) []model.AWSSecurityCredentials {
+func (fh *EBPFLessFieldHandlers) ResolveAWSSecurityCredentials(_ *model.Event, _ *model.Process) []model.AWSSecurityCredentials {
 	return nil
 }
 
 // ResolveSyscallCtxArgs resolve syscall ctx
 func (fh *EBPFLessFieldHandlers) ResolveSyscallCtxArgs(_ *model.Event, e *model.SyscallContext) {
 	e.Resolved = false
+}
+
+// ResolveSpanContext resolves the span context of the event.
+func (fh *EBPFLessFieldHandlers) ResolveSpanContext(ev *model.Event) *model.SpanContext {
+	return &ev.SpanContext
 }
 
 // ResolveSyscallCtxArgsStr1 resolve syscall ctx
@@ -498,4 +554,99 @@ func (fh *EBPFLessFieldHandlers) ResolveConnectHostnames(_ *model.Event, e *mode
 // ResolveAcceptHostnames resolves the hostnames of an accept event
 func (fh *EBPFLessFieldHandlers) ResolveAcceptHostnames(_ *model.Event, e *model.AcceptEvent) []string {
 	return e.Hostnames
+}
+
+// ResolveSetSockOptFilterHash resolves the filter hash of a setsockopt event
+func (fh *EBPFLessFieldHandlers) ResolveSetSockOptFilterHash(_ *model.Event, e *model.SetSockOptEvent) string {
+	if len(e.FilterHash) == 0 {
+		h := sha256.New()
+		h.Write(e.RawFilter)
+		bs := h.Sum(nil)
+		e.FilterHash = hex.EncodeToString(bs)
+		return e.FilterHash
+	}
+	return e.FilterHash
+}
+
+// ResolveSetSockOptFilterInstructions resolves the filter instructions of a setsockopt event
+func (fh *EBPFLessFieldHandlers) ResolveSetSockOptFilterInstructions(_ *model.Event, e *model.SetSockOptEvent) string {
+	if len(e.FilterInstructions) == 0 {
+		raw := parseFilter(e)
+
+		instructions, allDecoded := bpf.Disassemble(raw)
+		if !allDecoded {
+			seclog.Warnf("failed to decode setsockopt filter instructions: %s", e.FilterHash)
+			return ""
+		}
+
+		for i, inst := range instructions {
+			e.FilterInstructions += fmt.Sprintf("%03d: %s\n", i, inst)
+		}
+
+		return e.FilterInstructions
+	}
+	return e.FilterInstructions
+}
+
+// ResolveSetSockOptUsedImmediates resolves the immediates in the bpf filter of a setsockopt event
+func (fh *EBPFLessFieldHandlers) ResolveSetSockOptUsedImmediates(_ *model.Event, e *model.SetSockOptEvent) []int {
+	if e.UsedImmediates != nil {
+		return e.UsedImmediates
+	}
+	raw := parseFilter(e)
+	var kValues []int
+	for _, inst := range raw {
+		// Check if we load or branch on a magic value
+		if !slices.Contains(kValues, int(inst.K)) {
+			kValues = append(kValues, int(inst.K))
+		}
+
+	}
+	e.UsedImmediates = kValues
+	return e.UsedImmediates
+}
+
+// ResolveCapabilitiesAttempted resolves the accumulated attempted capabilities of a capabilities event
+func (fh *EBPFLessFieldHandlers) ResolveCapabilitiesAttempted(_ *model.Event, _ *model.CapabilitiesEvent) int {
+	return 0 // EBPFLess mode does not support capabilities usage reporting, so we return 0
+}
+
+// ResolveCapabilitiesUsed resolves the accumulated used capabilities of a capabilities event
+func (fh *EBPFLessFieldHandlers) ResolveCapabilitiesUsed(_ *model.Event, _ *model.CapabilitiesEvent) int {
+	return 0 // EBPFLess mode does not support capabilities usage reporting, so we return 0
+}
+
+// ResolveSSHClientIP resolves the ssh username of the event
+func (fh *EBPFLessFieldHandlers) ResolveSSHClientIP(_ *model.Event, _ *model.SSHSessionContext) net.IPNet {
+	return net.IPNet{} // EBPFLess mode does not support SSH
+}
+
+// ResolveSSHClientPort resolves the public key of the event
+func (fh *EBPFLessFieldHandlers) ResolveSSHClientPort(_ *model.Event, _ *model.SSHSessionContext) int {
+	return 0 // EBPFLess mode does not support SSH port
+}
+
+// ResolveSessionType resolves the session type of the event
+func (fh *EBPFLessFieldHandlers) ResolveSessionType(_ *model.Event, _ *model.UserSessionContext) int {
+	return 0
+}
+
+// ResolveSessionID resolves the session id of the event
+func (fh *EBPFLessFieldHandlers) ResolveSessionID(_ *model.Event, _ *model.UserSessionContext) string {
+	return ""
+}
+
+// ResolveSessionIdentity resolves the user of the event
+func (fh *EBPFLessFieldHandlers) ResolveSessionIdentity(_ *model.Event, _ *model.UserSessionContext) string {
+	return ""
+}
+
+// ResolveSignature resolves the event signature
+func (fh *EBPFLessFieldHandlers) ResolveSignature(e *model.Event) string {
+	if e.Signature == "" && e.ProcessContext != nil {
+		if sign, err := fh.resolvers.SignatureResolver.Sign(e.ProcessContext); err != nil && sign != "" {
+			e.Signature = sign
+		}
+	}
+	return e.Signature
 }

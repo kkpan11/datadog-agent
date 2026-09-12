@@ -87,6 +87,10 @@ const (
 	K8sPodDisruptionBudget = pkgorchestratormodel.K8sPodDisruptionBudget
 	// K8sEndpointSlice alias for pkgorchestratormodel.K8sEndpointSlice
 	K8sEndpointSlice = pkgorchestratormodel.K8sEndpointSlice
+	// K8sKubeletConfig alias for pkgorchestratormodel.K8sKubeletConfig
+	K8sKubeletConfig = pkgorchestratormodel.K8sKubeletConfig
+	// K8sConfigMap alias for pkgorchestratormodel.K8sConfigMap
+	K8sConfigMap = pkgorchestratormodel.K8sConfigMap
 	// ECSTask alias for pkgorchestratormodel.ECSTask
 	ECSTask = pkgorchestratormodel.ECSTask
 )

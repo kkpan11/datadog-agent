@@ -1,0 +1,58 @@
+From 429eb6aecc882620e4afad0d7a868f202b1eec93 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Hugo=20Beauz=C3=A9e-Luyssen?= <hugo.beauzee@datadoghq.com>
+Date: Fri, 21 Aug 2026 08:15:31 +0200
+Subject: [PATCH 2/4] fix c++ x86_64 header locations with our ctng toolchain
+
+---
+ toolchain/defs.bzl | 36 +++++++++++-------------------------
+ 1 file changed, 11 insertions(+), 25 deletions(-)
+
+diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
+index b6b2be2..f3a94a7 100644
+--- a/toolchain/defs.bzl
++++ b/toolchain/defs.bzl
+@@ -108,31 +108,17 @@ def _gcc_toolchain_impl(rctx):
+         ]
+     ]
+
+-    cxx_builtin_includes = []
+-    if target_arch == ARCHS.x86_64:
+-        cxx_builtin_includes.extend([
+-            include.format(
+-                gcc_version = rctx.attr.gcc_version,
+-                include_prefix = include_prefix,
+-            )
+-            for include in [
+-                "%workspace%/include/c++/{gcc_version}",
+-                "%workspace%/include/c++/{gcc_version}/{include_prefix}",
+-                "%workspace%/include/c++/{gcc_version}/backward",
+-            ]
+-        ])
+-    else:
+-        cxx_builtin_includes.extend([
+-            include.format(
+-                gcc_version = rctx.attr.gcc_version,
+-                include_prefix = include_prefix,
+-            )
+-            for include in [
+-                "%workspace%/{include_prefix}include/c++/{gcc_version}",
+-                "%workspace%/{include_prefix}include/c++/{gcc_version}/{include_prefix}",
+-                "%workspace%/{include_prefix}include/c++/{gcc_version}/backward",
+-            ]
+-        ])
++    cxx_builtin_includes = [
++        include.format(
++            gcc_version = rctx.attr.gcc_version,
++            include_prefix = include_prefix,
++        )
++        for include in [
++            "%workspace%/{include_prefix}include/c++/{gcc_version}",
++            "%workspace%/{include_prefix}include/c++/{gcc_version}/{include_prefix}",
++            "%workspace%/{include_prefix}include/c++/{gcc_version}/backward",
++        ]
++    ]
+
+     f_builtin_includes = [
+         include.format(
+--
+2.52.0

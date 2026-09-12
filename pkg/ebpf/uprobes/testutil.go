@@ -3,17 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2024-present Datadog, Inc.
 
-//go:build linux_bpf && test
+//go:build linux && bpf && test
 
 package uprobes
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +20,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	consumertestutil "github.com/DataDog/datadog-agent/pkg/eventmonitor/consumers/testutil"
-	"github.com/DataDog/datadog-agent/pkg/network/go/bininspect"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/http/testutil"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/utils"
 	"github.com/DataDog/datadog-agent/pkg/process/monitor"
@@ -93,9 +89,9 @@ type MockBinaryInspector struct {
 }
 
 // Inspect is a mock implementation of the BinaryInspector.Inspect method.
-func (m *MockBinaryInspector) Inspect(fpath utils.FilePath, requests []SymbolRequest) (map[string]bininspect.FunctionMetadata, error) {
+func (m *MockBinaryInspector) Inspect(fpath utils.FilePath, requests map[int][]SymbolRequest) (map[int]*InspectionResult, error) {
 	args := m.Called(fpath, requests)
-	return args.Get(0).(map[string]bininspect.FunctionMetadata), args.Error(1)
+	return args.Get(0).(map[int]*InspectionResult), args.Error(1)
 }
 
 // Cleanup is a mock implementation of the BinaryInspector.Cleanup method.
@@ -128,69 +124,12 @@ func newMockProcessMonitor() *mockProcessMonitor {
 
 // === Test utils
 
-// FakeProcFSEntry represents a fake /proc filesystem entry for testing purposes.
-type FakeProcFSEntry struct {
-	Pid     uint32
-	Cmdline string
-	Command string
-	Exe     string
-	Maps    string
-	Env     map[string]string
-}
-
-// getEnvironContents returns the formatted contents of the /proc/<pid>/environ file for the entry.
-func (f *FakeProcFSEntry) getEnvironContents() string {
-	if len(f.Env) == 0 {
-		return ""
-	}
-
-	formattedEnvVars := make([]string, 0, len(f.Env))
-	for k, v := range f.Env {
-		formattedEnvVars = append(formattedEnvVars, fmt.Sprintf("%s=%s", k, v))
-	}
-
-	return strings.Join(formattedEnvVars, "\x00") + "\x00"
-}
-
-// CreateFakeProcFS creates a fake /proc filesystem with the given entries, useful for testing attachment to processes.
-func CreateFakeProcFS(t *testing.T, entries []FakeProcFSEntry) string {
-	procRoot := t.TempDir()
-
-	for _, entry := range entries {
-		baseDir := filepath.Join(procRoot, strconv.Itoa(int(entry.Pid)))
-
-		createFile(t, filepath.Join(baseDir, "cmdline"), entry.Cmdline)
-		createFile(t, filepath.Join(baseDir, "comm"), entry.Command)
-		createFile(t, filepath.Join(baseDir, "maps"), entry.Maps)
-		createSymlink(t, entry.Exe, filepath.Join(baseDir, "exe"))
-		createFile(t, filepath.Join(baseDir, "environ"), entry.getEnvironContents())
-	}
-
-	return procRoot
-}
-
-func createFile(t *testing.T, path, data string) {
-	dir := filepath.Dir(path)
-	require.NoError(t, os.MkdirAll(dir, 0775))
-	require.NoError(t, os.WriteFile(path, []byte(data), 0775))
-}
-
-func createSymlink(t *testing.T, target, link string) {
-	if target == "" {
-		return
-	}
-
-	dir := filepath.Dir(link)
-	require.NoError(t, os.MkdirAll(dir, 0775))
-	require.NoError(t, os.Symlink(target, link))
-}
-
 func getLibSSLPath(t *testing.T) string {
 	curDir, err := testutil.CurDir()
 	require.NoError(t, err)
 
 	libmmap := filepath.Join(curDir, "..", "..", "network", "usm", "testdata", "site-packages", "ddtrace")
-	return filepath.Join(libmmap, fmt.Sprintf("libssl.so.%s", runtime.GOARCH))
+	return filepath.Join(libmmap, "libssl.so."+runtime.GOARCH)
 }
 
 // SetRegistry allows changing the file registry used by the attacher. This is useful for testing purposes, to
@@ -250,7 +189,12 @@ func waitAndRetryIfFail(t *testing.T, setupFunc func(), testFunc func() bool, re
 		}
 	}
 
-	require.Fail(t, "condition not met after %d retries", maxRetries, msgAndArgs)
+	extraFmt := ""
+	if len(msgAndArgs) > 0 {
+		extraFmt = fmt.Sprintf(msgAndArgs[0].(string), msgAndArgs[1:]...) + ": "
+	}
+
+	require.Fail(t, "condition not met", "%scondition not met after %d retries", extraFmt, maxRetries)
 }
 
 // processMonitorProxy is a wrapper around a ProcessMonitor that stores the

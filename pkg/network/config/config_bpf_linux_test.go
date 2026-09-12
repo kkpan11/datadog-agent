@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package config
 
@@ -32,7 +32,7 @@ func TestEventStreamEnabledForSupportedKernelsLinux(t *testing.T) {
 		require.NoError(t, err)
 
 		opts := eventmonitor.Opts{}
-		evm, err := eventmonitor.NewEventMonitor(emconfig, secconfig, opts)
+		evm, err := eventmonitor.NewEventMonitor(emconfig, secconfig, "test-hostname", opts)
 		require.NoError(t, err)
 		require.NoError(t, evm.Init())
 	} else {

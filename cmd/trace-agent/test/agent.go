@@ -3,6 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+//go:build test
+
 package test
 
 import (
@@ -24,17 +26,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/DataDog/viper"
-	yaml "gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
-	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 
 	"github.com/DataDog/datadog-agent/pkg/api/security"
+	"github.com/DataDog/datadog-agent/pkg/config/create"
+	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 	grpcutil "github.com/DataDog/datadog-agent/pkg/util/grpc"
+	utiltest "github.com/DataDog/datadog-agent/pkg/util/testutil"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/testutil"
 )
@@ -44,6 +48,11 @@ var ErrNotInstalled = errors.New("agent: trace-agent not found in $PATH")
 
 // SecretBackendBinary secret binary name
 var SecretBackendBinary = "secret-script.test"
+
+var (
+	tmpDir    string
+	buildOnce sync.Once
+)
 
 type grpcServer struct {
 	pb.UnimplementedAgentSecureServer
@@ -63,8 +72,62 @@ type agentRunner struct {
 	authToken            string
 }
 
+// CleanupCachedBinaries removes the temporary directory created for cached binaries.
+func CleanupCachedBinaries() {
+	if tmpDir != "" {
+		_, tmpDir = os.RemoveAll(tmpDir), ""
+	}
+}
+
+func buildBinaries(verbose bool) error {
+	var err error
+	tmpDir, err = os.MkdirTemp("", "trace-agent-integration-tests")
+	if err != nil {
+		return err
+	}
+	binpath := filepath.Join(tmpDir, "trace-agent")
+	if verbose {
+		log.Printf("agent: installing in %s...", binpath)
+	}
+	cmd := utiltest.IsolatedGoBuildCmd(tmpDir, binpath, "-tags", "otlp", "github.com/DataDog/datadog-agent/cmd/trace-agent")
+	o, err := cmd.CombinedOutput()
+	if err != nil {
+		if verbose {
+			log.Printf("error installing trace-agent: %v", err)
+			log.Print(string(o))
+		}
+		return ErrNotInstalled
+	}
+
+	binSecrets := filepath.Join(tmpDir, SecretBackendBinary)
+	cmd = utiltest.IsolatedGoBuildCmd(tmpDir, binSecrets, "./testdata/secretscript.go")
+	o, err = cmd.CombinedOutput()
+	if err != nil {
+		if verbose {
+			log.Printf("error installing secret-script: %v", err)
+			log.Print(string(o))
+		}
+		return ErrNotInstalled
+	}
+
+	if err := os.Chmod(binSecrets, 0700); err != nil {
+		if verbose {
+			log.Printf("error changing permissions secret-script: %v", err)
+		}
+		return ErrNotInstalled
+	}
+	return nil
+}
+
 func newAgentRunner(ddAddr string, verbose bool, buildSecretBackend bool) (*agentRunner, error) {
-	bindir, err := os.MkdirTemp("", "trace-agent-integration-tests")
+	var err error
+	buildOnce.Do(func() {
+		err = buildBinaries(verbose)
+	})
+	if err != nil {
+		return nil, err
+	}
+	bindir, err := os.MkdirTemp(tmpDir, "runner-")
 	if err != nil {
 		return nil, err
 	}
@@ -72,32 +135,18 @@ func newAgentRunner(ddAddr string, verbose bool, buildSecretBackend bool) (*agen
 	if verbose {
 		log.Printf("agent: installing in %s...", binpath)
 	}
-	// TODO(gbbr): find a way to re-use the same binary within a whole run
-	// instead of creating new ones on each test creating a new runner.
-	o, err := exec.Command("go", "build", "-tags", "otlp", "-o", binpath, "github.com/DataDog/datadog-agent/cmd/trace-agent").CombinedOutput()
-	if err != nil {
+	if err := os.Symlink(filepath.Join(tmpDir, "trace-agent"), binpath); err != nil {
 		if verbose {
 			log.Printf("error installing trace-agent: %v", err)
-			log.Print(string(o))
 		}
 		return nil, ErrNotInstalled
 	}
 
 	if buildSecretBackend {
 		binSecrets := filepath.Join(bindir, SecretBackendBinary)
-		o, err := exec.Command("go", "build", "-o", binSecrets, "./testdata/secretscript.go").CombinedOutput()
-
-		if err != nil {
+		if err := os.Symlink(filepath.Join(tmpDir, SecretBackendBinary), binSecrets); err != nil {
 			if verbose {
 				log.Printf("error installing secret-script: %v", err)
-				log.Print(string(o))
-			}
-			return nil, ErrNotInstalled
-		}
-
-		if err := os.Chmod(binSecrets, 0700); err != nil {
-			if verbose {
-				log.Printf("error changing permissions secret-script: %v", err)
 			}
 			return nil, ErrNotInstalled
 		}
@@ -170,9 +219,9 @@ func (s *agentRunner) Run(conf []byte) error {
 		case <-timeout:
 			return fmt.Errorf("agent: timed out waiting for start, log:\n%s", s.Log())
 		default:
-			if strings.Contains(s.log.String(), "Listening for traces at") {
+			if strings.Contains(s.log.String(), "trace-agent running...") {
 				if s.verbose {
-					log.Print("agent: Listening for traces")
+					log.Print("agent: trace-agent running...")
 				}
 				return nil
 			}
@@ -253,12 +302,13 @@ func (s *agentRunner) runAgentConfig(path string) <-chan error {
 // createConfigFile creates a config file from the given config, altering the
 // apm_config.apm_dd_url and log_level values and returns the full path.
 func (s *agentRunner) createConfigFile(conf []byte) (string, error) {
-	v := viper.New()
+	v := create.NewConfig("datadog")
+	v.SetTestOnlyDynamicSchema(true)
 	v.SetConfigType("yaml")
 	if err := v.ReadConfig(bytes.NewReader(conf)); err != nil {
 		return "", err
 	}
-	if v.IsSet("apm_config.receiver_port") {
+	if v.IsConfigured("apm_config.receiver_port") {
 		s.port = v.GetInt("apm_config.receiver_port")
 	} else {
 		if p, err := testutil.FindTCPPort(); err != nil {
@@ -267,20 +317,26 @@ func (s *agentRunner) createConfigFile(conf []byte) (string, error) {
 		} else {
 			s.port = p
 		}
-		v.Set("apm_config.receiver_port", s.port)
+		v.Set("apm_config.receiver_port", s.port, pkgconfigmodel.SourceFile)
 	}
-	v.Set("apm_config.apm_dd_url", "http://"+s.ddAddr)
-	if !v.IsSet("api_key") {
-		v.Set("api_key", "testing123")
+	v.Set("apm_config.apm_dd_url", "http://"+s.ddAddr, pkgconfigmodel.SourceFile)
+	if !v.IsConfigured("api_key") {
+		v.Set("api_key", "testing123", pkgconfigmodel.SourceFile)
 	}
-	if !v.IsSet("apm_config.trace_writer.flush_period_seconds") {
-		v.Set("apm_config.trace_writer.flush_period_seconds", 0.1)
+	if !v.IsConfigured("hostname") {
+		v.Set("hostname", "trace-agent-test", pkgconfigmodel.SourceFile)
 	}
-	if !v.IsSet("log_level") {
-		v.Set("log_level", "debug")
+	if !v.IsConfigured("apm_config.trace_writer.flush_period_seconds") {
+		v.Set("apm_config.trace_writer.flush_period_seconds", 0.1, pkgconfigmodel.SourceFile)
+	}
+	if !v.IsConfigured("log_level") {
+		v.Set("log_level", "debug", pkgconfigmodel.SourceFile)
+	}
+	if !v.IsConfigured("apm_config.enable_v1_trace_endpoint") {
+		v.Set("apm_config.enable_v1_trace_endpoint", true, pkgconfigmodel.SourceFile)
 	}
 
-	v.Set("cmd_port", s.agentServerListerner.Addr().(*net.TCPAddr).Port)
+	v.Set("cmd_port", s.agentServerListerner.Addr().(*net.TCPAddr).Port, pkgconfigmodel.SourceFile)
 
 	out, err := yaml.Marshal(v.AllSettings())
 	if err != nil {

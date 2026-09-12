@@ -10,12 +10,15 @@ package jmxfetch
 import (
 	"testing"
 
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 )
 
 func TestInitConfigJavaOptions(t *testing.T) {
-	j := NewJMXFetch(nil)
+	j := NewJMXFetch(nil, nil)
 
 	var initConfig integration.Data = []byte(`java_options: -Xmx200m`)
 
@@ -25,7 +28,7 @@ func TestInitConfigJavaOptions(t *testing.T) {
 }
 
 func TestConflictingInitConfigJavaOptions(t *testing.T) {
-	j := NewJMXFetch(nil)
+	j := NewJMXFetch(nil, nil)
 
 	var configOne integration.Data = []byte(`java_options: -Xmx200m`)
 	var configTwo integration.Data = []byte(`java_options: -Xmx444m`)
@@ -39,7 +42,7 @@ func TestConflictingInitConfigJavaOptions(t *testing.T) {
 }
 
 func TestConflictingInstanceJavaOptions(t *testing.T) {
-	j := NewJMXFetch(nil)
+	j := NewJMXFetch(nil, nil)
 
 	var configOne integration.Data = []byte(`java_options: -Xmx200m`)
 	var configTwo integration.Data = []byte(`java_options: -Xmx444m`)
@@ -53,7 +56,7 @@ func TestConflictingInstanceJavaOptions(t *testing.T) {
 }
 
 func TestConflictingInstanceInitJavaOptions(t *testing.T) {
-	j := NewJMXFetch(nil)
+	j := NewJMXFetch(nil, nil)
 
 	var configOne integration.Data = []byte(`java_options: -Xmx200m`)
 	var configTwo integration.Data = []byte(`java_options: -Xmx444m`)
@@ -64,4 +67,46 @@ func TestConflictingInstanceInitJavaOptions(t *testing.T) {
 	// First config wins
 	require.Contains(t, j.JavaOptions, "Xmx200m")
 	require.NotContains(t, j.JavaOptions, "Xmx444m")
+}
+
+func TestGetPreferredDSDEndpoint(t *testing.T) {
+	cfg := configmock.New(t)
+
+	t.Run("UDS configured but not available", func(t *testing.T) {
+		cfg.SetInTest("dogstatsd_socket", "/tmp/nonexistent-dsd-test.sock")
+		cfg.SetInTest("dogstatsd_port", 8125)
+		cfg.SetInTest("use_dogstatsd", true)
+
+		j := NewJMXFetch(nil, nil)
+		assert.Equal(t, "statsd:localhost:8125", j.getPreferredDSDEndpoint())
+	})
+
+	t.Run("UDS not configured", func(t *testing.T) {
+		cfg.SetInTest("dogstatsd_socket", "")
+		cfg.SetInTest("dogstatsd_port", 8125)
+		cfg.SetInTest("use_dogstatsd", true)
+
+		j := NewJMXFetch(nil, nil)
+		assert.Equal(t, "statsd:localhost:8125", j.getPreferredDSDEndpoint())
+	})
+
+	t.Run("bind host 0.0.0.0 normalized to localhost", func(t *testing.T) {
+		cfg.SetInTest("dogstatsd_socket", "")
+		cfg.SetInTest("dogstatsd_port", 8125)
+		cfg.SetInTest("use_dogstatsd", true)
+		cfg.SetInTest("bind_host", "0.0.0.0")
+
+		j := NewJMXFetch(nil, nil)
+		assert.Equal(t, "statsd:localhost:8125", j.getPreferredDSDEndpoint())
+	})
+
+	t.Run("custom bind host and port", func(t *testing.T) {
+		cfg.SetInTest("dogstatsd_socket", "")
+		cfg.SetInTest("dogstatsd_port", 9125)
+		cfg.SetInTest("use_dogstatsd", true)
+		cfg.SetInTest("bind_host", "127.0.0.2")
+
+		j := NewJMXFetch(nil, nil)
+		assert.Equal(t, "statsd:127.0.0.2:9125", j.getPreferredDSDEndpoint())
+	})
 }

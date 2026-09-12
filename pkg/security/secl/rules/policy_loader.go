@@ -7,6 +7,7 @@
 package rules
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -30,6 +31,12 @@ type PolicyLoaderOpts struct {
 	MacroFilters       []MacroFilter
 	RuleFilters        []RuleFilter
 	DisableEnforcement bool
+	ValidateBPFFilter  func(bpfFilter string) error
+}
+
+// PolicyReloadNotification contains information about a policy reload event
+type PolicyReloadNotification struct {
+	Silent bool // If true, skip reporting heartbeat events
 }
 
 // PolicyLoader defines a policy loader
@@ -38,8 +45,10 @@ type PolicyLoader struct {
 
 	Providers []PolicyProvider
 
-	listeners []chan struct{}
-	debouncer *debouncer.Debouncer
+	listeners     []chan PolicyReloadNotification
+	debouncer     *debouncer.Debouncer
+	pendingSilent bool
+	silentLock    sync.Mutex
 }
 
 // LoadPolicies gathers the policies in the correct precedence order and ensuring there's only 1 default policy.
@@ -80,20 +89,48 @@ func (p *PolicyLoader) LoadPolicies(opts PolicyLoaderOpts) ([]*Policy, *multierr
 		allPolicies = append([]*Policy{defaultPolicy}, allPolicies...)
 	}
 
+	// Remove policies that should be replaced
+	allPolicies = removeReplacedPolicies(allPolicies)
+
 	return allPolicies, errs
 }
 
+func removeReplacedPolicies(policies []*Policy) []*Policy {
+
+	policyIDsToRemove := make([]string, 0)
+
+	for _, policy := range policies {
+		if policy.Info.Source == PolicyProviderTypeRC && policy.Info.InternalType == CustomPolicyType && policy.Def.ReplacePolicyID != "" {
+			policyIDsToRemove = append(policyIDsToRemove, policy.Def.ReplacePolicyID)
+		}
+	}
+
+	policies = slices.DeleteFunc(policies, func(p *Policy) bool {
+		return p.Info.Source == PolicyProviderTypeRC && p.Info.InternalType == DefaultPolicyType && slices.Contains(policyIDsToRemove, p.Info.Name)
+	})
+
+	return policies
+}
+
 // NewPolicyReady returns chan to listen new policy ready event
-func (p *PolicyLoader) NewPolicyReady() <-chan struct{} {
+func (p *PolicyLoader) NewPolicyReady() <-chan PolicyReloadNotification {
 	p.Lock()
 	defer p.Unlock()
 
-	ch := make(chan struct{})
+	ch := make(chan PolicyReloadNotification)
 	p.listeners = append(p.listeners, ch)
 	return ch
 }
 
-func (p *PolicyLoader) onNewPoliciesReady() {
+func (p *PolicyLoader) onNewPoliciesReady(silent bool) {
+	p.silentLock.Lock()
+	// If we already have a pending silent notification, keep it
+	// If this is a silent notification, mark it
+	if silent {
+		p.pendingSilent = true
+	}
+	p.silentLock.Unlock()
+
 	p.debouncer.Call()
 }
 
@@ -101,10 +138,19 @@ func (p *PolicyLoader) notifyListeners() {
 	p.RLock()
 	defer p.RUnlock()
 
+	p.silentLock.Lock()
+	silent := p.pendingSilent
+	p.pendingSilent = false
+	p.silentLock.Unlock()
+
+	notification := PolicyReloadNotification{
+		Silent: silent,
+	}
+
 	// TODO(safchain) debounce
 	for _, ch := range p.listeners {
 		select {
-		case ch <- struct{}{}:
+		case ch <- notification:
 		default:
 		}
 	}

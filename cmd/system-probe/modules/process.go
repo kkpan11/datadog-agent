@@ -28,8 +28,7 @@ func init() { registerModule(Process) }
 
 // Process is a module that fetches process level data
 var Process = &module.Factory{
-	Name:             config.ProcessModule,
-	ConfigNamespaces: []string{},
+	Name: config.ProcessModule,
 	Fn: func(_ *sysconfigtypes.Config, _ module.FactoryDependencies) (module.Module, error) {
 		log.Infof("Creating process module for: %s", filepath.Base(os.Args[0]))
 
@@ -47,8 +46,9 @@ var Process = &module.Factory{
 var _ module.Module = &process{}
 
 type process struct {
-	probe     procutil.Probe
-	lastCheck atomic.Int64
+	probe           procutil.Probe
+	lastCheck       atomic.Int64
+	statsRunCounter atomic.Uint64
 }
 
 // GetStats returns stats for the module
@@ -60,32 +60,45 @@ func (t *process) GetStats() map[string]interface{} {
 
 // Register registers endpoints for the module to expose data
 func (t *process) Register(httpMux *module.Router) error {
-	var runCounter atomic.Uint64
-	httpMux.HandleFunc("/stats", func(w http.ResponseWriter, req *http.Request) {
-		start := time.Now()
-		t.lastCheck.Store(start.Unix())
-		pids, err := getPids(req)
-		if err != nil {
-			log.Errorf("Unable to get PIDs from request: %s", err)
-			w.WriteHeader(http.StatusBadRequest)
-		}
-
-		stats, err := t.probe.StatsWithPermByPID(pids)
-		if err != nil {
-			log.Errorf("unable to retrieve process stats: %s", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		contentType := req.Header.Get("Accept")
-		marshaler := encoding.GetMarshaler(contentType)
-		writeStats(w, marshaler, stats)
-
-		count := runCounter.Add(1)
-		logProcTracerRequests(count, len(stats), start)
-	}).Methods("POST")
-
+	httpMux.HandleFunc("POST /stats", t.statsHandler)
+	httpMux.HandleFunc("POST /service", t.serviceHandler)
+	httpMux.HandleFunc("POST /network", t.networkHandler)
 	return nil
+}
+
+// statsHandler handles requests for process IO stats
+func (t *process) statsHandler(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	t.lastCheck.Store(start.Unix())
+	pids, err := getPids(req)
+	if err != nil {
+		log.Errorf("Unable to get PIDs from request: %s", err)
+		w.WriteHeader(http.StatusBadRequest)
+	}
+
+	stats, err := t.probe.StatsWithPermByPID(pids)
+	if err != nil {
+		log.Errorf("unable to retrieve process stats: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	contentType := req.Header.Get("Accept")
+	marshaler := encoding.GetMarshaler(contentType)
+	writeStats(w, marshaler, stats)
+
+	count := t.statsRunCounter.Add(1)
+	logProcTracerRequests(count, len(stats), start)
+}
+
+// serviceHandler handles requests for service information for given processes
+func (t *process) serviceHandler(_ http.ResponseWriter, _ *http.Request) {
+	// TODO: Add implementation for this handler
+}
+
+// networkHandler handles requests for network stats for given processes
+func (t *process) networkHandler(_ http.ResponseWriter, _ *http.Request) {
+	// TODO: Add implementation for this handler
 }
 
 // Close cleans up the underlying probe object

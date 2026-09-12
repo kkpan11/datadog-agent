@@ -9,13 +9,13 @@ package hostname
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
 	"github.com/DataDog/datadog-agent/pkg/config/env"
 	"github.com/DataDog/datadog-agent/pkg/util/docker"
 	"github.com/DataDog/datadog-agent/pkg/util/hostname/validate"
 	"github.com/DataDog/datadog-agent/pkg/util/kubelet"
-	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
+	k8shostname "github.com/DataDog/datadog-agent/pkg/util/kubernetes/hostname"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -24,7 +24,7 @@ var (
 	configIsContainerized  = env.IsContainerized
 	configIsFeaturePresent = env.IsFeaturePresent
 
-	kubernetesGetKubeAPIServerHostname = kubernetes.GetKubeAPIServerHostname
+	kubernetesGetKubeAPIServerHostname = k8shostname.GetKubeAPIServerHostname
 	dockerGetHostname                  = docker.GetHostname
 	kubeletGetHostname                 = kubelet.GetHostname
 )
@@ -47,7 +47,7 @@ func callContainerProvider(ctx context.Context, provider func(context.Context) (
 // for testing purposes
 func fromContainer(ctx context.Context, _ string) (string, error) {
 	if !configIsContainerized() {
-		return "", fmt.Errorf("the agent is not containerized")
+		return "", errors.New("the agent is not containerized")
 	}
 
 	// Cluster-agent logic: Kube apiserver
@@ -70,5 +70,5 @@ func fromContainer(ctx context.Context, _ string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no container environment detected or none of them detected a valid hostname")
+	return "", errors.New("no container environment detected or none of them detected a valid hostname")
 }

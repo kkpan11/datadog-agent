@@ -13,11 +13,13 @@ import (
 	cmdconfig "github.com/DataDog/datadog-agent/cmd/agent/subcommands/config"
 	cmdconfigcheck "github.com/DataDog/datadog-agent/cmd/agent/subcommands/configcheck"
 	cmdcontrolsvc "github.com/DataDog/datadog-agent/cmd/agent/subcommands/controlsvc"
+	cmdcoverage "github.com/DataDog/datadog-agent/cmd/agent/subcommands/coverage"
 	cmddiagnose "github.com/DataDog/datadog-agent/cmd/agent/subcommands/diagnose"
 	cmddogstatsd "github.com/DataDog/datadog-agent/cmd/agent/subcommands/dogstatsd"
 	cmddogstatsdcapture "github.com/DataDog/datadog-agent/cmd/agent/subcommands/dogstatsdcapture"
 	cmddogstatsdreplay "github.com/DataDog/datadog-agent/cmd/agent/subcommands/dogstatsdreplay"
 	cmddogstatsdstats "github.com/DataDog/datadog-agent/cmd/agent/subcommands/dogstatsdstats"
+	cmdexperimental "github.com/DataDog/datadog-agent/cmd/agent/subcommands/experimental"
 	cmdflare "github.com/DataDog/datadog-agent/cmd/agent/subcommands/flare"
 	cmdhealth "github.com/DataDog/datadog-agent/cmd/agent/subcommands/health"
 	cmdhostname "github.com/DataDog/datadog-agent/cmd/agent/subcommands/hostname"
@@ -25,6 +27,7 @@ import (
 	cmdintegrations "github.com/DataDog/datadog-agent/cmd/agent/subcommands/integrations"
 	cmdjmx "github.com/DataDog/datadog-agent/cmd/agent/subcommands/jmx"
 	cmdlaunchgui "github.com/DataDog/datadog-agent/cmd/agent/subcommands/launchgui"
+	cmdotel "github.com/DataDog/datadog-agent/cmd/agent/subcommands/otel"
 	cmdprocesschecks "github.com/DataDog/datadog-agent/cmd/agent/subcommands/processchecks"
 	cmdremoteconfig "github.com/DataDog/datadog-agent/cmd/agent/subcommands/remoteconfig"
 	cmdrun "github.com/DataDog/datadog-agent/cmd/agent/subcommands/run"
@@ -36,7 +39,9 @@ import (
 	cmdstreamep "github.com/DataDog/datadog-agent/cmd/agent/subcommands/streamep"
 	cmdstreamlogs "github.com/DataDog/datadog-agent/cmd/agent/subcommands/streamlogs"
 	cmdtaggerlist "github.com/DataDog/datadog-agent/cmd/agent/subcommands/taggerlist"
+	cmdvalidatepodannotation "github.com/DataDog/datadog-agent/cmd/agent/subcommands/validatepodannotation"
 	cmdversion "github.com/DataDog/datadog-agent/cmd/agent/subcommands/version"
+	cmdworkloadfilterlist "github.com/DataDog/datadog-agent/cmd/agent/subcommands/workloadfilterlist"
 	cmdworkloadlist "github.com/DataDog/datadog-agent/cmd/agent/subcommands/workloadlist"
 )
 
@@ -47,6 +52,7 @@ func AgentSubcommands() []command.SubcommandFactory {
 		cmdcheck.Commands,
 		cmdconfigcheck.Commands,
 		cmdconfig.Commands,
+		cmdexperimental.Commands,
 		cmddiagnose.Commands,
 		cmddogstatsd.Commands,
 		cmddogstatsdcapture.Commands,
@@ -57,6 +63,7 @@ func AgentSubcommands() []command.SubcommandFactory {
 		cmdhostname.Commands,
 		cmdimport.Commands,
 		cmdlaunchgui.Commands,
+		cmdotel.Commands,
 		cmdanalyzelogs.Commands,
 		cmdremoteconfig.Commands,
 		cmdrun.Commands,
@@ -66,13 +73,16 @@ func AgentSubcommands() []command.SubcommandFactory {
 		cmdstreamlogs.Commands,
 		cmdstreamep.Commands,
 		cmdtaggerlist.Commands,
+		cmdvalidatepodannotation.Commands,
 		cmdversion.Commands,
 		cmdworkloadlist.Commands,
+		cmdworkloadfilterlist.Commands,
 		cmdjmx.Commands,
 		cmdsecrethelper.Commands,
 		cmdintegrations.Commands,
 		cmdstop.Commands,
 		cmdcontrolsvc.Commands,
 		cmdprocesschecks.Commands,
+		cmdcoverage.Commands,
 	}
 }

@@ -12,15 +12,11 @@ license_file "../LICENSE"
 
 homepage 'http://www.datadoghq.com'
 
+install_dir ENV["INSTALL_DIR"] || raise('INSTALL_DIR must be set in tasks/omnibus.py')
+
 if ohai['platform'] == "windows"
-  # Note: this is not the final install dir, not even the default one, just a convenient
-  # spaceless dir in which the agent will be built.
-  # Omnibus doesn't quote the Git commands it launches unfortunately, which makes it impossible
-  # to put a space here...
-  install_dir "C:/opt/datadog-agent/"
   maintainer 'Datadog Inc.' # Windows doesn't want our e-mail address :(
 else
-  install_dir ENV["INSTALL_DIR"] || '/opt/datadog-agent'
   maintainer 'Datadog Packages <package@datadoghq.com>'
 end
 
@@ -56,13 +52,13 @@ package :zip do
 
 
   additional_sign_files [
-    "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\process-agent.exe",
     "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\trace-agent.exe",
     "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent\\dogstatsd.exe",
-    "#{Omnibus::Config.source_dir()}\\cf-root\\bin\\agent.exe",
   ]
   if ENV['SIGN_WINDOWS_DD_WCS']
     dd_wcssign true
+    dd_wcs_cert ENV['WINDOWS_SIGNING_CERT'] if ENV['WINDOWS_SIGNING_CERT']
+    dd_wcs_config ENV['WINDOWS_SIGNING_CONFIG'] if ENV['WINDOWS_SIGNING_CONFIG']
   end
 end
 
@@ -75,7 +71,7 @@ end
 dependency 'preparation'
 
 # Datadog agent
-dependency 'datadog-iot-agent'
+dependency 'trace-agent-windows-cf'
 dependency 'datadog-dogstatsd'
 
 dependency 'datadog-buildpack-finalize'

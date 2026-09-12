@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-// TestUpgrade tests upgrading the agent from LAST_STABLE_VERSION to WINDOWS_AGENT_VERSION
+// TestUpgrade tests upgrading the agent from the stable version to the current version
 func TestUpgrade(t *testing.T) {
 	s := &testUpgradeSuite{}
 	previousAgentPackage, err := windowsAgent.GetLastStablePackageFromEnv()
@@ -54,7 +54,7 @@ func (s *testUpgradeSuite) TestUpgrade() {
 	}
 
 	// upgrade to the new version
-	if !s.Run(fmt.Sprintf("upgrade to %s", s.AgentPackage.AgentVersion()), func() {
+	if !s.Run("upgrade to "+s.AgentPackage.AgentVersion(), func() {
 		_, err := s.InstallAgent(vm,
 			windowsAgent.WithPackage(s.AgentPackage),
 			windowsAgent.WithInstallLogFile(filepath.Join(s.SessionOutputDir(), "upgrade.log")),
@@ -63,6 +63,17 @@ func (s *testUpgradeSuite) TestUpgrade() {
 	}) {
 		s.T().FailNow()
 	}
+
+	// The installer only disables dd-procmgr-service when the Agent user password is unavailable,
+	// which can only happen for domain accounts. This host uses the default local ddagentuser, whose
+	// password the installer always generates, so the service must stay enabled even though the
+	// upgrade above did not provide a password.
+	s.Run("process manager stays enabled for a local account", func() {
+		config, err := windowsCommon.GetServiceConfig(vm, "dd-procmgr-service")
+		s.Require().NoError(err)
+		s.Assert().Equal(windowsCommon.SERVICE_DEMAND_START, config.StartType,
+			"dd-procmgr-service must stay enabled for local accounts")
+	})
 
 	// run tests
 	t := s.newTester(vm)
@@ -73,7 +84,7 @@ func (s *testUpgradeSuite) TestUpgrade() {
 	s.uninstallAgentAndRunUninstallTests(t)
 }
 
-// TestUpgrade tests upgrading the agent from WINDOWS_AGENT_VERSION to UPGRADE_TEST_VERSION
+// TestUpgradeFromLatest tests upgrading the agent from the current version to the upgrade-test version
 func TestUpgradeFromLatest(t *testing.T) {
 	s := &testUpgradeFromLatestSuite{}
 	upgradeAgentPackge, err := windowsAgent.GetUpgradeTestPackageFromEnv()
@@ -91,7 +102,7 @@ func (s *testUpgradeFromLatestSuite) TestUpgradeFromLatest() {
 	vm := s.Env().RemoteHost
 
 	// install current version
-	if !s.Run(fmt.Sprintf("install %s", s.AgentPackage.AgentVersion()), func() {
+	if !s.Run("install "+s.AgentPackage.AgentVersion(), func() {
 		_, err := s.InstallAgent(vm,
 			windowsAgent.WithPackage(s.AgentPackage),
 			windowsAgent.WithInstallLogFile(filepath.Join(s.SessionOutputDir(), "install.log")),
@@ -106,7 +117,7 @@ func (s *testUpgradeFromLatestSuite) TestUpgradeFromLatest() {
 	s.Require().NoError(err, "should get product version")
 
 	// upgrade to test agent
-	if !s.Run(fmt.Sprintf("upgrade to %s", s.upgradeAgentPackge.AgentVersion()), func() {
+	if !s.Run("upgrade to "+s.upgradeAgentPackge.AgentVersion(), func() {
 		_, err := s.InstallAgent(vm,
 			windowsAgent.WithPackage(s.upgradeAgentPackge),
 			windowsAgent.WithInstallLogFile(filepath.Join(s.SessionOutputDir(), "upgrade.log")),
@@ -182,7 +193,7 @@ func (s *testUpgradeRollbackSuite) TestUpgradeRollback() {
 	s.uninstallAgent()
 }
 
-// TestUpgradeRollbackWithoutCWS tests that when upgrading the agent from X.51 to WINDOWS_AGENT_VERSION
+// TestUpgradeRollbackWithoutCWS tests that when upgrading the agent from X.51 to CURRENT_AGENT_VERSION
 // rolls back, that the ddprocmon service is not installed.
 func TestUpgradeRollbackWithoutCWS(t *testing.T) {
 	s := &testUpgradeRollbackWithoutCWSSuite{}
@@ -200,11 +211,11 @@ func (s *testUpgradeRollbackWithoutCWSSuite) SetupSuite() {
 	}
 
 	// CWS was GA in X.52, so start by installing X.51
-	// match X to the major version from WINDOWS_AGENT_VERSION
+	// match X to the major version from CURRENT_AGENT_VERSION
 	var err error
 	majorVersion := strings.Split(s.AgentPackage.Version, ".")[0]
 	s.previousAgentPackage = &windowsAgent.Package{
-		Version: fmt.Sprintf("%s.51.0-1", majorVersion),
+		Version: majorVersion + ".51.0-1",
 		Arch:    "x86_64",
 	}
 	s.previousAgentPackage.URL, err = windowsAgent.GetStableMSIURL(s.previousAgentPackage.Version, s.previousAgentPackage.Arch, "")
@@ -277,7 +288,7 @@ func (s *testUpgradeChangeUserSuite) TestUpgradeChangeUser() {
 	s.installAndTestLastStable(host)
 
 	// upgrade to the new version
-	if !s.Run(fmt.Sprintf("upgrade to %s", s.AgentPackage.AgentVersion()), func() {
+	if !s.Run("upgrade to "+s.AgentPackage.AgentVersion(), func() {
 		_, err := s.InstallAgent(host,
 			windowsAgent.WithPackage(s.AgentPackage),
 			windowsAgent.WithInstallLogFile(filepath.Join(s.SessionOutputDir(), "upgrade.log")),
@@ -339,7 +350,7 @@ func (s *testUpgradeChangeUserSuite) TestUpgradeChangeUser() {
 	s.uninstallAgentAndRunUninstallTests(t)
 }
 
-// TestUpgradeFromV5 tests upgrading from Agent 5 to WINDOWS_AGENT_VERSION
+// TestUpgradeFromV5 tests upgrading from Agent 5 to CURRENT_AGENT_VERSION
 func TestUpgradeFromV5(t *testing.T) {
 	var err error
 	s := &testUpgradeFromV5Suite{}
@@ -364,7 +375,7 @@ func (s *testUpgradeFromV5Suite) TestUpgrade5() {
 	s.installAgent5()
 
 	// upgrade to the new version
-	if !s.Run(fmt.Sprintf("upgrade to %s", s.AgentPackage.AgentVersion()), func() {
+	if !s.Run("upgrade to "+s.AgentPackage.AgentVersion(), func() {
 		_, err := s.InstallAgent(host,
 			windowsAgent.WithPackage(s.AgentPackage),
 			windowsAgent.WithInstallLogFile(filepath.Join(s.SessionOutputDir(), "upgrade.log")),
@@ -403,9 +414,7 @@ func (s *testUpgradeFromV5Suite) installAgent5() {
 	s.Assert().EventuallyWithT(func(t *assert.CollectT) {
 		cmd := fmt.Sprintf(`& "%s\embedded\python.exe" "%s\agent\agent.py" info`, installPath, installPath)
 		out, err := host.Execute(cmd)
-		if !assert.NoError(t, err, "should get agent info") {
-			return
-		}
+		require.NoError(t, err, "should get agent info")
 		s.T().Logf("Agent 5 info:\n%s", out)
 		assert.Contains(t, out, agentPackage.AgentVersion(), "info should have agent 5 version")
 	}, 5*time.Minute, 5*time.Second, "should get agent 5 info")
@@ -432,7 +441,7 @@ func (s *testUpgradeFromV5Suite) migrateAgent5Config() {
 	s.Require().Contains(out, "Success: imported the contents of", "migrate agent 5 config should succeed")
 }
 
-// TestUpgradeFromV6 tests upgrading from Agent 6 to WINDOWS_AGENT_VERSION
+// TestUpgradeFromV6 tests upgrading from Agent 6 to CURRENT_AGENT_VERSION
 func TestUpgradeFromV6(t *testing.T) {
 	var err error
 	s := &testUpgradeSuite{}

@@ -19,5 +19,17 @@ func (e *RuleEngine) GetSECLVariables() map[string]*api.SECLVariableState {
 		return nil
 	}
 
-	return e.getCommonSECLVariables(rs)
+	preparator := e.newSECLVariableEventPreparator()
+
+	rsVariables := rs.GetVariables()
+	seclVariables := make(map[string]*api.SECLVariableState, len(rsVariables))
+
+	e.fillCommonSECLVariables(rsVariables, seclVariables, preparator)
+
+	return seclVariables
+}
+
+// ConnectSBOMResolver connects the SBOM resolver to the bundled policy provider
+// so that SBOM-generated policies are automatically loaded when SBOMs are computed
+func (e *RuleEngine) ConnectSBOMResolver() {
 }

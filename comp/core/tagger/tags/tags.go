@@ -6,6 +6,17 @@
 // Package tags contains the list of tags that are added by the tagger
 package tags
 
+// *************************************************************************************
+// *                               ⚠️ IMPORTANT WARNING ⚠️
+// *
+// *  When adding, modifying, or removing ANY tag constant in this file, you MUST
+// *  also update the corresponding public documentation at the following locations:
+// *
+// *  # Kubernetes: https://docs.datadoghq.com/containers/kubernetes/tag
+// *  # ECS:        https://docs.datadoghq.com/containers/amazon_ecs/tags/
+// *  # Docker:     https://docs.datadoghq.com/containers/docker/tags/
+// *************************************************************************************
+
 const (
 	// STANDARD TAGS
 
@@ -24,6 +35,8 @@ const (
 	KubeClusterName = "kube_cluster_name"
 	// OrchClusterID is the tag for the orchestrator cluster ID
 	OrchClusterID = "orch_cluster_id"
+	// KubeDistribution is the tag for the managed Kubernetes cloud provider: eks, gke, aks
+	KubeDistribution = "kube_distribution"
 
 	// ImageName is the tag for the image name
 	ImageName = "image_name"
@@ -92,8 +105,29 @@ const (
 	KubeAppPartOf = "kube_app_part_of"
 	// KubeAppManagedBy is the tag for the "app.kubernetes.io/managed-by" Kubernetes label
 	KubeAppManagedBy = "kube_app_managed_by"
+	// KueueLocalQueue is the tag for the admitted Kueue local queue name from pod labels
+	KueueLocalQueue = "kueue_local_queue"
+	// KueueClusterQueue is the tag for the admitted Kueue cluster queue name from pod labels
+	KueueClusterQueue = "kueue_cluster_queue"
+	// KueueResourceFlavor is the tag for the Kueue ResourceFlavor name
+	KueueResourceFlavor = "kueue_resource_flavor"
+	// KueueWorkload is the tag for the Kueue Workload name
+	KueueWorkload = "kueue_workload"
+	// KueueWorkloadUID is the tag for the Kueue Workload UID
+	KueueWorkloadUID = "kueue_workload_uid"
 	// KubeAutoscalerKind is the tag reflecting if a pod is managed by an Autoscaler
 	KubeAutoscalerKind = "kube_autoscaler_kind"
+	// KubeStaticCPUsTag is the tag that describes a container's cpu management
+	// which is either true (dedicated CPUs) or false
+	KubeStaticCPUsTag = "kube_static_cpus"
+
+	// KubeServerVersion is the tag for the Kubernetes server version
+	KubeServerVersion = "kube_server_version"
+
+	// CPURestartPolicy is the tag for the container's CPU restart policy
+	CPURestartPolicy = "cpu_restart_policy"
+	// MemoryRestartPolicy is the tag for the container's memory restart policy
+	MemoryRestartPolicy = "memory_restart_policy"
 
 	// GPU related tags
 
@@ -105,12 +139,33 @@ const (
 	// comp/core/workloadmeta/def/types.go:GPU.Device for more detail on this
 	// field.
 	KubeGPUDevice = "gpu_device"
-
 	// KubeGPUUUID is the tag for the Kubernetes Resource GPU UUID
 	KubeGPUUUID = "gpu_uuid"
-
 	// GPUDriverVersion is the tag for the GPU driver version
 	GPUDriverVersion = "gpu_driver_version"
+	// GPUVirtualizationMode is the tag for the GPU virtualization mode
+	GPUVirtualizationMode = "gpu_virtualization_mode"
+	// GPUArchitecture is the tag for the GPU model architecture (e.g. Blackwell, Hopper, ...)
+	GPUArchitecture = "gpu_architecture"
+	// GPUType is the tag for the normalized GPU model type (e.g., a100, t4)
+	GPUType = "gpu_type"
+	// GPUSlicingMode is the tag for the GPU slicing mode (mig, none)
+	GPUSlicingMode = "gpu_slicing_mode"
+	// GPUParentGPUUUID is the tag for the parent GPU UUID
+	GPUParentGPUUUID = "gpu_parent_uuid"
+	// GPUPCIBusID is the tag for the PCI bus ID of the GPU
+	GPUPCIBusID = "gpu_pci_bus_id"
+	// GPUFabricClusterUUID is the tag for the NVLink fabric cluster UUID of the GPU
+	GPUFabricClusterUUID = "gpu_fabric_cluster_uuid"
+	// GPUFabricCliqueID is the tag for the NVLink fabric clique ID of the GPU
+	GPUFabricCliqueID = "gpu_fabric_clique_id"
+	// GPUNVLinkVersion is the tag for the GPU's NVLink version.
+	GPUNVLinkVersion = "gpu_nvlink_version"
+	// GPUNVLinkCapable is the tag indicating whether the GPU has one or more NVLink links.
+	GPUNVLinkCapable = "gpu_nvlink_capable"
+
+	// KubeArgoRollout is the tag for the Argo Rollout name
+	KubeArgoRollout = "kube_argo_rollout"
 
 	// OpenshiftDeploymentConfig is the tag for the OpenShift deployment config name
 	OpenshiftDeploymentConfig = "oshift_deployment_config"
@@ -131,8 +186,16 @@ const (
 	EcsContainerName = "ecs_container_name"
 	// EcsClusterName is the tag for the ECS cluster name
 	EcsClusterName = "ecs_cluster_name"
+	// EcsClusterARN is the tag for the ECS cluster ARN (Amazon Resource Name)
+	EcsClusterARN = "cluster_arn"
 	// EcsServiceName is the tag for the ECS service name
 	EcsServiceName = "ecs_service"
+	// EcsServiceARN is the tag for the ECS service ARN (Amazon Resource Name)
+	EcsServiceARN = "service_arn"
+	// EcsDaemonName is the tag for the ECS daemon name
+	EcsDaemonName = "ecs_daemon"
+	// EcsDaemonARN is the tag for the ECS daemon ARN (Amazon Resource Name)
+	EcsDaemonARN = "daemon_arn"
 	// AwsAccount is the tag for ECS account id
 	AwsAccount = "aws_account"
 
@@ -188,6 +251,10 @@ const (
 	TaskARN = "task_arn"
 	// MesosTask is the tag for the Mesos task
 	MesosTask = "mesos_task"
+	// TaskDefinitionARN is the tag for the task definition ARN (Amazon Resource Name)
+	TaskDefinitionARN = "task_definition_arn"
+	// DaemonTaskDefinitionARN is the tag for the daemon task definition ARN (Amazon Resource Name)
+	DaemonTaskDefinitionARN = "daemon_task_definition_arn"
 
 	// HIGH CARDINALITY
 

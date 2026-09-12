@@ -33,8 +33,8 @@ func AllPidsProcs(procRoot string) ([]int, error) {
 
 	pids := make([]int, 0, len(dirs))
 	for _, name := range dirs {
-		if pid, err := strconv.Atoi(name); err == nil {
-			pids = append(pids, pid)
+		if pid, err := strconv.ParseInt(name, 10, 32); err == nil {
+			pids = append(pids, int(pid))
 		}
 	}
 	return pids, nil
@@ -109,18 +109,17 @@ func GetProcessEnvVariable(pid int, procRoot string, envVar string) (string, err
 	return getEnvVariableFromBuffer(envFile, envVar), nil
 }
 
+// fdChunkSize is how many descriptor names findMemFdFilePath holds in memory
+// at once while searching a process' open descriptors.
+const fdChunkSize = 512
+
 // ErrMemFdFileNotFound is an error for when there was no file
 // found for a given process.
 var ErrMemFdFileNotFound = errors.New("memfd file not found")
 
-// GetProcessMemFdFile reads a maximum amount of bytes from the
-// memFdFileName if it was found.
-func GetProcessMemFdFile(pid int, procRoot string, memFdFileName string, memFdMaxSize int) ([]byte, error) {
-	path, found := findMemFdFilePath(pid, procRoot, memFdFileName)
-	if !found {
-		return nil, ErrMemFdFileNotFound
-	}
-
+// ReadMemFdFile reads a maximum amount of bytes from the memfd file at the given path.
+// The path should be a full path to an fd (e.g., /proc/1234/fd/5).
+func ReadMemFdFile(path string, memFdMaxSize int) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -133,7 +132,7 @@ func GetProcessMemFdFile(pid int, procRoot string, memFdFileName string, memFdMa
 	}
 
 	if !fileInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: not a regular file", memFdFileName)
+		return nil, fmt.Errorf("%s: not a regular file", path)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(file, int64(memFdMaxSize+1)))
@@ -146,6 +145,17 @@ func GetProcessMemFdFile(pid int, procRoot string, memFdFileName string, memFdMa
 	}
 
 	return data, nil
+}
+
+// GetProcessMemFdFile reads a maximum amount of bytes from the
+// memFdFileName if it was found.
+func GetProcessMemFdFile(pid int, procRoot string, memFdFileName string, memFdMaxSize int) ([]byte, error) {
+	path, found := findMemFdFilePath(pid, procRoot, memFdFileName)
+	if !found {
+		return nil, ErrMemFdFileNotFound
+	}
+
+	return ReadMemFdFile(path, memFdMaxSize)
 }
 
 // findMemfdFilePath searches for the file in the process open file descriptors.
@@ -161,6 +171,13 @@ func GetProcessMemFdFile(pid int, procRoot string, memFdFileName string, memFdMa
 // lrwx------ 1 foo foo 64 Aug 13 14:24 2 -> /dev/pts/6
 // lrwx------ 1 foo foo 64 Aug 13 14:24 3 -> '/memfd:dd_process_inject_info.msgpac (deleted)'
 // ```
+//
+// The directory is read a chunk at a time rather than all at once. A process
+// can hold hundreds of thousands of descriptors, and reading the whole
+// directory allocates a string for every one of them before the first is
+// examined. procfs generates the directory by walking the descriptor table in
+// order, so chunks arrive lowest descriptor first, which is where a memfd
+// published early in a process' startup will be.
 func findMemFdFilePath(pid int, procRoot string, memFdFileName string) (string, bool) {
 	fdsPath := filepath.Join(procRoot, strconv.Itoa(pid), "fd")
 	// quick path, the shadow file is the first opened file by the process
@@ -175,25 +192,25 @@ func findMemFdFilePath(pid int, procRoot string, memFdFileName string) (string, 
 	}
 	defer fdDir.Close()
 
-	fds, err := fdDir.Readdirnames(-1)
-	if err != nil {
-		// log.Warnf("failed to read %s: %s", fdsPath, err)
-		return "", false
-	}
-
-	for _, fd := range fds {
-		switch fd {
-		case "0", "1", "2", "3":
-			continue
-		default:
-			path := filepath.Join(fdsPath, fd)
-			if isMemfdFilePath(path, memFdFileName) {
-				return path, true
+	for {
+		fds, err := fdDir.Readdirnames(fdChunkSize)
+		for _, fd := range fds {
+			switch fd {
+			case "0", "1", "2", "3":
+				continue
+			default:
+				path := filepath.Join(fdsPath, fd)
+				if isMemfdFilePath(path, memFdFileName) {
+					return path, true
+				}
 			}
 		}
+		// io.EOF once the directory is exhausted, and any other error means
+		// there is nothing more to read either.
+		if err != nil {
+			return "", false
+		}
 	}
-
-	return "", false
 }
 
 func isMemfdFilePath(path, memfdFileName string) bool {
@@ -203,4 +220,13 @@ func isMemfdFilePath(path, memfdFileName string) bool {
 	}
 
 	return strings.HasPrefix(name, "/memfd:"+memfdFileName)
+}
+
+// ProcessExists returns true if the process exists in the procfs
+func ProcessExists(pid int) bool {
+	path := filepath.Join(HostProc(), strconv.Itoa(pid))
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	return true
 }

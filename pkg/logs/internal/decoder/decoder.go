@@ -6,12 +6,18 @@
 package decoder
 
 import (
+	"fmt"
+	"math"
 	"regexp"
+	"sync"
 	"time"
 
+	severityeventsdef "github.com/DataDog/datadog-agent/comp/anomalydetection/severityevents/def"
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
-	//nolint:revive // TODO(AML) Fix revive linter
+	severityprovider "github.com/DataDog/datadog-agent/comp/logs/severityprovider/def"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/structure"
+	"github.com/DataDog/datadog-agent/pkg/logs/internal/decoder/preprocessor"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/framer"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/parsers"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/parsers/noop"
@@ -43,9 +49,19 @@ func NewInput(content []byte) *message.Message {
 // The LineHandler processes the messages it as necessary (as single lines,
 // multiple lines, or auto-detecting the two), and sends the result to the
 // Decoder's output channel.
-type Decoder struct {
-	InputChan  chan *message.Message
-	OutputChan chan *message.Message
+type Decoder interface {
+	Start()
+	Stop()
+	GetLineCount() int64
+	GetDetectedPattern() *regexp.Regexp
+	InputChan() chan *message.Message
+	OutputChan() chan *message.Message
+}
+
+// decoderImpl is the default implementation of the Decoder interface
+type decoderImpl struct {
+	inputChan  chan *message.Message
+	outputChan chan *message.Message
 
 	framer      *framer.Framer
 	lineParser  LineParser
@@ -57,31 +73,45 @@ type Decoder struct {
 	detectedPattern *DetectedPattern
 }
 
+func (d *decoderImpl) InputChan() chan *message.Message {
+	return d.inputChan
+}
+
+func (d *decoderImpl) OutputChan() chan *message.Message {
+	return d.outputChan
+}
+
 // InitializeDecoder returns a properly initialized Decoder
-func InitializeDecoder(source *sources.ReplaceableSource, parser parsers.Parser, tailerInfo *status.InfoRegistry) *Decoder {
+func InitializeDecoder(source *sources.ReplaceableSource, parser parsers.Parser, tailerInfo *status.InfoRegistry) Decoder {
 	return NewDecoderWithFraming(source, parser, framer.UTF8Newline, nil, tailerInfo)
 }
 
-// Since a single source can have multiple file tailers - each with their own decoder instance:
-// make sure we sync info providers from all of the decoders so the status page displays it correctly.
-func syncSourceInfo(source *sources.ReplaceableSource, lh *MultiLineHandler) {
-	if existingInfo, ok := source.GetInfo(lh.countInfo.InfoKey()).(*status.CountInfo); ok {
-		// override the new decoders info to the instance we are already using
-		lh.countInfo = existingInfo
+// multiLineCountable is implemented by any handler or aggregator that tracks multiline match
+// and lines-combined counters, allowing them to be shared across multiple tailers for the same source.
+type multiLineCountable interface {
+	CountInfo() *status.CountInfo
+	SetCountInfo(*status.CountInfo)
+	LinesCombinedInfo() *status.CountInfo
+	SetLinesCombinedInfo(*status.CountInfo)
+}
+
+// syncSourceInfo ensures that multiple decoders for the same source share the same status counters,
+// so the status page displays a single combined count rather than per-tailer counts.
+func syncSourceInfo(source *sources.ReplaceableSource, c multiLineCountable) {
+	if existingInfo, ok := source.GetInfo(c.CountInfo().InfoKey()).(*status.CountInfo); ok {
+		c.SetCountInfo(existingInfo)
 	} else {
-		// this is the first decoder we have seen for this source - use it's count info
-		source.RegisterInfo(lh.countInfo)
+		source.RegisterInfo(c.CountInfo())
 	}
-	// Same as above for linesCombinedInfo
-	if existingInfo, ok := source.GetInfo(lh.linesCombinedInfo.InfoKey()).(*status.CountInfo); ok {
-		lh.linesCombinedInfo = existingInfo
+	if existingInfo, ok := source.GetInfo(c.LinesCombinedInfo().InfoKey()).(*status.CountInfo); ok {
+		c.SetLinesCombinedInfo(existingInfo)
 	} else {
-		source.RegisterInfo(lh.linesCombinedInfo)
+		source.RegisterInfo(c.LinesCombinedInfo())
 	}
 }
 
 // NewNoopDecoder initializes a decoder with all dependent components in passthrough mode.
-func NewNoopDecoder() *Decoder {
+func NewNoopDecoder() Decoder {
 	inputChan := make(chan *message.Message)
 	outputChan := make(chan *message.Message)
 	detectedPattern := &DetectedPattern{}
@@ -95,13 +125,20 @@ func NewNoopDecoder() *Decoder {
 }
 
 // NewDecoderWithFraming initialize a decoder with given endline strategy.
-func NewDecoderWithFraming(source *sources.ReplaceableSource, parser parsers.Parser, framing framer.Framing, multiLinePattern *regexp.Regexp, tailerInfo *status.InfoRegistry) *Decoder {
-	maxMessageSize := config.MaxMessageSizeBytes(pkgconfigsetup.Datadog())
+func NewDecoderWithFraming(source *sources.ReplaceableSource, parser parsers.Parser, framing framer.Framing, multiLinePattern *regexp.Regexp, tailerInfo *status.InfoRegistry) Decoder {
+	maxMessageSize := source.Config().GetMaxMessageSizeBytes(pkgconfigsetup.Datadog())
 	inputChan := make(chan *message.Message)
 	outputChan := make(chan *message.Message)
 	detectedPattern := &DetectedPattern{}
 
-	lineHandler := buildLineHandler(source, multiLinePattern, tailerInfo, outputChan, detectedPattern)
+	var sourceCategory []string
+	if sc := source.Config().SourceCategory; sc != "" {
+		sourceCategory = []string{"sourcecategory:" + sc}
+	}
+	baseBytes := message.TagMetadataBytes(source.Config().Tags, sourceCategory)
+	tokenizerMaxInputBytes, labelerMaxBytes := resolveTokenizerAndLabelerMaxInputBytes(source.Config().AutoMultiLineOptions, source.Config().ExperimentalAdaptiveSampling, source.Config().ExperimentalNoisyLogDetection)
+	tok := preprocessor.NewTokenizer(tokenizerMaxInputBytes)
+	lineHandler := buildLineHandler(source, multiLinePattern, tailerInfo, outputChan, detectedPattern, tok, labelerMaxBytes, baseBytes)
 
 	var lineParser LineParser
 	if parser.SupportsPartialLine() {
@@ -115,30 +152,515 @@ func NewDecoderWithFraming(source *sources.ReplaceableSource, parser parsers.Par
 	return New(inputChan, outputChan, framer, lineParser, lineHandler, detectedPattern)
 }
 
-func buildLineHandler(source *sources.ReplaceableSource, multiLinePattern *regexp.Regexp, tailerInfo *status.InfoRegistry, outputChan chan *message.Message, detectedPattern *DetectedPattern) LineHandler {
-	outputFn := func(m *message.Message) { outputChan <- m }
-	maxContentSize := config.MaxMessageSizeBytes(pkgconfigsetup.Datadog())
+// resolveTokenizerAndLabelerMaxInputBytes computes the tokenizer and labeler byte windows.
+// The labeler uses the effective auto-multiline tokenizer window (global, optionally overridden per source).
+// The tokenizer can be widened beyond that when adaptive sampling or noisy log detection is enabled,
+// so the sampler can observe more context without changing labeler behavior.
+func resolveTokenizerAndLabelerMaxInputBytes(sourceAutoMLSettings *config.SourceAutoMultiLineOptions, sourceAdaptiveSampling *config.SourceAdaptiveSamplingOptions, sourceNoisyLogDetection *bool) (tokenizerMaxInputBytes int, labelerMaxBytes int) {
+	labelerMaxBytes = pkgconfigsetup.Datadog().GetInt("logs_config.auto_multi_line.tokenizer_max_input_bytes")
+	if sourceAutoMLSettings != nil && sourceAutoMLSettings.TokenizerMaxInputBytes != nil {
+		labelerMaxBytes = *sourceAutoMLSettings.TokenizerMaxInputBytes
+	}
 
-	// construct the lineHandler
+	tokenizerMaxInputBytes = labelerMaxBytes
+	if resolveAdaptiveSamplerEnabled(sourceAdaptiveSampling) || resolveNoisyLogDetectionEnabled(sourceNoisyLogDetection) {
+		samplerMin := pkgconfigsetup.Datadog().GetInt("logs_config.experimental_adaptive_sampling.tokenizer_max_input_bytes")
+		if sourceAdaptiveSampling != nil && sourceAdaptiveSampling.TokenizerMaxInputBytes != nil {
+			samplerMin = *sourceAdaptiveSampling.TokenizerMaxInputBytes
+		}
+		if samplerMin > tokenizerMaxInputBytes {
+			tokenizerMaxInputBytes = samplerMin
+		}
+	}
+
+	return tokenizerMaxInputBytes, labelerMaxBytes
+}
+
+func resolveAdaptiveSamplerEnabled(sourceAdaptiveSampling *config.SourceAdaptiveSamplingOptions) bool {
+	if sourceAdaptiveSampling != nil && sourceAdaptiveSampling.Enabled != nil {
+		return *sourceAdaptiveSampling.Enabled
+	}
+
+	return pkgconfigsetup.Datadog().GetBool("logs_config.experimental_adaptive_sampling.enabled")
+}
+
+func resolveNoisyLogDetectionEnabled(sourceNoisyLogDetection *bool) bool {
+	if sourceNoisyLogDetection != nil {
+		return *sourceNoisyLogDetection
+	}
+
+	return pkgconfigsetup.Datadog().GetBool("logs_config.experimental_noisy_log_detection")
+}
+
+const disabledSourcesConfigKey = "logs_config.experimental_adaptive_sampling.disabled_sources"
+
+const (
+	smartSeverityProfilesEnabledConfigKey           = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.enabled"
+	smartSeverityProfilesMediumPassThroughConfigKey = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.medium.pass_through"
+	smartSeverityProfilesMediumRateLimitConfigKey   = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.medium.rate_limit"
+	smartSeverityProfilesMediumBurstSizeConfigKey   = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.medium.burst_size"
+	smartSeverityProfilesHighPassThroughConfigKey   = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.high.pass_through"
+	smartSeverityProfilesHighRateLimitConfigKey     = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.high.rate_limit"
+	smartSeverityProfilesHighBurstSizeConfigKey     = "logs_config.experimental_adaptive_sampling.smart_severity_profiles.high.burst_size"
+)
+
+// resolveSmartSeverityProfiles builds the Low/Medium/High profile triple. Each field of
+// Medium/High cascades independently from the level below when left unconfigured (Low ->
+// Medium -> High), so no combination of partially-configured fields can leave a higher
+// severity level less permissive than the one below it.
+func resolveSmartSeverityProfiles(low preprocessor.SamplerProfile) [severityeventsdef.NumSeverityLevels]preprocessor.SamplerProfile {
+	cfg := pkgconfigsetup.Datadog()
+
+	profiles := [severityeventsdef.NumSeverityLevels]preprocessor.SamplerProfile{
+		severityeventsdef.SeverityLow:    low,
+		severityeventsdef.SeverityMedium: low,
+		severityeventsdef.SeverityHigh:   low,
+	}
+
+	if cfg.IsConfigured(smartSeverityProfilesMediumRateLimitConfigKey) {
+		profiles[severityeventsdef.SeverityMedium].RateLimit = cfg.GetFloat64(smartSeverityProfilesMediumRateLimitConfigKey)
+	}
+	if cfg.IsConfigured(smartSeverityProfilesMediumBurstSizeConfigKey) {
+		profiles[severityeventsdef.SeverityMedium].BurstSize = clampBurstSize(cfg.GetFloat64(smartSeverityProfilesMediumBurstSizeConfigKey))
+	}
+	if cfg.IsConfigured(smartSeverityProfilesMediumPassThroughConfigKey) {
+		profiles[severityeventsdef.SeverityMedium].PassThrough = cfg.GetBool(smartSeverityProfilesMediumPassThroughConfigKey)
+	}
+
+	// High starts from Medium's already-resolved profile, then applies its own
+	// overrides per field.
+	profiles[severityeventsdef.SeverityHigh] = profiles[severityeventsdef.SeverityMedium]
+	if cfg.IsConfigured(smartSeverityProfilesHighRateLimitConfigKey) {
+		profiles[severityeventsdef.SeverityHigh].RateLimit = cfg.GetFloat64(smartSeverityProfilesHighRateLimitConfigKey)
+	}
+	if cfg.IsConfigured(smartSeverityProfilesHighBurstSizeConfigKey) {
+		profiles[severityeventsdef.SeverityHigh].BurstSize = clampBurstSize(cfg.GetFloat64(smartSeverityProfilesHighBurstSizeConfigKey))
+	}
+	if cfg.IsConfigured(smartSeverityProfilesHighPassThroughConfigKey) {
+		profiles[severityeventsdef.SeverityHigh].PassThrough = cfg.GetBool(smartSeverityProfilesHighPassThroughConfigKey)
+	}
+
+	return profiles
+}
+
+// smartSeverityProfileWarningRegistry separates global validation from
+// source-specific validation. Global configuration is reported once at logs-agent
+// startup, while each distinct source override discrepancy is reported once.
+type smartSeverityProfileWarningRegistry struct {
+	globalOnce sync.Once
+	mu         sync.Mutex
+	sources    map[smartSeveritySourceProfileKey]struct{}
+}
+
+type smartSeveritySourceProfileKey struct {
+	rateLimit float64
+	burstSize float64
+}
+
+func newSmartSeverityProfileWarningRegistry() *smartSeverityProfileWarningRegistry {
+	return &smartSeverityProfileWarningRegistry{sources: make(map[smartSeveritySourceProfileKey]struct{})}
+}
+
+func (r *smartSeverityProfileWarningRegistry) markSourceProfile(profile preprocessor.SamplerProfile) bool {
+	key := smartSeveritySourceProfileKey{
+		rateLimit: effectiveProfileLimit(profile.RateLimit, profile.PassThrough),
+		burstSize: effectiveProfileLimit(profile.BurstSize, profile.PassThrough),
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, found := r.sources[key]; found {
+		return false
+	}
+	r.sources[key] = struct{}{}
+	return true
+}
+
+var smartSeverityProfileWarnings = newSmartSeverityProfileWarningRegistry()
+
+// WarnGlobalSmartSeverityProfileDiscrepancies validates the global adaptive
+// sampling profile before log sources are started. It is safe to call repeatedly.
+func WarnGlobalSmartSeverityProfileDiscrepancies() {
+	if !pkgconfigsetup.Datadog().GetBool(smartSeverityProfilesEnabledConfigKey) {
+		return
+	}
+
+	low := preprocessor.SamplerProfile{
+		RateLimit: pkgconfigsetup.Datadog().GetFloat64("logs_config.experimental_adaptive_sampling.rate_limit"),
+		BurstSize: pkgconfigsetup.Datadog().GetFloat64("logs_config.experimental_adaptive_sampling.burst_size"),
+	}
+	profiles := resolveSmartSeverityProfiles(low)
+	smartSeverityProfileWarnings.warnGlobal(profiles, func(discrepancy string) {
+		log.Warnf("config adaptive sampler smart severity profiles: %s", discrepancy)
+	})
+}
+
+func (r *smartSeverityProfileWarningRegistry) warnGlobal(profiles [severityeventsdef.NumSeverityLevels]preprocessor.SamplerProfile, warn func(string)) {
+	r.globalOnce.Do(func() {
+		for _, discrepancy := range smartSeverityProfileDiscrepancies(profiles) {
+			warn(discrepancy)
+		}
+		if len(sourceSmartSeverityProfileDiscrepancies(profiles)) > 0 {
+			r.markSourceProfile(profiles[severityeventsdef.SeverityLow])
+		}
+	})
+}
+
+func warnSourceSmartSeverityProfileDiscrepancies(profiles [severityeventsdef.NumSeverityLevels]preprocessor.SamplerProfile, sourceAdaptiveSampling *config.SourceAdaptiveSamplingOptions, sourceDetails string) {
+	if sourceAdaptiveSampling == nil || (sourceAdaptiveSampling.RateLimit == nil && sourceAdaptiveSampling.BurstSize == nil) {
+		return
+	}
+
+	discrepancies := sourceSmartSeverityProfileDiscrepancies(profiles)
+	if len(discrepancies) == 0 || !smartSeverityProfileWarnings.markSourceProfile(profiles[severityeventsdef.SeverityLow]) {
+		return
+	}
+	for _, discrepancy := range discrepancies {
+		log.Warnf("config adaptive sampler smart severity profiles for source-specific experimental_adaptive_sampling (%s): %s", sourceDetails, discrepancy)
+	}
+}
+
+func adaptiveSamplingSourceDetails(source *sources.LogSource) string {
+	if source.Config.IntegrationSource != "" {
+		return fmt.Sprintf("log source %q, integration config %q (index %d)", source.Name, source.Config.IntegrationSource, source.Config.IntegrationSourceIndex)
+	}
+	return fmt.Sprintf("log source %q, type %q", source.Name, source.Config.Type)
+}
+
+func smartSeverityProfileDiscrepancies(profiles [severityeventsdef.NumSeverityLevels]preprocessor.SamplerProfile) []string {
+	low := profiles[severityeventsdef.SeverityLow]
+	medium := profiles[severityeventsdef.SeverityMedium]
+	high := profiles[severityeventsdef.SeverityHigh]
+
+	var discrepancies []string
+	lowRateLimit := effectiveProfileLimit(low.RateLimit, low.PassThrough)
+	mediumRateLimit := effectiveProfileLimit(medium.RateLimit, medium.PassThrough)
+	highRateLimit := effectiveProfileLimit(high.RateLimit, high.PassThrough)
+	if lowRateLimit > mediumRateLimit || mediumRateLimit > highRateLimit {
+		discrepancies = append(discrepancies, fmt.Sprintf("rate limits within logs_config.experimental_adaptive_sampling should be non-decreasing (low=%g, medium=%g, high=%g)", lowRateLimit, mediumRateLimit, highRateLimit))
+	}
+	lowBurstSize := effectiveProfileLimit(low.BurstSize, low.PassThrough)
+	mediumBurstSize := effectiveProfileLimit(medium.BurstSize, medium.PassThrough)
+	highBurstSize := effectiveProfileLimit(high.BurstSize, high.PassThrough)
+	if lowBurstSize > mediumBurstSize || mediumBurstSize > highBurstSize {
+		discrepancies = append(discrepancies, fmt.Sprintf("burst sizes within logs_config.experimental_adaptive_sampling should be non-decreasing (low=%g, medium=%g, high=%g)", lowBurstSize, mediumBurstSize, highBurstSize))
+	}
+	if medium.PassThrough && !high.PassThrough {
+		discrepancies = append(discrepancies, fmt.Sprintf("%s enabled but not %s", smartSeverityProfilesMediumPassThroughConfigKey, smartSeverityProfilesHighPassThroughConfigKey))
+	}
+	return discrepancies
+}
+
+// sourceSmartSeverityProfileDiscrepancies only checks the low-to-medium boundary:
+// medium and high are global settings and are checked during startup validation.
+func sourceSmartSeverityProfileDiscrepancies(profiles [severityeventsdef.NumSeverityLevels]preprocessor.SamplerProfile) []string {
+	low := profiles[severityeventsdef.SeverityLow]
+	medium := profiles[severityeventsdef.SeverityMedium]
+
+	var discrepancies []string
+	lowRateLimit := effectiveProfileLimit(low.RateLimit, low.PassThrough)
+	mediumRateLimit := effectiveProfileLimit(medium.RateLimit, medium.PassThrough)
+	if lowRateLimit > mediumRateLimit {
+		discrepancies = append(discrepancies, fmt.Sprintf("rate limits should be non-decreasing (low=%g, medium=%g)", lowRateLimit, mediumRateLimit))
+	}
+	lowBurstSize := effectiveProfileLimit(low.BurstSize, low.PassThrough)
+	mediumBurstSize := effectiveProfileLimit(medium.BurstSize, medium.PassThrough)
+	if lowBurstSize > mediumBurstSize {
+		discrepancies = append(discrepancies, fmt.Sprintf("burst sizes should be non-decreasing (low=%g, medium=%g)", lowBurstSize, mediumBurstSize))
+	}
+	return discrepancies
+}
+
+func effectiveProfileLimit(value float64, passThrough bool) float64 {
+	if passThrough {
+		return math.Inf(1)
+	}
+	return value
+}
+
+func newDisabledSet() map[string]struct{} {
+	entries := pkgconfigsetup.Datadog().GetStringSlice(disabledSourcesConfigKey)
+	m := make(map[string]struct{}, len(entries))
+	for _, s := range entries {
+		m[s] = struct{}{}
+	}
+	return m
+}
+
+// buildIsSourceDisabled builds a closure that checks whether the current source
+// is in the disabled_sources set. The set is built once at init; the source name
+// is read per-message through ReplaceableSource to track source swaps.
+// When Remote Config support is added, the set can be rebuilt via a callback
+// (e.g. using atomic.Pointer for lock-free reads) without changing the caller.
+func buildIsSourceDisabled(source *sources.ReplaceableSource) func() bool {
+	disabledSet := newDisabledSet()
+	if len(disabledSet) == 0 {
+		return nil
+	}
+	return func() bool {
+		_, disabled := disabledSet[source.Config().Source]
+		return disabled
+	}
+}
+
+// buildSourceTag builds a closure resolving the low-cardinality `log_source`
+// telemetry tag for the adaptive sampler.
+//
+// This deliberately reads Config.Source rather than LogSource.Name: Name is a
+// per-tailer identifier (e.g. "<namespace>/<pod>/<container>" for Kubernetes pod
+// files) whose cardinality is unbounded, while Config.Source is the same value the
+// agent ships as ddsource — see message.Origin.Source().
+//
+// Origin.Source() resolves three tiers; only Config.Source is reachable here:
+//   - mappedSource (remap_source rule) is applied in the processor, downstream of
+//     the tailer, so logs remapped by that rule are attributed to their pre-remap
+//     source in sampler telemetry.
+//   - the parser-derived source is only ever set by the journald tailer, which runs
+//     a noop decoder and therefore never has a sampler.
+//
+// The value is read per-message through ReplaceableSource so a source swap (e.g. on
+// file rotation) is picked up.
+func buildSourceTag(source *sources.ReplaceableSource) func() string {
+	return func() string {
+		return source.Config().Source
+	}
+}
+
+type samplerMode int
+
+const (
+	samplerDisabled samplerMode = iota
+	samplerAdaptiveSampling
+	samplerNoisyLogDetection
+)
+
+func resolveSamplerMode(sourceAdaptiveSampling *config.SourceAdaptiveSamplingOptions, sourceNoisyLogDetection *bool) samplerMode {
+	if resolveAdaptiveSamplerEnabled(sourceAdaptiveSampling) {
+		return samplerAdaptiveSampling
+	}
+	if resolveNoisyLogDetectionEnabled(sourceNoisyLogDetection) {
+		return samplerNoisyLogDetection
+	}
+	return samplerDisabled
+}
+
+func resolveAdaptiveSamplerConfig(sourceAdaptiveSampling *config.SourceAdaptiveSamplingOptions, tok *preprocessor.Tokenizer, sourceDetails ...string) preprocessor.AdaptiveSamplerConfig {
+	includeFilters, includeConfigured := resolveGlobalAdaptiveSamplerFilters("logs_config.experimental_adaptive_sampling.include", tok)
+	excludeFilters, _ := resolveGlobalAdaptiveSamplerFilters("logs_config.experimental_adaptive_sampling.exclude", tok)
+
+	c := preprocessor.AdaptiveSamplerConfig{
+		MaxPatterns:          pkgconfigsetup.Datadog().GetInt("logs_config.experimental_adaptive_sampling.max_patterns"),
+		RateLimit:            pkgconfigsetup.Datadog().GetFloat64("logs_config.experimental_adaptive_sampling.rate_limit"),
+		BurstSize:            pkgconfigsetup.Datadog().GetFloat64("logs_config.experimental_adaptive_sampling.burst_size"),
+		MatchThreshold:       pkgconfigsetup.Datadog().GetFloat64("logs_config.experimental_adaptive_sampling.match_threshold"),
+		ProtectImportantLogs: pkgconfigsetup.Datadog().GetBool("logs_config.experimental_adaptive_sampling.protect_important_logs"),
+		TagPatternHash:       pkgconfigsetup.Datadog().GetBool("logs_config.experimental_adaptive_sampling.tag_pattern_hash"),
+		Include:              includeFilters,
+		IncludeConfigured:    includeConfigured,
+		Exclude:              excludeFilters,
+	}
+
+	if sourceAdaptiveSampling != nil {
+		if sourceAdaptiveSampling.MaxPatterns != nil {
+			c.MaxPatterns = *sourceAdaptiveSampling.MaxPatterns
+		}
+		if sourceAdaptiveSampling.RateLimit != nil {
+			c.RateLimit = *sourceAdaptiveSampling.RateLimit
+		}
+		if sourceAdaptiveSampling.BurstSize != nil {
+			c.BurstSize = *sourceAdaptiveSampling.BurstSize
+		}
+		if sourceAdaptiveSampling.MatchThreshold != nil {
+			c.MatchThreshold = *sourceAdaptiveSampling.MatchThreshold
+		}
+		if sourceAdaptiveSampling.ProtectImportantLogs != nil {
+			c.ProtectImportantLogs = *sourceAdaptiveSampling.ProtectImportantLogs
+		}
+		if sourceAdaptiveSampling.TagPatternHash != nil {
+			c.TagPatternHash = *sourceAdaptiveSampling.TagPatternHash
+		}
+		if sourceAdaptiveSampling.Include != nil {
+			c.Include = resolveAdaptiveSamplerFilters(sourceAdaptiveSampling.Include, tok)
+			c.IncludeConfigured = true
+		}
+		if sourceAdaptiveSampling.Exclude != nil {
+			c.Exclude = resolveAdaptiveSamplerFilters(sourceAdaptiveSampling.Exclude, tok)
+		}
+	}
+
+	c = validateAdaptiveSamplerConfig(c)
+
+	c.SmartSeverityProfilesEnabled = pkgconfigsetup.Datadog().GetBool(smartSeverityProfilesEnabledConfigKey)
+	if c.SmartSeverityProfilesEnabled {
+		WarnGlobalSmartSeverityProfileDiscrepancies()
+		c.Profiles = resolveSmartSeverityProfiles(preprocessor.SamplerProfile{RateLimit: c.RateLimit, BurstSize: c.BurstSize})
+		details := "unknown source"
+		if len(sourceDetails) > 0 {
+			details = sourceDetails[0]
+		}
+		warnSourceSmartSeverityProfileDiscrepancies(c.Profiles, sourceAdaptiveSampling, details)
+		c.SeverityProvider = severityprovider.Current
+	}
+
+	return c
+}
+
+func resolveNoisyLogDetectionConfig(sourceAdaptiveSampling *config.SourceAdaptiveSamplingOptions, tok *preprocessor.Tokenizer) preprocessor.AdaptiveSamplerConfig {
+	c := resolveAdaptiveSamplerConfig(sourceAdaptiveSampling, tok)
+	c.DetectionOnly = true
+	return c
+}
+
+func resolveGlobalAdaptiveSamplerFilters(key string, tok *preprocessor.Tokenizer) ([]preprocessor.AdaptiveSamplerFilter, bool) {
+	cfg := pkgconfigsetup.Datadog()
+	if !cfg.IsConfigured(key) {
+		return nil, false
+	}
+
+	var rules []*config.AdaptiveSamplingRule
+	if err := structure.UnmarshalKey(cfg, key, &rules, structure.EnableStringUnmarshal); err != nil {
+		log.Warnf("Failed to unmarshal adaptive sampler filters from %s, skipping: %v", key, err)
+		return nil, true
+	}
+
+	return resolveAdaptiveSamplerFilters(rules, tok), true
+}
+
+func resolveAdaptiveSamplerFilters(rules []*config.AdaptiveSamplingRule, tok *preprocessor.Tokenizer) []preprocessor.AdaptiveSamplerFilter {
+	if len(rules) == 0 {
+		return nil
+	}
+	if tok == nil {
+		tok = preprocessor.NewTokenizer(0)
+	}
+
+	filters := make([]preprocessor.AdaptiveSamplerFilter, 0, len(rules))
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+
+		filter := preprocessor.AdaptiveSamplerFilter{}
+		if rule.Regex != "" {
+			compiled, err := regexp.Compile(rule.Regex)
+			if err != nil {
+				log.Warnf("Invalid adaptive sampler filter regex %q, skipping rule: %v", rule.Regex, err)
+				continue
+			}
+			filter.Regex = compiled
+		}
+		if rule.Sample != "" {
+			filter.SampleTokens, _ = tok.Tokenize([]byte(rule.Sample))
+		}
+		if filter.Regex == nil && len(filter.SampleTokens) == 0 {
+			log.Warn("Adaptive sampler filter rule is empty, skipping")
+			continue
+		}
+
+		filters = append(filters, filter)
+	}
+	return filters
+}
+
+func buildLineHandler(source *sources.ReplaceableSource, multiLinePattern *regexp.Regexp, tailerInfo *status.InfoRegistry, outputChan chan *message.Message, detectedPattern *DetectedPattern, tok *preprocessor.Tokenizer, labelerMaxBytes int, baseBytesEstimate int) LineHandler {
+	maxContentSize := config.MaxMessageSizeBytes(pkgconfigsetup.Datadog())
+	flushTimeout := config.AggregationTimeout(pkgconfigsetup.Datadog())
+
+	var sampler preprocessor.Sampler
+	sourceConfig := source.Config()
+	switch resolveSamplerMode(sourceConfig.ExperimentalAdaptiveSampling, sourceConfig.ExperimentalNoisyLogDetection) {
+	case samplerAdaptiveSampling:
+		cfg := resolveAdaptiveSamplerConfig(sourceConfig.ExperimentalAdaptiveSampling, tok, adaptiveSamplingSourceDetails(source.UnderlyingSource()))
+		cfg.IsSourceDisabled = buildIsSourceDisabled(source)
+		sampler = preprocessor.NewAdaptiveSampler(cfg, buildSourceTag(source), baseBytesEstimate)
+	case samplerNoisyLogDetection:
+		cfg := resolveNoisyLogDetectionConfig(sourceConfig.ExperimentalAdaptiveSampling, tok)
+		cfg.IsSourceDisabled = buildIsSourceDisabled(source)
+		sampler = preprocessor.NewAdaptiveSampler(cfg, buildSourceTag(source), baseBytesEstimate)
+	default:
+		sampler = preprocessor.NewNoopSampler()
+	}
+
+	// directOutputFn is used by legacy handlers that bypass the Preprocessor.
+	directOutputFn := func(msg *message.Message) { outputChan <- msg }
+
+	// User-configured multiline regex — each line is matched against the regex to detect group
+	// boundaries; completed groups are emitted as a single combined message.
 	var lineHandler LineHandler
 	for _, rule := range source.Config().ProcessingRules {
 		if rule.Type == config.MultiLine {
-			lh := NewMultiLineHandler(outputFn, rule.Regex, config.AggregationTimeout(pkgconfigsetup.Datadog()), maxContentSize, false, tailerInfo, "multi_line")
-			syncSourceInfo(source, lh)
-			lineHandler = lh
-		}
-	}
-	if lineHandler == nil {
-		if source.Config().LegacyAutoMultiLineEnabled(pkgconfigsetup.Datadog()) {
-			lineHandler = getLegacyAutoMultilineHandler(outputFn, multiLinePattern, maxContentSize, source, detectedPattern, tailerInfo)
-		} else if source.Config().AutoMultiLineEnabled(pkgconfigsetup.Datadog()) {
-			lineHandler = NewAutoMultilineHandler(outputFn, maxContentSize, config.AggregationTimeout(pkgconfigsetup.Datadog()), tailerInfo)
-		} else {
-			lineHandler = NewSingleLineHandler(outputFn, maxContentSize)
+			regexAggregator := preprocessor.NewRegexAggregator(rule.Regex, maxContentSize, false, tailerInfo, "multi_line")
+			syncSourceInfo(source, regexAggregator)
+			lineHandler = newPreprocessorHandler(regexAggregator, tok, preprocessor.NewNoopLabeler(), sampler, outputChan, preprocessor.NewNoopJSONAggregator(), preprocessor.NewNoopStackTraceAggregator(), flushTimeout, labelerMaxBytes)
 		}
 	}
 
-	return lineHandler
+	if lineHandler != nil {
+		return lineHandler
+	}
+
+	// Priority order when no user-configured regex rule was set:
+	// 1. Legacy auto multiline (bypasses Preprocessor; outputs directly to outputChan)
+	// 2. Auto multiline with aggregation — combines detected groups into one message
+	// 3. Auto multiline detection-only — tags group starts without combining, this is the default
+	// 4. Pass-through — tokenizes and samples every line individually
+	if source.Config().LegacyAutoMultiLineEnabled(pkgconfigsetup.Datadog()) {
+		return getLegacyAutoMultilineHandler(directOutputFn, multiLinePattern, maxContentSize, source, detectedPattern, tailerInfo)
+	} else if source.Config().AutoMultiLineEnabled(pkgconfigsetup.Datadog()) {
+		labeler := buildAutoMultilineLabeler(source.Config().AutoMultiLineOptions, source.Config().AutoMultiLineSamples, tailerInfo)
+		combiningAggregator := preprocessor.NewCombiningAggregator(maxContentSize,
+			pkgconfigsetup.Datadog().GetBool("logs_config.tag_truncated_logs"),
+			pkgconfigsetup.Datadog().GetBool("logs_config.tag_multi_line_logs"),
+			tailerInfo)
+		enableJSON := pkgconfigsetup.Datadog().GetBool("logs_config.auto_multi_line.enable_json_aggregation")
+		if source.Config().AutoMultiLineOptions != nil && source.Config().AutoMultiLineOptions.EnableJSONAggregation != nil {
+			enableJSON = *source.Config().AutoMultiLineOptions.EnableJSONAggregation
+		}
+		var jsonAgg preprocessor.JSONAggregator = preprocessor.NewNoopJSONAggregator()
+		if enableJSON {
+			jsonAgg = preprocessor.NewJSONAggregator(pkgconfigsetup.Datadog().GetBool("logs_config.auto_multi_line.tag_aggregated_json"), maxContentSize)
+		}
+		stackTraceParsers := resolveStackTraceParsers(source)
+		stackTraceAgg := preprocessor.NewStackTraceAggregatorFromNames(stackTraceParsers, maxContentSize,
+			pkgconfigsetup.Datadog().GetBool("logs_config.tag_multi_line_logs"))
+		return newPreprocessorHandler(combiningAggregator, tok, labeler, sampler, outputChan, jsonAgg, stackTraceAgg, flushTimeout, labelerMaxBytes)
+	} else if pkgconfigsetup.Datadog().GetBool("logs_config.auto_multi_line_detection_tagging") {
+		labeler := buildAutoMultilineLabeler(source.Config().AutoMultiLineOptions, source.Config().AutoMultiLineSamples, tailerInfo)
+		cfg := pkgconfigsetup.Datadog()
+		_, isDefaultPath := source.Config().AutoMultiLineStatus(cfg)
+		// JSON aggregation is disabled in detection mode — we don't want to combine JSON
+		// while only tagging everything else.
+		detectingAggregator := preprocessor.NewDetectingAggregator(tailerInfo, maxContentSize, pkgconfigsetup.Datadog().GetBool("logs_config.tag_truncated_logs"), isDefaultPath)
+		return newPreprocessorHandler(detectingAggregator, tok, labeler, sampler, outputChan, preprocessor.NewNoopJSONAggregator(), preprocessor.NewNoopStackTraceAggregator(), flushTimeout, labelerMaxBytes)
+	}
+	return newPreprocessorHandler(preprocessor.NewPassThroughAggregator(maxContentSize), tok, preprocessor.NewNoopLabeler(), sampler, outputChan, preprocessor.NewNoopJSONAggregator(), preprocessor.NewNoopStackTraceAggregator(), flushTimeout, 0)
+}
+
+// resolveStackTraceParsers returns the list of enabled stack trace parser
+// names for the given source, respecting per-source overrides.
+func resolveStackTraceParsers(source *sources.ReplaceableSource) []string {
+	opts := source.Config().AutoMultiLineOptions
+	if opts != nil && opts.StackTraceParsers != nil {
+		return *opts.StackTraceParsers
+	}
+	return pkgconfigsetup.Datadog().GetStringSlice("logs_config.auto_multi_line.stack_trace_parsers")
+}
+
+func validateAdaptiveSamplerConfig(c preprocessor.AdaptiveSamplerConfig) preprocessor.AdaptiveSamplerConfig {
+	if c.MaxPatterns <= 0 {
+		c.MaxPatterns = 1
+	}
+
+	c.BurstSize = clampBurstSize(c.BurstSize)
+
+	return c
+}
+
+// clampBurstSize floors burstSize at 1, avoiding negative starting credits.
+func clampBurstSize(burstSize float64) float64 {
+	if burstSize <= 0 {
+		return 1
+	}
+	return burstSize
 }
 
 func getLegacyAutoMultilineHandler(outputFn func(*message.Message), multiLinePattern *regexp.Regexp, maxContentSize int, source *sources.ReplaceableSource, detectedPattern *DetectedPattern, tailerInfo *status.InfoRegistry) LineHandler {
@@ -193,10 +715,10 @@ func buildLegacyAutoMultilineHandlerFromConfig(outputFn func(*message.Message), 
 }
 
 // New returns an initialized Decoder
-func New(InputChan chan *message.Message, OutputChan chan *message.Message, framer *framer.Framer, lineParser LineParser, lineHandler LineHandler, detectedPattern *DetectedPattern) *Decoder {
-	return &Decoder{
-		InputChan:       InputChan,
-		OutputChan:      OutputChan,
+func New(InputChan chan *message.Message, OutputChan chan *message.Message, framer *framer.Framer, lineParser LineParser, lineHandler LineHandler, detectedPattern *DetectedPattern) Decoder {
+	return &decoderImpl{
+		inputChan:       InputChan,
+		outputChan:      OutputChan,
 		framer:          framer,
 		lineParser:      lineParser,
 		lineHandler:     lineHandler,
@@ -205,28 +727,31 @@ func New(InputChan chan *message.Message, OutputChan chan *message.Message, fram
 }
 
 // Start starts the Decoder
-func (d *Decoder) Start() {
+func (d *decoderImpl) Start() {
 	go d.run()
 }
 
 // Stop stops the Decoder
-func (d *Decoder) Stop() {
+func (d *decoderImpl) Stop() {
 	// stop the entire decoder by closing the input.  This will "bubble" through the
 	// components and eventually cause run() to finish, closing OutputChan.
-	close(d.InputChan)
+	close(d.InputChan())
 }
 
-func (d *Decoder) run() {
+func (d *decoderImpl) run() {
 	defer func() {
-		// flush any remaining output in component order, and then close the
-		// output channel
+		// Flush any remaining output in component order, and then close the
+		// output channel. The framer flush gives the FrameMatcher a chance to
+		// emit buffered data that was waiting for a delimiter that never
+		// arrived (e.g. non-transparent syslog without a trailing LF).
+		d.framer.Flush()
 		d.lineParser.flush()
 		d.lineHandler.flush()
-		close(d.OutputChan)
+		close(d.outputChan)
 	}()
 	for {
 		select {
-		case msg, isOpen := <-d.InputChan:
+		case msg, isOpen := <-d.InputChan():
 			if !isOpen {
 				// InputChan has been closed, no more lines are expected
 				return
@@ -236,7 +761,7 @@ func (d *Decoder) run() {
 
 		case <-d.lineParser.flushChan():
 			log.Debug("Flushing line parser because the flush timeout has been reached.")
-			d.lineParser.flush()
+			d.lineParser.flushTimedOut()
 
 		case <-d.lineHandler.flushChan():
 			log.Debug("Flushing line handler because the flush timeout has been reached.")
@@ -246,14 +771,14 @@ func (d *Decoder) run() {
 }
 
 // GetLineCount returns the number of decoded lines
-func (d *Decoder) GetLineCount() int64 {
+func (d *decoderImpl) GetLineCount() int64 {
 	// for the moment, this counts _frames_, which aren't quite the same but
 	// close enough for logging purposes
 	return d.framer.GetFrameCount()
 }
 
 // GetDetectedPattern returns a detected pattern (if any)
-func (d *Decoder) GetDetectedPattern() *regexp.Regexp {
+func (d *decoderImpl) GetDetectedPattern() *regexp.Regexp {
 	if d.detectedPattern == nil {
 		return nil
 	}

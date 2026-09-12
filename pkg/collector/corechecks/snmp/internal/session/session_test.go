@@ -8,7 +8,7 @@ package session
 import (
 	"bufio"
 	"bytes"
-	"fmt"
+	"errors"
 	"io"
 	stdlog "log"
 	"testing"
@@ -18,10 +18,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/DataDog/datadog-agent/pkg/snmp/gosnmplib"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/snmp/internal/checkconfig"
 )
+
+func defaultAuthGosnmpProtocol(t *testing.T) gosnmp.SnmpV3AuthProtocol {
+	protocol, err := gosnmplib.GetAuthProtocol(defaultAuthProtocol())
+	require.NoError(t, err)
+	return protocol
+}
+
+func defaultPrivGosnmpProtocol(t *testing.T) gosnmp.SnmpV3PrivProtocol {
+	protocol, err := gosnmplib.GetPrivProtocol(defaultPrivProtocol())
+	require.NoError(t, err)
+	return protocol
+}
 
 func Test_snmpSession_Configure(t *testing.T) {
 	tests := []struct {
@@ -42,7 +55,7 @@ func Test_snmpSession_Configure(t *testing.T) {
 				IPAddress: "1.2.3.4",
 				Port:      uint16(1234),
 			},
-			expectedError: fmt.Errorf("an authentication method needs to be provided"),
+			expectedError: errors.New("an authentication method needs to be provided"),
 		},
 		{
 			name: "valid v1 config",
@@ -174,9 +187,9 @@ func Test_snmpSession_Configure(t *testing.T) {
 			expectedMsgFlags: gosnmp.AuthPriv,
 			expectedSecurityParameters: &gosnmp.UsmSecurityParameters{
 				UserName:                 "myUser",
-				AuthenticationProtocol:   gosnmp.MD5,
+				AuthenticationProtocol:   defaultAuthGosnmpProtocol(t),
 				AuthenticationPassphrase: "myAuthKey",
-				PrivacyProtocol:          gosnmp.DES,
+				PrivacyProtocol:          defaultPrivGosnmpProtocol(t),
 				PrivacyPassphrase:        "myPrivKey",
 			},
 		},
@@ -192,7 +205,7 @@ func Test_snmpSession_Configure(t *testing.T) {
 			expectedMsgFlags: gosnmp.AuthPriv,
 			expectedSecurityParameters: &gosnmp.UsmSecurityParameters{
 				UserName:                 "myUser",
-				AuthenticationProtocol:   gosnmp.MD5,
+				AuthenticationProtocol:   defaultAuthGosnmpProtocol(t),
 				AuthenticationPassphrase: "myAuthKey",
 				PrivacyProtocol:          gosnmp.AES,
 				PrivacyPassphrase:        "myPrivKey",
@@ -212,7 +225,7 @@ func Test_snmpSession_Configure(t *testing.T) {
 				UserName:                 "myUser",
 				AuthenticationProtocol:   gosnmp.SHA,
 				AuthenticationPassphrase: "myAuthKey",
-				PrivacyProtocol:          gosnmp.DES,
+				PrivacyProtocol:          defaultPrivGosnmpProtocol(t),
 				PrivacyPassphrase:        "myPrivKey",
 			},
 		},
@@ -228,7 +241,7 @@ func Test_snmpSession_Configure(t *testing.T) {
 				AuthProtocol: "invalid",
 			},
 			expectedVersion:            gosnmp.Version1, // default, not configured
-			expectedError:              fmt.Errorf("unsupported authentication protocol: invalid"),
+			expectedError:              errors.New("unsupported authentication protocol: invalid"),
 			expectedSecurityParameters: nil, // default, not configured
 		},
 		{
@@ -245,7 +258,7 @@ func Test_snmpSession_Configure(t *testing.T) {
 				PrivProtocol: "invalid",
 			},
 			expectedVersion:            gosnmp.Version1, // default, not configured
-			expectedError:              fmt.Errorf("unsupported privacy protocol: invalid"),
+			expectedError:              errors.New("unsupported privacy protocol: invalid"),
 			expectedSecurityParameters: nil, // default, not configured
 		},
 		{
@@ -259,7 +272,7 @@ func Test_snmpSession_Configure(t *testing.T) {
 				OidBatchSize:    100,
 			},
 			expectedVersion: gosnmp.Version1,
-			expectedError:   fmt.Errorf("config oidBatchSize (100) cannot be higher than gosnmp.MaxOids: 60"),
+			expectedError:   errors.New("config oidBatchSize (100) cannot be higher than gosnmp.MaxOids: 60"),
 		},
 	}
 	for _, tt := range tests {
@@ -288,7 +301,7 @@ func Test_snmpSession_traceLog_disabled(t *testing.T) {
 	}
 	var b bytes.Buffer
 	w := bufio.NewWriter(&b)
-	l, err := log.LoggerFromWriterWithMinLevelAndFormat(w, log.InfoLvl, "[%LEVEL] %FuncShort: %Msg")
+	l, err := log.LoggerFromWriterWithMinLevelAndLvlFuncMsgFormat(w, log.InfoLvl)
 	assert.Nil(t, err)
 	log.SetupLogger(l, "info")
 
@@ -305,7 +318,7 @@ func Test_snmpSession_traceLog_enabled(t *testing.T) {
 	}
 	var b bytes.Buffer
 	w := bufio.NewWriter(&b)
-	l, err := log.LoggerFromWriterWithMinLevelAndFormat(w, log.TraceLvl, "[%LEVEL] %FuncShort: %Msg")
+	l, err := log.LoggerFromWriterWithMinLevelAndLvlFuncMsgFormat(w, log.TraceLvl)
 	assert.Nil(t, err)
 	log.SetupLogger(l, "trace")
 
@@ -452,4 +465,84 @@ func TestFetchAllOIDsUsingGetNext_invalidZeroVariable(t *testing.T) {
 
 	resultOIDs := FetchAllOIDsUsingGetNext(sess) // no packet created if variables != 1
 	assert.Equal(t, []string(nil), resultOIDs)
+}
+
+// TestUseUnconnectedUDPSocketPropagation tests that UseUnconnectedUDPSocket config is applied to gosnmp
+func TestUseUnconnectedUDPSocketPropagation(t *testing.T) {
+	tests := []struct {
+		name                    string
+		useUnconnectedUDPSocket bool
+		expectedGosnmpValue     bool
+	}{
+		{
+			name:                    "UseUnconnectedUDPSocket true is propagated",
+			useUnconnectedUDPSocket: true,
+			expectedGosnmpValue:     true,
+		},
+		{
+			name:                    "UseUnconnectedUDPSocket false is propagated",
+			useUnconnectedUDPSocket: false,
+			expectedGosnmpValue:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &checkconfig.CheckConfig{
+				IPAddress:               "127.0.0.1",
+				Port:                    161,
+				CommunityString:         "public",
+				SnmpVersion:             "2c",
+				UseUnconnectedUDPSocket: tt.useUnconnectedUDPSocket,
+			}
+
+			sess, err := NewGosnmpSession(config)
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+
+			gosnmpSess, ok := sess.(*GosnmpSession)
+			require.True(t, ok, "Expected *GosnmpSession type")
+
+			assert.Equal(t, tt.expectedGosnmpValue, gosnmpSess.gosnmpInst.UseUnconnectedUDPSocket,
+				"UseUnconnectedUDPSocket should be propagated to gosnmp instance")
+		})
+	}
+}
+
+// Test_snmpSession_v3DefaultProtocols_FIPSCompatible documents that the default
+// v3 auth/priv protocols always produce usable USM keys, whether or not FIPS
+// mode is active.
+//
+// defaultAuthProtocol/defaultPrivProtocol select MD5/DES outside FIPS mode
+// and SHA256/AES under FIPS mode, since MD5/DES key derivation silently produces
+// an empty key under FIPS mode.
+//
+// NewGosnmpSession only fills the security-parameter struct; the crypto is not
+// exercised until USM key derivation runs. During a real collection that
+// happens lazily inside sess.GetNext (gosnmp's v3 discovery), but that path
+// needs a live device and would time out identically with or without FIPS. So
+// we drive the exact same key-derivation code directly via InitSecurityKeys.
+//
+// Run with GODEBUG=fips140=only to exercise the FIPS branch (SHA256/AES);
+// without it, this exercises the default branch (MD5/DES), which also
+// succeeds since MD5/DES work fine outside FIPS mode.
+func Test_snmpSession_v3DefaultProtocols_FIPSCompatible(t *testing.T) {
+	config := checkconfig.CheckConfig{
+		IPAddress: "1.2.3.4",
+		Port:      uint16(1234),
+		User:      "myUser",
+		AuthKey:   "myAuthKey", // defaults AuthProtocol via defaultAuthProtocol()
+		PrivKey:   "myPrivKey", // defaults PrivProtocol via defaultPrivProtocol()
+	}
+	s, err := NewGosnmpSession(&config)
+	require.NoError(t, err)
+
+	usm := s.(*GosnmpSession).gosnmpInst.SecurityParameters.(*gosnmp.UsmSecurityParameters)
+	// An authoritative engine ID is normally learned during discovery; set one
+	// so key localization runs without a live device.
+	usm.AuthoritativeEngineID = "myEngineID"
+
+	require.NoError(t, usm.InitSecurityKeys())
+	require.NotEmpty(t, usm.SecretKey, "auth key derivation produced no key (FIPS mode?)")
+	require.NotEmpty(t, usm.PrivacyKey, "priv key derivation produced no key (FIPS mode?)")
 }

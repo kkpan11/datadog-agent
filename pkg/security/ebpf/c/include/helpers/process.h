@@ -4,10 +4,9 @@
 #include "constants/custom.h"
 #include "constants/enums.h"
 #include "constants/offsets/process.h"
+#include "cgroup.h"
 #include "maps.h"
 #include "events_definition.h"
-
-#include "container.h"
 
 static __attribute__((always_inline)) void send_signal(u32 pid) {
     if (is_send_signal_available()) {
@@ -38,17 +37,12 @@ void __attribute__((always_inline)) copy_proc_entry(struct process_entry_t *src,
     bpf_probe_read(dst->comm, TASK_COMM_LEN, src->comm);
 }
 
-void __attribute__((always_inline)) copy_proc_cache(struct proc_cache_t *src, struct proc_cache_t *dst) {
-    copy_container_id(src->container.container_id, dst->container.container_id);
-    dst->container.cgroup_context.cgroup_flags = src->container.cgroup_context.cgroup_flags;
-    copy_proc_entry(&src->entry, &dst->entry);
-}
-
 void __attribute__((always_inline)) copy_pid_cache_except_exit_ts(struct pid_cache_t *src, struct pid_cache_t *dst) {
     dst->cookie = src->cookie;
     dst->user_session_id = src->user_session_id;
-    dst->ppid = src->ppid;
     dst->fork_timestamp = src->fork_timestamp;
+    dst->fork_flags = src->fork_flags;
+    dst->sid = src->sid;
     dst->credentials = src->credentials;
 }
 
@@ -74,6 +68,35 @@ struct proc_cache_t *__attribute__((always_inline)) get_proc_cache(u32 tgid) {
     return get_proc_from_cookie(pid_entry->cookie);
 }
 
+// update_proc_cache_cgroup refreshes the cached cgroup inode of the current task inline,
+// for hook points that cannot use the tail-call variant because they already chain to a
+// different tail call (e.g. resolve_dentry).
+static __attribute__((always_inline)) void update_proc_cache_cgroup() {
+    u64 cgroup_id = get_current_cgroup_id();
+    if (cgroup_id) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        struct proc_cache_t *entry = get_proc_cache(pid);
+        if (entry) {
+            entry->cgroup.path_key.ino = cgroup_id;
+        }
+    }
+}
+
+static u32 __attribute__((always_inline)) get_current_ppid(void) {
+    u32 ppid = 0;
+    u64 real_parent_offset = get_task_struct_real_parent_offset();
+    u64 tgid_offset = get_task_struct_tgid_offset();
+    if (real_parent_offset > 0 && tgid_offset > 0) {
+        struct task_struct *cur_task = (struct task_struct *)bpf_get_current_task();
+        struct task_struct *parent = NULL;
+        bpf_probe_read_kernel(&parent, sizeof(parent), (void *)cur_task + real_parent_offset);
+        if (parent) {
+            bpf_probe_read_kernel(&ppid, sizeof(ppid), (void *)parent + tgid_offset);
+        }
+    }
+    return ppid;
+}
+
 static struct proc_cache_t *__attribute__((always_inline)) fill_process_context_with_pid_tgid(struct process_context_t *data, u64 pid_tgid) {
     u32 tgid = pid_tgid >> 32;
 
@@ -88,13 +111,26 @@ static struct proc_cache_t *__attribute__((always_inline)) fill_process_context_
     }
 
     u32 pid = data->pid;
-    // consider kworker a pid which is ignored
-    u32 *is_ignored = bpf_map_lookup_elem(&pid_ignored, &pid);
-    if (is_ignored) {
+    if (IS_KERNEL_THREAD(pid)) {
         data->is_kworker = 1;
     }
 
-    struct proc_cache_t *pc = get_proc_cache(tgid);
+    // Read the live ppid from real_parent->tgid. Only valid when called
+    // from the actual task context (not for stored pid_tgid from io_uring).
+    if (pid_tgid == bpf_get_current_pid_tgid()) {
+        data->ppid = get_current_ppid();
+    }
+
+    struct pid_cache_t *pid_entry = get_pid_cache(tgid);
+    if (!pid_entry) {
+        return NULL;
+    }
+
+    // copy user session id and sid
+    data->user_session_id = pid_entry->user_session_id;
+    data->sid = pid_entry->sid;
+
+    struct proc_cache_t *pc = get_proc_from_cookie(pid_entry->cookie);
     if (pc) {
         data->inode = pc->entry.executable.path_key.ino;
     }
@@ -160,6 +196,21 @@ bool __attribute__((always_inline)) is_current_kworker_dying() {
     char comm[16];
     bpf_get_current_comm(comm, sizeof(comm));
     return comm[0] == 'k' && comm[1] == 'w' && comm[2] == 'o' && comm[3] == 'r' && comm[4] == 'k' && comm[5] == 'e' && comm[6] == 'r' && comm[7] == '/' && comm[8] == 'd' && comm[9] == 'y' && comm[10] == 'i' && comm[11] == 'n' && comm[12] == 'g';
+}
+
+static void __attribute__((always_inline)) fill_cgroup_context(struct proc_cache_t *entry, struct cgroup_context_t *cgroup) {
+    if (entry) {
+        cgroup->path_key = entry->cgroup.path_key;
+    } else {
+        cgroup->path_key.mount_id = 0;
+        cgroup->path_key.path_id = 0;
+        cgroup->path_key.ino = 0;
+    }
+}
+
+u64 __attribute__((always_inline)) get_cgroup_id(u32 tgid) {
+    struct proc_cache_t *entry = get_proc_cache(tgid);
+    return entry ? entry->cgroup.path_key.ino : 0;
 }
 
 #endif

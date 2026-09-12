@@ -25,8 +25,7 @@ that must be implemented by any supported backend, see `include/rtloader.h` for 
 
 ### Common
 
-The `common` folder contains C/C++ modules that are compiled into both
-`libdatadog-agent-three` and `libdatadog-agent-two` to avoid code duplication.
+The `common` folder contains C/C++ modules that are compiled into `libdatadog-agent-three`.
 Most of the code used to extend the embedded interpreter is there.
 
 ## Requirements
@@ -35,6 +34,15 @@ Most of the code used to extend the embedded interpreter is there.
 * Python 3.12.x development packages
 * Cmake version 3.15 or above
 * Go compiler with `cgo` capabilities to run the tests
+
+### Optional Requirements
+
+* [libexecinfo](https://github.com/fam007e/libexecinfo) or [libbacktrace](https://github.com/ianlancetaylor/libbacktrace)
+
+RTLoader can optionally show stack traces when a segfault happens, using `execinfo`, which is provided out of the box by the glibc.
+When building with other libc, you can install the shared libraries `libexecinfo` or `libbacktrace` instead.
+CMake should automatically pick it up so that you don't need to configure anything.
+If it doesn't, you can explicitly tell it where to find those by setting `Backtrace_LIBRARY` and `Backtrace_INCLUDE_DIR` options, eg. `-DBacktrace_LIBRARY=/usr/lib/libexecinfo.so -DBacktrace_INCLUDE_DIR=/usr/include`.
 
 ## Build
 
@@ -49,36 +57,6 @@ Then just run `make` to build the project.
 ## Examples
 
 - [Exposing Go functionality to Python](https://github.com/DataDog/datadog-agent/pull/4234)
-
-## Demo
-
-Examples about how to use RtLoader are provided in form of a C application under `demo`. The application expects to find a
-few things installed in the Python env. To easy development, a virtualenv can be used: the base check
-and the Directory check have to be installed before running the demo, if you have a local clone of `integrations-core`
-that should be a matter of `pip install /path_to_integrations_core/datadog_checks_base` and
-`pip install /path_to_integrations_core/directory`. Then depending on which Python version your virtualenv provides, run:
-
-OSX:
-```
-DYLD_LIBRARY_PATH=./three:./two ./demo/demo 2 $VIRTUAL_ENV
-```
-
-Unix
-```
-LD_LIBRARY_PATH=./three:./two ./demo/demo 2 $VIRTUAL_ENV
-```
-
-or
-
-OSX
-```
-DYLD_LIBRARY_PATH=./three:./two ./demo/demo 3 $VIRTUAL_ENV
-```
-
-Unix
-```
-LD_LIBRARY_PATH=./three:./two ./demo/demo 3 $VIRTUAL_ENV
-```
 
 ## Test
 

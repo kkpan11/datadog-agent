@@ -35,7 +35,7 @@ type Webhook struct {
 	name                    string
 	isEnabled               bool
 	endpoint                string
-	resources               map[string][]string
+	resources               []common.WebhookResourceRule
 	operations              []admissionregistrationv1.OperationType
 	matchConditions         []admissionregistrationv1.MatchCondition
 	demultiplexer           aggregator.Demultiplexer
@@ -50,11 +50,7 @@ func NewWebhook(datadogConfig config.Component, demultiplexer aggregator.Demulti
 		isEnabled: datadogConfig.GetBool("admission_controller.kubernetes_admission_events.enabled"),
 		endpoint:  "/kubernetes-admission-events",
 		// If we add more resources, we must rework the `kube_deployment` tag in the emitEvent() function.
-		resources: map[string][]string{
-			"apps": {
-				"deployments",
-			},
-		},
+		resources: []common.WebhookResourceRule{{APIGroup: "apps", APIVersion: "v1", Resources: []string{"deployments"}}},
 		operations: []admissionregistrationv1.OperationType{
 			admissionregistrationv1.OperationAll,
 		},
@@ -94,8 +90,13 @@ func (w *Webhook) Endpoint() string {
 
 // Resources returns the kubernetes resources for which the webhook should
 // be invoked
-func (w *Webhook) Resources() map[string][]string {
+func (w *Webhook) Resources() []common.WebhookResourceRule {
 	return w.resources
+}
+
+// Timeout returns the timeout for the webhook
+func (w *Webhook) Timeout() int32 {
+	return 0
 }
 
 // Operations returns the operations on the resources specified for which
@@ -107,7 +108,7 @@ func (w *Webhook) Operations() []admissionregistrationv1.OperationType {
 // LabelSelectors returns the label selectors that specify when the webhook
 // should be invoked
 func (w *Webhook) LabelSelectors(useNamespaceSelector bool) (namespaceSelector *metav1.LabelSelector, objectSelector *metav1.LabelSelector) {
-	return common.DefaultLabelSelectors(useNamespaceSelector)
+	return common.DefaultLabelSelectors(useNamespaceSelector, common.LabelSelectorsConfig{})
 }
 
 // MatchConditions returns the Match Conditions used for fine-grained
@@ -189,10 +190,10 @@ func generateDatadogEvent(request *admission.Request, webhookName string) (event
 
 	// Add labels to the tags.
 	for key, value := range newResource.GetLabels() {
-		tags = append(tags, fmt.Sprintf("%s:%s", key, value))
+		tags = append(tags, key+":"+value)
 	}
 	for key, value := range oldResource.GetLabels() {
-		tags = append(tags, fmt.Sprintf("%s:%s", key, value))
+		tags = append(tags, key+":"+value)
 	}
 
 	return event.Event{

@@ -9,6 +9,39 @@ from tasks.libs.common.download import download
 
 DEB_TESTING_BUCKET_URL = "https://apttesting.datad0g.com"
 RPM_TESTING_BUCKET_URL = "https://yumtesting.datad0g.com"
+DOCKER_REGISTRY = "registry.ddbuild.io/ci/datadog-agent"
+INSTALLER_OCI_REGISTRY = "registry.ddbuild.io/ci/remote-updates"
+
+# Maps (binary, flavor) -> Docker tag suffix.
+# Only (binary, flavor) pairs that have a published Docker image are listed.
+# All agent variants share the same `agent` image repo; flavor is encoded in the tag suffix.
+# installer is handled separately via get_installer_oci_url.
+_DOCKER_TAG_SUFFIXES: dict[str, dict[str, str]] = {
+    "agent": {
+        "": "-7",
+        "fips": "-7-fips",
+    },
+    "dogstatsd": {"": ""},
+}
+
+
+def get_docker_image_url(
+    pipeline_id: int,
+    binary: str,
+    flavor: str,
+    arch: str,
+    commit_short_sha: str,
+    ecr_release_suffix: str = "",
+) -> str:
+    flavor_map = _DOCKER_TAG_SUFFIXES.get(binary, {})
+    if flavor not in flavor_map:
+        raise Exit(code=1, message=f"No Docker image for binary='{binary}' flavor='{flavor}'")
+    suffix = flavor_map[flavor]
+    return f"{DOCKER_REGISTRY}/{binary}{ecr_release_suffix}:v{pipeline_id}-{commit_short_sha}{suffix}-{arch}"
+
+
+def get_installer_oci_url(pipeline_id: int) -> str:
+    return f"{INSTALLER_OCI_REGISTRY}/datadog-installer:pipeline-{pipeline_id}"
 
 
 def get_rpm_package_url(ctx: Context, pipeline_id: int, package_name: str, arch: str):
@@ -49,10 +82,10 @@ def get_deb_package_url(_: Context, pipeline_id: int, package_name: str, arch: s
     if arch == "amd64":
         arch2 = "x86_64"
 
-    packages_url = f"{DEB_TESTING_BUCKET_URL}/dists/pipeline-{pipeline_id}-a7-{arch2}/7/binary-{arch}/Packages"
+    packages_url = f"{DEB_TESTING_BUCKET_URL}/datadog-agent/pipeline-{pipeline_id}-a7/dists/stable-{arch2}/7/binary-{arch}/Packages"
 
     filename = _deb_get_filename_for_package(packages_url, package_name)
-    return f"{DEB_TESTING_BUCKET_URL}/{filename}"
+    return f"{DEB_TESTING_BUCKET_URL}/datadog-agent/pipeline-{pipeline_id}-a7/{filename}"
 
 
 def _deb_get_filename_for_package(packages_url: str, target_package_name: str) -> str:

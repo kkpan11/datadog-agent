@@ -8,20 +8,29 @@
 package fileprovider
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
+	auditor "github.com/DataDog/datadog-agent/comp/logs/auditor/mock"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
-	"github.com/DataDog/datadog-agent/pkg/logs/internal/util"
+	configmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/logs/sources"
 	"github.com/DataDog/datadog-agent/pkg/logs/status"
 	tailer "github.com/DataDog/datadog-agent/pkg/logs/tailers/file"
+	"github.com/DataDog/datadog-agent/pkg/logs/util/testutils"
+)
+
+const (
+	fileLimitWarning = "The limit on the maximum number of files in use (%d) has been reached. If you aren't tailing the files you want to be tailing, increase this limit (logs_config.open_files_limit in datadog.yaml), decrease the number of files you are tailing, or alter the logs_config.file_wildcard_selection_mode setting to by_modification_time."
 )
 
 type tempFs struct {
@@ -85,31 +94,31 @@ func (suite *ProviderTestSuite) SetupTest() {
 	suite.testDir = suite.T().TempDir()
 
 	// Create directory tree:
-	path := fmt.Sprintf("%s/1", suite.testDir)
+	path := suite.testDir + "/1"
 	err = os.Mkdir(path, os.ModePerm)
 	suite.Nil(err)
 
-	path = fmt.Sprintf("%s/1/1.log", suite.testDir)
+	path = suite.testDir + "/1/1.log"
 	_, err = os.Create(path)
 	suite.Nil(err)
 
-	path = fmt.Sprintf("%s/1/2.log", suite.testDir)
+	path = suite.testDir + "/1/2.log"
 	_, err = os.Create(path)
 	suite.Nil(err)
 
-	path = fmt.Sprintf("%s/1/3.log", suite.testDir)
+	path = suite.testDir + "/1/3.log"
 	_, err = os.Create(path)
 	suite.Nil(err)
 
-	path = fmt.Sprintf("%s/2", suite.testDir)
+	path = suite.testDir + "/2"
 	err = os.Mkdir(path, os.ModePerm)
 	suite.Nil(err)
 
-	path = fmt.Sprintf("%s/2/1.log", suite.testDir)
+	path = suite.testDir + "/2/1.log"
 	_, err = os.Create(path)
 	suite.Nil(err)
 
-	path = fmt.Sprintf("%s/2/2.log", suite.testDir)
+	path = suite.testDir + "/2/2.log"
 	_, err = os.Create(path)
 	suite.Nil(err)
 }
@@ -119,38 +128,38 @@ func (suite *ProviderTestSuite) TearDownTest() {
 }
 
 func (suite *ProviderTestSuite) TestFilesToTailReturnsSpecificFile() {
-	path := fmt.Sprintf("%s/1/1.log", suite.testDir)
+	path := suite.testDir + "/1/1.log"
 	fileProvider := NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
-	util.CreateSources(logSources)
-	files := fileProvider.FilesToTail(true, logSources)
+	testutils.CreateSources(logSources)
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 
 	suite.Equal(1, len(files))
 	suite.False(files[0].IsWildcardPath)
-	suite.Equal(fmt.Sprintf("%s/1/1.log", suite.testDir), files[0].Path)
+	suite.Equal(suite.testDir+"/1/1.log", files[0].Path)
 	suite.Equal(make([]string, 0), logSources[0].Messages.GetMessages())
 }
 
 func (suite *ProviderTestSuite) TestFilesToTailReturnsAllFilesFromDirectory() {
 	mockConfig := configmock.New(suite.T())
 
-	path := fmt.Sprintf("%s/1/*.log", suite.testDir)
+	path := suite.testDir + "/1/*.log"
 	fileProvider := NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
-	status.InitStatus(mockConfig, util.CreateSources(logSources))
-	files := fileProvider.FilesToTail(true, logSources)
+	status.InitStatus(mockConfig, testutils.CreateSources(logSources))
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 
 	suite.Equal(3, len(files))
 	suite.True(files[0].IsWildcardPath)
 	suite.True(files[1].IsWildcardPath)
 	suite.True(files[2].IsWildcardPath)
-	suite.Equal(fmt.Sprintf("%s/1/3.log", suite.testDir), files[0].Path)
-	suite.Equal(fmt.Sprintf("%s/1/2.log", suite.testDir), files[1].Path)
-	suite.Equal(fmt.Sprintf("%s/1/1.log", suite.testDir), files[2].Path)
+	suite.Equal(suite.testDir+"/1/3.log", files[0].Path)
+	suite.Equal(suite.testDir+"/1/2.log", files[1].Path)
+	suite.Equal(suite.testDir+"/1/1.log", files[2].Path)
 	suite.Equal([]string{"3 files tailed out of 3 files matching"}, logSources[0].Messages.GetMessages())
 	suite.Equal(
 		[]string{
-			"The limit on the maximum number of files in use (3) has been reached. Increase this limit (thanks to the attribute logs_config.open_files_limit in datadog.yaml) or decrease the number of tailed file.",
+			fmt.Sprintf(fileLimitWarning, suite.filesLimit),
 		},
 		status.Get(false).Warnings,
 	)
@@ -159,7 +168,7 @@ func (suite *ProviderTestSuite) TestFilesToTailReturnsAllFilesFromDirectory() {
 func (suite *ProviderTestSuite) TestCollectFilesWildcardFlag() {
 	// with wildcard
 
-	path := fmt.Sprintf("%s/1/*.log", suite.testDir)
+	path := suite.testDir + "/1/*.log"
 	fileProvider := NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
 	files, err := fileProvider.CollectFiles(logSources[0])
@@ -170,7 +179,7 @@ func (suite *ProviderTestSuite) TestCollectFilesWildcardFlag() {
 
 	// without wildcard
 
-	path = fmt.Sprintf("%s/1/1.log", suite.testDir)
+	path = suite.testDir + "/1/1.log"
 	fileProvider = NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources = suite.newLogSources(path)
 	files, err = fileProvider.CollectFiles(logSources[0])
@@ -181,40 +190,40 @@ func (suite *ProviderTestSuite) TestCollectFilesWildcardFlag() {
 }
 
 func (suite *ProviderTestSuite) TestFilesToTailReturnsAllFilesFromAnyDirectoryWithRightPermissions() {
-	path := fmt.Sprintf("%s/*/*1.log", suite.testDir)
+	path := suite.testDir + "/*/*1.log"
 	fileProvider := NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
-	util.CreateSources(logSources)
-	files := fileProvider.FilesToTail(true, logSources)
+	testutils.CreateSources(logSources)
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 
 	suite.Equal(2, len(files))
 	suite.True(files[0].IsWildcardPath)
 	suite.True(files[1].IsWildcardPath)
-	suite.Equal(fmt.Sprintf("%s/2/1.log", suite.testDir), files[0].Path)
-	suite.Equal(fmt.Sprintf("%s/1/1.log", suite.testDir), files[1].Path)
+	suite.Equal(suite.testDir+"/2/1.log", files[0].Path)
+	suite.Equal(suite.testDir+"/1/1.log", files[1].Path)
 	suite.Equal([]string{"2 files tailed out of 2 files matching"}, logSources[0].Messages.GetMessages())
 }
 
 func (suite *ProviderTestSuite) TestFilesToTailReturnsSpecificFileWithWildcard() {
 	mockConfig := configmock.New(suite.T())
 
-	path := fmt.Sprintf("%s/1/?.log", suite.testDir)
+	path := suite.testDir + "/1/?.log"
 	fileProvider := NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
-	status.InitStatus(mockConfig, util.CreateSources(logSources))
-	files := fileProvider.FilesToTail(true, logSources)
+	status.InitStatus(mockConfig, testutils.CreateSources(logSources))
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 
 	suite.Equal(3, len(files))
 	suite.True(files[0].IsWildcardPath)
 	suite.True(files[1].IsWildcardPath)
 	suite.True(files[2].IsWildcardPath)
-	suite.Equal(fmt.Sprintf("%s/1/3.log", suite.testDir), files[0].Path)
-	suite.Equal(fmt.Sprintf("%s/1/2.log", suite.testDir), files[1].Path)
-	suite.Equal(fmt.Sprintf("%s/1/1.log", suite.testDir), files[2].Path)
+	suite.Equal(suite.testDir+"/1/3.log", files[0].Path)
+	suite.Equal(suite.testDir+"/1/2.log", files[1].Path)
+	suite.Equal(suite.testDir+"/1/1.log", files[2].Path)
 	suite.Equal([]string{"3 files tailed out of 3 files matching"}, logSources[0].Messages.GetMessages())
 	suite.Equal(
 		[]string{
-			"The limit on the maximum number of files in use (3) has been reached. Increase this limit (thanks to the attribute logs_config.open_files_limit in datadog.yaml) or decrease the number of tailed file.",
+			fmt.Sprintf(fileLimitWarning, suite.filesLimit),
 		},
 		status.Get(false).Warnings,
 	)
@@ -222,34 +231,34 @@ func (suite *ProviderTestSuite) TestFilesToTailReturnsSpecificFileWithWildcard()
 
 func (suite *ProviderTestSuite) TestWildcardPathsAreSorted() {
 	filesLimit := 6
-	path := fmt.Sprintf("%s/*/*.log", suite.testDir)
+	path := suite.testDir + "/*/*.log"
 	fileProvider := NewFileProvider(filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
-	files := fileProvider.FilesToTail(true, logSources)
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 	suite.Equal(5, len(files))
 	for i := 0; i < len(files); i++ {
 		suite.Assert().True(files[i].IsWildcardPath)
 	}
-	suite.Equal(fmt.Sprintf("%s/1/3.log", suite.testDir), files[0].Path)
-	suite.Equal(fmt.Sprintf("%s/2/2.log", suite.testDir), files[1].Path)
-	suite.Equal(fmt.Sprintf("%s/1/2.log", suite.testDir), files[2].Path)
-	suite.Equal(fmt.Sprintf("%s/2/1.log", suite.testDir), files[3].Path)
-	suite.Equal(fmt.Sprintf("%s/1/1.log", suite.testDir), files[4].Path)
+	suite.Equal(suite.testDir+"/1/3.log", files[0].Path)
+	suite.Equal(suite.testDir+"/2/2.log", files[1].Path)
+	suite.Equal(suite.testDir+"/1/2.log", files[2].Path)
+	suite.Equal(suite.testDir+"/2/1.log", files[3].Path)
+	suite.Equal(suite.testDir+"/1/1.log", files[4].Path)
 }
 
 func (suite *ProviderTestSuite) TestNumberOfFilesToTailDoesNotExceedLimit() {
 	mockConfig := configmock.New(suite.T())
 
-	path := fmt.Sprintf("%s/*/*.log", suite.testDir)
+	path := suite.testDir + "/*/*.log"
 	fileProvider := NewFileProvider(suite.filesLimit, WildcardUseFileName)
 	logSources := suite.newLogSources(path)
-	status.InitStatus(mockConfig, util.CreateSources(logSources))
-	files := fileProvider.FilesToTail(true, logSources)
+	status.InitStatus(mockConfig, testutils.CreateSources(logSources))
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 	suite.Equal(suite.filesLimit, len(files))
 	suite.Equal([]string{"3 files tailed out of 5 files matching"}, logSources[0].Messages.GetMessages())
 	suite.Equal(
 		[]string{
-			"The limit on the maximum number of files in use (3) has been reached. Increase this limit (thanks to the attribute logs_config.open_files_limit in datadog.yaml) or decrease the number of tailed file.",
+			fmt.Sprintf(fileLimitWarning, suite.filesLimit),
 		},
 		status.Get(false).Warnings,
 	)
@@ -260,45 +269,45 @@ func (suite *ProviderTestSuite) TestAllWildcardPathsAreUpdated() {
 	filesLimit := 2
 	fileProvider := NewFileProvider(filesLimit, WildcardUseFileName)
 	logSources := []*sources.LogSource{
-		sources.NewLogSource("", &config.LogsConfig{Type: config.FileType, Path: fmt.Sprintf("%s/1/*.log", suite.testDir)}),
-		sources.NewLogSource("", &config.LogsConfig{Type: config.FileType, Path: fmt.Sprintf("%s/2/*.log", suite.testDir)}),
+		sources.NewLogSource("", &config.LogsConfig{Type: config.FileType, Path: suite.testDir + "/1/*.log"}),
+		sources.NewLogSource("", &config.LogsConfig{Type: config.FileType, Path: suite.testDir + "/2/*.log"}),
 	}
-	status.InitStatus(mockConfig, util.CreateSources(logSources))
-	files := fileProvider.FilesToTail(true, logSources)
+	status.InitStatus(mockConfig, testutils.CreateSources(logSources))
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 	suite.Equal(2, len(files))
 	suite.Equal([]string{"2 files tailed out of 3 files matching"}, logSources[0].Messages.GetMessages())
 	suite.Equal(
 		[]string{
-			"The limit on the maximum number of files in use (2) has been reached. Increase this limit (thanks to the attribute logs_config.open_files_limit in datadog.yaml) or decrease the number of tailed file.",
+			fmt.Sprintf(fileLimitWarning, filesLimit),
 		},
 		status.Get(false).Warnings,
 	)
 	suite.Equal([]string{"0 files tailed out of 2 files matching"}, logSources[1].Messages.GetMessages())
 	suite.Equal(
 		[]string{
-			"The limit on the maximum number of files in use (2) has been reached. Increase this limit (thanks to the attribute logs_config.open_files_limit in datadog.yaml) or decrease the number of tailed file.",
+			fmt.Sprintf(fileLimitWarning, filesLimit),
 		},
 		status.Get(false).Warnings,
 	)
 
-	os.Remove(fmt.Sprintf("%s/1/2.log", suite.testDir))
-	os.Remove(fmt.Sprintf("%s/1/3.log", suite.testDir))
-	os.Remove(fmt.Sprintf("%s/2/2.log", suite.testDir))
-	files = fileProvider.FilesToTail(true, logSources)
+	os.Remove(suite.testDir + "/1/2.log")
+	os.Remove(suite.testDir + "/1/3.log")
+	os.Remove(suite.testDir + "/2/2.log")
+	files = fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 	suite.Equal(2, len(files))
 	suite.Equal([]string{"1 files tailed out of 1 files matching"}, logSources[0].Messages.GetMessages())
 
 	suite.Equal([]string{"1 files tailed out of 1 files matching"}, logSources[1].Messages.GetMessages())
 	suite.Equal(
 		[]string{
-			"The limit on the maximum number of files in use (2) has been reached. Increase this limit (thanks to the attribute logs_config.open_files_limit in datadog.yaml) or decrease the number of tailed file.",
+			fmt.Sprintf(fileLimitWarning, filesLimit),
 		},
 		status.Get(false).Warnings,
 	)
 
-	os.Remove(fmt.Sprintf("%s/2/1.log", suite.testDir))
+	os.Remove(suite.testDir + "/2/1.log")
 
-	files = fileProvider.FilesToTail(true, logSources)
+	files = fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 	suite.Equal(1, len(files))
 	suite.Equal([]string{"1 files tailed out of 1 files matching"}, logSources[0].Messages.GetMessages())
 
@@ -307,21 +316,21 @@ func (suite *ProviderTestSuite) TestAllWildcardPathsAreUpdated() {
 
 func (suite *ProviderTestSuite) TestExcludePath() {
 	filesLimit := 6
-	path := fmt.Sprintf("%s/*/*.log", suite.testDir)
-	excludePaths := []string{fmt.Sprintf("%s/2/*.log", suite.testDir)}
+	path := suite.testDir + "/*/*.log"
+	excludePaths := []string{suite.testDir + "/2/*.log"}
 	fileProvider := NewFileProvider(filesLimit, WildcardUseFileName)
 	logSources := []*sources.LogSource{
 		sources.NewLogSource("", &config.LogsConfig{Type: config.FileType, Path: path, ExcludePaths: excludePaths}),
 	}
 
-	files := fileProvider.FilesToTail(true, logSources)
+	files := fileProvider.FilesToTail(context.Background(), true, logSources, auditor.NewMockAuditor())
 	suite.Equal(3, len(files))
 	for i := 0; i < len(files); i++ {
 		suite.Assert().True(files[i].IsWildcardPath)
 	}
-	suite.Equal(fmt.Sprintf("%s/1/3.log", suite.testDir), files[0].Path)
-	suite.Equal(fmt.Sprintf("%s/1/2.log", suite.testDir), files[1].Path)
-	suite.Equal(fmt.Sprintf("%s/1/1.log", suite.testDir), files[2].Path)
+	suite.Equal(suite.testDir+"/1/3.log", files[0].Path)
+	suite.Equal(suite.testDir+"/1/2.log", files[1].Path)
+	suite.Equal(suite.testDir+"/1/1.log", files[2].Path)
 }
 
 func TestProviderTestSuite(t *testing.T) {
@@ -374,6 +383,77 @@ func TestCollectFiles(t *testing.T) {
 		assert.Equal(t, fs.path("t.log"), files[2].Path)
 		assert.Equal(t, fs.path("z.log"), files[3].Path)
 	})
+
+	t.Run("LiteralPathToDirectoryReturnsError", func(t *testing.T) {
+		fs := newTempFs(t)
+		fs.mkDir("logsdir")
+
+		fileProvider := NewFileProvider(2, WildcardUseFileName)
+		source := sources.NewLogSource("dir", &config.LogsConfig{Type: config.FileType, Path: fs.path("logsdir")})
+		files, err := fileProvider.CollectFiles(source)
+		assert.Empty(t, files)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "is a directory")
+	})
+
+	t.Run("WildcardMatchingOnlyDirectoriesReturnsError", func(t *testing.T) {
+		fs := newTempFs(t)
+		fs.mkDir("alpha")
+		fs.mkDir("beta")
+
+		fileProvider := NewFileProvider(2, WildcardUseFileName)
+		source := sources.NewLogSource("dir-only", &config.LogsConfig{Type: config.FileType, Path: fs.path("*")})
+		files, err := fileProvider.CollectFiles(source)
+		assert.Empty(t, files)
+		assert.Error(t, err)
+		// Directories are filtered silently — a mix of files and subdirectories
+		// is a normal layout and shouldn't generate per-scan noise.
+		assert.Empty(t, source.Messages.GetMessages())
+	})
+
+	t.Run("WildcardSkipsDirectoriesAndKeepsFiles", func(t *testing.T) {
+		fs := newTempFs(t)
+		fs.mkDir("subdir")     // glob match that must be skipped
+		fs.createFile("a.log") // real file
+		fs.createFile("b.log") // real file
+
+		fileProvider := NewFileProvider(5, WildcardUseFileName)
+		source := sources.NewLogSource("mixed", &config.LogsConfig{Type: config.FileType, Path: fs.path("*")})
+		files, err := fileProvider.CollectFiles(source)
+		assert.NoError(t, err)
+		assert.Len(t, files, 2)
+		paths := []string{files[0].Path, files[1].Path}
+		assert.Contains(t, paths, fs.path("a.log"))
+		assert.Contains(t, paths, fs.path("b.log"))
+		assert.NotContains(t, paths, fs.path("subdir"))
+
+		assert.Empty(t, source.Messages.GetMessages())
+	})
+
+	t.Run("RecursiveGlobSkipsDirectoriesAndKeepsFiles", func(t *testing.T) {
+		mockConfig := configmock.New(t)
+		mockConfig.SetInTest("logs_config.enable_recursive_glob", true)
+
+		fs := newTempFs(t)
+		fs.mkDir("alpha")
+		fs.createFile("alpha/a.log")
+		fs.mkDir("alpha/beta")
+		fs.createFile("alpha/beta/b.log")
+
+		fileProvider := NewFileProvider(5, WildcardUseFileName)
+		source := sources.NewLogSource("recursive", &config.LogsConfig{Type: config.FileType, Path: fs.path("**")})
+		files, err := fileProvider.CollectFiles(source)
+		assert.NoError(t, err)
+
+		paths := make([]string, 0, len(files))
+		for _, f := range files {
+			paths = append(paths, f.Path)
+		}
+		assert.Contains(t, paths, fs.path("alpha/a.log"))
+		assert.Contains(t, paths, fs.path("alpha/beta/b.log"))
+		assert.NotContains(t, paths, fs.path("alpha"))
+		assert.NotContains(t, paths, fs.path("alpha/beta"))
+	})
 }
 
 func TestFilesToTail(t *testing.T) {
@@ -395,7 +475,7 @@ func TestFilesToTail(t *testing.T) {
 				sources.NewLogSource("wildcard", &config.LogsConfig{Type: config.FileType, Path: fs.path("a/*")}),
 				sources.NewLogSource("wildcardTwo", &config.LogsConfig{Type: config.FileType, Path: fs.path("b/*")}),
 			}
-			files := fileProvider.FilesToTail(true, sources)
+			files := fileProvider.FilesToTail(context.Background(), true, sources, auditor.NewMockAuditor())
 			assert.Len(t, files, 2)
 			assert.Equal(t, fs.path("a/z"), files[0].Path)
 			assert.Equal(t, fs.path("a/b"), files[1].Path)
@@ -424,7 +504,7 @@ func TestFilesToTail(t *testing.T) {
 				sources.NewLogSource("wildcardC", &config.LogsConfig{Type: config.FileType, Path: fs.path("a/c*")}),
 				sources.NewLogSource("wildcardTwo", &config.LogsConfig{Type: config.FileType, Path: fs.path("b/*")}),
 			}
-			files := fileProvider.FilesToTail(true, sources)
+			files := fileProvider.FilesToTail(context.Background(), true, sources, auditor.NewMockAuditor())
 			assert.Len(t, files, 2)
 			assert.Equal(t, fs.path("a/addd"), files[0].Path)
 			assert.Equal(t, fs.path("a/accc"), files[1].Path)
@@ -445,7 +525,7 @@ func TestFilesToTail(t *testing.T) {
 			sources := []*sources.LogSource{
 				sources.NewLogSource("wildcard", &config.LogsConfig{Type: config.FileType, Path: fs.path("*")}),
 			}
-			files := fileProvider.FilesToTail(true, sources)
+			files := fileProvider.FilesToTail(context.Background(), true, sources, auditor.NewMockAuditor())
 			assert.Len(t, files, 2)
 			assert.Equal(t, fs.path("a.log"), files[0].Path)
 			assert.Equal(t, fs.path("q.log"), files[1].Path)
@@ -465,7 +545,7 @@ func TestFilesToTail(t *testing.T) {
 				sources.NewLogSource("wildcard a", &config.LogsConfig{Type: config.FileType, Path: fs.path("a*")}),
 				sources.NewLogSource("wildcard b", &config.LogsConfig{Type: config.FileType, Path: fs.path("b*")}),
 			}
-			files := fileProvider.FilesToTail(true, sources)
+			files := fileProvider.FilesToTail(context.Background(), true, sources, auditor.NewMockAuditor())
 			assert.Len(t, files, 2)
 			assert.Equal(t, fs.path("abb.log"), files[0].Path)
 			assert.Equal(t, fs.path("aaa.log"), files[1].Path)
@@ -489,11 +569,42 @@ func TestFilesToTail(t *testing.T) {
 			sources.NewLogSource("wildcard", &config.LogsConfig{Type: config.FileType, Path: fs.path("a/*")}),
 			sources.NewLogSource("wildcardTwo", &config.LogsConfig{Type: config.FileType, Path: fs.path("b/*")}),
 		}
-		files := fileProvider.FilesToTail(true, sources)
+		files := fileProvider.FilesToTail(context.Background(), true, sources, auditor.NewMockAuditor())
 		assert.Len(t, files, 2)
 		assert.Equal(t, fs.path("a/c"), files[0].Path)
 		assert.Equal(t, fs.path("b/c"), files[1].Path)
 	})
+}
+
+// TestFilesToTailReportsWildcardMatchingNothing checks that a wildcard source resolving to no files is
+// reported rather than dropped. Both modes are covered because by_modification_time resolves wildcards
+// in a pass of its own, separate from the one every other source goes through, so it can regress alone.
+func TestFilesToTailReportsWildcardMatchingNothing(t *testing.T) {
+	modes := []struct {
+		name              string
+		wildcardSelection WildcardSelectionStrategy
+	}{
+		{"by_name", WildcardUseFileName},
+		{"by_modification_time", WildcardUseFileModTime},
+	}
+
+	for _, mode := range modes {
+		t.Run(mode.name, func(t *testing.T) {
+			fs := newTempFs(t)
+			// A directory the application has not written to yet, as opposed to a missing one, so the
+			// pattern is only unmatched rather than unreachable.
+			fs.mkDir("empty")
+
+			source := sources.NewLogSource("wildcard", &config.LogsConfig{Type: config.FileType, Path: fs.path("empty/*.log")})
+			fileProvider := NewFileProvider(2, mode.wildcardSelection)
+
+			files := fileProvider.FilesToTail(context.Background(), true, []*sources.LogSource{source}, auditor.NewMockAuditor())
+
+			assert.Empty(t, files)
+			assert.True(t, source.Status().IsError(), "a wildcard matching no files has to be reported on the status page")
+			assert.Contains(t, source.Status().GetError(), "could not find any file matching pattern")
+		})
+	}
 }
 
 func BenchmarkApplyOrdering(b *testing.B) {
@@ -654,6 +765,55 @@ func TestApplyOrdering(t *testing.T) {
 	})
 }
 
+func TestCollectFiles_RecursiveGlobEnabled(t *testing.T) {
+	fs := newTempFs(t)
+	fs.mkDir("alpha")
+	fs.mkDir("alpha/beta")
+	fs.mkDir("gamma")
+	fs.createFile("root.log")
+	fs.createFile("alpha/beta/ab.log")
+	fs.createFile("gamma/g.log")
+
+	fileProvider := NewFileProvider(10, WildcardUseFileName)
+	source := sources.NewLogSource("recursive", &config.LogsConfig{
+		Type: config.FileType,
+		Path: fs.path("**/*.log"),
+	})
+	cfg := configmock.New(t)
+	cfg.Set("logs_config.enable_recursive_glob", true, configmodel.SourceCLI)
+	status.InitStatus(cfg, testutils.CreateSources([]*sources.LogSource{source}))
+	files, err := fileProvider.CollectFiles(source)
+	assert.NoError(t, err)
+	paths := make(map[string]bool)
+	for _, f := range files {
+		paths[f.Path] = true
+	}
+	assert.True(t, paths[fs.path("root.log")], "should match top-level file")
+	assert.True(t, paths[fs.path("alpha/beta/ab.log")], "should match nested file")
+	assert.True(t, paths[fs.path("gamma/g.log")], "should match nested file")
+}
+
+func TestCollectFiles_RecursiveGlobDisabled(t *testing.T) {
+	fs := newTempFs(t)
+	fs.mkDir("alpha")
+	fs.mkDir("alpha/beta")
+	fs.createFile("root.log")
+	fs.createFile("alpha/beta/ab.log")
+
+	fileProvider := NewFileProvider(10, WildcardUseFileName)
+	source := sources.NewLogSource("recursive-off", &config.LogsConfig{
+		Type: config.FileType,
+		Path: fs.path("**/*.log"),
+	})
+	cfg := configmock.New(t)
+	cfg.Set("logs_config.enable_recursive_glob", false, configmodel.SourceCLI)
+	status.InitStatus(cfg, testutils.CreateSources([]*sources.LogSource{source}))
+	files, err := fileProvider.CollectFiles(source)
+	// When recursive glob is disabled, a '**' pattern should not expand; expect an error and no matches.
+	assert.Error(t, err)
+	assert.Len(t, files, 0)
+}
+
 func TestContainerIDInContainerLogFile(t *testing.T) {
 	assert := assert.New(t)
 
@@ -686,21 +846,21 @@ func TestContainerIDInContainerLogFile(t *testing.T) {
 	}
 
 	// we've found a symlink validating that the file we have just scanned is concerning the container we're currently processing for this source
-	assert.False(ShouldIgnore(true, &file), "the file existing in ContainersLogsDir is pointing to the same container, scanned file should be tailed")
+	assert.False(ShouldIgnore(true, &file, NewContainerLogSymlinkResolver()), "the file existing in ContainersLogsDir is pointing to the same container, scanned file should be tailed")
 
 	// now, let's change the container for which we are trying to scan files,
 	// because the symlink is pointing from another container, we should ignore
 	// that log file
 	file.Source.Config().Identifier = "1234123412341234123412341234123412341234123412341234123412341234"
-	assert.True(ShouldIgnore(true, &file), "the file existing in ContainersLogsDir is not pointing to the same container, scanned file should be ignored")
+	assert.True(ShouldIgnore(true, &file, NewContainerLogSymlinkResolver()), "the file existing in ContainersLogsDir is not pointing to the same container, scanned file should be ignored")
 
 	// in this scenario, no link is found in /var/log/containers, thus, we should not ignore the file
 	os.Remove("/tmp/myapp_my-namespace_myapp-abcdefabcdefabcdabcdefabcdefabcdabcdefabcdefabcdabcdefabcdefabcd.log")
-	assert.False(ShouldIgnore(true, &file), "no files existing in ContainersLogsDir, we should not ignore the file we have just scanned")
+	assert.False(ShouldIgnore(true, &file, NewContainerLogSymlinkResolver()), "no files existing in ContainersLogsDir, we should not ignore the file we have just scanned")
 
 	// in this scenario, the file we've found doesn't look like a container ID
 	os.Symlink("/var/log/pods/file-uuid-foo-bar.log", "/tmp/myapp_my-namespace_myapp-thisisnotacontainerIDevenifthisispointingtothecorrectfile.log")
-	assert.False(ShouldIgnore(true, &file), "no container ID found, we don't want to ignore this scanned file")
+	assert.False(ShouldIgnore(true, &file, NewContainerLogSymlinkResolver()), "no container ID found, we don't want to ignore this scanned file")
 }
 
 func TestContainerPathsAreCorrectlyIgnored(t *testing.T) {
@@ -740,6 +900,124 @@ func TestContainerPathsAreCorrectlyIgnored(t *testing.T) {
 		kubeSource,
 		sources.NewLogSource("wildcardTwo", &config.LogsConfig{Type: config.FileType, Path: fs.path("b/*")}),
 	}
-	files := fileProvider.FilesToTail(true, sources)
+	files := fileProvider.FilesToTail(context.Background(), true, sources, auditor.NewMockAuditor())
 	assert.Len(t, files, 2) // 1 file from k8s source, 1 file from regular file source.
+}
+
+// containerLogSource builds a Kubernetes container log source/file pair pointing at
+// podLogPath with the given container identifier, for exercising ShouldIgnore.
+func containerLogSource(podLogPath, identifier string) *tailer.File {
+	logSource := sources.NewLogSource("mylogsource", nil)
+	logSource.SetSourceType(sources.KubernetesSourceType)
+	logSource.Config = &config.LogsConfig{
+		Type:       config.FileType,
+		Path:       podLogPath,
+		Identifier: identifier,
+	}
+	return &tailer.File{Path: podLogPath, Source: sources.NewReplaceableSource(logSource)}
+}
+
+const (
+	testMatchingContainerID = "abcdefabcdefabcdabcdefabcdefabcdabcdefabcdefabcdabcdefabcdefabcd"
+	testOtherContainerID    = "1234123412341234123412341234123412341234123412341234123412341234"
+)
+
+// TestContainerLogSymlinkResolverCaching verifies the core behavior introduced by the
+// resolver: the ContainersLogsDir scan happens once and is reused for the lifetime of a
+// single resolver, while a fresh resolver rescans. This is what makes the scan run at
+// most once per launcher scan cycle instead of once per file.
+func TestContainerLogSymlinkResolverCaching(t *testing.T) {
+	origDir := ContainersLogsDir
+	defer func() { ContainersLogsDir = origDir }()
+
+	containersDir := t.TempDir()
+	ContainersLogsDir = containersDir + "/"
+
+	podLog := "/var/log/pods/file-uuid-foo-bar.log"
+	symlink := filepath.Join(containersDir, "myapp_my-namespace_myapp-"+testMatchingContainerID+".log")
+	require.NoError(t, os.Symlink(podLog, symlink))
+
+	// The source identifier deliberately differs from the container ID encoded in the
+	// symlink, so a successful scan classifies the file as "ignore".
+	file := containerLogSource(podLog, testOtherContainerID)
+
+	resolver := NewContainerLogSymlinkResolver()
+	// First call builds and caches the map; mismatch -> ignore.
+	assert.True(t, ShouldIgnore(true, file, resolver))
+
+	// Remove the symlink. A shared resolver must NOT rescan, so it keeps ignoring
+	// based on its cached map.
+	require.NoError(t, os.Remove(symlink))
+	assert.True(t, ShouldIgnore(true, file, resolver),
+		"a reused resolver should serve its cached scan and not observe the removed symlink")
+
+	// A fresh resolver rescans, no longer finds the symlink, and therefore stops ignoring.
+	assert.False(t, ShouldIgnore(true, file, NewContainerLogSymlinkResolver()),
+		"a new resolver should rescan and reflect the removed symlink")
+}
+
+// TestShouldIgnoreNilResolver documents the public contract that a nil resolver is
+// allowed and results in a one-off scan.
+func TestShouldIgnoreNilResolver(t *testing.T) {
+	origDir := ContainersLogsDir
+	defer func() { ContainersLogsDir = origDir }()
+
+	containersDir := t.TempDir()
+	ContainersLogsDir = containersDir + "/"
+
+	podLog := "/var/log/pods/file-uuid-foo-bar.log"
+	require.NoError(t, os.Symlink(podLog, filepath.Join(containersDir, "myapp_my-namespace_myapp-"+testMatchingContainerID+".log")))
+
+	file := containerLogSource(podLog, testMatchingContainerID)
+	// Matching identifier with a nil resolver -> tail.
+	assert.False(t, ShouldIgnore(true, file, nil))
+
+	// Mismatched identifier with a nil resolver -> ignore.
+	file.Source.Config().Identifier = testOtherContainerID
+	assert.True(t, ShouldIgnore(true, file, nil))
+}
+
+// TestShouldIgnoreMissingContainersDir guards the realistic case of a container source on
+// a host without /var/log/containers: the file should be tailed rather than ignored.
+func TestShouldIgnoreMissingContainersDir(t *testing.T) {
+	origDir := ContainersLogsDir
+	defer func() { ContainersLogsDir = origDir }()
+
+	ContainersLogsDir = filepath.Join(t.TempDir(), "does-not-exist") + "/"
+
+	file := containerLogSource("/var/log/pods/file-uuid-foo-bar.log", testMatchingContainerID)
+	assert.False(t, ShouldIgnore(true, file, NewContainerLogSymlinkResolver()),
+		"a missing containers directory should not cause files to be ignored")
+}
+
+func TestCollectFiles_RecursiveGlobWithExcludePaths(t *testing.T) {
+	fs := newTempFs(t)
+	fs.mkDir("alpha")
+	fs.mkDir("alpha/beta")
+	fs.mkDir("gamma")
+	fs.createFile("root.log")
+	fs.createFile("alpha/beta/ab.log")
+	fs.createFile("gamma/g.log")
+
+	fileProvider := NewFileProvider(10, WildcardUseFileName)
+	source := sources.NewLogSource("recursive-exclude", &config.LogsConfig{
+		Type:         config.FileType,
+		Path:         fs.path("**/*.log"),
+		ExcludePaths: []string{fs.path("alpha/**/*.log")},
+	})
+	cfg := configmock.New(t)
+	cfg.Set("logs_config.enable_recursive_glob", true, configmodel.SourceCLI)
+	status.InitStatus(cfg, testutils.CreateSources([]*sources.LogSource{source}))
+
+	files, err := fileProvider.CollectFiles(source)
+	assert.NoError(t, err)
+	paths := make(map[string]bool)
+	for _, f := range files {
+		paths[f.Path] = true
+	}
+	// Included
+	assert.True(t, paths[fs.path("root.log")], "root should be included")
+	assert.True(t, paths[fs.path("gamma/g.log")], "gamma should be included")
+	// Excluded by pattern
+	assert.False(t, paths[fs.path("alpha/beta/ab.log")], "alpha subtree should be excluded by ExcludePaths")
 }

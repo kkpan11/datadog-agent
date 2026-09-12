@@ -4,13 +4,14 @@
 // Copyright 2024-present Datadog, Inc.
 
 // Generate String() methods for nvInfoAttr,nvInfoFormat enums so they can be printed in logs/error messages
-//go:generate go run golang.org/x/tools/cmd/stringer@latest -output cubin_string.go -type=nvInfoAttr,nvInfoFormat -linecomment
+//go:generate go run golang.org/x/tools/cmd/stringer -output cubin_string.go -type=nvInfoAttr,nvInfoFormat -linecomment
 
 package cuda
 
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -179,7 +180,7 @@ func (cp *cubinParser) parseCubinElf(data []byte) error {
 	// Hacks to be able to parse the ELF: the ELF version is not supported by the Go ELF parser, so we need to
 	// trick it into thinking it's the old version. Check for boundaries first
 	if len(data) <= elfVersionOffset {
-		return fmt.Errorf("invalid cubin data, too short")
+		return errors.New("invalid cubin data, too short")
 	}
 	data[elfVersionOffset] = 1
 

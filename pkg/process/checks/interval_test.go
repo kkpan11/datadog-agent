@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 )
 
 func TestLegacyIntervalDefault(t *testing.T) {
@@ -90,7 +89,7 @@ func TestLegacyIntervalOverride(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := configmock.New(t)
-			cfg.SetWithoutSource(tc.setting, override)
+			cfg.SetInTest(tc.setting, override)
 			assert.Equal(t, time.Duration(override)*time.Second, GetInterval(cfg, tc.checkName))
 		})
 	}
@@ -116,35 +115,9 @@ func TestProcessDiscoveryInterval(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := configmock.New(t)
-			cfg.SetWithoutSource("process_config.process_discovery.interval", tc.interval)
+			cfg.SetInTest("process_config.process_discovery.interval", tc.interval)
 
 			assert.Equal(t, tc.expectedInterval, GetInterval(cfg, DiscoveryCheckName))
-		})
-	}
-}
-
-func TestProcessEventsInterval(t *testing.T) {
-	for _, tc := range []struct {
-		name             string
-		interval         time.Duration
-		expectedInterval time.Duration
-	}{
-		{
-			name:             "allowed interval",
-			interval:         30 * time.Second,
-			expectedInterval: 30 * time.Second,
-		},
-		{
-			name:             "below minimum",
-			interval:         0,
-			expectedInterval: pkgconfigsetup.DefaultProcessEventsCheckInterval,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := configmock.New(t)
-			cfg.SetWithoutSource("process_config.event_collection.interval", tc.interval)
-
-			assert.Equal(t, tc.expectedInterval, GetInterval(cfg, ProcessEventsCheckName))
 		})
 	}
 }

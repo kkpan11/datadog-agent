@@ -10,10 +10,10 @@ package jmxfetch
 import (
 	"fmt"
 
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
+	autodiscovery "github.com/DataDog/datadog-agent/comp/core/autodiscovery/def"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -31,13 +31,13 @@ func newJmxScheduler() *JmxScheduler {
 // Schedule implements Scheduler#Schedule.
 func (s *JmxScheduler) Schedule(configs []integration.Config) {
 	for _, config := range configs {
-		if !config.IsCheckConfig() || config.HasFilter(containers.MetricsFilter) {
+		if !config.IsCheckConfig() || config.HasFilter(workloadfilter.MetricsFilter) {
 			continue
 		}
 
 		digest := config.Digest()
 
-		for _, instance := range config.Instances {
+		for instanceIndex, instance := range config.Instances {
 			if !check.IsJMXInstance(config.Name, instance, config.InitConfig) {
 				continue
 			}
@@ -51,6 +51,7 @@ func (s *JmxScheduler) Schedule(configs []integration.Config) {
 				MetricConfig:  config.MetricConfig,
 				Name:          config.Name,
 				Provider:      config.Provider,
+				Source:        fmt.Sprintf("%s[%d]", config.Source, instanceIndex),
 			}
 
 			id := fmt.Sprintf("%v_%x", c.Name, c.IntDigest())

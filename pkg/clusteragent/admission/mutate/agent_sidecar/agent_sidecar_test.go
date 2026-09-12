@@ -8,8 +8,9 @@
 package agentsidecar
 
 import (
+	"encoding/json"
 	"fmt"
-	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,7 +21,7 @@ import (
 	mutatecommon "github.com/DataDog/datadog-agent/pkg/clusteragent/admission/mutate/common"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
-	apicommon "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common"
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common/namespace"
 	"github.com/DataDog/datadog-agent/pkg/util/pointer"
 )
 
@@ -28,7 +29,7 @@ const commonRegistry = "gcr.io/datadoghq"
 
 func TestInjectAgentSidecar(t *testing.T) {
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("admission_controller.agent_sidecar.container_registry", commonRegistry)
+	mockConfig.SetInTest("admission_controller.agent_sidecar.container_registry", commonRegistry)
 	tests := []struct {
 		Name                      string
 		Pod                       *corev1.Pod
@@ -36,6 +37,10 @@ func TestInjectAgentSidecar(t *testing.T) {
 		profilesJSON              string
 		ExpectError               bool
 		ExpectInjection           bool
+		KubernetesAPILogging      bool
+		TLSEnabled                bool
+		TLSCopyCAConfigMap        bool
+		DryRun                    *bool
 		ExpectedPodAfterInjection func() *corev1.Pod
 	}{
 		{
@@ -45,6 +50,7 @@ func TestInjectAgentSidecar(t *testing.T) {
 			profilesJSON:              "",
 			ExpectError:               true,
 			ExpectInjection:           false,
+			KubernetesAPILogging:      false,
 			ExpectedPodAfterInjection: func() *corev1.Pod { return nil },
 		},
 		{
@@ -70,6 +76,8 @@ func TestInjectAgentSidecar(t *testing.T) {
 			ExpectedPodAfterInjection: func() *corev1.Pod {
 				webhook := NewWebhook(mockConfig)
 				sidecar := webhook.getDefaultSidecarTemplate()
+				sidecar.VolumeMounts = readOnlyRootFilesystemVolumeMounts
+
 				webhook.addSecurityConfigToAgent(sidecar)
 				return &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
@@ -81,7 +89,7 @@ func TestInjectAgentSidecar(t *testing.T) {
 							{Name: "container-name"},
 							*sidecar,
 						},
-						Volumes: *webhook.getSecurityVolumeTemplates(),
+						Volumes: readOnlyRootFilesystemVolumes,
 					},
 				}
 			},
@@ -121,6 +129,93 @@ func TestInjectAgentSidecar(t *testing.T) {
 							{Name: "container-name"},
 							sidecar,
 						},
+					},
+				}
+			},
+		},
+		{
+			Name: "should inject sidecar, no security features if default overridden to false and eks logging enabled",
+			Pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-name",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "container-name"},
+					},
+				},
+			},
+			provider: "",
+			profilesJSON: `[{
+				"securityContext": {
+					"readOnlyRootFilesystem": false
+				}
+			}]`,
+			ExpectError:          false,
+			KubernetesAPILogging: true,
+			ExpectInjection:      true,
+			ExpectedPodAfterInjection: func() *corev1.Pod {
+				sidecar := *NewWebhook(mockConfig).getDefaultSidecarTemplate()
+				// Records the false readOnlyRootFilesystem but doesn't add the initContainers, volumes and mounts
+				sidecar.SecurityContext = &corev1.SecurityContext{
+					ReadOnlyRootFilesystem: pointer.Ptr(false),
+				}
+				sidecar.VolumeMounts = kubernetesAPILoggingVolumeMounts
+				return &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod-name",
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{Name: "container-name"},
+							sidecar,
+						},
+						Volumes: kubernetesAPILoggingVolumes,
+					},
+				}
+			},
+		},
+		{
+			Name: "should inject sidecar, security features enabled and eks logging enabled",
+			Pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-name",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "container-name"},
+					},
+				},
+			},
+			provider: "",
+			profilesJSON: `[{
+				"securityContext": {
+					"readOnlyRootFilesystem": true
+				}
+			}]`,
+			ExpectError:          false,
+			KubernetesAPILogging: true,
+			ExpectInjection:      true,
+			ExpectedPodAfterInjection: func() *corev1.Pod {
+				webhook := NewWebhook(mockConfig)
+				sidecar := webhook.getDefaultSidecarTemplate()
+				// Records the false readOnlyRootFilesystem but doesn't add the initContainers, volumes and mounts
+				sidecar.SecurityContext = &corev1.SecurityContext{
+					ReadOnlyRootFilesystem: pointer.Ptr(false),
+				}
+				sidecar.VolumeMounts = readOnlyRootFilesystemVolumeMounts
+				webhook.addSecurityConfigToAgent(sidecar)
+				return &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod-name",
+					},
+					Spec: corev1.PodSpec{
+						InitContainers: []corev1.Container{*webhook.getSecurityInitTemplate()},
+						Containers: []corev1.Container{
+							{Name: "container-name"},
+							*sidecar,
+						},
+						Volumes: readOnlyRootFilesystemVolumes,
 					},
 				}
 			},
@@ -265,6 +360,7 @@ func TestInjectAgentSidecar(t *testing.T) {
 			ExpectedPodAfterInjection: func() *corev1.Pod {
 				webhook := NewWebhook(mockConfig)
 				sidecar := webhook.getDefaultSidecarTemplate()
+				sidecar.VolumeMounts = readOnlyRootFilesystemVolumeMounts
 				webhook.addSecurityConfigToAgent(sidecar)
 				_, _ = withEnvOverrides(
 					sidecar,
@@ -323,7 +419,7 @@ func TestInjectAgentSidecar(t *testing.T) {
 							},
 							*sidecar,
 						},
-						Volumes: append(*webhook.getSecurityVolumeTemplates(),
+						Volumes: append(readOnlyRootFilesystemVolumes,
 							corev1.Volume{
 								Name: "ddsockets",
 								VolumeSource: corev1.VolumeSource{
@@ -372,6 +468,7 @@ func TestInjectAgentSidecar(t *testing.T) {
 			ExpectedPodAfterInjection: func() *corev1.Pod {
 				webhook := NewWebhook(mockConfig)
 				sidecar := webhook.getDefaultSidecarTemplate()
+				sidecar.VolumeMounts = readOnlyRootFilesystemVolumeMounts
 				webhook.addSecurityConfigToAgent(sidecar)
 
 				_, _ = withEnvOverrides(
@@ -449,7 +546,7 @@ func TestInjectAgentSidecar(t *testing.T) {
 							},
 							*sidecar,
 						},
-						Volumes: append(*webhook.getSecurityVolumeTemplates(),
+						Volumes: append(readOnlyRootFilesystemVolumes,
 							corev1.Volume{
 								Name: "ddsockets",
 								VolumeSource: corev1.VolumeSource{
@@ -461,17 +558,109 @@ func TestInjectAgentSidecar(t *testing.T) {
 				}
 			},
 		},
+		{
+			Name: "should inject sidecar with TLS volume mounts and env vars when TLS enabled (self-managed)",
+			Pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-name",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "container-name"},
+					},
+				},
+			},
+			provider:           "",
+			profilesJSON:       "[]",
+			TLSEnabled:         true,
+			TLSCopyCAConfigMap: false,
+			ExpectError:        false,
+			ExpectInjection:    true,
+			ExpectedPodAfterInjection: func() *corev1.Pod {
+				sidecar := *NewWebhook(mockConfig).getDefaultSidecarTemplate()
+
+				// TLS env vars should be added
+				sidecar.Env = append(sidecar.Env, []corev1.EnvVar{
+					{Name: "DD_CLUSTER_TRUST_CHAIN_ENABLE_TLS_VERIFICATION", Value: "true"},
+					{Name: "DD_CLUSTER_TRUST_CHAIN_CA_CERT_FILE_PATH", Value: caCertDirPath + "/ca.crt"},
+				}...)
+				// TLS volume mount should be added
+				sidecar.VolumeMounts = append(sidecar.VolumeMounts, clusterCACertVolumeMount)
+
+				return &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod-name",
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{Name: "container-name"},
+							sidecar,
+						},
+						// TLS volume should be added
+						Volumes: []corev1.Volume{clusterCACertVolume},
+					},
+				}
+			},
+		},
+		{
+			Name: "should inject sidecar with TLS env vars in dry-run mode",
+			Pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-name",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "container-name"},
+					},
+				},
+			},
+			provider:           "",
+			profilesJSON:       "[]",
+			TLSEnabled:         true,
+			TLSCopyCAConfigMap: true,
+			DryRun:             pointer.Ptr(true),
+			ExpectError:        false,
+			ExpectInjection:    true,
+			ExpectedPodAfterInjection: func() *corev1.Pod {
+				sidecar := *NewWebhook(mockConfig).getDefaultSidecarTemplate()
+
+				// TLS env vars should be added in dry-run mode
+				sidecar.Env = append(sidecar.Env, []corev1.EnvVar{
+					{Name: "DD_CLUSTER_TRUST_CHAIN_ENABLE_TLS_VERIFICATION", Value: "true"},
+					{Name: "DD_CLUSTER_TRUST_CHAIN_CA_CERT_FILE_PATH", Value: caCertDirPath + "/ca.crt"},
+				}...)
+				// TLS volume mount should be added in dry-run mode
+				sidecar.VolumeMounts = append(sidecar.VolumeMounts, clusterCACertVolumeMount)
+
+				return &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod-name",
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{Name: "container-name"},
+							sidecar,
+						},
+						// TLS volume should be added in dry-run mode
+						Volumes: []corev1.Volume{clusterCACertVolume},
+					},
+				}
+			},
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.Name, func(tt *testing.T) {
 			mockConfig := configmock.New(t)
-			mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", test.provider)
-			mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", test.profilesJSON)
+			mockConfig.SetInTest("admission_controller.agent_sidecar.provider", test.provider)
+			mockConfig.SetInTest("admission_controller.agent_sidecar.kubelet_api_logging.enabled", test.KubernetesAPILogging)
+			mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", test.profilesJSON)
+			mockConfig.SetInTest("admission_controller.agent_sidecar.cluster_agent.tls_verification.enabled", test.TLSEnabled)
+			mockConfig.SetInTest("admission_controller.agent_sidecar.cluster_agent.tls_verification.copy_ca_configmap", test.TLSCopyCAConfigMap)
 
 			webhook := NewWebhook(mockConfig)
 
-			injected, err := webhook.injectAgentSidecar(test.Pod, "", nil)
+			injected, err := webhook.injectAgentSidecar(test.Pod, "", nil, nil, test.DryRun)
 
 			if test.ExpectError {
 				assert.Error(tt, err, "expected non-nil error to be returned")
@@ -487,17 +676,10 @@ func TestInjectAgentSidecar(t *testing.T) {
 
 			expectedPod := test.ExpectedPodAfterInjection()
 			if expectedPod == nil {
-
 				assert.Nil(tt, test.Pod)
 			} else {
 				assert.NotNil(tt, test.Pod)
-				assert.Truef(
-					tt,
-					reflect.DeepEqual(*expectedPod, *test.Pod),
-					"expected %v, found %v",
-					*expectedPod,
-					*test.Pod,
-				)
+				assertJSONEqual(tt, normalizePod(expectedPod), normalizePod(test.Pod))
 			}
 
 		})
@@ -516,16 +698,16 @@ func TestDefaultSidecarTemplateAgentImage(t *testing.T) {
 			name:              "no configuration set",
 			setConfig:         func() model.Config { return configmock.New(t) },
 			containerRegistry: commonRegistry,
-			expectedImage:     fmt.Sprintf("%s/agent:latest", commonRegistry),
+			expectedImage:     commonRegistry + "/agent:latest",
 		},
 		{
 			name:              "setting custom registry, image and tag",
 			containerRegistry: "my-registry",
 			setConfig: func() model.Config {
 				mockConfig := configmock.New(t)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.container_registry", "my-registry")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.image_name", "my-image")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.image_tag", "my-tag")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.container_registry", "my-registry")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.image_name", "my-image")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.image_tag", "my-tag")
 				return mockConfig
 			},
 			expectedImage: "my-registry/my-image:my-tag",
@@ -553,8 +735,8 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 			name: "cluster agent not enabled",
 			setConfig: func() model.Config {
 				mockConfig := configmock.New(t)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.cluster_agent.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.container_registry", commonRegistry)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.cluster_agent.enabled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.container_registry", commonRegistry)
 				return mockConfig
 			},
 			expectedEnvVars: []corev1.EnvVar{
@@ -574,8 +756,8 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 			name: "cluster agent enabled with default values",
 			setConfig: func() model.Config {
 				mockConfig := configmock.New(t)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.cluster_agent.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.container_registry", commonRegistry)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.cluster_agent.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.container_registry", commonRegistry)
 				return mockConfig
 			},
 			expectedEnvVars: []corev1.EnvVar{
@@ -596,7 +778,7 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 				},
 				{
 					Name:  "DD_CLUSTER_AGENT_URL",
-					Value: fmt.Sprintf("https://datadog-cluster-agent.%s.svc.cluster.local:5005", apicommon.GetMyNamespace()),
+					Value: fmt.Sprintf("https://datadog-cluster-agent.%s.svc.cluster.local:5005", namespace.GetMyNamespace()),
 				},
 				{
 					Name:  "DD_ORCHESTRATOR_EXPLORER_ENABLED",
@@ -612,9 +794,9 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 			name: "cluster agent enabled with language derection enabled",
 			setConfig: func() model.Config {
 				mockConfig := configmock.New(t)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.cluster_agent.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.container_registry", commonRegistry)
-				mockConfig.SetWithoutSource("language_detection.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.cluster_agent.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.container_registry", commonRegistry)
+				mockConfig.SetInTest("language_detection.enabled", true)
 				return mockConfig
 			},
 			expectedEnvVars: []corev1.EnvVar{
@@ -635,7 +817,7 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 				},
 				{
 					Name:  "DD_CLUSTER_AGENT_URL",
-					Value: fmt.Sprintf("https://datadog-cluster-agent.%s.svc.cluster.local:5005", apicommon.GetMyNamespace()),
+					Value: fmt.Sprintf("https://datadog-cluster-agent.%s.svc.cluster.local:5005", namespace.GetMyNamespace()),
 				},
 				{
 					Name:  "DD_ORCHESTRATOR_EXPLORER_ENABLED",
@@ -651,11 +833,11 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 			name: "cluster agent enabled with custom values",
 			setConfig: func() model.Config {
 				mockConfig := configmock.New(t)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.cluster_agent.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.container_registry", commonRegistry)
-				mockConfig.SetWithoutSource("cluster_agent.cmd_port", 12345)
-				mockConfig.SetWithoutSource("cluster_agent.kubernetes_service_name", "test-service-name")
-				mockConfig.SetWithoutSource("language_detection.enabled", "false")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.cluster_agent.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.container_registry", commonRegistry)
+				mockConfig.SetInTest("cluster_agent.cmd_port", 12345)
+				mockConfig.SetInTest("cluster_agent.kubernetes_service_name", "test-service-name")
+				mockConfig.SetInTest("language_detection.enabled", false)
 				return mockConfig
 			},
 			expectedEnvVars: []corev1.EnvVar{
@@ -676,7 +858,7 @@ func TestDefaultSidecarTemplateClusterAgentEnvVars(t *testing.T) {
 				},
 				{
 					Name:  "DD_CLUSTER_AGENT_URL",
-					Value: fmt.Sprintf("https://test-service-name.%s.svc.cluster.local:12345", apicommon.GetMyNamespace()),
+					Value: fmt.Sprintf("https://test-service-name.%s.svc.cluster.local:12345", namespace.GetMyNamespace()),
 				},
 				{
 					Name:  "DD_ORCHESTRATOR_EXPLORER_ENABLED",
@@ -768,7 +950,7 @@ func TestIsReadOnlyRootFilesystem(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(tt *testing.T) {
 			mockConfig := configmock.New(t)
-			mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", test.profile)
+			mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", test.profile)
 			webhook := NewWebhook(mockConfig)
 			sidecar := webhook.getDefaultSidecarTemplate()
 
@@ -788,4 +970,168 @@ func TestIsReadOnlyRootFilesystem(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAttachVolume(t *testing.T) {
+	emptyDir := corev1.Volume{
+		Name: "volume",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		vol      corev1.Volume
+		base     *corev1.Pod
+		expected *corev1.Pod
+		wantErr  bool
+	}{
+		{
+			name: "volume is successfully attached to pod",
+			base: &corev1.Pod{},
+			vol:  emptyDir,
+			expected: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{emptyDir},
+				},
+			},
+		},
+		{
+			name: "volume already attached error",
+			base: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{emptyDir},
+				},
+			},
+			vol: emptyDir,
+			expected: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{emptyDir},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// attach the volume
+			err := attachVolume(tt.base, tt.vol)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("unexpected error: %v", err)
+			}
+			// check the error type
+			if tt.wantErr {
+				assert.IsType(t, &VolumeAlreadyAttached{}, err)
+			}
+			// volume slices are equal
+			assert.ElementsMatch(t, tt.base.Spec.Volumes, tt.expected.Spec.Volumes)
+		})
+	}
+}
+
+func TestMountVolume(t *testing.T) {
+	mount := corev1.VolumeMount{
+		Name:      "volume-mount",
+		MountPath: "/sys/var/log",
+	}
+
+	tests := []struct {
+		name     string
+		mnt      corev1.VolumeMount
+		base     *corev1.Container
+		expected *corev1.Container
+		wantErr  bool
+	}{
+		{
+			name: "mount is successfully mounted",
+			base: &corev1.Container{},
+			mnt:  mount,
+			expected: &corev1.Container{
+				VolumeMounts: []corev1.VolumeMount{mount},
+			},
+		},
+		{
+			name: "path already mounted on container error",
+			base: &corev1.Container{
+				VolumeMounts: []corev1.VolumeMount{mount},
+			},
+			mnt: mount,
+			expected: &corev1.Container{
+				VolumeMounts: []corev1.VolumeMount{mount},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// mount the volume
+			err := mountVolume(tt.base, tt.mnt)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("unexpected error: %v", err)
+			}
+			// check the error type
+			if tt.wantErr {
+				assert.IsType(t, &PathAlreadyMounted{}, err)
+			}
+			// volume slices are equal
+			assert.ElementsMatch(t, tt.base.VolumeMounts, tt.expected.VolumeMounts)
+		})
+	}
+}
+
+// assertJSONEqual() is a helper that outputs a human friendly
+// diff of the pods
+func assertJSONEqual(t *testing.T, a, b interface{}) {
+	t.Helper()
+
+	jsonA, _ := json.MarshalIndent(a, "", "  ")
+	jsonB, _ := json.MarshalIndent(b, "", "  ")
+	assert.JSONEq(t, string(jsonA), string(jsonB))
+}
+
+// normalizePod() sorts the nested slices where, in reality, order does not matter
+// but must be ordered for reflect.DeepEqual() comparison.
+func normalizePod(pod *corev1.Pod) *corev1.Pod {
+	copied := pod.DeepCopy()
+
+	copied.Spec.Containers = sortContainers(copied.Spec.Containers)
+	copied.Spec.Volumes = sortVolumes(copied.Spec.Volumes)
+
+	for i := range copied.Spec.Containers {
+		copied.Spec.Containers[i].VolumeMounts = sortVolumeMounts(copied.Spec.Containers[i].VolumeMounts)
+		copied.Spec.Containers[i].Env = sortEnv(copied.Spec.Containers[i].Env)
+	}
+
+	return copied
+}
+
+func sortContainers(containers []corev1.Container) []corev1.Container {
+	sort.SliceStable(containers, func(i, j int) bool {
+		return containers[i].Name < containers[j].Name
+	})
+	return containers
+}
+
+func sortVolumes(volumes []corev1.Volume) []corev1.Volume {
+	sort.SliceStable(volumes, func(i, j int) bool {
+		return volumes[i].Name < volumes[j].Name
+	})
+	return volumes
+}
+
+func sortVolumeMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
+	sort.SliceStable(mounts, func(i, j int) bool {
+		return mounts[i].MountPath < mounts[j].MountPath
+	})
+	return mounts
+}
+
+func sortEnv(envs []corev1.EnvVar) []corev1.EnvVar {
+	sort.SliceStable(envs, func(i, j int) bool {
+		return envs[i].Name < envs[j].Name
+	})
+	return envs
 }

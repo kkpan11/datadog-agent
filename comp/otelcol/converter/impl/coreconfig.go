@@ -59,7 +59,7 @@ func addEnv(conf *confmap.Conf, coreCfg config.Component) {
 			if profilerOptionsMap["env"] != nil && profilerOptionsMap["env"] != "" {
 				return
 			}
-			if coreCfg.Get("env") == nil || coreCfg.Get("env") == "" {
+			if coreCfg.GetString("env") == "" {
 				return
 			}
 			profilerOptionsMap["env"] = coreCfg.Get("env")
@@ -68,7 +68,7 @@ func addEnv(conf *confmap.Conf, coreCfg config.Component) {
 	*conf = *confmap.NewFromStringMap(stringMapConf)
 }
 
-// addAPIKeySite adds the API key and site from core config to github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog/config.APIConfig.
+// addAPIKeySite adds the API key and site from core config to github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/datadogconfig.APIConfig.
 func addAPIKeySite(conf *confmap.Conf, coreCfg config.Component, compType string, compName string) {
 	stringMapConf := conf.ToStringMap()
 	components, ok := stringMapConf[compType]
@@ -117,7 +117,7 @@ func addAPIKeySite(conf *confmap.Conf, coreCfg config.Component, compType string
 					// if site is nil or empty string, and core config site is unset, set default
 					// site. Site defaults to an empty string in helm chart:
 					// https://github.com/DataDog/helm-charts/blob/datadog-3.86.0/charts/datadog/templates/_otel_agent_config.yaml#L24.
-					apiMap["site"] = "datadoghq.com"
+					apiMap["site"] = defaultSite
 				}
 			}
 
@@ -137,7 +137,7 @@ func addAPIKeySite(conf *confmap.Conf, coreCfg config.Component, compType string
 				}
 			}
 			// TODO: add logic to either fail or log message if api key not found
-			if (apiKey == nil || apiKey == "" || match) && coreCfg.Get("api_key") != nil {
+			if (apiKey == nil || apiKey == "" || match) && coreCfg.IsConfigured("api_key") {
 				apiMap["key"] = coreCfg.GetString("api_key")
 			}
 		}

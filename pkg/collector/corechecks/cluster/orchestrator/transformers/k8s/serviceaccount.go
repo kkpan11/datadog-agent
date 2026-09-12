@@ -18,12 +18,17 @@ import (
 
 // ExtractServiceAccount returns the protobuf model corresponding to a
 // Kubernetes ServiceAccount resource.
+//
+//nolint:revive
 func ExtractServiceAccount(ctx processors.ProcessorContext, sa *corev1.ServiceAccount) *model.ServiceAccount {
 	serviceAccount := &model.ServiceAccount{
 		Metadata: extractMetadata(&sa.ObjectMeta),
 	}
 	if sa.AutomountServiceAccountToken != nil {
 		serviceAccount.AutomountServiceAccountToken = *sa.AutomountServiceAccountToken
+	} else {
+		// Default to true if not set see https://github.com/kubernetes/kubernetes/blob/71fa43e37f198ae8035a96ff9f1c112b03b9e0fa/plugin/pkg/admission/serviceaccount/admission.go#L264.
+		serviceAccount.AutomountServiceAccountToken = true
 	}
 	// Extract secret references.
 	for _, secret := range sa.Secrets {
@@ -44,9 +49,8 @@ func ExtractServiceAccount(ctx processors.ProcessorContext, sa *corev1.ServiceAc
 		})
 	}
 
-	pctx := ctx.(*processors.K8sProcessorContext)
 	serviceAccount.Tags = append(serviceAccount.Tags, transformers.RetrieveUnifiedServiceTags(sa.ObjectMeta.Labels)...)
-	serviceAccount.Tags = append(serviceAccount.Tags, transformers.RetrieveMetadataTags(sa.ObjectMeta.Labels, sa.ObjectMeta.Annotations, pctx.LabelsAsTags, pctx.AnnotationsAsTags)...)
+	serviceAccount.Tags = append(serviceAccount.Tags, transformers.RetrieveTeamTag(sa.ObjectMeta.Labels, sa.ObjectMeta.Annotations)...)
 
 	return serviceAccount
 }

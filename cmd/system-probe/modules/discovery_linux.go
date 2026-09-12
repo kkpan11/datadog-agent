@@ -6,7 +6,7 @@
 package modules
 
 import (
-	discoverymodule "github.com/DataDog/datadog-agent/pkg/collector/corechecks/servicediscovery/module"
+	discoverymodule "github.com/DataDog/datadog-agent/pkg/discovery/module"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/api/module"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/config"
 )
@@ -15,9 +15,8 @@ func init() { registerModule(DiscoveryModule) }
 
 // DiscoveryModule is the discovery module factory.
 var DiscoveryModule = &module.Factory{
-	Name:             config.DiscoveryModule,
-	ConfigNamespaces: []string{"discovery"},
-	Fn:               discoverymodule.NewDiscoveryModule,
+	Name: config.DiscoveryModule,
+	Fn:   discoverymodule.NewDiscoveryModule,
 	NeedsEBPF: func() bool {
 		return false
 	},

@@ -39,8 +39,6 @@ def setup(ctx, force=False):
 
     - force: If True, will override the existing settings
     """
-    print(color_message("* Setting up extensions", Color.BOLD))
-    setup_extensions(ctx)
     print(color_message("* Setting up tasks", Color.BOLD))
     setup_tasks(ctx, force)
     print(color_message("* Setting up tests", Color.BOLD))
@@ -49,6 +47,8 @@ def setup(ctx, force=False):
     setup_settings(ctx, force)
     print(color_message("* Setting up launch settings", Color.BOLD))
     setup_launch(ctx, force)
+    print(color_message("* Setting up extensions", Color.BOLD))
+    setup_extensions(ctx)
 
 
 @task(
@@ -72,6 +72,7 @@ def set_buildtags(
         build_include=build_include,
         build_exclude=build_exclude,
         flavor=flavor,
+        platform="linux",
     )
 
     if not os.path.exists(VSCODE_DIR):
@@ -111,7 +112,8 @@ def setup_devcontainer(
         build_include=build_include,
         build_exclude=build_exclude,
         flavor=flavor,
-        image=image,
+        # Fall back to the default developer environment image when none is given.
+        image=image or devcontainer.DEVCONTAINER_IMAGE,
     )
 
 
@@ -203,16 +205,14 @@ def setup_settings(_, force=False):
         if not force:
             return
 
-    build_tags = sorted(compute_config_build_tags())
+    build_tags = sorted(compute_config_build_tags(platform="linux"))
     with open(template) as template_f, open(settings, "w") as settings_f:
         vscode_config_template = template_f.read()
         settings_f.write(
             vscode_config_template.format(
                 build_tags=",".join(build_tags),
                 workspace_folder=os.getcwd(),
-                excluded_directories=["-rtloader/test", "-test/benchmarks", "-test/integration"]
-                if sys.platform != "linux"
-                else [],
+                excluded_directories=["-rtloader/test", "-test/integration"] if sys.platform != "linux" else [],
             ).replace("'", '"')
         )
     print(color_message("VSCode settings file created successfully.", Color.GREEN))

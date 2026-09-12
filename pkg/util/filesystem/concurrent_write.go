@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -45,7 +46,7 @@ func FetchArtifact[T any](ctx context.Context, location string, factory Artifact
 
 		select {
 		case <-ctx.Done():
-			return zero, fmt.Errorf("unable to read the artifact in the given time")
+			return zero, errors.New("unable to read the artifact in the given time")
 		case <-time.After(retryDelay):
 			// try again
 		}
@@ -86,6 +87,18 @@ func FetchOrCreateArtifact[T any](ctx context.Context, location string, factory 
 	res, err := TryFetchArtifact(location, factory)
 	if err == nil {
 		return res, nil
+	}
+
+	// On Windows, a stale lock file left by a previous run (crash, MSI rollback) may have
+	// restrictive ACLs that prevent the current process from opening it. Removing it first
+	// lets flock.New create a fresh file with correct permissions. This is safe because
+	// Windows prevents deleting a file that another process has open — if Remove succeeds,
+	// no live lock holder exists. On Unix this would be unsafe (unlink succeeds even with
+	// open fds, breaking the mutual-exclusion contract).
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(location + lockSuffix); err == nil {
+			log.Debugf("removed stale lock file for %v", location)
+		}
 	}
 
 	fileLock := flock.New(location + lockSuffix)
@@ -138,7 +151,10 @@ func FetchOrCreateArtifact[T any](ctx context.Context, location string, factory 
 
 		select {
 		case <-ctx.Done():
-			return zero, errors.Join(fmt.Errorf("unable to read the artifact or acquire the lock in the given time"), lockErr)
+			if lockErr != nil {
+				log.Errorf("failed to acquire lock for %v: %v", location, lockErr)
+			}
+			return zero, errors.Join(errors.New("unable to read the artifact or acquire the lock in the given time"), lockErr)
 		case <-time.After(retryDelay):
 			// try again
 		}

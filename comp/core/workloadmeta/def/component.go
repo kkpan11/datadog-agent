@@ -60,9 +60,39 @@ type Component interface {
 	// to this function.
 	GetKubernetesPodByName(podName, podNamespace string) (*KubernetesPod, error)
 
+	// ListKubernetesPods returns metadata about all known Kubernetes pods, equivalent
+	// to all entities with kind KindKubernetesPod.
+	ListKubernetesPods() []*KubernetesPod
+
+	// GetKubeletMetrics returns metadata about kubelet metrics.
+	GetKubeletMetrics() (*KubeletMetrics, error)
+
+	// GetKubeCapabilities returns metadata about kubernetes cluster capabilities.
+	GetKubeCapabilities() (*KubeCapabilities, error)
+
 	// GetKubernetesDeployment returns metadata about a Kubernetes deployment. It fetches
 	// the entity with kind KindKubernetesDeployment and the given ID.
 	GetKubernetesDeployment(id string) (*KubernetesDeployment, error)
+
+	// GetKubernetesNode returns metadata about a Kubernetes node. It fetches
+	// the entity with kind KindKubernetesNode and the given node name as ID.
+	GetKubernetesNode(name string) (*KubernetesNode, error)
+
+	// ListKubernetesNodes returns metadata about all known Kubernetes nodes.
+	ListKubernetesNodes() []*KubernetesNode
+
+	// GetKubernetesKueueQueue returns metadata about a Kubernetes Kueue queue. It fetches
+	// the entity with kind KindKubernetesKueueQueue and the given ID. The ID includes
+	// the queue type, so LocalQueue and ClusterQueue entities are distinct.
+	GetKubernetesKueueQueue(id string) (*KubernetesKueueQueue, error)
+
+	// GetKubernetesKueueResourceFlavor returns metadata about a Kubernetes Kueue ResourceFlavor.
+	// It fetches the entity with kind KindKubernetesKueueResourceFlavor and the given ID.
+	GetKubernetesKueueResourceFlavor(id string) (*KubernetesKueueResourceFlavor, error)
+
+	// GetKubernetesKueueWorkload returns metadata about a Kubernetes Kueue Workload.
+	// It fetches the entity with kind KindKubernetesKueueWorkload and the given ID.
+	GetKubernetesKueueWorkload(id string) (*KubernetesKueueWorkload, error)
 
 	// GetKubernetesMetadata returns metadata about a Kubernetes resource. It fetches
 	// the entity with kind KubernetesMetadata and the given ID.
@@ -96,9 +126,18 @@ type Component interface {
 	// to all entities with kind KindProcess.
 	ListProcesses() []*Process
 
+	// GetContainerForProcess returns the container associated with a process if it exists.
+	// It fetches the entity with kind KindProcess and the given pid and then the entity
+	// with kind KindContainer with the cid from the process entity.
+	GetContainerForProcess(processID string) (*Container, error)
+
 	// GetGPU returns metadata about a GPU device. It fetches the entity
 	// with kind KindGPU and the given ID.
 	GetGPU(id string) (*GPU, error)
+
+	// GetKubelet returns the kubelet. It fetches the entity with kind KindKubelet.
+	// There can only be one kubelet entity so further specification is unnecessary.
+	GetKubelet() (*Kubelet, error)
 
 	// ListGPUs returns metadata about all known GPU devices, equivalent
 	// to all entities with kind KindGPU.
@@ -113,7 +152,12 @@ type Component interface {
 	Notify(events []CollectorEvent)
 
 	// Dump lists the content of the store, for debugging purposes.
+	// When verbose=true, includes per-source entities in addition to merged entities.
 	Dump(verbose bool) WorkloadDumpResponse
+
+	// DumpStructured lists the content of the store as structured entities.
+	// Always returns only merged entities. Use Dump(verbose=true) for per-source details.
+	DumpStructured() WorkloadDumpStructuredResponse
 
 	// ResetProcesses resets the state of the store so that newProcesses are the
 	// only entites stored.

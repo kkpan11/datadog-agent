@@ -20,7 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
@@ -47,8 +46,9 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 
 	// don't use the global store so we can inspect the store without
 	// it being modified by other tests.
-	metaController.store = &metaBundleStore{
-		cache: gocache.New(gocache.NoExpiration, 5*time.Second),
+	metaController.store = &MetaBundleStore{
+		cache:       gocache.New(gocache.NoExpiration, 5*time.Second),
+		subscribers: make(map[string][]chan struct{}),
 	}
 
 	pod1 := newFakePod(
@@ -78,17 +78,13 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 			"metadata-controller",
 			workloadmeta.Event{
 				Type: workloadmeta.EventTypeSet,
-				Entity: &workloadmeta.KubernetesMetadata{
+				Entity: &workloadmeta.KubernetesNode{
 					EntityID: workloadmeta.EntityID{
-						Kind: workloadmeta.KindKubernetesMetadata,
+						Kind: workloadmeta.KindKubernetesNode,
 						ID:   nodeName,
 					},
 					EntityMeta: workloadmeta.EntityMeta{
 						Name: nodeName,
-					},
-					GVR: &schema.GroupVersionResource{
-						Version:  "v1",
-						Resource: "nodes",
 					},
 				},
 			},
@@ -98,7 +94,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 
 	// Wait until the workloadmeta events have been processed
 	require.Eventually(t, func() bool {
-		return len(metaController.wmeta.ListKubernetesMetadata(workloadmeta.IsNodeMetadata)) == 3
+		return len(metaController.wmeta.ListKubernetesNodes()) == 3
 	}, 5*time.Second, 100*time.Millisecond)
 
 	tests := []struct {
@@ -355,7 +351,7 @@ func TestMetadataControllerSyncEndpoints(t *testing.T) {
 			assert.Equal(t, len(tt.expectedBundles), nonNilKeys, "Unexpected metaBundles found")
 
 			for nodeName, expectedMapper := range tt.expectedBundles {
-				metaBundle, ok := metaController.store.get(nodeName)
+				metaBundle, ok := metaController.store.Get(nodeName)
 				require.True(t, ok, "No meta bundle for %s", nodeName)
 				assert.Equal(t, expectedMapper, metaBundle.Services, nodeName)
 			}
@@ -368,8 +364,9 @@ func TestMetadataControllerSyncEndpointSlices(t *testing.T) {
 
 	metaController, informerFactory := newFakeMetadataController(client, newMockWorkloadMeta(t), true)
 
-	metaController.store = &metaBundleStore{
-		cache: gocache.New(gocache.NoExpiration, 5*time.Second),
+	metaController.store = &MetaBundleStore{
+		cache:       gocache.New(gocache.NoExpiration, 5*time.Second),
+		subscribers: make(map[string][]chan struct{}),
 	}
 
 	pod1 := newFakePod(
@@ -399,17 +396,13 @@ func TestMetadataControllerSyncEndpointSlices(t *testing.T) {
 			"metadata-controller",
 			workloadmeta.Event{
 				Type: workloadmeta.EventTypeSet,
-				Entity: &workloadmeta.KubernetesMetadata{
+				Entity: &workloadmeta.KubernetesNode{
 					EntityID: workloadmeta.EntityID{
-						Kind: workloadmeta.KindKubernetesMetadata,
+						Kind: workloadmeta.KindKubernetesNode,
 						ID:   nodeName,
 					},
 					EntityMeta: workloadmeta.EntityMeta{
 						Name: nodeName,
-					},
-					GVR: &schema.GroupVersionResource{
-						Version:  "v1",
-						Resource: "nodes",
 					},
 				},
 			},
@@ -418,7 +411,7 @@ func TestMetadataControllerSyncEndpointSlices(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool {
-		return len(metaController.wmeta.ListKubernetesMetadata(workloadmeta.IsNodeMetadata)) == 3
+		return len(metaController.wmeta.ListKubernetesNodes()) == 3
 	}, 5*time.Second, 100*time.Millisecond)
 
 	tests := []struct {
@@ -647,7 +640,7 @@ func TestMetadataControllerSyncEndpointSlices(t *testing.T) {
 			assert.Equal(t, len(tt.expectedBundles), nonNilKeys, "Unexpected metaBundles found")
 
 			for nodeName, expectedMapper := range tt.expectedBundles {
-				metaBundle, ok := metaController.store.get(nodeName)
+				metaBundle, ok := metaController.store.Get(nodeName)
 				require.True(t, ok, "No meta bundle for %s", nodeName)
 				assert.Equal(t, expectedMapper, metaBundle.Services, nodeName)
 			}
@@ -841,7 +834,7 @@ func newMockWorkloadMeta(t *testing.T) workloadmeta.Component {
 		t,
 		fx.Options(
 			fx.Provide(func() log.Component { return logmock.New(t) }),
-			config.MockModule(),
+			fx.Provide(func() config.Component { return config.NewMock(t) }),
 			workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 		),
 	)
@@ -900,7 +893,7 @@ func newFakeEndpoint(nodeName string, pod corev1.Pod) discv1.Endpoint {
 func (m *metadataController) countNonNilKeys() int {
 	nonNilKeys := 0
 	for _, key := range m.store.listKeys() {
-		value, _ := m.store.get(key)
+		value, _ := m.store.Get(key)
 		if value != nil && len(value.Services) > 0 {
 			nonNilKeys++
 		}
@@ -908,7 +901,7 @@ func (m *metadataController) countNonNilKeys() int {
 	return nonNilKeys
 }
 
-func (m *metaBundleStore) listKeys() []string {
+func (m *MetaBundleStore) listKeys() []string {
 	keys := []string{}
 	for k := range m.cache.Items() {
 		k = strings.TrimPrefix(k, "agent/KubernetesMetadataMapping/")

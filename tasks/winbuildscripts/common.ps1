@@ -90,7 +90,7 @@ function Expand-ModCache() {
 
     $MODCACHE_ROOT = $root
     $MODCACHE_FILE_ROOT = $modcache
-    $MODCACHE_XZ_FILE = Join-Path $MODCACHE_ROOT "$MODCACHE_FILE_ROOT.tar.xz"
+    $MODCACHE_ZST_FILE = Join-Path $MODCACHE_ROOT "$MODCACHE_FILE_ROOT.tar.zst"
     $MODCACHE_TAR_FILE = Join-Path $MODCACHE_ROOT "$MODCACHE_FILE_ROOT.tar"
 
     if (-not $env:GOMODCACHE) {
@@ -98,12 +98,12 @@ function Expand-ModCache() {
         return
     }
 
-    Write-Host "MODCACHE_XZ_FILE $MODCACHE_XZ_FILE MODCACHE_TAR_FILE $MODCACHE_TAR_FILE GOMODCACHE $env:GOMODCACHE"
-    if (Test-Path $MODCACHE_XZ_FILE) {
-        Write-Host "Extracting modcache file $MODCACHE_XZ_FILE"
-        & 7z.exe x $MODCACHE_XZ_FILE -o"$MODCACHE_ROOT" -bt
+    Write-Host "MODCACHE_ZST_FILE $MODCACHE_ZST_FILE MODCACHE_TAR_FILE $MODCACHE_TAR_FILE GOMODCACHE $env:GOMODCACHE"
+    if (Test-Path $MODCACHE_ZST_FILE) {
+        Write-Host "Extracting modcache file $MODCACHE_ZST_FILE"
+        & 7z.exe x $MODCACHE_ZST_FILE -o"$MODCACHE_ROOT" -bt
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to extract $MODCACHE_XZ_FILE"
+            Write-Error "Failed to extract $MODCACHE_ZST_FILE"
             exit 1
         }
         Get-ChildItem $MODCACHE_TAR_FILE
@@ -113,17 +113,21 @@ function Expand-ModCache() {
         # get replaced by the same files
         & 7z.exe x $MODCACHE_TAR_FILE -o"$env:GOMODCACHE\cache" -aoa -bt
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to extract $MODCACHE_XZ_FILE"
+            Write-Error "Failed to extract $MODCACHE_ZST_FILE"
             exit 1
         }
         Write-Host "Modcache extracted"
     } else {
-        Write-Host "Modcache XZ file $MODCACHE_XZ_FILE not found, dependencies will be downloaded"
+        if ($env:CI) {
+            Write-Error "Modcache zst file $MODCACHE_ZST_FILE not found in CI"
+            exit 1
+        }
+        Write-Host "Modcache zst file $MODCACHE_ZST_FILE not found, dependencies will be downloaded"
     }
 
-    if (Test-Path $MODCACHE_XZ_FILE) {
-        Write-Host "Deleting modcache tar.xz $MODCACHE_XZ_FILE"
-        Remove-Item -Force $MODCACHE_XZ_FILE
+    if (Test-Path $MODCACHE_ZST_FILE) {
+        Write-Host "Deleting modcache tar.zst $MODCACHE_ZST_FILE"
+        Remove-Item -Force $MODCACHE_ZST_FILE
     }
     if (Test-Path $MODCACHE_TAR_FILE) {
         Write-Host "Deleting modcache tar $MODCACHE_TAR_FILE"
@@ -134,17 +138,15 @@ function Expand-ModCache() {
 function Install-Deps() {
     Write-Host "Installing python requirements"
     pip3.exe install dda
-    dda self dep sync -f legacy-tasks
+    dda self dep sync -f legacy-build
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to install python requirements"
         exit 1
     }
-    Write-Host "Installing go dependencies"
-    dda inv -- -e deps
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to install dependencies"
-        exit 1
-    }
+    # Note on Go dependencies
+    # CI: downloaded in the CI via the modcache archive, see Expand-ModCache
+    # Locally: go automatically downloads deps when running go build/test.
+    #          if you want to pre-download everything, see `dda inv deps`
 }
 
 function Install-TestingDeps() {
@@ -198,7 +200,7 @@ The name of the secret to fetch
 The field of the secret to fetch. Only used with vault secrets.
 
 .EXAMPLE
-$Env:CODECOV_TOKEN=$(Get-VaultSecret -parameterName "$Env:CODECOV_TOKEN")
+$Env:DD_API_KEY=$(Get-VaultSecret -parameterName "$Env:AGENT_API_KEY_ORG2" -parameterField token)
 
 Fetch a secret and store it in an environment variable
 
@@ -211,7 +213,7 @@ function Get-VaultSecret() {
     $tmpFile = [System.IO.Path]::GetTempFileName()
     try {
         # Use Out-Null to suppress the output of the fetch_secret script
-        & "$PSScriptRoot\..\..\tools\ci\fetch_secret.ps1" -parameterName $parameterName -tempFile "$tmpfile" | Out-Null
+        & "$PSScriptRoot\..\..\tools\ci\fetch_secret.ps1" -parameterName $parameterName -parameterField $parameterField -tempFile "$tmpfile" | Out-Null
         $err = $LASTEXITCODE
         If ($LASTEXITCODE -ne "0") {
             throw "Failed to fetch ${parameterName}: $err"
@@ -298,21 +300,30 @@ function Invoke-BuildScript {
         }
 
         if ($BuildOutOfSource) {
+            # Expand modcache from c:\mnt to avoid needlessly xcopy'ing large tarballs
+            if ($InstallDeps) {
+                Expand-ModCache -root "c:\mnt" -modcache modcache
+            }
+            if ($InstallTestingDeps) {
+                Expand-ModCache -root "c:\mnt" -modcache modcache_tools
+            }
             Enter-BuildRoot
         } else {
             Enter-RepoRoot
+            # Expand modcache from current directory otherwise
+            if ($InstallDeps) {
+                Expand-ModCache -modcache modcache
+            }
+            if ($InstallTestingDeps) {
+                Expand-ModCache -modcache modcache_tools
+            }
         }
 
         Enable-DevEnv
 
-        # Expand modcache
-        # TODO: Can these be moved inside the Install-Deps/Install-TestingDeps functions,
-        #       or is it important that they both be run before `dda inv deps` ?
-        if ($InstallDeps) {
-            Expand-ModCache -modcache modcache
-        }
-        if ($InstallTestingDeps) {
-            Expand-ModCache -modcache modcache_tools
+        # Initialize CI identity if running in CI environment
+        if ($env:CI) {
+            Initialize-CIIdentity
         }
 
         # Install deps
@@ -346,3 +357,24 @@ function Invoke-BuildScript {
         }
     }
 }
+
+<#
+.SYNOPSIS
+Downloads the CI identity client and assumes the CI Identity IAM role.
+
+.DESCRIPTION
+This function downloads the CI identity client from S3 and uses it to assume the CI Identity IAM role.
+It is typically called in CI environments to authenticate with AWS services.
+
+.NOTES
+This function requires AWS CLI to be available and properly configured.
+#>
+function Initialize-CIIdentity() {
+    Write-Host "Assuming CI role..."
+    C:\devtools\ci-identities-gitlab-job-client.exe assume-role
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to assume CI role (exit code: $LASTEXITCODE)"
+        exit 1
+    }
+}
+

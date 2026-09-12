@@ -8,7 +8,7 @@ package server
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -20,7 +20,7 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/tagger/origindetection"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/proto"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 	"github.com/DataDog/datadog-agent/pkg/util/grpc"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -105,7 +105,7 @@ func (s *Server) TaggerStreamEntities(in *pb.StreamTagsRequest, out pb.AgentSecu
 	if streamingID == "" {
 		streamingID = uuid.New().String()
 	}
-	subscriptionID := fmt.Sprintf("streaming-client-%s", streamingID)
+	subscriptionID := "streaming-client-" + streamingID
 
 	// initBurst is a flag indicating if the initial sync is still in progress or not
 	// true means the sync hasn't yet been finalised
@@ -116,7 +116,7 @@ func (s *Server) TaggerStreamEntities(in *pb.StreamTagsRequest, out pb.AgentSecu
 	defer s.throttler.Release(tk)
 
 	subscription, err := s.taggerComponent.Subscribe(subscriptionID, filter)
-	log.Debugf("cluster tagger has just initiated subscription for %q at time %v", subscriptionID, time.Now().Unix())
+	log.Debugf("tagger server has just initiated subscription for %q at time %v", subscriptionID, time.Now().Unix())
 	if err != nil {
 		log.Errorf("Failed to subscribe to tagger for subscription %q", subscriptionID)
 		return err
@@ -124,20 +124,12 @@ func (s *Server) TaggerStreamEntities(in *pb.StreamTagsRequest, out pb.AgentSecu
 
 	defer subscription.Unsubscribe()
 
-	sendFunc := func(chunk []*pb.StreamTagsEvent) error {
-		return grpc.DoWithTimeout(func() error {
-			return out.Send(&pb.StreamTagsResponse{
-				Events: chunk,
-			})
-		}, taggerStreamSendTimeout)
-	}
-
 	for {
 		select {
 		case events, ok := <-subscription.EventsChan():
 			if !ok {
 				log.Warnf("subscriber channel closed, client will reconnect")
-				return fmt.Errorf("subscriber channel closed")
+				return errors.New("subscriber channel closed")
 			}
 
 			ticker.Reset(streamKeepAliveInterval)
@@ -153,7 +145,15 @@ func (s *Server) TaggerStreamEntities(in *pb.StreamTagsRequest, out pb.AgentSecu
 				responseEvents = append(responseEvents, e)
 			}
 
-			if err := processChunksInPlace(responseEvents, s.maxEventSize, computeTagsEventInBytes, sendFunc); err != nil {
+			sendFunc := func(chunk []*pb.StreamTagsEvent) error {
+				return grpc.DoWithTimeout(func() error {
+					return out.Send(&pb.StreamTagsResponse{
+						Events: chunk,
+					})
+				}, taggerStreamSendTimeout)
+			}
+
+			if err := grpc.ProcessChunksInPlace(responseEvents, s.maxEventSize, computeTagsEventInBytes, sendFunc); err != nil {
 				log.Warnf("error sending tagger event: %s", err)
 				s.telemetry.ServerStreamErrors.Inc()
 				return err
@@ -162,7 +162,7 @@ func (s *Server) TaggerStreamEntities(in *pb.StreamTagsRequest, out pb.AgentSecu
 			if initBurst {
 				initBurst = false
 				s.throttler.Release(tk)
-				log.Infof("cluster tagger has just finished initialization for subscription %q at time %v", subscriptionID, time.Now().Unix())
+				log.Infof("tagger server has just finished initialization for subscription %q at time %v", subscriptionID, time.Now().Unix())
 			}
 
 		case <-out.Context().Done():

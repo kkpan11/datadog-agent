@@ -1,6 +1,5 @@
 using Datadog.AgentCustomActions;
 using Datadog.CustomActions;
-using NineDigit.WixSharpExtensions;
 using System;
 using System.IO;
 using System.Linq;
@@ -30,7 +29,7 @@ namespace WixSetup.Datadog_Agent
         // Source directories
         private const string InstallerSource = @"C:\opt\datadog-agent";
         private const string BinSource = @"C:\opt\datadog-agent\bin\agent";
-        private const string EtcSource = @"C:\omnibus-ruby\src\etc\datadog-agent";
+        private const string EtcSource = @"C:\opt\datadog-agent\etc\datadog-agent";
 
         private readonly AgentBinaries _agentBinaries;
         private readonly AgentFeatures _agentFeatures = new();
@@ -75,6 +74,10 @@ namespace WixSetup.Datadog_Agent
                 {
                     AttributesDefinition = "Hidden=yes;Secure=yes"
                 },
+                new Property("DD_APP_KEY")
+                {
+                    AttributesDefinition = "Hidden=yes;Secure=yes"
+                },
                 new Property("DDAGENTUSER_NAME")
                 {
                     AttributesDefinition = "Secure=yes"
@@ -97,6 +100,14 @@ namespace WixSetup.Datadog_Agent
                 {
                     AttributesDefinition = "Secure=yes",
                 },
+                new Property("DD_INFRASTRUCTURE_MODE")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("DD_LOG_LEVEL")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
                 // Custom WindowsBuild property since MSI caps theirs at 9600
                 new Property("DDAGENT_WINDOWSBUILD")
                 {
@@ -107,6 +118,10 @@ namespace WixSetup.Datadog_Agent
                     AttributesDefinition = "Secure=yes"
                 },
                 new Property("FLEET_INSTALL", "0")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("DD_INSTALL_ONLY")
                 {
                     AttributesDefinition = "Secure=yes"
                 },
@@ -125,7 +140,39 @@ namespace WixSetup.Datadog_Agent
                 {
                     AttributesDefinition = "Secure=yes"
                 },
+                new Property("DD_INSTALLER_DEFAULT_PKG_VERSION_DATADOG_APM_INJECT")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
                 new Property("DD_INSTALLER_REGISTRY_URL")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("DD_REMOTE_UPDATES")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("DD_OTELCOLLECTOR_ENABLED")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("DD_PRIVATE_ACTION_RUNNER_ENABLED")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("DD_PRIVATE_ACTION_RUNNER_ACTIONS_ALLOWLIST")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                new Property("KEEP_INSTALLED_PACKAGES")
+                {
+                    AttributesDefinition = "Secure=yes"
+                },
+                // When set to a truthy value (1/true/yes), the installer skips re-applying the
+                // ddagentuser SeDeny*LogonRight assignments so customers can preserve custom
+                // user-rights changes across upgrades. SeServiceLogonRight is always granted
+                // because the Agent service cannot start without it.
+                new Property("DDAGENTUSER_KEEP_RIGHTS")
                 {
                     AttributesDefinition = "Secure=yes"
                 },
@@ -193,6 +240,7 @@ namespace WixSetup.Datadog_Agent
             // Always generate a new GUID otherwise WixSharp will generate one based on
             // the version
             project.ProductId = Guid.NewGuid();
+            project.AlwaysScheduleInitRuntime = false;
             project
                 .SetCustomActions(_agentCustomActions)
                 .SetProjectInfo(
@@ -221,20 +269,23 @@ namespace WixSetup.Datadog_Agent
                     bannerImage: new FileInfo(InstallerBannerImagePath),
                     // $@"{installerSource}\LICENSE" is not RTF and Compiler.AllowNonRtfLicense = true doesn't help.
                     licenceRtfFile: new FileInfo(ProductLicenceRtfFilePath)
-                )
-                .AddDirectories(
-                    CreateProgramFilesFolder(),
-                    CreateAppDataFolder(),
-                    new Dir(new Id("ProgramMenuDatadog"), @"%ProgramMenu%\Datadog",
-                        new ExeFileShortcut
-                        {
-                            Name = "Datadog Agent Manager",
-                            Target = "[AGENT]ddtray.exe",
-                            Arguments = "\"--launch-gui\"",
-                            WorkingDirectory = "AGENT",
-                        }
-                    )
                 );
+
+            // WiX 5 migration: AddDirectories is not available in WixSharp_wix4, add to Dirs array instead
+            project.Dirs = new Dir[]
+            {
+                CreateProgramFilesFolder(),
+                CreateAppDataFolder(),
+                new Dir(new Id("ProgramMenuDatadog"), @"%ProgramMenu%\Datadog",
+                    new ExeFileShortcut
+                    {
+                        Name = "Datadog Agent Manager",
+                        Target = "[AGENT]ddtray.exe",
+                        Arguments = "\"--launch-gui\"",
+                        WorkingDirectory = "AGENT",
+                    }
+                )
+            };
 
             project.SetNetFxPrerequisite(Condition.Net45_Installed,
                 "This application requires the .Net Framework 4.5, or later to be installed.");
@@ -276,7 +327,8 @@ namespace WixSetup.Datadog_Agent
             project.InstallerVersion = 500;
             project.DefaultFeature = _agentFeatures.MainApplication;
             project.Codepage = "1252";
-            project.InstallPrivileges = InstallPrivileges.elevated;
+            // WiX 5 migration: InstallPrivileges is obsolete in WiX4.
+            // Per-machine installation (elevated) is the default, so this line is removed.
             project.LocalizationFile = "localization-en-us.wxl";
             if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AGENT_MSI_OUTDIR")))
             {
@@ -284,17 +336,50 @@ namespace WixSetup.Datadog_Agent
                 project.OutDir = Environment.GetEnvironmentVariable("AGENT_MSI_OUTDIR");
             }
             project.OutFileName = _agentFlavor.PackageOutFileName;
-            project.Package.AttributesDefinition = $"Comments={ProductComment}";
+            // WiX 5 migration: Comments attribute is no longer valid on Package element
+            // The comment is already set via ControlPanelInfo.Comments in SetControlPanelInfo()
 
             // clear default media as we will add it via MediaTemplate
             project.Media.Clear();
             project.WixSourceGenerated += document =>
             {
                 WixSourceGenerated?.Invoke(document);
+
+                // WiX 5 migration: Convert StandardDirectory to Directory with explicit Name attribute.
+                // This is required for MSI administrative install (msiexec /a) to work correctly.
+                //
+                // Background: WiX 5 uses StandardDirectory for well-known folders like ProgramFiles64Folder.
+                // During admin install, StandardDirectory produces a short name (e.g., "PFiles64") instead
+                // of the full name ("ProgramFiles64Folder") because it doesn't populate the Name attribute.
+                //
+                // The datadog-installer bootstrap uses admin install to extract files from the MSI and
+                // expects the path: ...\ProgramFiles64Folder\Datadog\Datadog Agent\bin\datadog-installer.exe
+                // See: pkg/fleet/installer/paths/installer_paths_windows.go - GetAdminInstallerBinaryPath()
+                var standardDir = document.FindAll("StandardDirectory")
+                    .FirstOrDefault(x => x.HasAttribute("Id", "ProgramFiles64Folder"));
+                if (standardDir != null)
+                {
+                    var newDir = new XElement("Directory");
+                    newDir.SetAttributeValue("Id", "ProgramFiles64Folder");
+                    newDir.SetAttributeValue("Name", "ProgramFiles64Folder");
+                    foreach (var child in standardDir.Elements().ToList())
+                    {
+                        child.Remove();
+                        newDir.Add(child);
+                    }
+                    standardDir.ReplaceWith(newDir);
+                }
+
+                // WiX 5 migration: Product was renamed to Package in WiX 4/5
                 document
-                    .Select("Wix/Product")
+                    .Select("Wix/Package")
                     .AddElement("MediaTemplate",
                         "CabinetTemplate=cab{0}.cab; CompressionLevel=high; EmbedCab=yes; MaximumUncompressedMediaSize=2");
+                // WiX 5 migration: SummaryInformation/Comments is a new element in WiX 5
+                // ControlPanelInfo.Comments doesn't generate this, so we add it manually
+                document
+                    .Select("Wix/Package")
+                    .AddElement("SummaryInformation", $"Comments={ProductComment}");
 
                 // Windows Installer (MSI.dll) calls the obsolete SetFileSecurityW function during CreateFolder rollback,
                 // this causes directories in the CreateFolder table to have their SE_DACL_AUTO_INHERITED flag removed.
@@ -302,7 +387,10 @@ namespace WixSetup.Datadog_Agent
                 // to be left behind on uninstall.
                 document.FindAll("CreateFolder")
                     .ForEach(x => x.Remove());
+                // Remove auto-generated RemoveFolder elements, except for ProgramMenuDatadog which is needed
+                // for ICE64 compliance (user profile directories must be in RemoveFile table).
                 document.FindAll("RemoveFolder")
+                    .Where(x => !x.HasAttribute("Id", value => value.Contains("ProgramMenuDatadog")))
                     .ForEach(x => x.Remove());
 
                 // Wix# is auto-adding components for the following directories for some reason, which causes them to be placed
@@ -328,14 +416,15 @@ namespace WixSetup.Datadog_Agent
                         value => value.StartsWith("APPLICATIONDATADIRECTORY") ||
                                  value.StartsWith("EXAMPLECONFSLOCATION")))
                     .ForEach(c => c.SetAttributeValue("KeyPath", "yes"));
+                // WiX 5 migration: WixFailWhenDeferred was replaced with util:FailWhenDeferred element
                 document
-                    .Select("Wix/Product")
-                    .AddElement("CustomActionRef", "Id=WixFailWhenDeferred");
+                    .Select("Wix/Package")
+                    .Add(new XElement(WixExtension.Util.ToXName("FailWhenDeferred")));
+                // WiX 5 migration: Condition is now an attribute, not inner text
                 document
-                    .Select("Wix/Product/InstallExecuteSequence")
+                    .Select("Wix/Package/InstallExecuteSequence")
                     .AddElement("DeleteServices",
-                        value:
-                        "(Installed AND (REMOVE=\"ALL\") AND NOT (WIX_UPGRADE_DETECTED OR UPGRADINGPRODUCTCODE))");
+                        "Condition=(Installed AND (REMOVE=\"ALL\") AND NOT (WIX_UPGRADE_DETECTED OR UPGRADINGPRODUCTCODE))");
 
                 // We don't use the Wix "Merge" MSM feature because it seems to be a no-op...
                 document
@@ -348,20 +437,6 @@ namespace WixSetup.Datadog_Agent
                     .FindAll("Feature")
                     .First(x => x.HasAttribute("Id", value => value == "MainApplication"))
                     .AddElement("MergeRef", "Id=ddnpminstall");
-                // Conditionally include the APM injection MSM while it is in active development to make it easier
-                // to build/ship without it.
-                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WINDOWS_APMINJECT_MODULE")))
-                {
-                    document
-                        .FindAll("Directory")
-                        .First(x => x.HasAttribute("Id", value => value == "AGENT"))
-                        .AddElement("Merge",
-                            $"Id=ddapminstall; SourceFile={BinSource}\\ddapminstall.msm; DiskId=1; Language=1033");
-                    document
-                        .FindAll("Feature")
-                        .First(x => x.HasAttribute("Id", value => value == "MainApplication"))
-                        .AddElement("MergeRef", "Id=ddapminstall");
-                }
                 document
                     .FindAll("Directory")
                     .First(x => x.HasAttribute("Id", value => value == "AGENT"))
@@ -571,7 +646,11 @@ namespace WixSetup.Datadog_Agent
                         Log = "Application",
                         EventMessageFile = $"[AGENT]{Path.GetFileName(_agentBinaries.TraceAgent)}",
                         AttributesDefinition = "SupportsErrors=yes; SupportsInformationals=yes; SupportsWarnings=yes; KeyPath=yes"
-                    }
+                    },
+                    new WixSharp.File(_agentBinaries.DatadogInterop)
+            );
+            var scriptsBinDir = new Dir(new Id("SCRIPTS"), "scripts",
+                 new Files($@"{InstallerSource}\bin\scripts\*")
             );
             var securityAgentService = GenerateDependentServiceInstaller(
                 new Id("ddagentsecurityservice"),
@@ -590,6 +669,45 @@ namespace WixSetup.Datadog_Agent
                 AttributesDefinition = "SupportsErrors=yes; SupportsInformationals=yes; SupportsWarnings=yes; KeyPath=yes"
             }
             );
+            if (_agentFlavor.FlavorName != Constants.FipsFlavor)
+            {
+                var privateActionRunnerService = GenerateDependentServiceInstaller(
+                    new Id("ddagentprivaterunnerservice"),
+                    Constants.PrivateActionRunnerServiceName,
+                    "Datadog Private Action Runner",
+                    "Execute private actions for Datadog",
+                    "[DDAGENTUSER_PROCESSED_FQ_NAME]",
+                    "[DDAGENTUSER_PROCESSED_PASSWORD]");
+                agentBinDir.AddFile(new WixSharp.File(_agentBinaries.PrivateActionRunner, privateActionRunnerService));
+                agentBinDir.Add(new EventSource
+                {
+                    Name = Constants.PrivateActionRunnerServiceName,
+                    Log = "Application",
+                    EventMessageFile = $"[AGENT]{Path.GetFileName(_agentBinaries.PrivateActionRunner)}",
+                    AttributesDefinition = "SupportsErrors=yes; SupportsInformationals=yes; SupportsWarnings=yes; KeyPath=yes"
+                });
+
+                agentBinDir.AddFile(new WixSharp.File(_agentBinaries.ParControl));
+            }
+            var procmgrService = GenerateDependentServiceInstaller(
+                new Id("ddagentprocmgrservice"),
+                Constants.ProcmgrServiceName,
+                "Datadog Process Manager",
+                "Manage Datadog agent processes",
+                "[DDAGENTUSER_PROCESSED_FQ_NAME]",
+                "[DDAGENTUSER_PROCESSED_PASSWORD]");
+            agentBinDir.AddFile(new WixSharp.File(_agentBinaries.ProcmgrService, procmgrService));
+            agentBinDir.Add(new EventSource
+            {
+                Name = Constants.ProcmgrServiceName,
+                Log = "Application",
+                EventMessageFile = $"[AGENT]{Path.GetFileName(_agentBinaries.ProcmgrService)}",
+                AttributesDefinition = "SupportsErrors=yes; SupportsInformationals=yes; SupportsWarnings=yes; KeyPath=yes"
+            });
+            agentBinDir.AddFile(new WixSharp.File(_agentBinaries.Procmgr));
+
+            agentBinDir.AddFile(new WixSharp.File(_agentBinaries.AgentDataPlane));
+
             var targetBinFolder = new Dir(new Id("BIN"), "bin",
                 new WixSharp.File(_agentBinaries.Agent, agentService),
                 // Temporary binary for extracting the embedded Python - will be deleted
@@ -628,8 +746,14 @@ namespace WixSetup.Datadog_Agent
                         Account = "LocalSystem",
                         Vital = true
                     }
-                )
+                ),
+                scriptsBinDir
             );
+            targetBinFolder.AddFile(new WixSharp.File(_agentBinaries.SecretGenericConnector));
+            if (_agentFlavor.FlavorName != Constants.FipsFlavor)
+            {
+                targetBinFolder.AddFile(new WixSharp.File(_agentBinaries.DdCompilePolicy));
+            }
 
             return targetBinFolder;
         }
@@ -639,16 +763,21 @@ namespace WixSetup.Datadog_Agent
             var appData = new Dir(new Id("APPLICATIONDATADIRECTORY"), "Datadog",
                 new DirFiles($@"{EtcSource}\*.yaml.example"),
                 new Dir("checks.d"),
-                new Dir("protected"),
+                new Dir("protected",
+                    new DirFiles($@"{EtcSource}\protected\*")),
                 new Dir("run"),
                 new Dir("logs"),
                 new Dir(new Id("EXAMPLECONFSLOCATION"), "conf.d",
-                    new Files($@"{EtcSource}\extra_package_files\EXAMPLECONFSLOCATION\*")
+                    new Files($@"{EtcSource}\conf.d\*")
                 ));
 
             appData.AddDir(new Dir(new Id("security.d"),
                        "runtime-security.d",
                        new Files($@"{EtcSource}\runtime-security.d\*.*")
+            ));
+
+            appData.AddDir(new Dir("private-action-runner",
+                       new Files($@"{EtcSource}\private-action-runner\*.*")
             ));
 
             return new Dir(new Id("%CommonAppData%"), appData)

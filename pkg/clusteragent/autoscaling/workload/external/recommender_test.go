@@ -18,12 +18,13 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	clock "k8s.io/utils/clock/testing"
 
 	kubeAutoscaling "github.com/DataDog/agent-payload/v5/autoscaling/kubernetes"
 	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
 	datadoghq "github.com/DataDog/datadog-operator/api/datadoghq/v1alpha2"
 
-	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling"
+	autoscalingstore "github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/store"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload/model"
 	"github.com/DataDog/datadog-agent/pkg/util/pointer"
@@ -119,15 +120,19 @@ func TestProcess(t *testing.T) {
 	}.Build()
 
 	// setup store
-	store := autoscaling.NewStore[model.PodAutoscalerInternal]()
-	store.Set("default/autoscaler1", dpaExternal, "")
-	store.Set("default/autoscaler2", dpaLocal, "")
+	store := autoscalingstore.NewStore[model.PodAutoscalerInternal]()
+	item1, _ := store.Get("default/autoscaler1")
+	item1.Upsert(dpaExternal, "")
+	item2, _ := store.Get("default/autoscaler2")
+	item2.Upsert(dpaLocal, "")
 
 	// test
-	recommender := NewRecommender(pw, store, "test-cluster")
+	fakeClock := clock.NewFakeClock(time.Now())
+	recommender, err := NewRecommender(ctx, fakeClock, pw, store, "test-cluster", nil)
+	assert.NoError(t, err)
 	recommender.process(ctx)
 
-	paiExternal, found := store.Get("default/autoscaler1")
+	paiExternal, found := store.Peek("default/autoscaler1")
 	assert.True(t, found)
 	assert.Nil(t, paiExternal.MainScalingValues().HorizontalError)
 	assert.Equal(t, datadoghqcommon.DatadogPodAutoscalerExternalValueSource, paiExternal.MainScalingValues().Horizontal.Source)
@@ -135,7 +140,7 @@ func TestProcess(t *testing.T) {
 	assert.Equal(t, recommendationTimestamp.Unix(), paiExternal.MainScalingValues().Horizontal.Timestamp.Unix())
 
 	// Autoscalers without external recommender annotation should not be updated
-	paiLocal, found := store.Get("default/autoscaler2")
+	paiLocal, found := store.Peek("default/autoscaler2")
 	assert.True(t, found)
 	assert.Equal(t, paiLocal.MainScalingValues(), model.ScalingValues{})
 }

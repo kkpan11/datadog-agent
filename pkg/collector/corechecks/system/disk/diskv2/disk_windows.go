@@ -8,23 +8,52 @@
 package diskv2
 
 import (
+	"errors"
 	"fmt"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
-	win "golang.org/x/sys/windows"
 	"slices"
 	"strings"
 	"unsafe"
 
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 	gopsutil_disk "github.com/shirou/gopsutil/v4/disk"
+	win "golang.org/x/sys/windows"
 )
+
+var defaultStatFn statFunc = func(_ string) (StatT, error) { return StatT{}, nil }
+
+// GetDriveTypeFn returns the Windows drive type for a given path.
+// It is a variable so it can be overridden in tests.
+var GetDriveTypeFn = func(path string) uint32 {
+	typePath, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		return win.DRIVE_UNKNOWN
+	}
+	return win.GetDriveType(typePath)
+}
 
 func defaultIgnoreCase() bool {
 	return true
 }
 
 func baseDeviceName(device string) string {
-	return strings.ToLower(strings.Trim(device, "\\"))
+	return normalizeWindowsDeviceName(device)
+}
+
+// normalizeDeviceTag returns the device name for use in the device: tag.
+func normalizeDeviceTag(deviceName string) string {
+	return normalizeWindowsDeviceName(deviceName)
+}
+
+// normalizeWindowsDeviceName strips the surrounding backslashes of a Windows
+// device name (C:\ -> c:), turns the remaining ones into forward slashes
+// (F:\Tlog -> f:/tlog), and lowercases the result.
+//
+// Backslashes must never reach the backend: metric intake normalizes the
+// device resource with \ -> / but tag values with \ -> _, so a raw backslash
+// records the same volume under two device values.
+func normalizeWindowsDeviceName(deviceName string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.Trim(deviceName, `\`), `\`, "/"))
 }
 
 func (c *Check) fetchAllDeviceLabelsFromLsblk() error {
@@ -40,10 +69,13 @@ func (c *Check) fetchAllDeviceLabelsFromBlkid() error {
 }
 
 func (c *Check) excludePartitionInPlatform(partition gopsutil_disk.PartitionStat) bool {
-	/* skip cd-rom drives with no disk in it; they may raise
-	ENOENT, pop-up a Windows GUI error for a non-ready
-	partition or just hang;
-	and all the other excluded disks */
+	// Skip CD-ROM drives entirely, including inserted CDFS/UDF media.
+	// gopsutil does not expose drive type in PartitionStat on Windows, so use
+	// the same GetDriveType API that psutil uses under the Python disk check.
+	if GetDriveTypeFn(partition.Mountpoint) == win.DRIVE_CDROM {
+		return true
+	}
+
 	return slices.Contains(partition.Opts, "cdrom") || partition.Fstype == ""
 }
 
@@ -147,5 +179,18 @@ func wNetAddConnection2(localName, remoteName, password, username string) error 
 	return nil
 }
 
+// isExpectedIOCounterError returns true for Windows errors that indicate the
+// system does not support IOCTL_DISK_PERFORMANCE (e.g. disk performance
+// counters disabled on Windows Server 2016, or virtual drives like Google Drive).
+func isExpectedIOCounterError(err error) bool {
+	return errors.Is(err, win.ERROR_INVALID_FUNCTION) || errors.Is(err, win.ERROR_NOT_SUPPORTED)
+}
+
 func (c *Check) sendInodesMetrics(_ sender.Sender, _ *gopsutil_disk.UsageStat, _ []string) {
+}
+
+func (c *Check) loadRootDevices() (map[string]string, error) {
+	rootDevices := make(map[string]string)
+
+	return rootDevices, nil
 }

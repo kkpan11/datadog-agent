@@ -6,42 +6,47 @@
 package apiimpl
 
 import (
+	"crypto/tls"
 	"net/http"
 	"time"
 
 	configendpoint "github.com/DataDog/datadog-agent/comp/api/api/apiimpl/internal/config"
+	"github.com/DataDog/datadog-agent/comp/api/api/apiimpl/listener"
 	"github.com/DataDog/datadog-agent/comp/api/api/apiimpl/observability"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 )
 
 const ipcServerName string = "IPC API Server"
 const ipcServerShortName string = "IPC"
 
 func (server *apiServer) startIPCServer(ipcServerAddr string, tmf observability.TelemetryMiddlewareFactory) (err error) {
-	server.ipcListener, err = getListener(ipcServerAddr)
+	ipcListener, err := listener.GetListener(ipcServerAddr)
 	if err != nil {
 		return err
 	}
+	server.ipcAddr = ipcListener.Addr()
 
 	configEndpointMux := configendpoint.GetConfigEndpointMuxCore(server.cfg)
-	configEndpointMux.Use(validateToken)
 
 	ipcMux := http.NewServeMux()
 	ipcMux.Handle(
 		"/config/v1/",
-		http.StripPrefix("/config/v1", configEndpointMux))
+		observability.MountWithPrefix("/config/v1", configEndpointMux))
 
 	// add some observability
 	ipcMuxHandler := tmf.Middleware(ipcServerShortName)(ipcMux)
 	ipcMuxHandler = observability.LogResponseHandler(ipcServerName)(ipcMuxHandler)
 
+	serverTLSConfig := server.ipc.GetTLSServerConfig()
+	serverTLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+
 	ipcServer := &http.Server{
 		Addr:      ipcServerAddr,
-		Handler:   http.TimeoutHandler(ipcMuxHandler, time.Duration(pkgconfigsetup.Datadog().GetInt64("server_timeout"))*time.Second, "timeout"),
-		TLSConfig: server.ipc.GetTLSServerConfig(),
+		Handler:   http.TimeoutHandler(ipcMuxHandler, time.Duration(server.cfg.GetInt64("server_timeout"))*time.Second, "timeout"),
+		TLSConfig: serverTLSConfig,
 	}
 
-	startServer(server.ipcListener, ipcServer, ipcServerName)
+	server.ipcServer = ipcServer
+	startServer(ipcListener, ipcServer, ipcServerName)
 
 	return nil
 }

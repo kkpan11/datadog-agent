@@ -17,19 +17,21 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/installer/command"
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/sysprobeconfigimpl"
-	"github.com/DataDog/datadog-agent/comp/updater/localapiclient"
-	"github.com/DataDog/datadog-agent/comp/updater/localapiclient/localapiclientimpl"
+	sysprobeconfigimpl "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/impl"
+	localapiclient "github.com/DataDog/datadog-agent/comp/updater/localapiclient/def"
+	localapiclientfx "github.com/DataDog/datadog-agent/comp/updater/localapiclient/fx"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
 type cliParams struct {
 	command.GlobalParams
-	pkg     string
-	version string
-	catalog string
+	pkg              string
+	version          string
+	catalog          string
+	configs          string
+	encryptedSecrets map[string]string
 }
 
 func apiCommands(global *command.GlobalParams) []*cobra.Command {
@@ -45,6 +47,20 @@ func apiCommands(global *command.GlobalParams) []*cobra.Command {
 			})
 		},
 	}
+
+	setConfigCatalogCmd := &cobra.Command{
+		Hidden: true,
+		Use:    "set-config-catalog configs",
+		Short:  "Internal command to set the config catalog to use",
+		Args:   cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return experimentFxWrapper(setConfigCatalog, &cliParams{
+				GlobalParams: *global,
+				configs:      args[0],
+			})
+		},
+	}
+
 	installCmd := &cobra.Command{
 		Use:     "install package version",
 		Aliases: []string{"install"},
@@ -111,14 +127,20 @@ func apiCommands(global *command.GlobalParams) []*cobra.Command {
 		Aliases: []string{"start-config"},
 		Short:   "Starts an experiment",
 		Args:    cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			secrets, err := cmd.Flags().GetStringToString("secret")
+			if err != nil {
+				return err
+			}
 			return experimentFxWrapper(startConfig, &cliParams{
-				GlobalParams: *global,
-				pkg:          args[0],
-				version:      args[1],
+				GlobalParams:     *global,
+				pkg:              args[0],
+				version:          args[1],
+				encryptedSecrets: secrets,
 			})
 		},
 	}
+	startConfigExperimentCmd.Flags().StringToString("secret", nil, "Encrypted secret as key=value pairs")
 	stopConfigExperimentCmd := &cobra.Command{
 		Use:     "stop-config-experiment package",
 		Aliases: []string{"stop-config"},
@@ -155,6 +177,7 @@ func apiCommands(global *command.GlobalParams) []*cobra.Command {
 	}
 	return []*cobra.Command{
 		setCatalogCmd,
+		setConfigCatalogCmd,
 		startExperimentCmd,
 		stopExperimentCmd,
 		promoteExperimentCmd,
@@ -171,13 +194,13 @@ func experimentFxWrapper(f interface{}, params *cliParams) error {
 	return fxutil.OneShot(f,
 		fx.Supply(core.BundleParams{
 			ConfigParams:         config.NewAgentParams(params.ConfFilePath),
-			SecretParams:         secrets.NewEnabledParams(),
 			SysprobeConfigParams: sysprobeconfigimpl.NewParams(),
 			LogParams:            log.ForOneShot("INSTALLER", "off", true),
 		}),
-		core.Bundle(),
+		core.Bundle(core.WithSecrets()),
+		hostnameimpl.Module(),
 		fx.Supply(params),
-		localapiclientimpl.Module(),
+		localapiclientfx.Module(),
 	)
 }
 
@@ -185,6 +208,15 @@ func catalog(params *cliParams, client localapiclient.Component) error {
 	err := client.SetCatalog(params.catalog)
 	if err != nil {
 		fmt.Println("Error setting catalog:", err)
+		return err
+	}
+	return nil
+}
+
+func setConfigCatalog(params *cliParams, client localapiclient.Component) error {
+	err := client.SetConfigCatalog(params.configs)
+	if err != nil {
+		fmt.Println("Error setting config catalog:", err)
 		return err
 	}
 	return nil
@@ -218,7 +250,7 @@ func promote(params *cliParams, client localapiclient.Component) error {
 }
 
 func startConfig(params *cliParams, client localapiclient.Component) error {
-	err := client.StartConfigExperiment(params.pkg, params.version)
+	err := client.StartConfigExperiment(params.pkg, params.version, params.encryptedSecrets)
 	if err != nil {
 		fmt.Println("Error starting config experiment:", err)
 		return err

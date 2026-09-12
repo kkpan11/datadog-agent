@@ -9,45 +9,42 @@ package ddflareextensionimpl
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
 
-	"github.com/gorilla/mux"
-
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	"github.com/DataDog/datadog-agent/pkg/api/coverage"
+	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
+
+var errNoIPCComponent = errors.New("cannot start the Datadog flare extension server: no IPC component provided, which is required to authenticate requests")
 
 type server struct {
 	srv      *http.Server
 	listener net.Listener
 }
 
-// validateToken - validates token for legacy API
-func validateToken(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := util.Validate(w, r); err != nil {
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func newServer(endpoint string, handler http.Handler, auth bool) (*server, error) {
-	r := mux.NewRouter()
+func newServer(endpoint string, handler http.Handler, optIpcComp option.Option[ipc.Component]) (*server, error) {
+	r := http.NewServeMux()
 	r.Handle("/", handler)
-
-	// no easy way currently to pass required bearer auth token to OSS collector;
-	// skip the validation if running inside a separate collector
-	// TODO: determine way to allow OSS collector to authenticate with agent, OTEL-2226
-	if auth && util.GetAuthToken() != "" {
-		r.Use(validateToken)
-	}
+	coverage.SetupCoverageHandler(r)
 
 	s := &http.Server{
-		Addr:      endpoint,
-		TLSConfig: util.GetTLSServerConfig(),
-		Handler:   r,
+		Addr:    endpoint,
+		Handler: r,
 	}
+
+	// The IPC component is mandatory: it supplies both the TLS server config and the
+	// authentication middleware for this endpoint. Serving without it would expose the
+	// Agent's effective configuration, environment and status to any local caller, so
+	// fail closed rather than falling back to an unauthenticated listener.
+	ipcComp, ok := optIpcComp.Get()
+	if !ok {
+		return nil, errNoIPCComponent
+	}
+	s.TLSConfig = ipcComp.GetTLSServerConfig()
+	s.Handler = ipcComp.HTTPMiddleware(r)
 
 	listener, err := net.Listen("tcp", endpoint)
 	if err != nil {
@@ -68,5 +65,12 @@ func (s *server) start() error {
 }
 
 func (s *server) shutdown(ctx context.Context) error {
-	return s.srv.Shutdown(ctx)
+	if err := s.srv.Shutdown(ctx); err != nil {
+		return err
+	}
+	// close `tlsListener` in case the server was never started.
+	if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
 }

@@ -32,10 +32,12 @@ class RtLoader
 {
 public:
     //! Constructor.
-    RtLoader(cb_memory_tracker_t memtrack_cb);
+    RtLoader(rtloader_malloc_t, rtloader_free_t);
 
     //! Destructor.
+    // clang-format off
     virtual ~RtLoader(){};
+    // clang-format on
 
     // Public API
     //! Pure virtual init member.
@@ -103,13 +105,22 @@ public:
       \param check_id_str A C-string containing the identifier for the check instance.
       \param check_name A C-string containing the check name.
       \param agent_config_str A C-string containing the full agent configuration.
+      \param provider A C-string containing the configuration provider name for the check instance.
       \param check The output python object pointer to the instantiated check, if we succeed.
       \return A boolean indicating the success or not of the operation.
     */
     virtual bool getCheck(RtLoaderPyObject *py_class, const char *init_config_str, const char *instance_str,
                           const char *check_id_str, const char *check_name, const char *agent_config_str,
-                          RtLoaderPyObject *&check)
+                          const char *provider, RtLoaderPyObject *&check)
         = 0;
+
+    //! Pure virtual discoverConfig member.
+    /*!
+      \param py_class The python check class we wish to run discovery against.
+      \param service_json A JSON C-string containing service metadata for discovery.
+      \return A C-string with the JSON serialized discovered configs, or NULL on error.
+    */
+    virtual char *discoverConfig(RtLoaderPyObject *py_class, const char *service_json) = 0;
 
     //! Pure virtual runCheck member.
     /*!
@@ -237,9 +248,6 @@ public:
       \return A yaml-encoded C-string with the list of every datadog integration wheel installed.
     */
     virtual char *getIntegrationList() = 0;
-#define _PY_MEM_MODULE "utils.py_mem"
-#define _PY_MEM_SUMMARY_FUNC "get_mem_stats"
-    virtual char *getInterpreterMemoryUsage() = 0;
 
     // aggregator API
     //! setSubmitMetricCb member.
@@ -514,6 +522,22 @@ public:
     */
     virtual void setEmitAgentTelemetryCb(cb_emit_agent_telemetry_t) = 0;
 
+    //! setReportIssueCb member.
+    /*!
+      \param A cb_report_issue_t function pointer to the CGO callback.
+
+      Reports a health platform issue from Python via JSON-encoded IssueReport.
+    */
+    virtual void setReportIssueCb(cb_report_issue_t) = 0;
+
+    //! setResolveIssueCb member.
+    /*!
+      \param A cb_resolve_issue_t function pointer to the CGO callback.
+
+      Marks a health platform issue resolved by IssueId from Python.
+    */
+    virtual void setResolveIssueCb(cb_resolve_issue_t) = 0;
+
 protected:
     //! _allocateInternalErrorDiagnoses member.
     /*!
@@ -535,20 +559,12 @@ private:
   \param python_exe A C-string path to the python interpreter.
   \return A pointer to the RtLoader instance created by the implementing function.
 */
-typedef RtLoader *(create_t)(const char *python_home, const char *python_exe, cb_memory_tracker_t memtrack_cb);
+typedef RtLoader *(create_t)(const char *python_home, const char *python_exe, rtloader_malloc_t, rtloader_free_t);
 
 /*! destroy_t function prototype
   \typedef destroy_t defines the destructor function prototype to destroy existing RtLoader instances.
   \param A RtLoader object pointer to the instance that should be destroyed.
 */
 typedef void(destroy_t)(RtLoader *);
-
-#ifndef _WIN32
-/*! core_trigger_t function pointer
-  \brief function pointer to the core triggering routine.
-  \param An integer corresponding to the signal number that triggered the dump.
-*/
-typedef void (*core_trigger_t)(int);
-#endif
 
 #endif

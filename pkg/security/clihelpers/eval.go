@@ -13,10 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"runtime"
 
-	secconfig "github.com/DataDog/datadog-agent/pkg/security/config"
 	pconfig "github.com/DataDog/datadog-agent/pkg/security/probe/config"
 	"github.com/DataDog/datadog-agent/pkg/security/probe/kfilters"
 	"github.com/DataDog/datadog-agent/pkg/security/rules/filtermodel"
@@ -36,10 +36,11 @@ type EvalReport struct {
 	Error     error `json:",omitempty"`
 }
 
-// EventData defines the structure used to represent an event
-type EventData struct {
-	Type   eval.EventType
-	Values map[string]interface{}
+// TestData defines the structure used to represent an event and its variables
+type TestData struct {
+	Type      eval.EventType
+	Values    map[string]any
+	Variables map[string]any
 }
 
 // EvalRuleParams are parameters to the EvalRule function
@@ -50,20 +51,53 @@ type EvalRuleParams struct {
 	EventFile       string
 }
 
-// EvalRule evaluates a rule against an event
-func EvalRule(evalArgs EvalRuleParams) error {
-	policiesDir := evalArgs.Dir
+func evalRule(provider rules.PolicyProvider, decoder *json.Decoder, evalArgs EvalRuleParams) (EvalReport, error) {
+	var report EvalReport
+
+	// we need to initialize the model early on to handle legacy field when setting field values in dataFromJSON
+	var m eval.Model
+	var eventCtor func() eval.Event
+	if evalArgs.UseWindowsModel {
+		wmodel := &winmodel.Model{}
+		wmodel.SetLegacyFields(winmodel.SECLLegacyFields)
+		m = wmodel
+		eventCtor = newFakeWindowsEvent
+	} else {
+		lmodel := &model.Model{}
+		lmodel.SetLegacyFields(model.SECLLegacyFields)
+		m = lmodel
+		eventCtor = newFakeEvent
+	}
+
+	event, variables, err := dataFromJSON(decoder)
+	if err != nil {
+		return report, err
+	}
+
+	report.Event = event
+
+	// store the variables values so that we can reapply them after policies are loaded
+	variablesValues := make(map[string]any)
+	for k, v := range variables {
+		rv, ok := v.(eval.Variable)
+		if !ok {
+			continue
+		}
+
+		value, _ := rv.GetValue()
+		variablesValues[k] = value
+	}
 
 	// enabled all the rules
 	enabled := map[eval.EventType]bool{"*": true}
 
 	ruleOpts := rules.NewRuleOpts(enabled)
-	evalOpts := newEvalOpts(evalArgs.UseWindowsModel)
+	evalOpts := newEvalOpts(evalArgs.UseWindowsModel).WithVariables(variables)
 	ruleOpts.WithLogger(seclog.DefaultLogger)
 
 	agentVersionFilter, err := newAgentVersionFilter()
 	if err != nil {
-		return fmt.Errorf("failed to create agent version filter: %w", err)
+		return report, fmt.Errorf("failed to create agent version filter: %w", err)
 	}
 
 	loaderOpts := rules.PolicyLoaderOpts{
@@ -77,31 +111,23 @@ func EvalRule(evalArgs EvalRuleParams) error {
 		},
 	}
 
-	provider, err := rules.NewPoliciesDirProvider(policiesDir)
-	if err != nil {
-		return err
-	}
-
 	loader := rules.NewPolicyLoader(provider)
 
-	var ruleSet *rules.RuleSet
-	if evalArgs.UseWindowsModel {
-		ruleSet = rules.NewRuleSet(&winmodel.Model{}, newFakeWindowsEvent, ruleOpts, evalOpts)
-	} else {
-		ruleSet = rules.NewRuleSet(&model.Model{}, newFakeEvent, ruleOpts, evalOpts)
+	ruleSet := rules.NewRuleSet(m, eventCtor, ruleOpts, evalOpts)
+	if _, err := ruleSet.LoadPolicies(loader, loaderOpts); err.ErrorOrNil() != nil {
+		return report, err
 	}
 
-	if err := ruleSet.LoadPolicies(loader, loaderOpts); err.ErrorOrNil() != nil {
-		return err
-	}
-
-	event, err := eventDataFromJSON(evalArgs.EventFile)
-	if err != nil {
-		return err
-	}
-
-	report := EvalReport{
-		Event: event,
+	// reapply the variables values
+	vars := ruleSet.GetVariables()
+	for k, v := range variablesValues {
+		if _, ok := vars[k]; ok {
+			if mv, ok := vars[k].(eval.MutableVariable); ok {
+				if err := mv.Set(nil, v); err != nil {
+					return report, fmt.Errorf("failed to set variable %s: %w", k, err)
+				}
+			}
+		}
 	}
 
 	if !evalArgs.UseWindowsModel {
@@ -114,6 +140,33 @@ func EvalRule(evalArgs EvalRuleParams) error {
 	}
 
 	report.Succeeded = ruleSet.Evaluate(event)
+
+	return report, nil
+}
+
+// EvalRule evaluates a rule against an event
+func EvalRule(evalArgs EvalRuleParams) error {
+	policiesDir := evalArgs.Dir
+
+	f, err := os.Open(evalArgs.EventFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	decoder := json.NewDecoder(f)
+	decoder.UseNumber()
+
+	provider, err := rules.NewPoliciesDirProvider(policiesDir)
+	if err != nil {
+		return err
+	}
+
+	report, err := evalRule(provider, decoder, evalArgs)
+	if err != nil {
+		return err
+	}
+
 	output, err := json.MarshalIndent(report, "", "    ")
 	if err != nil {
 		return err
@@ -127,36 +180,21 @@ func EvalRule(evalArgs EvalRuleParams) error {
 	return nil
 }
 
-func eventDataFromJSON(file string) (eval.Event, error) {
-	f, err := os.Open(file)
+func eventFromTestData(testData TestData) (eval.Event, error) {
+	kind, err := model.ParseEvalEventType(testData.Type)
 	if err != nil {
 		return nil, err
-	}
-	defer f.Close()
-
-	decoder := json.NewDecoder(f)
-	decoder.UseNumber()
-
-	var eventData EventData
-	if err := decoder.Decode(&eventData); err != nil {
-		return nil, err
-	}
-
-	kind := secconfig.ParseEvalEventType(eventData.Type)
-	if kind == model.UnknownEventType {
-		return nil, errors.New("unknown event type")
 	}
 
 	event := &model.Event{
 		BaseEvent: model.BaseEvent{
-			Type:             uint32(kind),
-			FieldHandlers:    &model.FakeFieldHandlers{},
-			ContainerContext: &model.ContainerContext{},
+			Type:          uint32(kind),
+			FieldHandlers: &model.FakeFieldHandlers{},
 		},
 	}
 	event.Init()
 
-	for k, v := range eventData.Values {
+	for k, v := range testData.Values {
 		switch v := v.(type) {
 		case json.Number:
 			value, err := v.Int64()
@@ -184,6 +222,147 @@ func eventDataFromJSON(file string) (eval.Event, error) {
 	}
 
 	return event, nil
+}
+
+// variableEntry is the new-format entry: a JSON object with a required "value"
+// field plus all eval.VariableOpts fields inlined.
+type variableEntry struct {
+	Value any `json:"value"`
+	eval.VariableOpts
+}
+
+// parseVariableEntry accepts both the old format (a direct value) and the new
+// format (a JSON object with a required "value" field and optional VariableOpts
+// fields).  It returns the unwrapped value and the VariableOpts decoded from
+// the entry.
+func parseVariableEntry(raw any) (any, eval.VariableOpts, error) {
+	opts := eval.VariableOpts{TTL: 10000000}
+
+	if _, ok := raw.(map[string]any); !ok {
+		// Old format: the entry itself is the variable value.
+		return raw, opts, nil
+	}
+
+	// New format: re-encode to JSON then unmarshal into the typed struct so
+	// that all VariableOpts fields are populated in a single, extensible step.
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, opts, fmt.Errorf("failed to marshal variable entry: %w", err)
+	}
+
+	var entry variableEntry
+	entry.VariableOpts = opts // carry the default TTL
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, opts, fmt.Errorf("failed to unmarshal variable entry: %w", err)
+	}
+
+	if entry.Value == nil {
+		return nil, opts, errors.New("variable entry is missing required 'value' field")
+	}
+
+	return entry.Value, entry.VariableOpts, nil
+}
+
+func variablesFromTestData(testData TestData) (map[string]eval.SECLVariable, error) {
+	variables := make(map[string]eval.SECLVariable)
+
+	// copy the embedded variables
+	maps.Copy(variables, model.SECLVariables)
+
+	// add the variables from the test data
+	for k, raw := range testData.Variables {
+		v, varOpts, err := parseVariableEntry(raw)
+		if err != nil {
+			return nil, fmt.Errorf("variable %s: %w", k, err)
+		}
+		switch v := v.(type) {
+		case string:
+			if rules.IsScopeVariable(k) {
+				variables[k] = eval.NewScopedStringVariable(func(_ *eval.Context, _ bool) (string, bool) {
+					return v, true
+				}, nil, varOpts)
+			} else {
+				variables[k] = eval.NewStringVariable(v, varOpts)
+			}
+		case []any:
+			switch v[0].(type) {
+			case string:
+				values := make([]string, len(v))
+				for i, value := range v {
+					values[i] = value.(string)
+				}
+				if rules.IsScopeVariable(k) {
+					variables[k] = eval.NewScopedStringArrayVariable(func(_ *eval.Context, _ bool) ([]string, bool) {
+						return values, true
+					}, nil, varOpts)
+				} else {
+					variables[k] = eval.NewStringArrayVariable(values, varOpts)
+				}
+			case json.Number:
+				values := make([]int, len(v))
+				for i, value := range v {
+					v64, err := value.(json.Number).Int64()
+					if err != nil {
+						return nil, fmt.Errorf("failed to convert %s to int: %w", v, err)
+					}
+					values[i] = int(v64)
+				}
+
+				if rules.IsScopeVariable(k) {
+					variables[k] = eval.NewScopedIntArrayVariable(func(_ *eval.Context, _ bool) ([]int, bool) {
+						return values, true
+					}, nil, varOpts)
+				} else {
+					variables[k] = eval.NewIntArrayVariable(values, varOpts)
+				}
+			default:
+				return nil, fmt.Errorf("unknown variable type %s: %T", k, v)
+			}
+		case json.Number:
+			value, err := v.Int64()
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert %s to int: %w", v, err)
+			}
+			if rules.IsScopeVariable(k) {
+				variables[k] = eval.NewScopedIntVariable(func(_ *eval.Context, _ bool) (int, bool) {
+					return int(value), true
+				}, nil, varOpts)
+			} else {
+				variables[k] = eval.NewIntVariable(int(value), varOpts)
+			}
+		case bool:
+			if rules.IsScopeVariable(k) {
+				variables[k] = eval.NewScopedBoolVariable(func(_ *eval.Context, _ bool) (bool, bool) {
+					return v, true
+				}, nil, varOpts)
+			} else {
+				variables[k] = eval.NewBoolVariable(v, varOpts)
+			}
+		default:
+			return nil, fmt.Errorf("unknown variable type %s: %T", k, v)
+		}
+	}
+
+	return variables, nil
+}
+
+func dataFromJSON(decoder *json.Decoder) (eval.Event, map[string]eval.SECLVariable, error) {
+	var testData TestData
+	if err := decoder.Decode(&testData); err != nil {
+		return nil, nil, err
+	}
+
+	event, err := eventFromTestData(testData)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	variables, err := variablesFromTestData(testData)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return event, variables, nil
 }
 
 func anySliceToStringSlice(in []any) ([]string, bool) {
@@ -262,12 +441,22 @@ func CheckPoliciesLocal(args CheckPoliciesLocalParams, writer io.Writer) error {
 		return fmt.Errorf("failed to create agent version filter: %w", err)
 	}
 
+	hostname, _ := os.Hostname()
+
 	os := runtime.GOOS
 	if args.UseWindowsModel {
 		os = "windows"
 	}
 
-	ruleFilterModel := filtermodel.NewOSOnlyFilterModel(os)
+	rfmCfg := filtermodel.RuleFilterEventConfig{
+		COREEnabled: false,
+		Origin:      "",
+	}
+
+	ruleFilterModel, err := filtermodel.NewRuleFilterModel(rfmCfg, hostname, os)
+	if err != nil {
+		return fmt.Errorf("failed to create rule filter: %w", err)
+	}
 	seclRuleFilter := rules.NewSECLRuleFilter(ruleFilterModel)
 
 	loaderOpts := rules.PolicyLoaderOpts{
@@ -296,7 +485,7 @@ func CheckPoliciesLocal(args CheckPoliciesLocalParams, writer io.Writer) error {
 		ruleSet = rules.NewRuleSet(&model.Model{}, newFakeEvent, ruleOpts, evalOpts)
 		ruleSet.SetFakeEventCtor(newFakeEvent)
 	}
-	if err := ruleSet.LoadPolicies(loader, loaderOpts); err.ErrorOrNil() != nil {
+	if _, err := ruleSet.LoadPolicies(loader, loaderOpts); err.ErrorOrNil() != nil {
 		return err
 	}
 

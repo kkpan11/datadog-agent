@@ -9,38 +9,15 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	serverlessMetrics "github.com/DataDog/datadog-agent/pkg/serverless/metrics"
 )
 
 func TestGetContainerAppTags(t *testing.T) {
-	service := &ContainerApp{}
-
-	t.Setenv("CONTAINER_APP_NAME", "test_app_name")
-	t.Setenv("CONTAINER_APP_ENV_DNS_SUFFIX", "test.bluebeach.eastus.azurecontainerapps.io")
-	t.Setenv("CONTAINER_APP_REVISION", "test_revision")
-	t.Setenv("CONTAINER_APP_REPLICA_NAME", "test--6nyz8z7-b845f7667-m7hlv")
-
-	t.Setenv("DD_AZURE_SUBSCRIPTION_ID", "test_subscription_id")
-	t.Setenv("DD_AZURE_RESOURCE_GROUP", "test_resource_group")
-
-	tags := service.GetTags()
-
-	assert.Equal(t, map[string]string{
-		"app_name":         "test_app_name",
-		"origin":           "containerapp",
-		"region":           "eastus",
-		"revision":         "test_revision",
-		"replica_name":     "test--6nyz8z7-b845f7667-m7hlv",
-		"_dd.origin":       "containerapp",
-		"aca.replica.name": "test--6nyz8z7-b845f7667-m7hlv",
-		"aca.app.name":     "test_app_name",
-		"aca.app.region":   "eastus",
-		"aca.app.revision": "test_revision",
-	}, tags)
-}
-
-func TestGetContainerAppTagsWithOptionalEnvVars(t *testing.T) {
 	service := NewContainerApp()
 
 	t.Setenv("CONTAINER_APP_NAME", "test_app_name")
@@ -51,7 +28,7 @@ func TestGetContainerAppTagsWithOptionalEnvVars(t *testing.T) {
 	t.Setenv("DD_AZURE_SUBSCRIPTION_ID", "test_subscription_id")
 	t.Setenv("DD_AZURE_RESOURCE_GROUP", "test_resource_group")
 
-	err := service.Init()
+	err := service.Init(nil)
 	assert.NoError(t, err)
 
 	tags := service.GetTags()
@@ -78,6 +55,59 @@ func TestGetContainerAppTagsWithOptionalEnvVars(t *testing.T) {
 	assert.Nil(t, err)
 }
 
+func TestGetContainerAppTagsBeforeInit(t *testing.T) {
+	// This test demonstrates that GetTags can be called before Init
+	// and will correctly fall back to environment variables for subscription_id and resource_group
+	service := NewContainerApp()
+	t.Setenv("CONTAINER_APP_NAME", "test_app")
+	t.Setenv("CONTAINER_APP_ENV_DNS_SUFFIX", "test.bluebeach.westus.azurecontainerapps.io")
+	t.Setenv("CONTAINER_APP_REVISION", "test_revision")
+	t.Setenv("CONTAINER_APP_REPLICA_NAME", "test--replica")
+
+	t.Setenv("DD_AZURE_SUBSCRIPTION_ID", "test_subscription_id")
+	t.Setenv("DD_AZURE_RESOURCE_GROUP", "test_resource_group")
+
+	// Call GetTags BEFORE Init - it should still get the values from env vars
+	tags := service.GetTags()
+
+	err := service.Init(nil)
+	assert.NoError(t, err)
+
+	// Verify that subscription_id and resource_group are populated from env vars
+	assert.Equal(t, "test_subscription_id", tags["subscription_id"])
+	assert.Equal(t, "test_resource_group", tags["resource_group"])
+	assert.Equal(t, "test_subscription_id", tags["aca.subscription.id"])
+	assert.Equal(t, "test_resource_group", tags["aca.resource.group"])
+	assert.Equal(t, "/subscriptions/test_subscription_id/resourcegroups/test_resource_group/providers/microsoft.app/containerapps/test_app", tags["resource_id"])
+	assert.Equal(t, "/subscriptions/test_subscription_id/resourcegroups/test_resource_group/providers/microsoft.app/containerapps/test_app", tags["aca.resource.id"])
+}
+
+func TestGetContainerAppTagsEmptyDNSSuffix(t *testing.T) {
+	service := NewContainerApp()
+	t.Setenv("CONTAINER_APP_NAME", "test_app")
+	t.Setenv("CONTAINER_APP_ENV_DNS_SUFFIX", "")
+	t.Setenv("CONTAINER_APP_REVISION", "test_revision")
+	t.Setenv("CONTAINER_APP_REPLICA_NAME", "test--replica")
+
+	tags := service.GetTags()
+
+	assert.Equal(t, "unknown", tags["region"])
+	assert.Equal(t, "unknown", tags[acaRegion])
+}
+
+func TestGetContainerAppTagsShortDNSSuffix(t *testing.T) {
+	service := NewContainerApp()
+	t.Setenv("CONTAINER_APP_NAME", "test_app")
+	t.Setenv("CONTAINER_APP_ENV_DNS_SUFFIX", "foo.bar")
+	t.Setenv("CONTAINER_APP_REVISION", "test_revision")
+	t.Setenv("CONTAINER_APP_REPLICA_NAME", "test--replica")
+
+	tags := service.GetTags()
+
+	assert.Equal(t, "unknown", tags["region"])
+	assert.Equal(t, "unknown", tags[acaRegion])
+}
+
 func TestInitHasErrorsWhenMissingSubscriptionId(t *testing.T) {
 	service := NewContainerApp()
 	if os.Getenv("SERVERLESS_TEST") == "true" {
@@ -88,7 +118,7 @@ func TestInitHasErrorsWhenMissingSubscriptionId(t *testing.T) {
 
 		t.Setenv("DD_AZURE_RESOURCE_GROUP", "test_resource_group")
 
-		service.Init()
+		service.Init(nil)
 		return
 	}
 
@@ -113,7 +143,7 @@ func TestInitHasErrorsWhenMissingResourceGroup(t *testing.T) {
 
 		t.Setenv("DD_AZURE_SUBSCRIPTION_ID", "test_subscription_id")
 
-		service.Init()
+		service.Init(nil)
 		return
 	}
 
@@ -126,4 +156,32 @@ func TestInitHasErrorsWhenMissingResourceGroup(t *testing.T) {
 	} else { //nolint:revive // TODO(SERV) Fix revive linter
 		assert.FailNow(t, "Process didn't exit when not specifying DD_AZURE_RESOURCE_GROUP")
 	}
+}
+
+func TestContainerAppShutdownEmitsMetrics(t *testing.T) {
+	skipOnWindows(t)
+	demux := createDemultiplexer(t)
+	agent := &serverlessMetrics.ServerlessMetricAgent{Demux: demux}
+
+	service := NewContainerApp()
+	service.Shutdown(agent, true, nil)
+
+	generatedMetrics, timedMetrics := demux.WaitForSamples(100 * time.Millisecond)
+	assert.Empty(t, timedMetrics)
+	assert.Len(t, generatedMetrics, 2)
+
+	foundShutdown := false
+	for _, sample := range generatedMetrics {
+		if sample.Name == containerAppShutdownMetricName {
+			foundShutdown = true
+		}
+	}
+	assert.True(t, foundShutdown, "shutdown metric not emitted")
+}
+
+func TestContainerAppShutdownNilMetricAgent(t *testing.T) {
+	service := NewContainerApp()
+	require.NotPanics(t, func() {
+		service.Shutdown(nil, true, nil)
+	})
 }

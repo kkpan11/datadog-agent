@@ -21,14 +21,18 @@ type dockerStreamMatcher struct {
 	contentLenLimit int
 }
 
-// FindFrame implements EndLineMatcher#FindFrame.
-func (s *dockerStreamMatcher) FindFrame(buf []byte, seen int) ([]byte, int) {
+// FlushFrame implements FrameMatcher. Partial docker stream data is not
+// emitted at end-of-stream.
+func (s *dockerStreamMatcher) FlushFrame([]byte) ([]byte, int) { return nil, 0 }
+
+// FindFrame implements FrameMatcher#FindFrame.
+func (s *dockerStreamMatcher) FindFrame(buf []byte, seen int) ([]byte, int, bool) {
 	for i := seen; i < len(buf); i++ {
 		if buf[i] == '\n' && !s.matchHeader([]byte{}, buf[:i]) {
-			return buf[:i], i + 1
+			return buf[:i], i + 1, false
 		}
 	}
-	return nil, 0
+	return nil, 0, false
 }
 
 // When a newline (in byte is 10) is matching, an additional check need to

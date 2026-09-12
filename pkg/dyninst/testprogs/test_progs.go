@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // Package testprogs contains logic to build and use go programs for testing.
 //
@@ -28,54 +28,73 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 const helpMsg = "consider running `dda inv system-probe.build-dyninst-test-programs`"
 
+// MustGetCommonConfigs calls GetCommonConfigs and checks for an error..
+func MustGetCommonConfigs(t testing.TB) []Config {
+	cfgs, err := GetCommonConfigs()
+	require.NoError(t, err)
+	return cfgs
+}
+
+// MustGetPrograms calls GetPrograms and checks for an error.
+func MustGetPrograms(t testing.TB) []string {
+	programs, err := GetPrograms()
+	require.NoError(t, err)
+	return programs
+}
+
+// MustGetBinary calls GetBinary and checks for an error.
+func MustGetBinary(t testing.TB, name string, cfg Config) string {
+	bin, err := GetBinary(name, cfg)
+	require.NoError(t, err)
+	return bin
+}
+
 // GetCommonConfigs returns a list of configurations that are suggested for
 // use in tests. In scenarios where the source code is available, other
 // configurations may still be available via GetBinary.
-func GetCommonConfigs(t *testing.T) []Config {
-	return must(t, func(state *state) ([]Config, error) {
-		return state.commonConfigs, nil
-	}, "get common configs")
+func GetCommonConfigs() ([]Config, error) {
+	state, err := getState()
+	if err != nil {
+		return nil, fmt.Errorf("testprogs: %w", err)
+	}
+	return state.commonConfigs, nil
 }
 
 // GetPrograms returns a list of programs that are available for testing.
-func GetPrograms(t *testing.T) []string {
-	return must(t, func(state *state) ([]string, error) {
-		return state.programs, nil
-	}, "get programs")
+func GetPrograms() ([]string, error) {
+	state, err := getState()
+	if err != nil {
+		return nil, fmt.Errorf("testprogs: %w", err)
+	}
+	return state.programs, nil
 }
 
 // GetBinary returns the path to the binary for the given name and
-// configuration.  If the binary is not found, it will be compiled if the source
+// configuration. If the binary is not found, it will be compiled if the source
 // code is available.
-func GetBinary(t *testing.T, name string, cfg Config) string {
-	return must(t, func(state *state) (string, error) {
-		return getBinary(state, name, cfg)
-	}, "get binary")
-}
-
-// must is a helper function that gets the state and calls the given function.
-// If the function returns an error, it will fail the test.
-func must[A any](t *testing.T, f func(*state) (A, error), errMsg string) A {
+func GetBinary(name string, cfg Config) (string, error) {
 	state, err := getState()
 	if err != nil {
-		t.Fatalf("testprogs: %v", err)
+		return "", fmt.Errorf("testprogs: %w", err)
 	}
-	a, err := f(state)
+	bin, err := getBinary(state, name, cfg)
 	if err != nil {
-		t.Fatalf("testprogs: %s: %v", errMsg, err)
+		return "", fmt.Errorf("testprogs: %w", err)
 	}
-	return a
+	return bin, nil
 }
 
+// state is the state of the testprogs package.
 type state struct {
 	// A list of common configurations that are available for testing.
 	commonConfigs []Config
@@ -88,6 +107,8 @@ type state struct {
 	progsSrcDir string
 	// Whether the source code is available.
 	haveSources bool
+	// The directory where the probe configs are stored.
+	probesCfgsDir string
 }
 
 var (
@@ -96,6 +117,7 @@ var (
 	globalStateOnce sync.Once
 )
 
+// getState returns the global state of the testprogs package.
 func getState() (*state, error) {
 	globalStateOnce.Do(func() {
 		var haveSources bool
@@ -120,13 +142,9 @@ func initStateFromBinaries(
 	haveSources bool,
 	progsSrcDir string,
 ) (state, error) {
-	buildInfo, ok := debug.ReadBuildInfo()
-	if !ok {
-		return state{}, fmt.Errorf("failed to read build info")
-	}
 	pkgPath := strings.TrimPrefix(
 		reflect.TypeOf(Config{}).PkgPath(),
-		buildInfo.Main.Path+"/",
+		"github.com/DataDog/datadog-agent/",
 	)
 	const maxDirectoryDepth = 10
 	binariesDir := path.Join(".", pkgPath, "binaries")
@@ -142,6 +160,10 @@ found:
 	if err != nil {
 		return state{}, fmt.Errorf("failed to get absolute path for binaries directory: %w", err)
 	}
+	probesCfgsDir, err := filepath.Abs(path.Join(binariesDir, "../testdata/probes"))
+	if err != nil {
+		return state{}, fmt.Errorf("failed to get absolute path for probes directory: %w", err)
+	}
 	// Now we want to iterate over the binaries directory and read the
 	// packages names of the directories as well as parsing out the
 	// configuration from the directory name.
@@ -155,11 +177,10 @@ found:
 		if !file.IsDir() {
 			continue
 		}
-		cfg, err := parseConfig(file.Name())
+		cfg, err := ParseConfig(file.Name())
 		if err != nil {
 			return state{}, fmt.Errorf("failed to parse config from directory name: %w", err)
 		}
-		configs[cfg] = struct{}{}
 		files, err := os.ReadDir(path.Join(binariesDir, file.Name()))
 		if err != nil {
 			return state{}, fmt.Errorf("failed to read program directory: %w", err)
@@ -177,6 +198,8 @@ found:
 				continue
 			}
 			programConfigs[file.Name()]++
+			// Only count the config if there's at least one program for it.
+			configs[cfg] = struct{}{}
 		}
 	}
 	numConfigs := len(configs)
@@ -203,10 +226,11 @@ found:
 		binariesDir:   binariesDir,
 		progsSrcDir:   progsSrcDir,
 		haveSources:   haveSources,
+		probesCfgsDir: probesCfgsDir,
 	}, nil
 }
 
-// GetBinary returns the path to the binary for the given name and metadata.
+// getBinary returns the path to the binary for the given name and metadata.
 func getBinary(
 	state *state,
 	name string,
@@ -288,12 +312,6 @@ func (m *Config) String() string {
 	return fmt.Sprintf("arch=%s,toolchain=%s", m.GOARCH, m.GOTOOLCHAIN)
 }
 
-// Go124 is the go version 1.24.1.
-const Go124 = "go1.24.1"
-
-// Local is the local go version.
-const Local = "local"
-
 const (
 	// Amd64 is the amd64 architecture.
 	Amd64 = "amd64"
@@ -306,13 +324,13 @@ func (m *Config) Validate() error {
 	switch m.GOARCH {
 	case Amd64, Arm64:
 	case "":
-		return fmt.Errorf("GOARCH is required")
+		return errors.New("GOARCH is required")
 	default:
 		return fmt.Errorf("GOARCH is invalid: %q", m.GOARCH)
 	}
 
 	if m.GOTOOLCHAIN == "" {
-		return fmt.Errorf("GOTOOLCHAIN is required")
+		return errors.New("GOTOOLCHAIN is required")
 	}
 	if !goVersionRegex.MatchString(m.GOTOOLCHAIN) {
 		return fmt.Errorf("GOTOOLCHAIN is invalid: %q", m.GOTOOLCHAIN)
@@ -320,7 +338,8 @@ func (m *Config) Validate() error {
 	return nil
 }
 
-func parseConfig(s string) (Config, error) {
+// ParseConfig parses a Config string of the form "arch=ARCH,toolchain=VERSION".
+func ParseConfig(s string) (Config, error) {
 	parts := strings.Split(s, ",")
 	var cfg Config
 	for _, part := range parts {
@@ -344,5 +363,5 @@ func parseConfig(s string) (Config, error) {
 }
 
 var (
-	goVersionRegex = regexp.MustCompile(`^(go1\.\d+\.\d+|local)$`)
+	goVersionRegex = regexp.MustCompile(`^(go1\.\d+(\.|rc)\d+)$`)
 )

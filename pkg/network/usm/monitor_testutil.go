@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf && test
+//go:build linux && bpf && test
 
 package usm
 
@@ -17,11 +17,13 @@ import (
 
 	manager "github.com/DataDog/ebpf-manager"
 
+	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	netebpf "github.com/DataDog/datadog-agent/pkg/network/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/network/ebpf/probes"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/buildmode"
+	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 )
 
 // Helper type to wrap & mock Protocols in tests. We keep an instance of the
@@ -66,10 +68,19 @@ func (p *protocolMock) PostStart() error {
 
 func (p *protocolMock) Stop() {
 	if p.spec.stopFn != nil {
-		p.Stop()
+		p.spec.stopFn()
 	} else {
 		p.inner.Stop()
 	}
+}
+
+// Modifiers forwards the inner protocol's modifiers (e.g. the direct consumer's
+// perf.EventHandler), which the manager needs to load the eBPF programs correctly.
+func (p *protocolMock) Modifiers() []ddebpf.Modifier {
+	if mp, ok := p.inner.(protocols.ModifierProvider); ok {
+		return mp.Modifiers()
+	}
+	return nil
 }
 
 func (p *protocolMock) DumpMaps(io.Writer, string, *ebpf.Map)        {}
@@ -114,4 +125,14 @@ func (m *Monitor) SetConnectionProtocol(t *testing.T, p netebpf.ProtocolStackWra
 	connProtocolMap, _, err := m.ebpfProgram.GetMap(probes.ConnectionProtocolMap)
 	require.NoError(t, err)
 	require.NoError(t, connProtocolMap.Update(unsafe.Pointer(&tup), unsafe.Pointer(&p), ebpf.UpdateAny))
+}
+
+// skipIfKernelNotSupported skips the test if the current kernel version is below the minimum required version.
+func skipIfKernelNotSupported(t *testing.T, minimumKernelVersion kernel.Version, protocolName string) {
+	t.Helper()
+	currKernelVersion, err := kernel.HostVersion()
+	require.NoError(t, err)
+	if currKernelVersion < minimumKernelVersion {
+		t.Skipf("%s monitoring can not run on kernel before %v", protocolName, minimumKernelVersion)
+	}
 }

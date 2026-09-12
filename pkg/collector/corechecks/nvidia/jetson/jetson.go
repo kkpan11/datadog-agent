@@ -8,14 +8,16 @@
 package nvidia
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
@@ -36,7 +38,12 @@ const (
 	kb = 1024
 	mb = kb * 1024
 	gb = mb * 1024
+
+	defaultTegraStatsPath = "/usr/bin/tegrastats"
 )
+
+// allowedCharsInPathRegex matches the only characters allowed for `tegrastats_path`, given by the user through the config
+var allowedCharsInPathRegex = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
 // The configuration for the jetson check
 type checkCfg struct {
@@ -104,6 +111,21 @@ func getSizeMultiplier(unit string) float64 {
 	}
 }
 
+// validateTegraStatsPath verifies that the path is absolute and doesn't contain invalid characters
+func validateTegraStatsPath(path string) error {
+	// check if any character of the path is not in the allowed list
+	if !allowedCharsInPathRegex.MatchString(path) {
+		return fmt.Errorf("tegrastats_path contains invalid characters: %q", path)
+	}
+
+	// Reject non-absolute path
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("tegrastats_path should be absolute: %q", path)
+	}
+
+	return nil
+}
+
 // Parses the output of tegrastats
 func (c *JetsonCheck) processTegraStatsOutput(tegraStatsOuptut string) error {
 	sender, err := c.GetSender()
@@ -112,33 +134,41 @@ func (c *JetsonCheck) processTegraStatsOutput(tegraStatsOuptut string) error {
 	}
 
 	for _, metricSender := range c.metricsSenders {
-		err = metricSender.SendMetrics(sender, tegraStatsOuptut)
-		if err != nil {
-			return err
+		if err := metricSender.SendMetrics(sender, tegraStatsOuptut); err != nil {
+			// A single metric sender failing to parse its fields (e.g. a power rail
+			// that isn't present on this device) shouldn't prevent every other
+			// metric from being reported.
+			log.Warnf("error sending jetson metric: %s", err)
 		}
 	}
 	sender.Commit()
 	return nil
 }
 
+// runCommand executes the tegrastats command, optionally with sudo.
+func runCommand(ctx context.Context, binary string, args []string, useSudo bool) ([]byte, error) {
+	var cmd *exec.Cmd
+	if useSudo {
+		// -n, non-interactive mode, no prompts are used
+		cmd = exec.CommandContext(ctx, "sudo", append([]string{binary}, args...)...)
+	} else {
+		cmd = exec.CommandContext(ctx, binary, args...)
+	}
+	return cmd.Output()
+}
+
 // Run executes the check
 func (c *JetsonCheck) Run() error {
-	tegraStatsCmd := fmt.Sprintf("%s %s", c.tegraStatsPath, strings.Join(c.commandOpts, " "))
-	cmdStr := fmt.Sprintf("(%s) & pid=$!; (sleep %d && kill -9 $pid)", tegraStatsCmd, int((2 * tegraStatsInterval).Seconds()))
-	var cmd *exec.Cmd
-	if c.useSudo {
-		// -n, non-interactive mode, no prompts are used
-		cmd = exec.Command("sudo", "-n", "sh", "-c", cmdStr)
-	} else {
-		cmd = exec.Command("sh", "-c", cmdStr)
-	}
-
-	tegrastatsOutput, err := cmd.Output()
+	// Kill tegrastats if it runs for twice as long as the interval we specified, to avoid blocking
+	// the check forever
+	ctx, cancel := context.WithTimeout(context.Background(), 2*tegraStatsInterval)
+	defer cancel()
+	tegrastatsOutput, err := runCommand(ctx, c.tegraStatsPath, c.commandOpts, c.useSudo)
 	if err != nil {
 		switch err := err.(type) {
 		case *exec.ExitError:
 			if len(tegrastatsOutput) <= 0 {
-				return fmt.Errorf("tegrastats did not produce any output: %s", err)
+				return fmt.Errorf("tegrastats did not produce any output: %s. Stderr: %s", err, string(err.Stderr))
 			}
 			// We kill the process, so ExitError is expected - as long as
 			// we got our output.
@@ -155,8 +185,8 @@ func (c *JetsonCheck) Run() error {
 }
 
 // Configure the GPU check
-func (c *JetsonCheck) Configure(senderManager sender.SenderManager, _ uint64, data integration.Data, initConfig integration.Data, source string) error {
-	err := c.CommonConfigure(senderManager, initConfig, data, source)
+func (c *JetsonCheck) Configure(senderManager sender.SenderManager, _ uint64, data integration.Data, initConfig integration.Data, source string, provider string) error {
+	err := c.CommonConfigure(senderManager, initConfig, data, source, provider)
 	if err != nil {
 		return err
 	}
@@ -165,10 +195,17 @@ func (c *JetsonCheck) Configure(senderManager sender.SenderManager, _ uint64, da
 	if err := yaml.Unmarshal(data, &conf); err != nil {
 		return err
 	}
+
+	// fallback to the default path if none is provided
 	if conf.TegraStatsPath != "" {
 		c.tegraStatsPath = conf.TegraStatsPath
 	} else {
-		c.tegraStatsPath = "/usr/bin/tegrastats"
+		c.tegraStatsPath = defaultTegraStatsPath
+	}
+
+	// Validate tegrastats path
+	if err := validateTegraStatsPath(c.tegraStatsPath); err != nil {
+		return err
 	}
 
 	// We run tegrastats once and then kill the process. However, we set the interval to 500ms

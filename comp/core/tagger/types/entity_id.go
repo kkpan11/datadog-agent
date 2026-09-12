@@ -16,8 +16,8 @@ const separatorLength = len(separator)
 
 var globalEntityID = NewEntityID(InternalID, "global-entity-id")
 
-// GetSeparatorLengh returns the length of the entityID separator
-func GetSeparatorLengh() int {
+// GetSeparatorLength returns the length of the entityID separator
+func GetSeparatorLength() int {
 	return separatorLength
 }
 
@@ -73,6 +73,16 @@ const (
 	KubernetesDeployment EntityIDPrefix = "deployment"
 	// KubernetesMetadata is the prefix `kubernetes_metadata`
 	KubernetesMetadata EntityIDPrefix = "kubernetes_metadata"
+	// KubernetesNode is the prefix `kubernetes_node`
+	KubernetesNode EntityIDPrefix = "kubernetes_node"
+	// KubernetesKueueQueue is the prefix `kubernetes_kueue_queue`
+	KubernetesKueueQueue EntityIDPrefix = "kubernetes_kueue_queue"
+	// KueueResourceFlavor is the prefix `kueue_resource_flavor`
+	KueueResourceFlavor EntityIDPrefix = "kueue_resource_flavor"
+	// KueueWorkload is the prefix `kueue_workload`
+	KueueWorkload EntityIDPrefix = "kueue_workload"
+	// KubernetesCapabilities is the prefix `kubernetes_capabilities`
+	KubernetesCapabilities EntityIDPrefix = "kubernetes_capabilities"
 	// KubernetesPodUID is the prefix `kubernetes_pod_uid`
 	KubernetesPodUID EntityIDPrefix = "kubernetes_pod_uid"
 	// Process is the prefix `process`
@@ -81,6 +91,10 @@ const (
 	InternalID EntityIDPrefix = "internal"
 	// GPU is the prefix `gpu`
 	GPU EntityIDPrefix = "gpu"
+	// Kubelet is the prefix `kubelet`
+	Kubelet EntityIDPrefix = "kubelet"
+	// Crd is the prefix `crd`
+	Crd EntityIDPrefix = "crd"
 )
 
 // AllPrefixesSet returns a set of all possible entity id prefixes that can be used in the tagger
@@ -92,10 +106,17 @@ func AllPrefixesSet() map[EntityIDPrefix]struct{} {
 		Host:                   {},
 		KubernetesDeployment:   {},
 		KubernetesMetadata:     {},
+		KubernetesNode:         {},
+		KubernetesKueueQueue:   {},
+		KueueResourceFlavor:    {},
+		KueueWorkload:          {},
 		KubernetesPodUID:       {},
 		Process:                {},
 		InternalID:             {},
 		GPU:                    {},
+		Kubelet:                {},
+		Crd:                    {},
+		KubernetesCapabilities: {},
 	}
 }
 

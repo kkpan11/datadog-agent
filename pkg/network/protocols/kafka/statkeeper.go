@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package kafka
 
@@ -63,7 +63,7 @@ func (statKeeper *StatKeeper) Process(tx *EbpfTx) {
 			statKeeper.telemetry.dropped.Add(int64(tx.RecordsCount()))
 			return
 		}
-		requestStats = NewRequestStats()
+		requestStats = requestStatsPool.Get()
 		statKeeper.stats[key] = requestStats
 	}
 

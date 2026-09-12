@@ -50,18 +50,15 @@ type Config struct {
 	// EnableApprovers defines if in-kernel approvers should be activated or not
 	EnableApprovers bool
 
+	// BasenameApproversSize defines the size of the map used for the basename approvers
+	BasenameApproversSize int
+
 	// EnableDiscarders defines if in-kernel discarders should be activated or not
 	EnableDiscarders bool
 
 	// FlushDiscarderWindow defines the maximum time window for discarders removal.
 	// This is used during reload to avoid removing all the discarders at the same time.
 	FlushDiscarderWindow int
-
-	// SocketPath is the path to the socket that is used to communicate with the security agent and process agent
-	SocketPath string
-
-	// EventServerBurst defines the maximum burst of events that can be sent over the grpc server
-	EventServerBurst int
 
 	// PIDCacheSize is the size of the user space PID caches
 	PIDCacheSize int
@@ -71,6 +68,9 @@ type Config struct {
 
 	// CustomSensitiveWords defines words to add to the scrubber
 	CustomSensitiveWords []string
+
+	// CustomSensitiveRegexps defines regexps to add to the scrubber
+	CustomSensitiveRegexps []string
 
 	// ERPCDentryResolutionEnabled determines if the ERPC dentry resolution is enabled
 	ERPCDentryResolutionEnabled bool
@@ -85,14 +85,23 @@ type Config struct {
 	// EnvsWithValue lists environnement variables that will be fully exported
 	EnvsWithValue []string
 
-	// RuntimeMonitor defines if the Go runtime and system monitor should be enabled
-	RuntimeMonitor bool
-
 	// EventStreamUseRingBuffer specifies whether to use eBPF ring buffers when available
 	EventStreamUseRingBuffer bool
 
 	// EventStreamBufferSize specifies the buffer size of the eBPF map used for events
 	EventStreamBufferSize int
+
+	// EventStreamDispatcherQueueEnabled enables the user-space dispatcher queue (off by default)
+	EventStreamDispatcherQueueEnabled bool
+
+	// EventStreamDispatcherQueueSize is the dispatcher queue capacity in bytes, multiplied by CPU count when PerCore is set
+	EventStreamDispatcherQueueSize int
+
+	// EventStreamDispatcherQueueSizePerCore multiplies EventStreamDispatcherQueueSize by the number of CPUs
+	EventStreamDispatcherQueueSizePerCore bool
+
+	// EventStreamDispatcherQueueSizeMin is a floor in bytes applied after size and optional per-core scaling
+	EventStreamDispatcherQueueSizeMin int
 
 	// EventStreamUseFentry specifies whether to use eBPF fentry when available instead of kprobes
 	EventStreamUseFentry bool
@@ -102,6 +111,9 @@ type Config struct {
 
 	// EventStreamKretprobeMaxActive specifies the maximum number of active kretprobe at a given time
 	EventStreamKretprobeMaxActive int
+
+	// EventStreamUseSyscallTaskStorage specifies whether to use a task storage map to store syscall context
+	EventStreamUseSyscallTaskStorage bool
 
 	// RuntimeCompilationEnabled defines if the runtime-compilation is enabled
 	RuntimeCompilationEnabled bool
@@ -141,11 +153,18 @@ type Config struct {
 	// NetworkIngressEnabled defines if the network ingress probes should be activated
 	NetworkIngressEnabled bool
 
+	// NetworkSkLookupPidResolutionEnabled defines if the TC classifiers should resolve packet PIDs
+	// through bpf_sk_lookup and sk-local storage. When disabled, the flow_pid map is used instead.
+	NetworkSkLookupPidResolutionEnabled bool
+
 	// NetworkRawPacketEnabled defines if the network raw packet is enabled
 	NetworkRawPacketEnabled bool
 
 	// NetworkRawPacketLimiterRate defines the rate at which raw packets should be sent to user space
 	NetworkRawPacketLimiterRate int
+
+	// NetworkRawPacketRestriction defines the global raw packet filter
+	NetworkRawPacketFilter string
 
 	// NetworkPrivateIPRanges defines the list of IP that should be considered private
 	NetworkPrivateIPRanges []string
@@ -162,6 +181,9 @@ type Config struct {
 	// DNSResolverCacheSize is the numer of entries in the DNS resolver LRU cache
 	DNSResolverCacheSize int
 
+	// DNSResolverCnameMaxDepth is the maximum CNAME chain depth followed when resolving an IP to hostnames
+	DNSResolverCnameMaxDepth int
+
 	// DNSResolutionEnabled resolving DNS names from IP addresses
 	DNSResolutionEnabled bool
 
@@ -170,6 +192,14 @@ type Config struct {
 
 	// SpanTrackingCacheSize is the size of the span tracking cache
 	SpanTrackingCacheSize int
+
+	// CapabilitiesMonitoringEnabled defines whether process capabilities usage should be reported
+	CapabilitiesMonitoringEnabled bool
+	// CapabilitiesMonitoringPeriod defines the period at which process capabilities usage events should be reported back to userspace
+	CapabilitiesMonitoringPeriod time.Duration
+
+	// SnapshotUsingListmount enables the use of listmount to take filesystem mount snapshots
+	SnapshotUsingListmount bool
 }
 
 // NewConfig returns a new Config object
@@ -179,47 +209,52 @@ func NewConfig() (*Config, error) {
 	setEnv()
 
 	c := &Config{
-		Config:                             *ebpf.NewConfig(),
-		EnableAllProbes:                    getBool("enable_all_probes"),
-		EnableKernelFilters:                getBool("enable_kernel_filters"),
-		EnableApprovers:                    getBool("enable_approvers"),
-		EnableDiscarders:                   getBool("enable_discarders"),
-		FlushDiscarderWindow:               getInt("flush_discarder_window"),
-		PIDCacheSize:                       getInt("pid_cache_size"),
-		StatsTagsCardinality:               getString("events_stats.tags_cardinality"),
-		CustomSensitiveWords:               getStringSlice("custom_sensitive_words"),
-		ERPCDentryResolutionEnabled:        getBool("erpc_dentry_resolution_enabled"),
-		MapDentryResolutionEnabled:         getBool("map_dentry_resolution_enabled"),
-		DentryCacheSize:                    getInt("dentry_cache_size"),
-		RuntimeMonitor:                     getBool("runtime_monitor.enabled"),
-		NetworkLazyInterfacePrefixes:       getStringSlice("network.lazy_interface_prefixes"),
-		NetworkClassifierPriority:          uint16(getInt("network.classifier_priority")),
-		NetworkClassifierHandle:            uint16(getInt("network.classifier_handle")),
-		RawNetworkClassifierHandle:         uint16(getInt("network.raw_classifier_handle")),
-		NetworkFlowMonitorPeriod:           getDuration("network.flow_monitor.period"),
-		NetworkFlowMonitorEnabled:          getBool("network.flow_monitor.enabled"),
-		NetworkFlowMonitorSKStorageEnabled: getBool("network.flow_monitor.sk_storage.enabled"),
-		EventStreamUseRingBuffer:           getBool("event_stream.use_ring_buffer"),
-		EventStreamBufferSize:              getInt("event_stream.buffer_size"),
-		EventStreamUseFentry:               getBool("event_stream.use_fentry"),
-		EventStreamUseKprobeFallback:       getBool("event_stream.use_kprobe_fallback"),
-		EventStreamKretprobeMaxActive:      getInt("event_stream.kretprobe_max_active"),
+		Config:                                *ebpf.NewConfig(),
+		EnableAllProbes:                       getBool("enable_all_probes"),
+		EnableKernelFilters:                   getBool("enable_kernel_filters"),
+		EnableApprovers:                       getBool("enable_approvers"),
+		BasenameApproversSize:                 getInt("basename_approvers_size"),
+		EnableDiscarders:                      getBool("enable_discarders"),
+		FlushDiscarderWindow:                  getInt("flush_discarder_window"),
+		PIDCacheSize:                          getInt("pid_cache_size"),
+		StatsTagsCardinality:                  getString("events_stats.tags_cardinality"),
+		CustomSensitiveWords:                  getStringSlice("custom_sensitive_words"),
+		CustomSensitiveRegexps:                getStringSlice("custom_sensitive_regexps"),
+		ERPCDentryResolutionEnabled:           getBool("erpc_dentry_resolution_enabled"),
+		MapDentryResolutionEnabled:            getBool("map_dentry_resolution_enabled"),
+		DentryCacheSize:                       getInt("dentry_cache_size"),
+		NetworkLazyInterfacePrefixes:          getStringSlice("network.lazy_interface_prefixes"),
+		NetworkClassifierPriority:             uint16(getInt("network.classifier_priority")),
+		NetworkClassifierHandle:               uint16(getInt("network.classifier_handle")),
+		RawNetworkClassifierHandle:            uint16(getInt("network.raw_classifier_handle")),
+		NetworkFlowMonitorPeriod:              getDuration("network.flow_monitor.period"),
+		NetworkFlowMonitorEnabled:             getBool("network.flow_monitor.enabled"),
+		NetworkFlowMonitorSKStorageEnabled:    getBool("network.flow_monitor.sk_storage.enabled"),
+		EventStreamUseRingBuffer:              getBool("event_stream.use_ring_buffer"),
+		EventStreamBufferSize:                 getInt("event_stream.buffer_size"),
+		EventStreamDispatcherQueueEnabled:     getBool("event_stream.dispatcher_queue.enabled"),
+		EventStreamDispatcherQueueSize:        getInt("event_stream.dispatcher_queue.size"),
+		EventStreamDispatcherQueueSizePerCore: getBool("event_stream.dispatcher_queue.size_per_core"),
+		EventStreamDispatcherQueueSizeMin:     getInt("event_stream.dispatcher_queue.size_min"),
+		EventStreamUseFentry:                  getBool("event_stream.use_fentry"),
+		EventStreamUseKprobeFallback:          getBool("event_stream.use_kprobe_fallback"),
+		EventStreamKretprobeMaxActive:         getInt("event_stream.kretprobe_max_active"),
+		EventStreamUseSyscallTaskStorage:      getBool("event_stream.use_syscall_task_storage"),
 
-		EnvsWithValue:               getStringSlice("envs_with_value"),
-		NetworkEnabled:              getBool("network.enabled"),
-		NetworkIngressEnabled:       getBool("network.ingress.enabled"),
-		NetworkRawPacketEnabled:     getBool("network.raw_packet.enabled"),
-		NetworkRawPacketLimiterRate: getInt("network.raw_packet.limiter_rate"),
-		NetworkPrivateIPRanges:      getStringSlice("network.private_ip_ranges"),
-		NetworkExtraPrivateIPRanges: getStringSlice("network.extra_private_ip_ranges"),
-		StatsPollingInterval:        time.Duration(getInt("events_stats.polling_interval")) * time.Second,
-		SyscallsMonitorEnabled:      getBool("syscalls_monitor.enabled"),
-		DNSResolverCacheSize:        getInt("dns_resolution.cache_size"),
-		DNSResolutionEnabled:        getBool("dns_resolution.enabled"),
-
-		// event server
-		SocketPath:       pkgconfigsetup.SystemProbe().GetString(join(evNS, "socket")),
-		EventServerBurst: pkgconfigsetup.SystemProbe().GetInt(join(evNS, "event_server.burst")),
+		EnvsWithValue:                       getStringSlice("envs_with_value"),
+		NetworkEnabled:                      getBool("network.enabled"),
+		NetworkIngressEnabled:               getBool("network.ingress.enabled"),
+		NetworkSkLookupPidResolutionEnabled: getBool("network.sk_lookup_pid_resolution.enabled"),
+		NetworkRawPacketEnabled:             getBool("network.raw_packet.enabled"),
+		NetworkRawPacketLimiterRate:         getInt("network.raw_packet.limiter_rate"),
+		NetworkRawPacketFilter:              getString("network.raw_packet.filter"),
+		NetworkPrivateIPRanges:              getStringSlice("network.private_ip_ranges"),
+		NetworkExtraPrivateIPRanges:         getStringSlice("network.extra_private_ip_ranges"),
+		StatsPollingInterval:                time.Duration(getInt("events_stats.polling_interval")) * time.Second,
+		SyscallsMonitorEnabled:              getBool("syscalls_monitor.enabled"),
+		DNSResolverCacheSize:                getInt("dns_resolution.cache_size"),
+		DNSResolverCnameMaxDepth:            getInt("dns_resolution.cname_max_depth"),
+		DNSResolutionEnabled:                getBool("dns_resolution.enabled"),
 
 		// runtime compilation
 		RuntimeCompilationEnabled: getBool("runtime_compilation.enabled"),
@@ -227,6 +262,13 @@ func NewConfig() (*Config, error) {
 		// span tracking
 		SpanTrackingEnabled:   getBool("span_tracking.enabled"),
 		SpanTrackingCacheSize: getInt("span_tracking.cache_size"),
+
+		// Process capabilities monitoring
+		CapabilitiesMonitoringEnabled: getBool("capabilities_monitoring.enabled"),
+		CapabilitiesMonitoringPeriod:  getDuration("capabilities_monitoring.period"),
+
+		// Mount resolver
+		SnapshotUsingListmount: getBool("snapshot_using_listmount"),
 	}
 
 	if err := c.sanitize(); err != nil {
@@ -295,10 +337,6 @@ func (c *Config) sanitizeConfigNetwork() {
 	}
 }
 
-func join(pieces ...string) string {
-	return strings.Join(pieces, ".")
-}
-
 func getAllKeys(key string) (string, string) {
 	deprecatedKey := strings.Join([]string{rsNS, key}, ".")
 	newKey := strings.Join([]string{evNS, key}, ".")
@@ -330,7 +368,7 @@ func getInt(key string) int {
 
 func getDuration(key string) time.Duration {
 	deprecatedKey, newKey := getAllKeys(key)
-	if pkgconfigsetup.SystemProbe().IsSet(deprecatedKey) {
+	if pkgconfigsetup.SystemProbe().IsConfigured(deprecatedKey) {
 		log.Warnf("%s has been deprecated: please set %s instead", deprecatedKey, newKey)
 		return pkgconfigsetup.SystemProbe().GetDuration(deprecatedKey)
 	}

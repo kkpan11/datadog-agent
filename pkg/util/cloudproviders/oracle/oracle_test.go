@@ -20,7 +20,7 @@ import (
 
 func TestGetHostAliases(t *testing.T) {
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("cloud_provider_metadata", []string{"oracle"})
+	cfg.SetInTest("cloud_provider_metadata", []string{"oracle"})
 
 	ctx := context.Background()
 	expected := "ocid1.instance.oc1.iad.anuwcljte6cuweqcz7sarpn43hst2kaaaxbbbccbaaa6vpd66tvcyhgiifsq"
@@ -45,7 +45,7 @@ func TestGetHostAliases(t *testing.T) {
 
 func TestGetNTPHosts(t *testing.T) {
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("cloud_provider_metadata", []string{"oracle"})
+	cfg.SetInTest("cloud_provider_metadata", []string{"oracle"})
 
 	ctx := context.Background()
 	expectedHosts := []string{"169.254.169.254"}
@@ -61,4 +61,52 @@ func TestGetNTPHosts(t *testing.T) {
 
 	actualHosts := GetNTPHosts(ctx)
 	assert.Equal(t, expectedHosts, actualHosts)
+}
+
+func TestGetHostCCRID(t *testing.T) {
+	cfg := configmock.New(t)
+	cfg.SetInTest("cloud_provider_metadata", []string{"oracle"})
+
+	ctx := context.Background()
+	expected := "ocid1.instance.oc1.iad.anuwcljsma7556acga2pgx4yidhq5fncc66ixo5ohiziovqvmki3r6au5piq"
+	var lastRequest *http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		io.WriteString(w, expected)
+		lastRequest = r
+	}))
+	defer ts.Close()
+
+	defer func(url string) { metadataURL = url }(metadataURL)
+	metadataURL = ts.URL
+
+	ccrid, err := GetHostCCRID(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, expected, ccrid)
+	assert.Equal(t, lastRequest.URL.Path, "/opc/v2/instance/id")
+	assert.Equal(t, lastRequest.Header.Get("Authorization"), "Bearer Oracle")
+}
+
+func TestGetInstanceType(t *testing.T) {
+	cfg := configmock.New(t)
+	cfg.SetInTest("cloud_provider_metadata", []string{"oracle"})
+
+	ctx := context.Background()
+	expected := "VM.Standard.E5.Flex"
+	var lastRequest *http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		io.WriteString(w, expected)
+		lastRequest = r
+	}))
+	defer ts.Close()
+
+	defer func(url string) { metadataURL = url }(metadataURL)
+	metadataURL = ts.URL
+
+	instanceType, err := GetInstanceType(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, expected, instanceType)
+	assert.Equal(t, lastRequest.URL.Path, "/opc/v2/instance/shape")
+	assert.Equal(t, lastRequest.Header.Get("Authorization"), "Bearer Oracle")
 }

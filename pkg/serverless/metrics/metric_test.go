@@ -3,31 +3,47 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+//go:build test
+
 package metrics
 
 import (
-	"errors"
-	"fmt"
-	"math/rand"
-	"net"
+	"context"
 	"net/http"
 	"os"
 	"runtime"
-	"strconv"
-	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx"
 
+	"github.com/DataDog/datadog-agent/comp/core"
+	delegatedauthmock "github.com/DataDog/datadog-agent/comp/core/delegatedauth/mock"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretsmock "github.com/DataDog/datadog-agent/comp/core/secrets/mock"
 	nooptagger "github.com/DataDog/datadog-agent/comp/core/tagger/impl-noop"
-	dogstatsdServer "github.com/DataDog/datadog-agent/comp/dogstatsd/server"
+	filterlistmock "github.com/DataDog/datadog-agent/comp/filterlist/fx-mock"
+	defaultforwarder "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/def"
+	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/endpoints"
+	defaultforwardernoop "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/noop-impl"
+	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/resolver"
+	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/transaction"
+	haagentmock "github.com/DataDog/datadog-agent/comp/haagent/mock"
+	logscompression "github.com/DataDog/datadog-agent/comp/serializer/logscompression/fx-mock"
+	metricscompression "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/fx-mock"
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
+	pkgmetrics "github.com/DataDog/datadog-agent/pkg/metrics"
+	"github.com/DataDog/datadog-agent/pkg/serverless/metrics/metricstest"
 	"github.com/DataDog/datadog-agent/pkg/util/cache"
+	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	"github.com/DataDog/datadog-agent/pkg/util/hostname"
 )
 
@@ -38,216 +54,263 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestStartDoesNotBlock(t *testing.T) {
-	if os.Getenv("CI") == "true" && runtime.GOOS == "darwin" && runtime.GOARCH == "amd64" {
-		t.Skip("TestStartDoesNotBlock is known to fail on the macOS Gitlab runners because of the already running Agent")
+func TestConstructionDoesNotBlock(t *testing.T) {
+	if os.Getenv("CI") == "true" && runtime.GOOS == "darwin" {
+		t.Skip("known to fail on the macOS Gitlab runners because of the already running Agent")
 	}
 	mockConfig := configmock.New(t)
-	pkgconfigsetup.LoadWithoutSecret(mockConfig, nil)
-	metricAgent := &ServerlessMetricAgent{
-		SketchesBucketOffset: time.Second * 10,
-		Tagger:               nooptagger.NewComponent(),
-	}
-	defer metricAgent.Stop()
-	metricAgent.Start(10*time.Second, &MetricConfig{}, &MetricDogStatsD{})
+	pkgconfigsetup.LoadDatadog(mockConfig, secretsmock.New(t), delegatedauthmock.New(t), nil)
+	deps := metricstest.New(t, nooptagger.NewComponent())
+	metricAgent := &ServerlessMetricAgent{Demux: deps.Demux}
 	assert.NotNil(t, metricAgent.Demux)
-	assert.True(t, metricAgent.IsReady())
 }
 
-type ValidMetricConfigMocked struct{}
-
-func (m *ValidMetricConfigMocked) GetMultipleEndpoints() (map[string][]utils.APIKeys, error) {
-	return map[string][]utils.APIKeys{"http://localhost:8888": {utils.NewAPIKeys("api_key", "value")}}, nil
+// countingForwarder wraps a no-op forwarder, provides a real domain resolver so
+// that the serializer's pipeline path is exercised, and counts sketch transactions.
+type countingForwarder struct {
+	defaultforwarder.Component
+	sketchCount atomic.Int64
+	resolvers   []resolver.DomainResolver
 }
 
-type InvalidMetricConfigMocked struct{}
-
-func (m *InvalidMetricConfigMocked) GetMultipleEndpoints() (map[string][]utils.APIKeys, error) {
-	return nil, fmt.Errorf("error")
-}
-
-func TestStartInvalidConfig(t *testing.T) {
-	metricAgent := &ServerlessMetricAgent{
-		SketchesBucketOffset: time.Second * 10,
-		Tagger:               nooptagger.NewComponent(),
+func newCountingForwarder() *countingForwarder {
+	r, _ := resolver.NewSingleDomainResolver("https://fake.datadoghq.com",
+		[]configutils.APIKeys{configutils.NewAPIKeys("api_key", "fakeapikey")})
+	return &countingForwarder{
+		Component: defaultforwardernoop.NewComponent(),
+		resolvers: []resolver.DomainResolver{r},
 	}
-	defer metricAgent.Stop()
-	metricAgent.Start(1*time.Second, &InvalidMetricConfigMocked{}, &MetricDogStatsD{})
-	assert.False(t, metricAgent.IsReady())
 }
 
-//nolint:revive // TODO(SERV) Fix revive linter
-type MetricDogStatsDMocked struct{}
-
-//nolint:revive // TODO(SERV) Fix revive linter
-func (m *MetricDogStatsDMocked) NewServer(_ aggregator.Demultiplexer) (dogstatsdServer.ServerlessDogstatsd, error) {
-	return nil, fmt.Errorf("error")
+// GetDomainResolvers returns the fake resolver so buildPipelines creates a pipeline.
+func (f *countingForwarder) GetDomainResolvers() []resolver.DomainResolver {
+	return f.resolvers
 }
 
-func TestStartInvalidDogStatsD(t *testing.T) {
-	metricAgent := &ServerlessMetricAgent{
-		SketchesBucketOffset: time.Second * 10,
-		Tagger:               nooptagger.NewComponent(),
+// SubmitTransaction increments the sketch counter when a sketch-series transaction reaches the intake.
+func (f *countingForwarder) SubmitTransaction(txn *transaction.HTTPTransaction) error {
+	if txn.Endpoint.Name == endpoints.SketchSeriesEndpoint.Name {
+		f.sketchCount.Add(1)
 	}
-	defer metricAgent.Stop()
-	metricAgent.Start(1*time.Second, &MetricConfig{}, &MetricDogStatsDMocked{})
-	assert.False(t, metricAgent.IsReady())
+	return nil
 }
 
-func TestStartWithProxy(t *testing.T) {
-	t.SkipNow()
+// SubmitSketchSeries is kept for interface compliance but is not called by the pipeline path.
+func (f *countingForwarder) SubmitSketchSeries(_ transaction.BytesPayloads, _ http.Header) error {
+	return nil
+}
+
+// TestStopDrainsBeforeFlush asserts that, with dogstatsd_flush_incomplete_buckets
+// enabled, AgentDemultiplexer.Stop() drains the timeSamplerWorker's samplesChan
+// before its final flush, so a sample submitted via AddEnhancedMetric
+// immediately before Stop is delivered to the serializer. Without the drain
+// barrier the worker's select can pick the flush trigger over samplesChan and
+// flush before the sample is incorporated — a race that drops ~50% of samples
+// in practice. 100 iterations exercise that race.
+func TestStopDrainsBeforeFlush(t *testing.T) {
+	synctest.Test(t, testStopDrainsBeforeFlush)
+}
+
+func testStopDrainsBeforeFlush(t *testing.T) {
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource(statsDMetricBlocklistKey, []string{})
+	pkgconfigsetup.LoadDatadog(mockConfig, secretsmock.New(t), delegatedauthmock.New(t), nil)
+	// Gate Stop()'s per-worker sample drain (and the incomplete-bucket flush),
+	// the same way serverless-init does via preloadEarly.
+	mockConfig.SetInTest("dogstatsd_flush_incomplete_buckets", true)
 
-	t.Setenv(proxyEnabledEnvVar, "true")
+	cf := newCountingForwarder()
 
-	metricAgent := &ServerlessMetricAgent{
-		SketchesBucketOffset: time.Second * 10,
-		Tagger:               nooptagger.NewComponent(),
+	deps := fxutil.Test[aggregator.TestDeps](t,
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		fx.Provide(func() defaultforwarder.Component { return cf }),
+		core.MockBundle(),
+		hostnameimpl.MockModule(),
+		haagentmock.Module(),
+		logscompression.MockModule(),
+		metricscompression.MockModule(),
+		filterlistmock.MockModule(),
+	)
+
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		opts := aggregator.DefaultAgentDemultiplexerOptions()
+		opts.FlushInterval = time.Hour // disable automatic flushes
+		opts.DontStartForwarders = true
+		demux := aggregator.InitAndStartAgentDemultiplexerForTest(deps, opts, "")
+
+		agent := New(demux, Tags{})
+		agent.AddEnhancedMetric("test.metric", 1.0, pkgmetrics.MetricSourceServerless, 1000.0)
+
+		// Stop() must drain the worker's samplesChan before flushing so the
+		// late sample reliably reaches the serializer. Without the drain barrier
+		// the worker's select can pick the flush trigger first and drop it.
+		demux.Stop()
 	}
-	defer metricAgent.Stop()
-	metricAgent.Start(10*time.Second, &MetricConfig{}, &MetricDogStatsD{})
 
-	expected := []string{
-		invocationsMetric,
-		ErrorsMetric,
-	}
-
-	setValues := mockConfig.GetStringSlice(statsDMetricBlocklistKey)
-	assert.Equal(t, expected, setValues)
+	require.Equal(t, int64(iterations), cf.sketchCount.Load(),
+		"every AddEnhancedMetric followed by Stop() must produce exactly one sketch flush")
 }
 
-func TestRaceFlushVersusAddSample(t *testing.T) {
-	if os.Getenv("CI") == "true" && runtime.GOOS == "darwin" && runtime.GOARCH == "amd64" {
-		t.Skip("TestRaceFlushVersusAddSample is known to fail on the macOS Gitlab runners because of the already running Agent")
-	}
-	metricAgent := &ServerlessMetricAgent{
-		SketchesBucketOffset: time.Second * 10,
-		Tagger:               nooptagger.NewComponent(),
-	}
-	defer metricAgent.Stop()
-	metricAgent.Start(10*time.Second, &ValidMetricConfigMocked{}, &MetricDogStatsD{})
-
-	assert.NotNil(t, metricAgent.Demux)
-
-	server := http.Server{
-		Addr: "localhost:8888",
-		Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-			time.Sleep(10 * time.Millisecond)
-		}),
-	}
-	defer server.Close()
-
-	go func() {
-		err := server.ListenAndServe()
-		if !errors.Is(err, http.ErrServerClosed) {
-			panic(err)
-		}
-	}()
-
-	go func() {
-		for i := 0; i < 1000; i++ {
-			n := rand.Intn(10)
-			time.Sleep(time.Duration(n) * time.Microsecond)
-			go SendTimeoutEnhancedMetric([]string{"tag0:value0", "tag1:value1"}, metricAgent.Demux)
-		}
-	}()
-
-	go func() {
-		for i := 0; i < 1000; i++ {
-			n := rand.Intn(10)
-			time.Sleep(time.Duration(n) * time.Microsecond)
-			go metricAgent.Flush()
-		}
-	}()
-
-	time.Sleep(2 * time.Second)
+// wrappedDemux mirrors the demultiplexerimpl.demultiplexer wrapper struct that
+// Fx actually supplies to ServerlessMetricAgent: the aggregator.Demultiplexer
+// interface holds a struct that embeds *aggregator.AgentDemultiplexer rather
+// than the pointer itself. This test confirms a sample submitted through the
+// agent's interface-typed Demux is still drained and flushed by Stop() on
+// the underlying concrete demultiplexer.
+type wrappedDemux struct {
+	*aggregator.AgentDemultiplexer
 }
 
-func TestBuildMetricBlocklist(t *testing.T) {
-	userProvidedBlocklist := []string{
-		"user.defined.a",
-		"user.defined.b",
-	}
-	expected := []string{
-		"user.defined.a",
-		"user.defined.b",
-		invocationsMetric,
-	}
-	result := buildMetricBlocklist(userProvidedBlocklist)
-	assert.Equal(t, expected, result)
-}
-
-func TestBuildMetricBlocklistForProxy(t *testing.T) {
-	userProvidedBlocklist := []string{
-		"user.defined.a",
-		"user.defined.b",
-	}
-	expected := []string{
-		"user.defined.a",
-		"user.defined.b",
-		invocationsMetric,
-		ErrorsMetric,
-	}
-	result := buildMetricBlocklistForProxy(userProvidedBlocklist)
-	assert.Equal(t, expected, result)
-}
-
-// getAvailableUDPPort requests a random port number and makes sure it is available
-func getAvailableUDPPort() (int, error) {
-	conn, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return -1, fmt.Errorf("can't find an available udp port: %s", err)
-	}
-	defer conn.Close()
-
-	_, portString, err := net.SplitHostPort(conn.LocalAddr().String())
-	if err != nil {
-		return -1, fmt.Errorf("can't find an available udp port: %s", err)
-	}
-	portInt, err := strconv.Atoi(portString)
-	if err != nil {
-		return -1, fmt.Errorf("can't convert udp port: %s", err)
-	}
-
-	return portInt, nil
-}
-
-func TestRaceFlushVersusParsePacket(t *testing.T) {
+func TestStopDrainsThroughWrappedDemux(t *testing.T) {
 	mockConfig := configmock.New(t)
-	port, err := getAvailableUDPPort()
-	require.NoError(t, err)
-	mockConfig.SetDefault("dogstatsd_port", port)
+	pkgconfigsetup.LoadDatadog(mockConfig, secretsmock.New(t), delegatedauthmock.New(t), nil)
+	mockConfig.SetInTest("dogstatsd_flush_incomplete_buckets", true)
 
-	demux, err := aggregator.InitAndStartServerlessDemultiplexer(nil, time.Second*1000, nooptagger.NewComponent())
-	require.NoError(t, err, "cannot start Demultiplexer")
+	cf := newCountingForwarder()
 
-	s, err := dogstatsdServer.NewServerlessServer(demux)
-	require.NoError(t, err, "cannot start DSD")
-	defer s.Stop()
+	deps := fxutil.Test[aggregator.TestDeps](t,
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		fx.Provide(func() defaultforwarder.Component { return cf }),
+		core.MockBundle(),
+		hostnameimpl.MockModule(),
+		haagentmock.Module(),
+		logscompression.MockModule(),
+		metricscompression.MockModule(),
+		filterlistmock.MockModule(),
+	)
 
-	url := fmt.Sprintf("127.0.0.1:%d", mockConfig.GetInt("dogstatsd_port"))
-	conn, err := net.Dial("udp", url)
-	require.NoError(t, err, "cannot connect to DSD socket")
-	defer conn.Close()
+	opts := aggregator.DefaultAgentDemultiplexerOptions()
+	opts.FlushInterval = time.Hour
+	opts.DontStartForwarders = true
+	demux := aggregator.InitAndStartAgentDemultiplexerForTest(deps, opts, "")
 
-	finish := &sync.WaitGroup{}
-	finish.Add(2)
+	// The agent receives the wrapper (as Fx supplies it in production); the
+	// late sample is submitted through that interface-typed Demux.
+	agent := New(wrappedDemux{AgentDemultiplexer: demux}, Tags{})
+	agent.AddEnhancedMetric("test.metric", 1.0, pkgmetrics.MetricSourceServerless, 1000.0)
 
-	go func(wg *sync.WaitGroup) {
-		for i := 0; i < 1000; i++ {
-			conn.Write([]byte("daemon:666|g|#sometag1:somevalue1,sometag2:somevalue2"))
-			time.Sleep(10 * time.Nanosecond)
-		}
-		wg.Done()
-	}(finish)
+	demux.Stop()
 
-	go func(wg *sync.WaitGroup) {
-		for i := 0; i < 1000; i++ {
-			s.ServerlessFlush(time.Second * 10)
-		}
-		wg.Done()
-	}(finish)
+	require.Equal(t, int64(1), cf.sketchCount.Load(),
+		"Stop() must drain pending samples submitted through the wrapped Demux and flush them")
+}
 
-	finish.Wait()
+// TestShutdownCascadeFlushesLateSample is the end-to-end integration of the
+// serverless-init shutdown cascade. It builds the full Fx graph that
+// cmd/serverless-init wires (forwarder -> demultiplexer -> DogStatsD server),
+// with a counting forwarder injected and the flush-on-stop gate enabled, then
+// submits a late metric through the production emit path (ServerlessMetricAgent
+// on the bundle's Demux) and stops the app. app.Stop fires the OnStop hooks in
+// reverse construction order — dsdServer.stop -> demux.Stop() ->
+// forwarder.Stop — so the demux drains its samplesChan and flushes the late
+// sample to the serializer before the forwarder tears down. Asserting the
+// counting forwarder received exactly one sketch proves the whole cascade
+// delivers the sample without an external orchestrator.
+func TestShutdownCascadeFlushesLateSample(t *testing.T) {
+	if os.Getenv("CI") == "true" && runtime.GOOS == "darwin" {
+		t.Skip("known to fail on the macOS Gitlab runners because of the already running Agent")
+	}
+	mockConfig := configmock.New(t)
+	pkgconfigsetup.LoadDatadog(mockConfig, secretsmock.New(t), delegatedauthmock.New(t), nil)
+	// Enable the flush-on-stop gate the cascade relies on, mirroring the
+	// override cmd/serverless-init sets in preloadEarly.
+	mockConfig.SetInTest("dogstatsd_flush_incomplete_buckets", true)
+	// The Fx demux uses the 15s DefaultFlushInterval; the test completes well
+	// within that window, so the only flush is the one app.Stop drives.
+
+	cf := newCountingForwarder()
+
+	app, deps := metricstest.StartBundle(t, nooptagger.NewComponent(), cf)
+
+	// Submit a late sample through the production emit path, just like an
+	// in-flight request would right before serverless-init shuts down.
+	agent := New(deps.Demux, Tags{})
+	agent.AddEnhancedMetric("test.metric", 1.0, pkgmetrics.MetricSourceServerless, 1000.0)
+
+	// Drive the shutdown cascade: OnStop fires dsdServer.stop -> demux.Stop()
+	// -> forwarder.Stop in reverse construction order.
+	require.NoError(t, app.Stop(context.Background()))
+
+	require.Equal(t, int64(1), cf.sketchCount.Load(),
+		"the OnStop cascade must drain and flush the late sample to the forwarder")
+}
+
+// TestFlushAllDeliversOpenBucketSample proves FlushAll delivers a sample still
+// sitting in the current, open bucket — no periodic flush needed.
+// require.Eventually retries because AddEnhancedMetric and the worker
+// processing it race (the still-open SampleDrainer gap); that's not what this
+// test covers.
+func TestFlushAllDeliversOpenBucketSample(t *testing.T) {
+	mockConfig := configmock.New(t)
+	pkgconfigsetup.LoadDatadog(mockConfig, secretsmock.New(t), delegatedauthmock.New(t), nil)
+
+	cf := newCountingForwarder()
+
+	deps := fxutil.Test[aggregator.TestDeps](t,
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		fx.Provide(func() defaultforwarder.Component { return cf }),
+		core.MockBundle(),
+		hostnameimpl.MockModule(),
+		haagentmock.Module(),
+		logscompression.MockModule(),
+		metricscompression.MockModule(),
+		filterlistmock.MockModule(),
+	)
+
+	opts := aggregator.DefaultAgentDemultiplexerOptions()
+	opts.FlushInterval = time.Hour // disable automatic flushes
+	opts.DontStartForwarders = true
+	demux := aggregator.InitAndStartAgentDemultiplexerForTest(deps, opts, "")
+	defer demux.Stop()
+
+	agent := New(demux, Tags{})
+	// An hour out so the bucket can never close mid-test, regardless of real
+	// bucket-boundary timing.
+	future := float64(time.Now().Add(time.Hour).UnixNano()) / float64(time.Second)
+	agent.AddEnhancedMetric("test.metric", 1.0, pkgmetrics.MetricSourceServerless, future)
+
+	require.Eventually(t, func() bool {
+		agent.FlushAll()
+		return cf.sketchCount.Load() >= 1
+	}, time.Second, time.Millisecond,
+		"FlushAll must deliver a sample from the still-open bucket")
+}
+
+// TestFlushSkipsOpenBucket is the negative control for
+// TestFlushAllDeliversOpenBucketSample: Flush must never include a sample
+// from the still-open bucket.
+func TestFlushSkipsOpenBucket(t *testing.T) {
+	mockConfig := configmock.New(t)
+	pkgconfigsetup.LoadDatadog(mockConfig, secretsmock.New(t), delegatedauthmock.New(t), nil)
+
+	cf := newCountingForwarder()
+
+	deps := fxutil.Test[aggregator.TestDeps](t,
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		fx.Provide(func() defaultforwarder.Component { return cf }),
+		core.MockBundle(),
+		hostnameimpl.MockModule(),
+		haagentmock.Module(),
+		logscompression.MockModule(),
+		metricscompression.MockModule(),
+		filterlistmock.MockModule(),
+	)
+
+	opts := aggregator.DefaultAgentDemultiplexerOptions()
+	opts.FlushInterval = time.Hour // disable automatic flushes
+	opts.DontStartForwarders = true
+	demux := aggregator.InitAndStartAgentDemultiplexerForTest(deps, opts, "")
+	defer demux.Stop()
+
+	agent := New(demux, Tags{})
+	future := float64(time.Now().Add(time.Hour).UnixNano()) / float64(time.Second)
+	agent.AddEnhancedMetric("test.metric", 1.0, pkgmetrics.MetricSourceServerless, future)
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		agent.Flush()
+		time.Sleep(time.Millisecond)
+	}
+	assert.Equal(t, int64(0), cf.sketchCount.Load(),
+		"Flush must not deliver a sample from the still-open bucket")
 }

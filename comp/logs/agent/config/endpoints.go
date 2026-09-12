@@ -11,7 +11,8 @@ import (
 
 	"go.uber.org/atomic"
 
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/model"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	pkgconfigutils "github.com/DataDog/datadog-agent/pkg/config/utils"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/scrubber"
@@ -37,6 +38,19 @@ const (
 	EPIntakeVersion2
 )
 
+// EmptyPathPrefix is the default path prefix for the endpoint.
+const EmptyPathPrefix = ""
+
+// DiagnosticProtocol specifies which protocol to use for diagnostic endpoints.
+type DiagnosticProtocol int
+
+const (
+	// DiagnosticHTTP builds HTTP endpoints for diagnostic use
+	DiagnosticHTTP DiagnosticProtocol = iota
+	// DiagnosticTCP builds TCP endpoints for diagnostic use
+	DiagnosticTCP
+)
+
 // Endpoint holds all the organization and network parameters to send logs to Datadog.
 type Endpoint struct {
 	isReliable bool
@@ -55,6 +69,7 @@ type Endpoint struct {
 
 	Host                    string `mapstructure:"host" json:"host"`
 	Port                    int
+	PathPrefix              string `mapstructure:"path_prefix" json:"path_prefix"`
 	UseCompression          bool   `mapstructure:"use_compression" json:"use_compression"`
 	CompressionKind         string `mapstructure:"compression_kind" json:"compression_kind"`
 	CompressionLevel        int    `mapstructure:"compression_level" json:"compression_level"`
@@ -72,6 +87,8 @@ type Endpoint struct {
 	TrackType IntakeTrackType
 	Protocol  IntakeProtocol
 	Origin    IntakeOrigin
+
+	ExtraHTTPHeaders map[string]string
 }
 
 // unmarshalEndpoint is used to load additional endpoints from the configuration which stored as JSON/mapstructure.
@@ -80,6 +97,11 @@ type unmarshalEndpoint struct {
 	APIKey     string `mapstructure:"api_key" json:"api_key"`
 	IsReliable *bool  `mapstructure:"is_reliable" json:"is_reliable"`
 	UseSSL     *bool  `mapstructure:"use_ssl" json:"use_ssl"`
+
+	// ConnectionResetIntervalSeconds is the per-endpoint connection reset interval in seconds.
+	// A nil value means "not set" and will inherit the main endpoint's value.
+	// A zero value explicitly disables connection resets for this endpoint.
+	ConnectionResetIntervalSeconds *int `mapstructure:"connection_reset_interval" json:"connection_reset_interval"`
 
 	Endpoint `mapstructure:",squash"`
 }
@@ -91,13 +113,14 @@ type EndpointCompressionOptions struct {
 }
 
 // NewEndpoint returns a new Endpoint with the minimal field initialized.
-func NewEndpoint(apiKey string, apiKeyConfigPath string, host string, port int, useSSL bool) Endpoint {
+func NewEndpoint(apiKey string, apiKeyConfigPath string, host string, port int, pathPrefix string, useSSL bool) Endpoint {
 	apiKey = pkgconfigutils.SanitizeAPIKey(apiKey)
 	return Endpoint{
 		apiKey:            atomic.NewString(apiKey),
 		configSettingPath: apiKeyConfigPath,
 		Host:              host,
 		Port:              port,
+		PathPrefix:        pathPrefix,
 		useSSL:            useSSL,
 		isReliable:        true, // by default endpoints are reliable
 	}
@@ -105,23 +128,29 @@ func NewEndpoint(apiKey string, apiKeyConfigPath string, host string, port int, 
 
 // newTCPEndpoint returns a new TCP Endpoint based on LogsConfigKeys. The endpoint is by default reliable and will use
 // socks proxy and SSL settings from the configuration.
-func newTCPEndpoint(logsConfig *LogsConfigKeys) Endpoint {
+// If registerCallback is true, the endpoint will register for config updates to receive API key rotations.
+// Use registerCallback=false for transient/diagnostic endpoints that will be discarded after use.
+func newTCPEndpoint(logsConfig *LogsConfigKeys, registerCallback bool) Endpoint {
 	apiKey, configPath := logsConfig.getMainAPIKey()
 	e := Endpoint{
 		apiKey:                  atomic.NewString(apiKey),
 		configSettingPath:       configPath,
 		ProxyAddress:            logsConfig.socks5ProxyAddress(),
 		ConnectionResetInterval: logsConfig.connectionResetInterval(),
-		useSSL:                  logsConfig.logsNoSSL(),
+		useSSL:                  !logsConfig.logsNoSSL(),
 		isReliable:              true, // by default endpoints are reliable
 	}
-	e.onConfigUpdate(logsConfig)
+	if registerCallback {
+		e.onConfigUpdate(logsConfig)
+	}
 	return e
 }
 
 // newHTTPEndpoint returns a new HTTP Endpoint based on LogsConfigKeys The endpoint is by default reliable and will use
 // the settings related to HTTP from the configuration (compression, Backoff, recovery, ...).
-func newHTTPEndpoint(logsConfig *LogsConfigKeys) Endpoint {
+// If registerCallback is true, the endpoint will register for config updates to receive API key rotations.
+// Use registerCallback=false for transient/diagnostic endpoints that will be discarded after use.
+func newHTTPEndpoint(logsConfig *LogsConfigKeys, registerCallback bool) Endpoint {
 
 	apiKey, configPath := logsConfig.getMainAPIKey()
 	e := Endpoint{
@@ -136,22 +165,26 @@ func newHTTPEndpoint(logsConfig *LogsConfigKeys) Endpoint {
 		BackoffFactor:           logsConfig.senderBackoffFactor(),
 		RecoveryInterval:        logsConfig.senderRecoveryInterval(),
 		RecoveryReset:           logsConfig.senderRecoveryReset(),
-		useSSL:                  logsConfig.logsNoSSL(),
+		useSSL:                  !logsConfig.logsNoSSL(),
 		isReliable:              true, // by default endpoints are reliable
 	}
-	e.onConfigUpdate(logsConfig)
+	if registerCallback {
+		e.onConfigUpdate(logsConfig)
+	}
 	return e
 }
 
 // The setting from 'logs_config.additional_endpoints' is directly unmarshalled from the configuration into a
 // []unmarshalEndpoint and do not use the constructors. In this case, the Endpoint is initialized to returned the API
 // key from the loaded data instead of 'api_key'/'logs_config.api_key'.
-func loadTCPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys) []Endpoint {
+// If registerCallback is true, the endpoints will register for config updates to receive API key rotations.
+// Use registerCallback=false for transient/diagnostic endpoints that will be discarded after use.
+func loadTCPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys, registerCallback bool) []Endpoint {
 	additionals, configKeyUsed := l.getAdditionalEndpoints()
 
 	newEndpoints := make([]Endpoint, 0, len(additionals))
 	for idx, e := range additionals {
-		newE := NewEndpoint(e.APIKey, configKeyUsed, e.Host, e.Port, false)
+		newE := NewEndpoint(e.APIKey, configKeyUsed, e.Host, e.Port, EmptyPathPrefix, false)
 
 		newE.isAdditionalEndpoint = true
 		newE.additionalEndpointsIdx = idx
@@ -160,7 +193,11 @@ func loadTCPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys) []Endpoint {
 		newE.CompressionLevel = e.CompressionLevel
 		newE.ProxyAddress = l.socks5ProxyAddress()
 		newE.isReliable = e.IsReliable == nil || *e.IsReliable
-		newE.ConnectionResetInterval = e.ConnectionResetInterval
+		if e.ConnectionResetIntervalSeconds != nil {
+			newE.ConnectionResetInterval = time.Duration(*e.ConnectionResetIntervalSeconds) * time.Second
+		} else {
+			newE.ConnectionResetInterval = main.ConnectionResetInterval
+		}
 		newE.BackoffFactor = e.BackoffFactor
 		newE.BackoffBase = e.BackoffBase
 		newE.BackoffMax = e.BackoffMax
@@ -177,17 +214,22 @@ func loadTCPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys) []Endpoint {
 			newE.useSSL = main.useSSL
 		}
 		newEndpoints = append(newEndpoints, newE)
-		newE.onConfigUpdate(l)
+		if registerCallback {
+			newE.onConfigUpdate(l)
+		}
 	}
 	return newEndpoints
 }
 
-func loadHTTPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys, intakeTrackType IntakeTrackType, intakeProtocol IntakeProtocol, intakeOrigin IntakeOrigin) []Endpoint {
+// loadHTTPAdditionalEndpoints loads additional HTTP endpoints from configuration.
+// If registerCallback is true, the endpoints will register for config updates to receive API key rotations.
+// Use registerCallback=false for transient/diagnostic endpoints that will be discarded after use.
+func loadHTTPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys, intakeTrackType IntakeTrackType, intakeProtocol IntakeProtocol, intakeOrigin IntakeOrigin, registerCallback bool) []Endpoint {
 	additionals, configKeyUsed := l.getAdditionalEndpoints()
 
 	newEndpoints := make([]Endpoint, 0, len(additionals))
 	for idx, e := range additionals {
-		newE := NewEndpoint(e.APIKey, configKeyUsed, e.Host, e.Port, false)
+		newE := NewEndpoint(e.APIKey, configKeyUsed, e.Host, e.Port, e.PathPrefix, false)
 
 		newE.isAdditionalEndpoint = true
 		newE.additionalEndpointsIdx = idx
@@ -196,7 +238,11 @@ func loadHTTPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys, intakeTrackTy
 		newE.CompressionLevel = main.CompressionLevel
 		newE.ProxyAddress = e.ProxyAddress
 		newE.isReliable = e.IsReliable == nil || *e.IsReliable
-		newE.ConnectionResetInterval = e.ConnectionResetInterval
+		if e.ConnectionResetIntervalSeconds != nil {
+			newE.ConnectionResetInterval = time.Duration(*e.ConnectionResetIntervalSeconds) * time.Second
+		} else {
+			newE.ConnectionResetInterval = main.ConnectionResetInterval
+		}
 		newE.BackoffFactor = main.BackoffFactor
 		newE.BackoffBase = main.BackoffBase
 		newE.BackoffMax = main.BackoffMax
@@ -223,7 +269,9 @@ func loadHTTPAdditionalEndpoints(main Endpoint, l *LogsConfigKeys, intakeTrackTy
 		}
 
 		newEndpoints = append(newEndpoints, newE)
-		newE.onConfigUpdate(l)
+		if registerCallback {
+			newE.onConfigUpdate(l)
+		}
 	}
 	return newEndpoints
 }
@@ -247,7 +295,8 @@ func (e *Endpoint) GetStatus(prefix string, useHTTP bool) string {
 
 	host := e.Host
 	port := e.Port
-
+	pathPrefix := e.PathPrefix
+	redactedAPIKey := scrubber.HideKeyExceptLastChars(e.GetAPIKey())
 	var protocol string
 	if useHTTP {
 		if e.UseSSL() {
@@ -272,34 +321,53 @@ func (e *Endpoint) GetStatus(prefix string, useHTTP bool) string {
 		}
 	}
 
-	return fmt.Sprintf("%sSending %s logs in %s to %s on port %d", prefix, compression, protocol, host, port)
+	status := fmt.Sprintf("%sSending %s logs in %s to %s on port %d (API Key: %s)", prefix, compression, protocol, host, port, redactedAPIKey)
+	if pathPrefix != EmptyPathPrefix {
+		status = fmt.Sprintf("%s and path prefix \"%s\"", status, pathPrefix)
+	}
+	return status
 }
 
 // onConfigUpdate handles configuration change notification to update the internal API key of the Endpoint if needed
 func (e *Endpoint) onConfigUpdate(l *LogsConfigKeys) {
-	l.getConfig().OnUpdate(func(key string, oldVal interface{}, newVal interface{}) {
+	if e.isAdditionalEndpoint {
+		e.onConfigUpdateAdditionalEndpoints(l)
+	} else {
+		e.onConfigUpdateFromReaderMainEndpoint(l.getConfig())
+	}
+}
+
+// onConfigUpdateFromReaderMainEndpoint handles configuration change notification to update the internal API key of the
+// endpoint if it is the main endpoint
+func (e *Endpoint) onConfigUpdateFromReaderMainEndpoint(config model.Reader) {
+	config.OnUpdate(func(key string, _ model.Source, oldVal interface{}, newVal interface{}, _ uint64, _ model.Source) {
 		if key != e.configSettingPath {
 			return
 		}
 
-		// main Endpoints can directly get their API key from the configuration without having to load complex
-		// types.
-		if !e.isAdditionalEndpoint {
-			if newAPIKey, ok := newVal.(string); !ok {
-				log.Errorf("new API key for '%s' is invalid (not a string) ignoring new value", e.configSettingPath)
-			} else {
-				if oldKey, ok := oldVal.(string); ok && oldKey != e.apiKey.Load() {
-					// This should never happens as it means that an update from the config was
-					// missed
-					log.Warnf("old API key for '%s' doesn't match the one in this endpoints", e.configSettingPath)
-				}
-				log.Infof("rotating API key for '%s': %s -> %s",
-					e.configSettingPath,
-					scrubber.HideKeyExceptLastFiveChars(e.apiKey.Load()),
-					scrubber.HideKeyExceptLastFiveChars(newAPIKey),
-				)
-				e.apiKey.Store(newAPIKey)
+		if newAPIKey, ok := newVal.(string); !ok {
+			log.Errorf("new API key for '%s' is invalid (not a string) ignoring new value", e.configSettingPath)
+		} else {
+			if oldKey, ok := oldVal.(string); ok && oldKey != e.apiKey.Load() {
+				// This should never happens as it means that an update from the config was
+				// missed
+				log.Warnf("old API key for '%s' doesn't match the one in this endpoints", e.configSettingPath)
 			}
+			log.Infof("rotating API key for '%s': %s -> %s",
+				e.configSettingPath,
+				scrubber.HideKeyExceptLastChars(e.apiKey.Load()),
+				scrubber.HideKeyExceptLastChars(newAPIKey),
+			)
+			e.apiKey.Store(newAPIKey)
+		}
+	})
+}
+
+// onConfigUpdateAdditionalEndpoints handles configuration change notification to update the internal API key of the
+// endpoint, when the endpoint is an additional endpoint
+func (e *Endpoint) onConfigUpdateAdditionalEndpoints(l *LogsConfigKeys) {
+	l.getConfig().OnUpdate(func(key string, _ model.Source, _ interface{}, _ interface{}, _ uint64, _ model.Source) {
+		if key != e.configSettingPath {
 			return
 		}
 
@@ -314,8 +382,8 @@ func (e *Endpoint) onConfigUpdate(l *LogsConfigKeys) {
 		log.Infof("rotating API key for '%s' endpoints number %d: %s -> %s",
 			e.configSettingPath,
 			e.additionalEndpointsIdx,
-			scrubber.HideKeyExceptLastFiveChars(e.apiKey.Load()),
-			scrubber.HideKeyExceptLastFiveChars(newAPIKey),
+			scrubber.HideKeyExceptLastChars(e.apiKey.Load()),
+			scrubber.HideKeyExceptLastChars(newAPIKey),
 		)
 		e.apiKey.Store(newAPIKey)
 	})
@@ -358,11 +426,11 @@ func NewEndpoints(main Endpoint, additionalEndpoints []Endpoint, useProto bool, 
 		additionalEndpoints,
 		useProto,
 		useHTTP,
-		pkgconfigsetup.DefaultBatchWait,
-		pkgconfigsetup.DefaultBatchMaxConcurrentSend,
-		pkgconfigsetup.DefaultBatchMaxSize,
-		pkgconfigsetup.DefaultBatchMaxContentSize,
-		pkgconfigsetup.DefaultInputChanSize,
+		time.Duration(constants.DefaultBatchWait),
+		constants.DefaultBatchMaxConcurrentSend,
+		constants.DefaultBatchMaxSize,
+		constants.DefaultBatchMaxContentSize,
+		constants.DefaultInputChanSize,
 	)
 }
 

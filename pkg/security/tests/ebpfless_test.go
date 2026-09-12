@@ -25,6 +25,8 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
 )
 
+var _ = declare(TestEBPFLessAttach, testOpts{ebpfLessEnabled: true, dontWaitEBPFLessClient: true})
+
 func TestEBPFLessAttach(t *testing.T) {
 	t.Skip("not stable yet")
 
@@ -42,7 +44,7 @@ func TestEBPFLessAttach(t *testing.T) {
 		},
 	}
 
-	test, err := newTestModule(t, nil, ruleDefs, withStaticOpts(testOpts{ebpfLessEnabled: true, dontWaitEBPFLessClient: true}))
+	test, err := newTestModule(t, nil, ruleDefs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +57,7 @@ func TestEBPFLessAttach(t *testing.T) {
 
 	doneCh := make(chan bool)
 
-	test.WaitSignal(t, func() error {
+	test.WaitSignalFromRule(t, func() error {
 		go func() {
 			testFile, _, err := test.Path("test-ebpfless-attach")
 			if err != nil {
@@ -99,7 +101,7 @@ func TestEBPFLessAttach(t *testing.T) {
 		return nil
 	}, func(_ *model.Event, rule *rules.Rule) {
 		assertTriggeredRule(t, rule, "test_ebpfless_attach")
-	})
+	}, "test_ebpfless_attach")
 
 	select {
 	case <-doneCh:

@@ -12,6 +12,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
 	"github.com/DataDog/datadog-agent/pkg/serializer/types"
+	"github.com/DataDog/datadog-agent/pkg/util/infratags"
 )
 
 // Sender allows sending metrics from checks/a check
@@ -28,20 +29,25 @@ type Sender interface {
 	Historate(metric string, value float64, hostname string, tags []string)
 	Distribution(metric string, value float64, hostname string, tags []string)
 	ServiceCheck(checkName string, status servicecheck.ServiceCheckStatus, hostname string, tags []string, message string)
+	OpenmetricsBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool)
 	HistogramBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool)
 	// GaugeWithTimestamp reports a new gauge value to the intake with the given timestamp.
 	// Gauge time series measure a simple value over time.
 	// Unlike Gauge(), each submitted value will be passed to the intake as is, without aggregation. Each time series can have only one value per timestamp.
+	// The timestamp is in seconds since epoch (accepts fractional seconds)
 	GaugeWithTimestamp(metric string, value float64, hostname string, tags []string, timestamp float64) error
 	// CountWithTimestamp reports a new count value to the intake with the given timestamp.
 	// Count time series measure how many times something happened in some time period.
 	// Unlike Count(), each submitted value will be passed to the intake as is, without aggregation. Each time series can have only one value per timestamp.
+	// The timestamp is in seconds since epoch (accepts fractional seconds)
 	CountWithTimestamp(metric string, value float64, hostname string, tags []string, timestamp float64) error
 	Event(e event.Event)
 	EventPlatformEvent(rawEvent []byte, eventType string)
 	GetSenderStats() stats.SenderStats
 	DisableDefaultHostname(disable bool)
 	SetCheckCustomTags(tags []string)
+	// SetInfraTagger sets the Tagger that appends infra_mode tags to every metric sample.
+	SetInfraTagger(tagger *infratags.Tagger)
 	SetCheckService(service string)
 	SetNoIndex(noIndex bool)
 	FinalizeCheckServiceTag()
@@ -49,16 +55,9 @@ type Sender interface {
 	OrchestratorManifest(msgs []types.ProcessMessageBody, clusterID string)
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 type SenderManager interface {
 	GetSender(id checkid.ID) (Sender, error)
 	SetSender(Sender, checkid.ID) error
 	DestroySender(id checkid.ID)
 	GetDefaultSender() (Sender, error)
-}
-
-// DiagnoseSenderManager is the SenderManager used by the diagnose command
-// It creates an instance of senderManager lazily to keep the same behavior as before.
-type DiagnoseSenderManager interface {
-	LazyGetSenderManager() (SenderManager, error)
 }

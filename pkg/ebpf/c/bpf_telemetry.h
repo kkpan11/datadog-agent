@@ -4,11 +4,13 @@
 #include "bpf_helpers.h"
 #include "telemetry_types.h"
 #include "map-defs.h"
+#include "compiler.h"
 
 /* redefinition of some error values */
 #ifdef COMPILE_CORE
+#define ENOMEM 12
+#define EBUSY  16
 #define EEXIST 17
-#define EBUSY 16
 #endif
 
 #define STR(x) #x
@@ -61,6 +63,7 @@ static void *(*bpf_telemetry_update_patch)(unsigned long, ...) = (void *)PATCH_T
 #define FN_INDX_bpf_skb_load_bytes bpf_skb_load_bytes_indx
 #define FN_INDX_bpf_perf_event_output bpf_perf_event_output_indx
 #define FN_INDX_bpf_ringbuf_output bpf_ringbuf_output_indx
+#define FN_INDX_bpf_copy_from_user bpf_copy_from_user_indx
 
 #define helper_with_telemetry(fn, ...)                                                          \
     ({                                                                                          \
@@ -128,6 +131,15 @@ static void *(*bpf_telemetry_update_patch)(unsigned long, ...) = (void *)PATCH_T
         errno_ret;                                                                             \
     })
 
+#define bpf_sk_storage_get_or_create(map, sk, val)                                  \
+    ({                                                                              \
+        void *ret = bpf_sk_storage_get(&map, sk, val, BPF_SK_STORAGE_GET_F_CREATE); \
+        if (ret == NULL) {                                                          \
+            __record_map_telemetry(map, ENOMEM);                                    \
+        }                                                                           \
+        ret;                                                                        \
+    })
+
 #define bpf_probe_read_with_telemetry(...) \
     helper_with_telemetry(bpf_probe_read, __VA_ARGS__)
 
@@ -154,5 +166,47 @@ static void *(*bpf_telemetry_update_patch)(unsigned long, ...) = (void *)PATCH_T
 
 #define bpf_ringbuf_output_with_telemetry(...) \
     helper_with_telemetry(bpf_ringbuf_output, __VA_ARGS__)
+
+#define bpf_copy_from_user_with_telemetry(...) \
+    helper_with_telemetry(bpf_copy_from_user, __VA_ARGS__)
+
+#if defined(bpf_target_x86)
+
+#define PT_REGS_USER_STACK_PARM_WITH_TELEMETRY(x, n, ret)                                       \
+    ({                                                                           \
+        __u64 p = 0;                                                             \
+        ret = bpf_probe_read_user_with_telemetry(&p, sizeof(p), ((__u64 *)x->__PT_SP_REG) + n); \
+        p;                                                                       \
+    })
+
+#define PT_REGS_USER_PARM7_WITH_TELEMETRY(x, ret) PT_REGS_USER_STACK_PARM_WITH_TELEMETRY(x, 1, ret)
+#define PT_REGS_USER_PARM8_WITH_TELEMETRY(x, ret) PT_REGS_USER_STACK_PARM_WITH_TELEMETRY(x, 2, ret)
+#define PT_REGS_USER_PARM9_WITH_TELEMETRY(x, ret) PT_REGS_USER_STACK_PARM_WITH_TELEMETRY(x, 3, ret)
+#define PT_REGS_USER_PARM10_WITH_TELEMETRY(x, ret) PT_REGS_USER_STACK_PARM_WITH_TELEMETRY  (x, 4, ret)
+
+#elif defined(bpf_target_arm64)
+
+#define PT_REGS_USER_STACK_PARM_WITH_TELEMETRY(x, n, ret)                                       \
+    ({                                                                           \
+         unsigned long p = 0;                                                    \
+        ret = bpf_probe_read_user_with_telemetry(&p, sizeof(p), ((unsigned long *)x->sp) + n); \
+        p;                                                                          \
+    })
+
+// params 7 and 8 do not use the stack in arm64, so we can just use the normal read macros
+#define PT_REGS_USER_PARM7_WITH_TELEMETRY(x, ret) PT_REGS_USER_PARM7(x, ret)
+#define PT_REGS_USER_PARM8_WITH_TELEMETRY(x, ret) PT_REGS_USER_PARM8(x, ret)
+
+#define PT_REGS_USER_PARM9_WITH_TELEMETRY(x, ret) PT_REGS_USER_STACK_PARM(__PT_REGS_CAST(x), 0, ret)
+#define PT_REGS_USER_PARM10_WITH_TELEMETRY(x, ret) PT_REGS_USER_STACK_PARM(__PT_REGS_CAST(x), 1, ret)
+
+#else
+
+#define PT_REGS_USER_PARM7_WITH_TELEMETRY(x, ret) ({ _Pragma(__BPF_TARGET_MISSING); 0l; })
+#define PT_REGS_USER_PARM8_WITH_TELEMETRY(x, ret) ({ _Pragma(__BPF_TARGET_MISSING); 0l; })
+#define PT_REGS_USER_PARM9_WITH_TELEMETRY(x, ret) ({ _Pragma(__BPF_TARGET_MISSING); 0l; })
+#define PT_REGS_USER_PARM10_WITH_TELEMETRY(x, ret) ({ _Pragma(__BPF_TARGET_MISSING); 0l; })
+
+#endif
 
 #endif // BPF_TELEMETRY_H

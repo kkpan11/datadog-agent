@@ -3,10 +3,11 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//nolint:revive
+// Package flare provides log flare collection functionality for diagnostics
 package flare
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -17,6 +18,8 @@ import (
 
 // FlareController is a type that contains information needed to insert into a
 // flare from the logs agent.
+//
+//nolint:revive // exported: ignore package name struct conflict
 type FlareController struct {
 	mu           sync.Mutex
 	allFiles     []string
@@ -30,7 +33,7 @@ func NewFlareController() *FlareController {
 
 // FillFlare is the callback function for the flare where information in the
 // FlareController can be printed.
-func (fc *FlareController) FillFlare(fb flaretypes.FlareBuilder) error {
+func (fc *FlareController) FillFlare(_ context.Context, fb flaretypes.FlareBuilder) error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
@@ -55,7 +58,7 @@ func (fc *FlareController) FillFlare(fb flaretypes.FlareBuilder) error {
 			default:
 				fi, err := os.Stat(file)
 				if err != nil {
-					fileInfo = fmt.Sprintf("%s\n", err.Error())
+					fileInfo = err.Error() + "\n"
 				} else {
 					fileInfo = fmt.Sprintf("%s %s\n", file, fi.Mode().String())
 				}
@@ -77,7 +80,7 @@ func (fc *FlareController) SetAllFiles(files []string) {
 	fc.allFiles = files
 }
 
-// SetAllJournalFiles assigns the journalFiles parameter of FlareController
+// AddToJournalFiles assigns the journalFiles parameter of FlareController
 func (fc *FlareController) AddToJournalFiles(files []string) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()

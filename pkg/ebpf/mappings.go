@@ -9,7 +9,7 @@ package ebpf
 
 import (
 	"errors"
-	"fmt"
+	"strings"
 	"sync"
 
 	manager "github.com/DataDog/ebpf-manager"
@@ -171,16 +171,16 @@ func GetModuleFromProgID(id uint32) (string, error) {
 }
 
 // GetPerfEventFDByProbeID returns the fd mapped for a probe or an error if no mappings exists
-func GetPerfEventFDByProbeID(probeID ebpf.ProgramID) (uint32, error) {
+func GetPerfEventFDByProbeID(probeID ebpf.ProgramID) (uint32, bool) {
 	mappingLock.RLock()
 	defer mappingLock.RUnlock()
 
 	fd, ok := probeIDToFDMappings[probeID]
 	if ok {
-		return fd, nil
+		return fd, true
 	}
 
-	return 0, fmt.Errorf("no fd exists for probe with id %d", probeID)
+	return 0, false
 }
 
 // RemoveNameMappings removes the full name mappings for ebpf maps in the manager
@@ -295,7 +295,10 @@ func AddProbeFDMappings(mgr *manager.Manager) {
 	mappingLock.Lock()
 	defer mappingLock.Unlock()
 
-	for _, p := range mgr.Probes {
+	// GetProbes returns a copy of the probes. We use this because mgr.Probes is mutable
+	// and so may change from underneath us.
+	probes := mgr.GetProbes()
+	for _, p := range probes {
 		if p == nil || !p.IsRunning() {
 			continue
 		}
@@ -306,6 +309,11 @@ func AddProbeFDMappings(mgr *manager.Manager) {
 		}
 
 		if specs[0].Type != ebpf.Kprobe {
+			continue
+		}
+		progType, _, _ := strings.Cut(specs[0].SectionName, "/")
+		switch progType {
+		case "uprobe", "uretprobe":
 			continue
 		}
 

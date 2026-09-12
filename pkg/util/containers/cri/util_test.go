@@ -12,6 +12,8 @@
 package cri
 
 import (
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -19,8 +21,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	fakeremote "github.com/DataDog/datadog-agent/internal/third_party/kubernetes/pkg/kubelet/cri/remote/fake"
+	"google.golang.org/grpc"
+	criv1 "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/cri-client/pkg/fake"
 )
 
 func TestCRIUtilInit(t *testing.T) {
@@ -56,17 +59,72 @@ func TestCRIUtilListContainerStats(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestCRIUtilExecSync(t *testing.T) {
+	client := &recordingRuntimeServiceClient{
+		resp: &criv1.ExecSyncResponse{
+			Stdout:   []byte("stdout"),
+			Stderr:   []byte("stderr"),
+			ExitCode: 7,
+		},
+	}
+	util := &CRIUtil{
+		queryTimeout: 1 * time.Second,
+		clientV1:     client,
+	}
+
+	stdout, stderr, exitCode, err := util.ExecSync(context.Background(), "container-id", []string{"cat", "/etc/redis/redis.conf"}, 3*time.Second)
+
+	require.NoError(t, err)
+	assert.Equal(t, []byte("stdout"), stdout)
+	assert.Equal(t, []byte("stderr"), stderr)
+	assert.Equal(t, int32(7), exitCode)
+	require.NotNil(t, client.execSyncReq)
+	assert.Equal(t, "container-id", client.execSyncReq.ContainerId)
+	assert.Equal(t, []string{"cat", "/etc/redis/redis.conf"}, client.execSyncReq.Cmd)
+	assert.Equal(t, int64(3), client.execSyncReq.Timeout)
+}
+
+func TestCRIUtilExecSyncReturnsClientError(t *testing.T) {
+	expectedErr := errors.New("runtime unavailable")
+	util := &CRIUtil{
+		queryTimeout: 1 * time.Second,
+		clientV1: &recordingRuntimeServiceClient{
+			err: expectedErr,
+		},
+	}
+
+	stdout, stderr, exitCode, err := util.ExecSync(context.Background(), "container-id", []string{"cat", "/etc/redis/redis.conf"}, time.Second)
+
+	require.ErrorIs(t, err, expectedErr)
+	assert.Nil(t, stdout)
+	assert.Nil(t, stderr)
+	assert.Equal(t, int32(0), exitCode)
+}
+
 // createAndStartFakeRemoteRuntime creates and starts fakeremote.RemoteRuntime.
 // It returns the RemoteRuntime, endpoint on success.
 // Users should call fakeRuntime.Stop() to cleanup the server.
-func createAndStartFakeRemoteRuntime(t *testing.T) (*fakeremote.RemoteRuntime, string) {
-	endpoint, err := fakeremote.GenerateEndpoint()
+func createAndStartFakeRemoteRuntime(t *testing.T) (*fake.RemoteRuntime, string) {
+	endpoint, err := fake.GenerateEndpoint()
 	require.NoError(t, err)
 
-	fakeRuntime := fakeremote.NewFakeRemoteRuntime()
+	fakeRuntime := fake.NewFakeRemoteRuntime()
 
 	err = fakeRuntime.Start(endpoint)
 	require.NoError(t, err)
 
 	return fakeRuntime, endpoint
+}
+
+type recordingRuntimeServiceClient struct {
+	criv1.RuntimeServiceClient
+
+	execSyncReq *criv1.ExecSyncRequest
+	resp        *criv1.ExecSyncResponse
+	err         error
+}
+
+func (c *recordingRuntimeServiceClient) ExecSync(_ context.Context, req *criv1.ExecSyncRequest, _ ...grpc.CallOption) (*criv1.ExecSyncResponse, error) {
+	c.execSyncReq = req
+	return c.resp, c.err
 }

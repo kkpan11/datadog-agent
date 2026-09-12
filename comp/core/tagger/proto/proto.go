@@ -43,7 +43,7 @@ func Tagger2PbEntityEvent(event types.EntityEvent) (*pb.StreamTagsEvent, error) 
 	case types.EventTypeDeleted:
 		eventType = pb.EventType_DELETED
 	default:
-		return nil, fmt.Errorf("invalid event type %q", event.EventType)
+		return nil, fmt.Errorf("invalid event type %d", event.EventType)
 	}
 
 	return &pb.StreamTagsEvent{
@@ -54,6 +54,7 @@ func Tagger2PbEntityEvent(event types.EntityEvent) (*pb.StreamTagsEvent, error) 
 			OrchestratorCardinalityTags: entity.OrchestratorCardinalityTags,
 			LowCardinalityTags:          entity.LowCardinalityTags,
 			StandardTags:                entity.StandardTags,
+			IsComplete:                  entity.IsComplete,
 		},
 	}, nil
 }

@@ -173,6 +173,18 @@ var (
 
 		"kube-proxy.bind-address": "",
 	}
+
+	// Kubernetes keeps historical defaults for these three kubelet flags to
+	// preserve the command line API (applyLegacyDefaults in
+	// cmd/kubelet/app/options/options.go) and drops them once --config is used,
+	// where the KubeletConfiguration defaults apply instead. The two disagree,
+	// and the configuration file value is the secure one.
+	// reference: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/apis/config/v1beta1/defaults.go
+	confDefaults = map[string]string{
+		"kubelet.anonymous-auth":     "false",
+		"kubelet.authorization-mode": "Webhook",
+		"kubelet.read-only-port":     "0",
+	}
 )
 
 const preamble = `// Unless explicitly stated otherwise all files in this repository are licensed
@@ -451,7 +463,9 @@ func printKomponentCode(komp *komponent) string {
 			return fmt.Sprintf("res.%s = l.loadTokenFileMeta(%s)", toGoField(c.flagName), v)
 		case "*K8sConfigFileMeta":
 			if komp.name == "kubelet" && c.flagName == "config" {
-				return fmt.Sprintf("res.%s = l.loadKubeletConfigFileMeta(%s)", toGoField(c.flagName), v)
+				// The kubelet also reads the drop-ins of --config-dir, which
+				// override the file given to --config.
+				return fmt.Sprintf("res.%s = l.loadKubeletConfigFileMeta(%s, flags[\"--config-dir\"])", toGoField(c.flagName), v)
 			}
 			return fmt.Sprintf("res.%s, _ = l.loadConfigFileMeta(%s)", toGoField(c.flagName), v)
 		case "*K8sKubeletConfigFileMeta":
@@ -469,8 +483,8 @@ func printKomponentCode(komp *komponent) string {
 
 	titled := cases.Title(language.English, cases.NoLower).String(komp.name)
 	goStructName := strings.ReplaceAll(titled, "-", "")
-	s := ""
-	s += fmt.Sprintf("type K8s%sConfig struct {\n", goStructName)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "type K8s%sConfig struct {\n", goStructName)
 	for _, c := range komp.confs {
 		if !isKnownFlag(c.flagName) {
 			continue
@@ -479,21 +493,22 @@ func printKomponentCode(komp *komponent) string {
 		if !strings.HasPrefix(goType, "*") && !strings.HasPrefix(goType, "[]") {
 			goType = "*" + goType
 		}
-		s += fmt.Sprintf(" %s %s `json:\"%s,omitempty\"` // versions: %s\n",
+		fmt.Fprintf(&sb, " %s %s `json:\"%s,omitempty\"` // versions: %s\n",
 			toGoField(c.flagName), goType, toGoJSONTag(c.flagName), strings.Join(c.versions, ", "))
 	}
-	s += " SkippedFlags map[string]string `json:\"skippedFlags,omitempty\"`\n"
-	s += "}\n"
-	s += fmt.Sprintf("func (l *loader) newK8s%sConfig(flags map[string]string) *K8s%sConfig {\n", goStructName, goStructName)
-	s += "if (flags == nil) { return nil }\n"
-	s += fmt.Sprintf("var res K8s%sConfig\n", goStructName)
+	sb.WriteString(" SkippedFlags map[string]string `json:\"skippedFlags,omitempty\"`\n")
+	sb.WriteString("}\n")
+	fmt.Fprintf(&sb, "func (l *loader) newK8s%sConfig(flags map[string]string) *K8s%sConfig {\n", goStructName, goStructName)
+	sb.WriteString("if (flags == nil) { return nil }\n")
+	fmt.Fprintf(&sb, "var res K8s%sConfig\n", goStructName)
 	for _, c := range komp.confs {
 		if !isKnownFlag(c.flagName) {
 			continue
 		}
-		s += fmt.Sprintf("if v, ok := flags[\"--%s\"]; ok {\n", c.flagName)
-		s += fmt.Sprintf("delete(flags, \"--%s\")\n", c.flagName)
-		s += printAssignment(c, "v") + "\n"
+		fmt.Fprintf(&sb, "if v, ok := flags[\"--%s\"]; ok {\n", c.flagName)
+		fmt.Fprintf(&sb, "delete(flags, \"--%s\")\n", c.flagName)
+		sb.WriteString(printAssignment(c, "v"))
+		sb.WriteString("\n")
 		if c.flagDefault != "" {
 			// kube-apiserver and etcd components do not have any configuration file.
 			if komp.name != "kube-apiserver" && komp.name != "etcd" && komp.name != "kube-controller-manager" {
@@ -506,21 +521,25 @@ func printKomponentCode(komp *komponent) string {
 					panic(fmt.Errorf("missing %s configuration associated path to flag %q (default = %q)", komp.name, c.flagName, c.flagDefault))
 				}
 				if configCursor != "" {
-					s += fmt.Sprintf("\n} else if !l.configFileMetaHasField(res.Config, %q) {\n", configCursor)
+					fmt.Fprintf(&sb, "\n} else if !l.configFileMetaHasField(res.Config, %q) {\n", configCursor)
 				} else {
-					s += "\n} else {\n"
+					sb.WriteString("\n} else {\n")
 				}
 			} else {
-				s += "\n} else {\n"
+				sb.WriteString("\n} else {\n")
 			}
-			s += printAssignment(c, fmt.Sprintf("%q", c.flagDefault))
+			def := fmt.Sprintf("%q", c.flagDefault)
+			if confDefault, ok := confDefaults[komp.name+"."+c.flagName]; ok {
+				def = fmt.Sprintf("flagDefault(res.Config, %q, %q)", c.flagDefault, confDefault)
+			}
+			sb.WriteString(printAssignment(c, def))
 		}
-		s += "}\n"
+		sb.WriteString("}\n")
 	}
-	s += "if len(flags) > 0 { res.SkippedFlags = flags }\n"
-	s += "return &res\n"
-	s += "}\n"
-	return s
+	sb.WriteString("if len(flags) > 0 { res.SkippedFlags = flags }\n")
+	sb.WriteString("return &res\n")
+	sb.WriteString("}\n")
+	return sb.String()
 }
 
 func downloadEtcdAndExtractFlags(componentVersion string) *komponent {
@@ -704,12 +723,12 @@ func scanK8sHelpLine(line string) (*conf, bool) {
 		str = eatWhitespace(str)
 	}
 
-	if idx := strings.Index(str, "[default="); idx >= 0 {
-		conf.flagDefault = scanDefaultValue(str[idx+len("[default="):], '[', ']')
-	} else if idx := strings.Index(str, "[default "); idx >= 0 {
-		conf.flagDefault = scanDefaultValue(str[idx+len("[default "):], '[', ']')
-	} else if idx := strings.Index(str, "(default "); idx >= 0 {
-		conf.flagDefault = scanDefaultValue(str[idx+len("(default "):], '(', ')')
+	if _, after, ok := strings.Cut(str, "[default="); ok {
+		conf.flagDefault = scanDefaultValue(after, '[', ']')
+	} else if _, after, ok := strings.Cut(str, "[default "); ok {
+		conf.flagDefault = scanDefaultValue(after, '[', ']')
+	} else if _, after, ok := strings.Cut(str, "(default "); ok {
+		conf.flagDefault = scanDefaultValue(after, '(', ')')
 	}
 	if conf.flagType == "" {
 		conf.flagType = "bool"
@@ -753,7 +772,7 @@ func parseTypeBool(str string) string {
 
 func parseTypeCIDRs(str string) string {
 	var cidrs []string
-	for _, s := range strings.Split(str, ",") {
+	for s := range strings.SplitSeq(str, ",") {
 		s = strings.TrimSpace(s)
 		_, _, err := net.ParseCIDR(s)
 		if err != nil {

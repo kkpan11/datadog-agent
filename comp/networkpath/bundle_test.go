@@ -12,20 +12,23 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/eventplatformimpl"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	eventplatformmock "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/mock"
+	traceroute "github.com/DataDog/datadog-agent/comp/networkpath/traceroute/def"
+	traceroutemock "github.com/DataDog/datadog-agent/comp/networkpath/traceroute/mock"
 	rdnsquerier "github.com/DataDog/datadog-agent/comp/rdnsquerier/fx-mock"
-	logscompression "github.com/DataDog/datadog-agent/comp/serializer/logscompression/fx-mock"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
 func TestBundleDependencies(t *testing.T) {
 	fxutil.TestBundle(t, Bundle(),
 		core.MockBundle(),
-		eventplatformimpl.MockModule(),
+		hostnameimpl.MockModule(),
+		eventplatformmock.MockModule(),
 		rdnsquerier.MockModule(),
-		logscompression.MockModule(),
 		fx.Provide(func() statsd.ClientInterface {
 			return &statsd.NoOpClient{}
 		}),
+		fx.Provide(func(t testing.TB) traceroute.Component { return traceroutemock.Mock(t) }),
 	)
 }

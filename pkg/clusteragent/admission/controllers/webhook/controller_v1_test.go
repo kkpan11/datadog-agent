@@ -2,14 +2,15 @@
 // under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
-// Skip mac os test as cluster agent doesn't run on mac os
-//go:build kubeapiserver && !darwin
+
+//go:build kubeapiserver
 
 package webhook
 
 import (
 	"context"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -25,6 +26,8 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core"
 	configComp "github.com/DataDog/datadog-agent/comp/core/config"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/common"
@@ -43,6 +46,9 @@ const (
 func getV1Cfg(t *testing.T) Config { return NewConfig(true, false, false, configComp.NewMock(t)) }
 
 func TestSecretNotFoundV1(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("Skipping on macOS and Windows as Datadog Cluster Agent is not supported on those platforms.")
+	}
 	f := newFixtureV1(t)
 	v1Cfg := getV1Cfg(t)
 
@@ -62,6 +68,9 @@ func TestSecretNotFoundV1(t *testing.T) {
 }
 
 func TestCreateWebhookV1(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("Skipping on macOS and Windows as Datadog Cluster Agent is not supported on those platforms.")
+	}
 	f := newFixtureV1(t)
 	v1Cfg := getV1Cfg(t)
 
@@ -97,6 +106,9 @@ func TestCreateWebhookV1(t *testing.T) {
 }
 
 func TestUpdateOutdatedWebhookV1(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("Skipping on macOS and Windows as Datadog Cluster Agent is not supported on those platforms.")
+	}
 	f := newFixtureV1(t)
 	v1Cfg := getV1Cfg(t)
 
@@ -167,22 +179,22 @@ func TestAdmissionControllerFailureModeV1(t *testing.T) {
 	c, _ := f.createController()
 
 	for _, value := range []string{"Ignore", "ignore", "BadVal", ""} {
-		mockConfig.SetWithoutSource("admission_controller.failure_policy", value)
+		mockConfig.SetInTest("admission_controller.failure_policy", value)
 		c.config = NewConfig(true, false, false, mockConfig)
 
-		validatingWebhookSkeleton := c.getValidatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nil, nil, nil)
+		validatingWebhookSkeleton := c.getValidatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nil, nil, nil, 0)
 		assert.Equal(t, admiv1.Ignore, *validatingWebhookSkeleton.FailurePolicy)
-		mutatingWebhookSkeleton := c.getMutatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nil, nil, nil)
+		mutatingWebhookSkeleton := c.getMutatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nil, nil, nil, 0)
 		assert.Equal(t, admiv1.Ignore, *mutatingWebhookSkeleton.FailurePolicy)
 	}
 
 	for _, value := range []string{"Fail", "fail"} {
-		mockConfig.SetWithoutSource("admission_controller.failure_policy", value)
+		mockConfig.SetInTest("admission_controller.failure_policy", value)
 		c.config = NewConfig(true, false, false, mockConfig)
 
-		validatingWebhookSkeleton := c.getValidatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nil, nil, nil)
+		validatingWebhookSkeleton := c.getValidatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nil, nil, nil, 0)
 		assert.Equal(t, admiv1.Fail, *validatingWebhookSkeleton.FailurePolicy)
-		mutatingWebhookSkeleton := c.getMutatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nil, nil, nil)
+		mutatingWebhookSkeleton := c.getMutatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nil, nil, nil, 0)
 		assert.Equal(t, admiv1.Fail, *mutatingWebhookSkeleton.FailurePolicy)
 	}
 }
@@ -193,10 +205,10 @@ func TestAdmissionControllerReinvocationPolicyV1(t *testing.T) {
 	c, _ := f.createController()
 
 	for _, value := range []string{"IfNeeded", "ifneeded", "Never", "never", "wrong", ""} {
-		mockConfig.SetWithoutSource("admission_controller.reinvocationpolicy", value)
+		mockConfig.SetInTest("admission_controller.reinvocationpolicy", value)
 		c.config = NewConfig(true, false, false, mockConfig)
 
-		mutatingWebhookSkeleton := c.getMutatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nil, nil, nil)
+		mutatingWebhookSkeleton := c.getMutatingWebhookSkeleton("foo", "/bar", []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nil, nil, nil, 0)
 		assert.Equal(t, admiv1.IfNeededReinvocationPolicy, *mutatingWebhookSkeleton.ReinvocationPolicy)
 	}
 }
@@ -209,7 +221,28 @@ func TestGenerateTemplatesV1(t *testing.T) {
 	sideEffects := admiv1.SideEffectClassNone
 	port := int32(443)
 	timeout := mockConfig.GetInt32("admission_controller.timeout_seconds")
-	webhook := func(name, path string, objSelector, nsSelector *metav1.LabelSelector, matchConditions []admiv1.MatchCondition, operations []admiv1.OperationType, resources []string) admiv1.MutatingWebhook {
+
+	excludedDefaultNs := []string{"kube-system", "nsfoo"}
+	defaultNsSelector := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      common.NamespaceLabelKey,
+				Operator: metav1.LabelSelectorOpNotIn,
+				Values:   excludedDefaultNs,
+			},
+		},
+	}
+	probeNsSelectorWithAKS := &metav1.LabelSelector{
+		MatchExpressions: append([]metav1.LabelSelectorRequirement{
+			{
+				Key:      common.NamespaceLabelKey,
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"nsfoo"},
+			},
+		}, common.AzureAKSLabelSelectorRequirement()...),
+	}
+
+	webhook := func(name, path string, objSelector, nsSelector *metav1.LabelSelector, matchConditions []admiv1.MatchCondition, operations []admiv1.OperationType, resources []string, to int32) admiv1.MutatingWebhook {
 		return admiv1.MutatingWebhook{
 			Name: name,
 			ClientConfig: admiv1.WebhookClientConfig{
@@ -234,7 +267,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 			FailurePolicy:           &failurePolicy,
 			MatchPolicy:             &matchPolicy,
 			SideEffects:             &sideEffects,
-			TimeoutSeconds:          &timeout,
+			TimeoutSeconds:          &to,
 			AdmissionReviewVersions: []string{"v1", "v1beta1"},
 			ObjectSelector:          objSelector,
 			NamespaceSelector:       nsSelector,
@@ -250,11 +283,11 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "config injection, mutate all",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -266,18 +299,18 @@ func TestGenerateTemplatesV1(t *testing.T) {
 							Values:   []string{"false"},
 						},
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
 			name: "config injection, mutate labelled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -285,18 +318,18 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
 			name: "tags injection, mutate all",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", true)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -308,18 +341,18 @@ func TestGenerateTemplatesV1(t *testing.T) {
 							Values:   []string{"false"},
 						},
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
 			name: "tags injection, mutate labelled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", true)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -327,18 +360,18 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
 			name: "lib injection, mutate all",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -350,18 +383,42 @@ func TestGenerateTemplatesV1(t *testing.T) {
 							Values:   []string{"false"},
 						},
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
-			name: "lib injection, mutate labelled",
+			name: "lib injection, on demand",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+			},
+			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
+			want: func() []admiv1.MutatingWebhook {
+				webhook := webhook("datadog.webhook.lib.injection", "/injectlib", &metav1.LabelSelector{
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{
+							Key:      "admission.datadoghq.com/enabled",
+							Operator: metav1.LabelSelectorOpNotIn,
+							Values:   []string{"false"},
+						},
+					},
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
+				return []admiv1.MutatingWebhook{webhook}
+			},
+		},
+		{
+			name: "lib injection, on demand disabled, mutate labelled",
+			setupConfig: func(mockConfig model.Config) {
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", true)
+				mockConfig.SetInTest("apm_config.instrumentation.on_demand", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -369,17 +426,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
 			name: "config and tags injection, mutate labelled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", true)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -387,23 +444,23 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				webhookTags := webhook("datadog.webhook.standard.tags", "/injecttags", &metav1.LabelSelector{
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhookConfig, webhookTags}
 			},
 		},
 		{
 			name: "config and tags injection, mutate all",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", true)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -415,7 +472,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 							Values:   []string{"false"},
 						},
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				webhookTags := webhook("datadog.webhook.standard.tags", "/injecttags", &metav1.LabelSelector{
 					MatchExpressions: []metav1.LabelSelectorRequirement{
 						{
@@ -424,19 +481,19 @@ func TestGenerateTemplatesV1(t *testing.T) {
 							Values:   []string{"false"},
 						},
 					},
-				}, nil, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+				}, defaultNsSelector, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhookConfig, webhookTags}
 			},
 		},
 		{
 			name: "namespace selector enabled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", true)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -444,25 +501,39 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{
+							Key:      common.NamespaceLabelKey,
+							Operator: metav1.LabelSelectorOpNotIn,
+							Values:   excludedDefaultNs,
+						},
+					},
+				}, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				webhookTags := webhook("datadog.webhook.standard.tags", "/injecttags", nil, &metav1.LabelSelector{
 					MatchLabels: map[string]string{
 						"admission.datadoghq.com/enabled": "true",
 					},
-				}, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"})
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{
+							Key:      common.NamespaceLabelKey,
+							Operator: metav1.LabelSelectorOpNotIn,
+							Values:   excludedDefaultNs,
+						},
+					},
+				}, []admiv1.MatchCondition{}, []admiv1.OperationType{admiv1.Create}, []string{"pods"}, timeout)
 				return []admiv1.MutatingWebhook{webhookConfig, webhookTags}
 			},
 		},
 		{
 			name: "AKS-specific label selector without namespace selector enabled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.add_aks_selectors", true)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.add_aks_selectors", true)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -481,6 +552,11 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					&metav1.LabelSelector{
 						MatchExpressions: []metav1.LabelSelectorRequirement{
 							{
+								Key:      common.NamespaceLabelKey,
+								Operator: metav1.LabelSelectorOpNotIn,
+								Values:   excludedDefaultNs,
+							},
+							{
 								Key:      "control-plane",
 								Operator: metav1.LabelSelectorOpDoesNotExist,
 							},
@@ -499,20 +575,78 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					timeout,
 				)
 				return []admiv1.MutatingWebhook{webhook}
 			},
 		},
 		{
+			name: "AKS-specific label selector with probe enabled",
+			setupConfig: func(mockConfig model.Config) {
+				mockConfig.SetInTest("admission_controller.add_aks_selectors", true)
+				mockConfig.SetInTest("admission_controller.probe.enabled", true)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+			},
+			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, false, false, mockConfig) },
+			want: func() []admiv1.MutatingWebhook {
+				configWebhook := webhook(
+					"datadog.webhook.agent.config",
+					"/injectconfig",
+					&metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{
+								Key:      "admission.datadoghq.com/enabled",
+								Operator: metav1.LabelSelectorOpNotIn,
+								Values:   []string{"false"},
+							},
+						},
+					},
+					&metav1.LabelSelector{
+						MatchExpressions: append([]metav1.LabelSelectorRequirement{
+							{
+								Key:      common.NamespaceLabelKey,
+								Operator: metav1.LabelSelectorOpNotIn,
+								Values:   excludedDefaultNs,
+							},
+						}, common.AzureAKSLabelSelectorRequirement()...),
+					},
+					[]admiv1.MatchCondition{},
+					[]admiv1.OperationType{admiv1.Create},
+					[]string{"pods"},
+					timeout,
+				)
+				probeWebhook := webhook(
+					"datadog.webhook.probe",
+					"/injectconfig",
+					&metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							common.ProbeLabelKey: "true",
+						},
+					},
+					probeNsSelectorWithAKS,
+					nil,
+					[]admiv1.OperationType{admiv1.Create},
+					[]string{"configmaps"},
+					timeout,
+				)
+				return []admiv1.MutatingWebhook{configWebhook, probeWebhook}
+			},
+		},
+		{
 			name: "AKS-specific label selector with namespace selector enabled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.add_aks_selectors", true)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.add_aks_selectors", true)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", true)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", true)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(false, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -528,6 +662,11 @@ func TestGenerateTemplatesV1(t *testing.T) {
 								Values:   []string{"false"},
 							},
 							{
+								Key:      common.NamespaceLabelKey,
+								Operator: metav1.LabelSelectorOpNotIn,
+								Values:   excludedDefaultNs,
+							},
+							{
 								Key:      "control-plane",
 								Operator: metav1.LabelSelectorOpDoesNotExist,
 							},
@@ -546,6 +685,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					timeout,
 				)
 				return []admiv1.MutatingWebhook{webhook}
 			},
@@ -553,14 +693,15 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "cws instrumentation",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", true)
+				mockConfig.SetInTest("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.timeout", 2)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -580,6 +721,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				execWebhook := webhook(
 					"datadog.webhook.cws.exec.instrumentation",
@@ -589,6 +731,57 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Connect},
 					[]string{"pods/exec"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
+				)
+				return []admiv1.MutatingWebhook{podWebhook, execWebhook}
+			},
+		},
+		{
+			name: "AKS-specific label selector applied to webhooks with no namespace selector of their own",
+			setupConfig: func(mockConfig model.Config) {
+				mockConfig.SetInTest("admission_controller.add_aks_selectors", true)
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", true)
+				mockConfig.SetInTest("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.timeout", 2)
+			},
+			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, false, false, mockConfig) },
+			want: func() []admiv1.MutatingWebhook {
+				aksOnlySelector := &metav1.LabelSelector{
+					MatchExpressions: common.AzureAKSLabelSelectorRequirement(),
+				}
+				podWebhook := webhook(
+					"datadog.webhook.cws.pod.instrumentation",
+					"/inject-pod-cws",
+					&metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{
+								Key:      cwsinstrumentation.PodLabelEnabled,
+								Operator: metav1.LabelSelectorOpNotIn,
+								Values:   []string{"false"},
+							},
+						},
+					},
+					aksOnlySelector,
+					[]admiv1.MatchCondition{},
+					[]admiv1.OperationType{admiv1.Create},
+					[]string{"pods"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
+				)
+				execWebhook := webhook(
+					"datadog.webhook.cws.exec.instrumentation",
+					"/inject-command-cws",
+					nil,
+					aksOnlySelector,
+					[]admiv1.MatchCondition{},
+					[]admiv1.OperationType{admiv1.Connect},
+					[]string{"pods/exec"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				return []admiv1.MutatingWebhook{podWebhook, execWebhook}
 			},
@@ -596,14 +789,15 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "cws instrumentation, mutate unlabelled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.timeout", 2)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, false, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -619,6 +813,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				execWebhook := webhook(
 					"datadog.webhook.cws.exec.instrumentation",
@@ -628,6 +823,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Connect},
 					[]string{"pods/exec"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				return []admiv1.MutatingWebhook{podWebhook, execWebhook}
 			},
@@ -635,14 +831,15 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "cws instrumentation, namespace selector",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", true)
-				mockConfig.SetWithoutSource("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", true)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", true)
+				mockConfig.SetInTest("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.timeout", 2)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -662,6 +859,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				execWebhook := webhook(
 					"datadog.webhook.cws.exec.instrumentation",
@@ -671,6 +869,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Connect},
 					[]string{"pods/exec"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				return []admiv1.MutatingWebhook{podWebhook, execWebhook}
 			},
@@ -678,14 +877,15 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "cws instrumentation, namespace selector, mutate unlabelled",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", true)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", true)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", true)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("cluster_agent.service_account_name", "datadog-cluster-agent")
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.timeout", 2)
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -701,6 +901,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				execWebhook := webhook(
 					"datadog.webhook.cws.exec.instrumentation",
@@ -710,6 +911,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Connect},
 					[]string{"pods/exec"},
+					mockConfig.GetInt32("admission_controller.cws_instrumentation.timeout"),
 				)
 				return []admiv1.MutatingWebhook{podWebhook, execWebhook}
 			},
@@ -717,17 +919,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, misconfigured profiles, supported provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "fargate")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "misconfigured")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "fargate")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "misconfigured")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -737,17 +939,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, no selectors specified, supported provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "fargate")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "fargate")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -763,6 +965,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					timeout,
 				)
 				return []admiv1.MutatingWebhook{podWebhook}
 			},
@@ -770,17 +973,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, no selectors specified, unsupported provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "unsupported-prov")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "unsupported-prov")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -790,17 +993,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, no selectors specified, no provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -810,17 +1013,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, only single namespace selector, no provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[{\"NamespaceSelector\": {\"MatchLabels\": {\"labelKey\": \"labelVal\"}}}]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[{\"NamespaceSelector\": {\"MatchLabels\": {\"labelKey\": \"labelVal\"}}}]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -834,6 +1037,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					timeout,
 				)
 				return []admiv1.MutatingWebhook{podWebhook}
 			},
@@ -841,17 +1045,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, valid selector specified, unsupported provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "unsupported-prov")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[{\"ObjectSelector\": {\"MatchLabels\": {\"labelKey\": \"labelVal\"}}}]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "unsupported-prov")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[{\"ObjectSelector\": {\"MatchLabels\": {\"labelKey\": \"labelVal\"}}}]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -861,17 +1065,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, only single object selector, no provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[{\"ObjectSelector\": {\"MatchLabels\": {\"labelKey\": \"labelVal\"}}}]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[{\"ObjectSelector\": {\"MatchLabels\": {\"labelKey\": \"labelVal\"}}}]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -883,6 +1087,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					timeout,
 				)
 				return []admiv1.MutatingWebhook{podWebhook}
 			},
@@ -890,17 +1095,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, one object selector and one namespace selector, no provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[{\"ObjectSelector\": {\"MatchLabels\": {\"labelKey1\": \"labelVal1\"}}, \"NamespaceSelector\": {\"MatchLabels\": {\"labelKey2\": \"labelVal2\"}}}]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[{\"ObjectSelector\": {\"MatchLabels\": {\"labelKey1\": \"labelVal1\"}}, \"NamespaceSelector\": {\"MatchLabels\": {\"labelKey2\": \"labelVal2\"}}}]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -912,6 +1117,7 @@ func TestGenerateTemplatesV1(t *testing.T) {
 					[]admiv1.MatchCondition{},
 					[]admiv1.OperationType{admiv1.Create},
 					[]string{"pods"},
+					timeout,
 				)
 				return []admiv1.MutatingWebhook{podWebhook}
 			},
@@ -919,17 +1125,17 @@ func TestGenerateTemplatesV1(t *testing.T) {
 		{
 			name: "agent sidecar injection, multiple selectors (should refuse to create webhook), provider specified",
 			setupConfig: func(mockConfig model.Config) {
-				mockConfig.SetWithoutSource("admission_controller.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.namespace_selector_fallback", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_config.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.inject_tags.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.auto_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.enabled", false)
-				mockConfig.SetWithoutSource("admission_controller.cws_instrumentation.mutate_unlabelled", false)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.enabled", true)
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.provider", "fargate")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.selectors", "[{\"NamespaceSelector\": {\"MatchLabels\":{\"labelKey1\": \"labelVal1\"}}} , {\"ObjectSelector\": {\"MatchLabels\": {\"labelKey2\": \"labelVal2\"}}}]")
-				mockConfig.SetWithoutSource("admission_controller.agent_sidecar.profiles", "[]")
+				mockConfig.SetInTest("admission_controller.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.namespace_selector_fallback", false)
+				mockConfig.SetInTest("admission_controller.inject_config.enabled", false)
+				mockConfig.SetInTest("admission_controller.inject_tags.enabled", false)
+				mockConfig.SetInTest("admission_controller.auto_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.enabled", false)
+				mockConfig.SetInTest("admission_controller.cws_instrumentation.mutate_unlabelled", false)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.enabled", true)
+				mockConfig.SetInTest("admission_controller.agent_sidecar.provider", "fargate")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.selectors", "[{\"NamespaceSelector\": {\"MatchLabels\":{\"labelKey1\": \"labelVal1\"}}} , {\"ObjectSelector\": {\"MatchLabels\": {\"labelKey2\": \"labelVal2\"}}}]")
+				mockConfig.SetInTest("admission_controller.agent_sidecar.profiles", "[]")
 			},
 			configFunc: func(mockConfig model.Config) Config { return NewConfig(true, true, false, mockConfig) },
 			want: func() []admiv1.MutatingWebhook {
@@ -939,19 +1145,24 @@ func TestGenerateTemplatesV1(t *testing.T) {
 	}
 
 	wmeta := fxutil.Test[workloadmeta.Component](t,
-		core.MockBundle(),
-		fx.Replace(configComp.MockParams{Overrides: map[string]interface{}{"kube_resources_namespace": "nsfoo"}}),
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		fx.Provide(func() configComp.Component {
+			return configComp.NewMockWithOverrides(t, map[string]interface{}{"kube_resources_namespace": "nsfoo"})
+		}),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 	)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mockConfig := configmock.New(t)
-			mockConfig.SetWithoutSource("kube_resources_namespace", "nsfoo")
+			mockConfig.SetInTest("kube_resources_namespace", "nsfoo")
+			mockConfig.SetInTest("admission_controller.add_aks_selectors", false)
+			mockConfig.SetInTest("admission_controller.probe.enabled", false)
 			tt.setupConfig(mockConfig)
 
 			c := &ControllerV1{}
 			c.config = tt.configFunc(mockConfig)
-			c.webhooks = c.generateWebhooks(wmeta, nil, mockConfig, nil)
+			filterStore := newFilterStoreFromConfig(t, mockConfig)
+			c.webhooks = c.generateWebhooks(mockConfig, wmeta, nil, nil, nil, nil, filterStore, nil, nil, nil)
 			c.generateTemplates()
 
 			assert.EqualValues(t, tt.want(), c.mutatingWebhookTemplates)
@@ -968,8 +1179,8 @@ func TestGetValidatingWebhookSkeletonV1(t *testing.T) {
 	path := "/bar"
 	defaultTimeout := mockConfig.GetInt32("admission_controller.timeout_seconds")
 	customTimeout := int32(2)
-	namespaceSelector, _ := common.DefaultLabelSelectors(true)
-	_, objectSelector := common.DefaultLabelSelectors(false)
+	namespaceSelector, _ := common.DefaultLabelSelectors(true, common.LabelSelectorsConfig{})
+	_, objectSelector := common.DefaultLabelSelectors(false, common.LabelSelectorsConfig{})
 	webhook := func(to *int32, objSelector, nsSelector *metav1.LabelSelector, matchConditions []admiv1.MatchCondition) admiv1.ValidatingWebhook {
 		return admiv1.ValidatingWebhook{
 			Name: "datadog.webhook.foo",
@@ -1021,7 +1232,7 @@ func TestGetValidatingWebhookSkeletonV1(t *testing.T) {
 				path:       "/bar",
 			},
 			namespaceSelector: false,
-			want:              webhook(&defaultTimeout, objectSelector, nil, nil),
+			want:              webhook(&defaultTimeout, objectSelector, &metav1.LabelSelector{}, nil),
 		},
 		{
 			name: "namespace selector",
@@ -1040,25 +1251,25 @@ func TestGetValidatingWebhookSkeletonV1(t *testing.T) {
 			},
 			timeout:           &customTimeout,
 			namespaceSelector: false,
-			want:              webhook(&customTimeout, objectSelector, nil, nil),
+			want:              webhook(&customTimeout, objectSelector, &metav1.LabelSelector{}, nil),
 		},
 	}
 
-	mockConfig.SetWithoutSource("kube_resources_namespace", "nsfoo")
+	mockConfig.SetInTest("kube_resources_namespace", "nsfoo")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.timeout != nil {
-				mockConfig.SetWithoutSource("admission_controller.timeout_seconds", *tt.timeout)
+				mockConfig.SetInTest("admission_controller.timeout_seconds", *tt.timeout)
 				defer mockConfig.UnsetForSource("admission_controller.timeout_seconds", model.SourceUnknown)
 			}
 
 			c := &ControllerV1{}
 			c.config = NewConfig(false, tt.namespaceSelector, false, mockConfig)
 
-			nsSelector, objSelector := common.DefaultLabelSelectors(tt.namespaceSelector)
+			nsSelector, objSelector := common.DefaultLabelSelectors(tt.namespaceSelector, common.LabelSelectorsConfig{})
 
-			assert.EqualValues(t, tt.want, c.getValidatingWebhookSkeleton(tt.args.nameSuffix, tt.args.path, []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nsSelector, objSelector, nil))
+			assert.EqualValues(t, tt.want, c.getValidatingWebhookSkeleton(tt.args.nameSuffix, tt.args.path, []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nsSelector, objSelector, nil, 0))
 		})
 	}
 }
@@ -1073,8 +1284,8 @@ func TestGetMutatingWebhookSkeletonV1(t *testing.T) {
 	path := "/bar"
 	defaultTimeout := mockConfig.GetInt32("admission_controller.timeout_seconds")
 	customTimeout := int32(2)
-	namespaceSelector, _ := common.DefaultLabelSelectors(true)
-	_, objectSelector := common.DefaultLabelSelectors(false)
+	namespaceSelector, _ := common.DefaultLabelSelectors(true, common.LabelSelectorsConfig{})
+	_, objectSelector := common.DefaultLabelSelectors(false, common.LabelSelectorsConfig{})
 	webhook := func(to *int32, objSelector, nsSelector *metav1.LabelSelector, matchConditions []admiv1.MatchCondition) admiv1.MutatingWebhook {
 		return admiv1.MutatingWebhook{
 			Name: "datadog.webhook.foo",
@@ -1127,7 +1338,7 @@ func TestGetMutatingWebhookSkeletonV1(t *testing.T) {
 				path:       "/bar",
 			},
 			namespaceSelector: false,
-			want:              webhook(&defaultTimeout, objectSelector, nil, nil),
+			want:              webhook(&defaultTimeout, objectSelector, &metav1.LabelSelector{}, nil),
 		},
 		{
 			name: "namespace selector",
@@ -1146,25 +1357,25 @@ func TestGetMutatingWebhookSkeletonV1(t *testing.T) {
 			},
 			timeout:           &customTimeout,
 			namespaceSelector: false,
-			want:              webhook(&customTimeout, objectSelector, nil, nil),
+			want:              webhook(&customTimeout, objectSelector, &metav1.LabelSelector{}, nil),
 		},
 	}
 
-	mockConfig.SetWithoutSource("kube_resources_namespace", "nsfoo")
+	mockConfig.SetInTest("kube_resources_namespace", "nsfoo")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.timeout != nil {
-				mockConfig.SetWithoutSource("admission_controller.timeout_seconds", *tt.timeout)
+				mockConfig.SetInTest("admission_controller.timeout_seconds", *tt.timeout)
 				defer mockConfig.SetDefault("admission_controller.timeout_seconds", defaultTimeout)
 			}
 
 			c := &ControllerV1{}
 			c.config = NewConfig(false, tt.namespaceSelector, false, mockConfig)
 
-			nsSelector, objSelector := common.DefaultLabelSelectors(tt.namespaceSelector)
+			nsSelector, objSelector := common.DefaultLabelSelectors(tt.namespaceSelector, common.LabelSelectorsConfig{})
 
-			assert.EqualValues(t, tt.want, c.getMutatingWebhookSkeleton(tt.args.nameSuffix, tt.args.path, []admiv1.OperationType{admiv1.Create}, map[string][]string{"": {"pods"}}, nsSelector, objSelector, nil))
+			assert.EqualValues(t, tt.want, c.getMutatingWebhookSkeleton(tt.args.nameSuffix, tt.args.path, []admiv1.OperationType{admiv1.Create}, []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}}, nsSelector, objSelector, nil, 0))
 		})
 	}
 }
@@ -1194,7 +1405,13 @@ func (f *fixtureV1) createController() (*ControllerV1, informers.SharedInformerF
 		getV1Cfg(f.t),
 		wmeta,
 		nil,
+		nil,
 		datadogConfig,
+		nil,
+		nil,
+		newFilterStoreFromConfig(f.t, datadogConfig),
+		nil,
+		nil,
 		nil,
 	), factory
 }

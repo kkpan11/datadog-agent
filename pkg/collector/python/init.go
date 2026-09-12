@@ -20,12 +20,14 @@ import (
 	"time"
 	"unsafe"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
+	coreaggregator "github.com/DataDog/datadog-agent/pkg/collector/aggregator"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
 	"github.com/DataDog/datadog-agent/pkg/fips"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/cache"
 	"github.com/DataDog/datadog-agent/pkg/util/executable"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -33,8 +35,12 @@ import (
 )
 
 /*
-#cgo !windows LDFLAGS: -ldatadog-agent-rtloader -ldl
-#cgo windows LDFLAGS: -ldatadog-agent-rtloader -lstdc++ -static
+// On AIX, Go's CGO requires shared libraries to be wrapped in .a archives.
+// libdatadog-agent-rtloader.a is built from the .so file using "ar -X64 -r".
+#cgo aix LDFLAGS: -L${SRCDIR}/../../../rtloader/build/rtloader -ldatadog-agent-rtloader -ldl
+#cgo !aix,!windows LDFLAGS: -L${SRCDIR}/../../../rtloader/build/rtloader -ldatadog-agent-rtloader -ldl
+#cgo windows LDFLAGS: -L${SRCDIR}/../../../rtloader/build/rtloader -ldatadog-agent-rtloader -lstdc++ -static
+#cgo CFLAGS: -I "${SRCDIR}/../../../rtloader/include"  -I "${SRCDIR}/../../../rtloader/common"
 
 #include "datadog_agent_rtloader.h"
 #include "rtloader_mem.h"
@@ -45,14 +51,6 @@ import (
 
 char *getStringAddr(char **array, unsigned int idx) {
 	return array[idx];
-}
-
-//
-// init memory tracking facilities method
-//
-void MemoryTracker(void *, size_t, rtloader_mem_ops_t);
-void initMemoryTracker(void) {
-	set_memory_tracker_cb(MemoryTracker);
 }
 
 //
@@ -99,6 +97,8 @@ char* ObfuscateSQLExecPlan(char *, bool, char **);
 double getProcessStartTime();
 char* ObfuscateMongoDBString(char *, char **);
 void EmitAgentTelemetry(char *, char *, double, char *);
+void ReportIssue(char *, char *, char **);
+void ResolveIssue(char *, char **);
 
 void initDatadogAgentModule(rtloader_t *rtloader) {
 	set_get_clustername_cb(rtloader, GetClusterName);
@@ -118,24 +118,24 @@ void initDatadogAgentModule(rtloader_t *rtloader) {
 	set_get_process_start_time_cb(rtloader, getProcessStartTime);
 	set_obfuscate_mongodb_string_cb(rtloader, ObfuscateMongoDBString);
 	set_emit_agent_telemetry_cb(rtloader, EmitAgentTelemetry);
+	set_report_issue_cb(rtloader, ReportIssue);
+	set_resolve_issue_cb(rtloader, ResolveIssue);
 }
 
 //
 // aggregator module
 //
 
-void SubmitMetric(char *, metric_type_t, char *, double, char **, char *, bool);
-void SubmitServiceCheck(char *, char *, int, char **, char *, char *);
-void SubmitEvent(char *, event_t *);
-void SubmitHistogramBucket(char *, char *, long long, float, float, int, char *, char **, bool);
-void SubmitEventPlatformEvent(char *, char *, int, char *);
-
-void initAggregatorModule(rtloader_t *rtloader) {
-	set_submit_metric_cb(rtloader, SubmitMetric);
-	set_submit_service_check_cb(rtloader, SubmitServiceCheck);
-	set_submit_event_cb(rtloader, SubmitEvent);
-	set_submit_histogram_bucket_cb(rtloader, SubmitHistogramBucket);
-	set_submit_event_platform_event_cb(rtloader, SubmitEventPlatformEvent);
+// The submit callbacks are owned by the collector aggregator package; their
+// addresses are received here as opaque pointers and registered with rtloader.
+// Referencing those exported symbols directly would fail this package's cgo
+// link on the MinGW/Windows linker.
+void initAggregatorModule(rtloader_t *rtloader, void *m, void *sc, void *e, void *h, void *ep) {
+	set_submit_metric_cb(rtloader, (cb_submit_metric_t)m);
+	set_submit_service_check_cb(rtloader, (cb_submit_service_check_t)sc);
+	set_submit_event_cb(rtloader, (cb_submit_event_t)e);
+	set_submit_histogram_bucket_cb(rtloader, (cb_submit_histogram_bucket_t)h);
+	set_submit_event_platform_event_cb(rtloader, (cb_submit_event_platform_event_t)ep);
 }
 
 //
@@ -176,6 +176,14 @@ void GetKubeletConnectionInfo(char **);
 
 void initkubeutilModule(rtloader_t *rtloader) {
 	set_get_connection_info_cb(rtloader, GetKubeletConnectionInfo);
+}
+
+//
+// Wrapper to call _free function pointer from CGO
+//
+
+static inline void call_free(void* ptr) {
+    _free(ptr);
 }
 */
 import "C"
@@ -224,6 +232,9 @@ var (
 	pyInitLock    sync.RWMutex
 	pyDestroyLock sync.RWMutex
 	pyInitErrors  []string
+
+	// ErrNotInitialized is returned when rtloader is not initialized yet
+	ErrNotInitialized = errors.New("rtloader is not initialized")
 )
 
 func init() {
@@ -252,9 +263,9 @@ func addExpvarPythonInitErrors(msg string) error {
 	return errors.New(msg)
 }
 
-func sendTelemetry(pythonVersion string) {
+func sendTelemetry() {
 	tags := []string{
-		fmt.Sprintf("python_version:%s", pythonVersion),
+		"python_version:3",
 	}
 	if agentVersion, err := version.Agent(); err == nil {
 		tags = append(tags,
@@ -362,12 +373,11 @@ func resolvePythonExecPath(ignoreErrors bool) (string, error) {
 
 // Initialize initializes the Python interpreter
 func Initialize(paths ...string) error {
-	pythonVersion := pkgconfigsetup.Datadog().GetString("python_version")
 	allowPathHeuristicsFailure := pkgconfigsetup.Datadog().GetBool("allow_python_path_heuristics_failure")
 
 	// Memory related RTLoader-global initialization
 	if pkgconfigsetup.Datadog().GetBool("memtrack_enabled") {
-		C.initMemoryTracker()
+		InitMemoryTracker()
 	}
 
 	// Any platform-specific initialization
@@ -386,43 +396,42 @@ func Initialize(paths ...string) error {
 	var pyErr *C.char
 
 	csPythonHome := TrackedCString(PythonHome)
-	defer C._free(unsafe.Pointer(csPythonHome))
+	defer C.call_free(unsafe.Pointer(csPythonHome))
 	csPythonExecPath := TrackedCString(pythonBinPath)
-	defer C._free(unsafe.Pointer(csPythonExecPath))
+	defer C.call_free(unsafe.Pointer(csPythonExecPath))
 
-	if pythonVersion == "3" {
-		log.Infof("Initializing rtloader with Python 3 %s", PythonHome)
-		rtloader = C.make3(csPythonHome, csPythonExecPath, &pyErr)
-	} else {
-		return addExpvarPythonInitErrors(fmt.Sprintf("unsuported version of python: %s", pythonVersion))
-	}
+	log.Infof("Initializing rtloader with Python 3 %s", PythonHome)
+	rtloader = C.make3(csPythonHome, csPythonExecPath, &pyErr)
 
 	if rtloader == nil {
 		err := addExpvarPythonInitErrors(
-			fmt.Sprintf("could not load runtime python for version %s: %s", pythonVersion, C.GoString(pyErr)),
+			"could not load runtime python for version 3: " + C.GoString(pyErr),
 		)
 		if pyErr != nil {
 			// pyErr tracked when created in rtloader
-			C._free(unsafe.Pointer(pyErr))
+			C.call_free(unsafe.Pointer(pyErr))
 		}
 		return err
 	}
 
 	// Should we track python memory?
+	var pymemTelemetryInterval time.Duration
 	if pkgconfigsetup.Datadog().GetBool("telemetry.python_memory") {
-		var interval time.Duration
 		if pkgconfigsetup.Datadog().GetBool("telemetry.enabled") {
 			// detailed telemetry is enabled
-			interval = 1 * time.Second
-		} else if pkgconfigsetup.IsAgentTelemetryEnabled(pkgconfigsetup.Datadog()) {
+			pymemTelemetryInterval = 1 * time.Second
+		} else if configutils.IsAgentTelemetryEnabled(pkgconfigsetup.Datadog()) {
 			// default telemetry is enabled (emitted every 15 minute)
-			interval = 15 * time.Minute
+			pymemTelemetryInterval = 15 * time.Minute
 		}
+	}
 
-		// interval is 0 if telemetry is disabled
-		if interval > 0 {
-			initPymemTelemetry(interval)
-		}
+	// pymemTelemetryInterval is 0 if telemetry is disabled
+	pymemTelemetryEnabled := pymemTelemetryInterval > 0
+	if pymemTelemetryEnabled {
+		// This must happen before C.init(rtloader) below: it installs the
+		// allocator hooks the interpreter needs to be using from the start.
+		C.init_pymem_stats(rtloader)
 	}
 
 	// Set the PYTHONPATH if needed.
@@ -435,17 +444,24 @@ func Initialize(paths ...string) error {
 	C.initCgoFree(rtloader)
 	C.initLogger(rtloader)
 	C.initDatadogAgentModule(rtloader)
-	C.initAggregatorModule(rtloader)
+	aggCb := coreaggregator.GetCallbacks()
+	C.initAggregatorModule(rtloader, aggCb.Metric, aggCb.ServiceCheck, aggCb.Event, aggCb.HistogramBucket, aggCb.EventPlatformEvent)
 	C.initUtilModule(rtloader)
 	C.initTaggerModule(rtloader)
-	initContainerFilter() // special init for the container go code
 	C.initContainersModule(rtloader)
 	C.initkubeutilModule(rtloader)
 
 	// Init RtLoader machinery
 	if C.init(rtloader) == 0 {
-		err := fmt.Sprintf("could not initialize rtloader: %s", C.GoString(C.get_error(rtloader)))
+		err := "could not initialize rtloader: " + C.GoString(C.get_error(rtloader))
+		// rtloader failed to initialize, clear the global to avoid trying to use it later
+		rtloader = nil
 		return addExpvarPythonInitErrors(err)
+	}
+
+	// Only start the pymem telemetry worker once we know rtloader initialized successfully
+	if pymemTelemetryEnabled {
+		startPymemTelemetryWorker(pymemTelemetryInterval)
 	}
 
 	// Lock the GIL
@@ -469,7 +485,7 @@ func Initialize(paths ...string) error {
 		log.Errorf("Could not query python information: %s", C.GoString(C.get_error(rtloader)))
 	}
 
-	sendTelemetry(pythonVersion)
+	sendTelemetry()
 
 	return nil
 }
@@ -480,12 +496,10 @@ func GetRtLoader() *C.rtloader_t {
 	return rtloader
 }
 
-func initPymemTelemetry(d time.Duration) {
-	C.init_pymem_stats(rtloader)
-
+func startPymemTelemetryWorker(d time.Duration) {
 	// "alloc" for consistency with go memstats and mallochook metrics.
-	alloc := telemetry.NewSimpleCounter("pymem", "alloc", "Total number of bytes allocated by the python interpreter since the start of the agent.")
-	inuse := telemetry.NewSimpleGauge("pymem", "inuse", "Number of bytes currently allocated by the python interpreter.")
+	alloc := telemetryimpl.GetCompatComponent().NewSimpleCounter("pymem", "alloc", "Total number of bytes allocated by the python interpreter since the start of the agent.")
+	inuse := telemetryimpl.GetCompatComponent().NewSimpleGauge("pymem", "inuse", "Number of bytes currently allocated by the python interpreter.")
 
 	go func() {
 		t := time.NewTicker(d)

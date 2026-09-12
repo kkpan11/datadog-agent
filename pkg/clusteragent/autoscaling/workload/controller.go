@@ -9,40 +9,49 @@ package workload
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
+	datadoghq "github.com/DataDog/datadog-operator/api/datadoghq/v1alpha2"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
+	k8sclient "k8s.io/client-go/kubernetes"
 	scaleclient "k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 
-	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
-	datadoghq "github.com/DataDog/datadog-operator/api/datadoghq/v1alpha2"
-
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling"
+	autoscalingstore "github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/store"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload/metrics"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload/model"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/metricsstore"
+	workloadpatcher "github.com/DataDog/datadog-agent/pkg/clusteragent/patcher"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common"
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common/namespace"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/pointer"
-
-	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common"
 )
 
 const (
 	// TODO: evaluate the retry values vs backoff time of the workqueue
 	maxRetry int = 5
 
-	controllerID = "dpa-c"
+	controllerID autoscalingstore.SenderID = "dpa-c"
 
-	staleTimestampThreshold = time.Minute * 10 // time to wait before considering a recommendation stale
+	defaultStaleTimestampThreshold = 30 * time.Minute // time to wait before considering a recommendation stale
+
+	podWatcherSyncRequeueAfter = 30 * time.Second
 )
 
 var (
@@ -53,7 +62,10 @@ var (
 	}
 )
 
-type store = autoscaling.Store[model.PodAutoscalerInternal]
+type (
+	store     = autoscalingstore.Store[model.PodAutoscalerInternal]
+	limitHeap = autoscaling.HashHeap[model.PodAutoscalerInternal]
+)
 
 // Controller for DatadogPodAutoscaler objects
 type Controller struct {
@@ -65,15 +77,19 @@ type Controller struct {
 	eventRecorder record.EventRecorder
 	store         *store
 
-	limitHeap *autoscaling.HashHeap
+	limitHeap *limitHeap
 
 	podWatcher           PodWatcher
+	scaler               scaler
 	horizontalController *horizontalController
 	verticalController   *verticalController
 
 	localSender sender.Sender
 
 	isFallbackEnabled bool
+	fallbackMu        sync.Mutex // guards isFallbackEnabled
+
+	metricsStore *metricsstore.MetricsStore[*model.PodAutoscalerInternal]
 }
 
 // NewController returns a new workload autoscaling controller
@@ -83,13 +99,15 @@ func NewController(
 	eventRecorder record.EventRecorder,
 	restMapper apimeta.RESTMapper,
 	scaleClient scaleclient.ScalesGetter,
+	client k8sclient.Interface,
 	dynamicClient dynamic.Interface,
 	dynamicInformer dynamicinformer.DynamicSharedInformerFactory,
 	isLeader func() bool,
 	store *store,
 	podWatcher PodWatcher,
 	localSender sender.Sender,
-	limitHeap *autoscaling.HashHeap,
+	limitHeap *limitHeap,
+	globalTagsFunc func() []string,
 ) (*Controller, error) {
 	c := &Controller{
 		clusterID:         clusterID,
@@ -114,23 +132,38 @@ func NewController(
 
 	c.Controller = baseController
 	c.limitHeap = limitHeap
-	store.RegisterObserver(autoscaling.Observer{
-		SetFunc:    c.limitHeap.InsertIntoHeap,
-		DeleteFunc: c.limitHeap.DeleteFromHeap,
-	})
 	c.store = store
 	c.podWatcher = podWatcher
+	c.scaler = newScaler(restMapper, scaleClient)
 
-	// TODO: Ensure that controllers do not take action before the podwatcher is synced
-	c.horizontalController = newHorizontalReconciler(c.clock, eventRecorder, restMapper, scaleClient)
-	c.verticalController = newVerticalController(c.clock, eventRecorder, dynamicClient, c.podWatcher)
+	// Initialize metrics store
+	c.metricsStore = metricsstore.NewMetricsStore(metrics.GeneratePodAutoscalerMetrics, localSender, c.IsLeader, globalTagsFunc)
+	c.store.RegisterObserver(
+		autoscalingstore.Observer{
+			SetFunc: func(key string, _ autoscalingstore.SenderID) {
+				pai, found := c.store.Peek(key)
+				if !found {
+					return
+				}
+				c.metricsStore.Add(key, &pai)
+			},
+			DeleteFunc: func(key string, _ autoscalingstore.SenderID) { c.metricsStore.Delete(key) },
+		})
+
+	c.horizontalController = newHorizontalReconciler(c.clock, eventRecorder, c.scaler)
+
+	patchClient := workloadpatcher.NewPatcher(dynamicClient, nil) // let controller handle leader check
+	c.verticalController = newVerticalController(c.clock, eventRecorder, client, isLeader, patchClient, c.podWatcher)
 
 	return c, nil
 }
 
 // PreStart is called before the controller starts
 func (c *Controller) PreStart(ctx context.Context) {
-	startLocalTelemetry(ctx, c.localSender, []string{"kube_cluster_id:" + c.clusterID, "crd_api_version:" + podAutoscalerGVR.Version})
+	autoscaling.StartLocalTelemetry(ctx, c.localSender, "workload", []string{"kube_cluster_id:" + c.clusterID, "crd_api_version:" + podAutoscalerGVR.Version})
+
+	// Start periodic metrics submission (every 30 seconds)
+	go c.metricsStore.WriteAllPeriodically(ctx, 30*time.Second)
 }
 
 // Process implements the Processor interface (so required to be public)
@@ -158,13 +191,13 @@ func (c *Controller) processPodAutoscaler(ctx context.Context, key, ns, name str
 	}
 
 	switch {
-	case errors.IsNotFound(err):
+	case k8serrors.IsNotFound(err):
 		// We ignore not found here as we may need to create a DatadogPodAutoscaler later
 		podAutoscaler = nil
 	case err != nil:
 		return autoscaling.Requeue, fmt.Errorf("Unable to retrieve DatadogPodAutoscaler: %w", err)
 	case podAutoscalerCachedObj == nil:
-		return autoscaling.Requeue, fmt.Errorf("Could not parse empty DatadogPodAutoscaler from local cache")
+		return autoscaling.Requeue, errors.New("Could not parse empty DatadogPodAutoscaler from local cache")
 	}
 
 	// No error path, check what to do with this event
@@ -176,51 +209,65 @@ func (c *Controller) processPodAutoscaler(ctx context.Context, key, ns, name str
 	// If the object is present in Kubernetes, we will update our local version
 	// Otherwise, we clear it from our local store
 	if podAutoscaler != nil {
-		c.store.Set(key, model.NewPodAutoscalerInternal(podAutoscaler), c.ID)
+		item, _ := c.store.Get(key)
+		item.Upsert(model.NewPodAutoscalerInternal(podAutoscaler), c.ID)
 	} else {
-		c.store.Delete(key, c.ID)
+		item, _ := c.store.Get(key)
+		item.Delete(c.ID)
 	}
 
 	return autoscaling.NoRequeue, nil
 }
 
 // Synchronize DatadogPodAutoscaler state between internal store and Kubernetes objects
-// Make sure any `return` has the proper store Unlock
+// The deferred item.Release() acts as a safety net; it becomes a no-op once a terminal (Upsert/Delete) runs.
 // podAutoscaler is read-only, any changes require a DeepCopy
 func (c *Controller) syncPodAutoscaler(ctx context.Context, key, ns, name string, podAutoscaler *datadoghq.DatadogPodAutoscaler) (autoscaling.ProcessResult, error) {
-	podAutoscalerInternal, podAutoscalerInternalFound := c.store.LockRead(key, true)
+	item, podAutoscalerInternalFound := c.store.Get(key)
+	defer item.Release()
 
 	// Object is missing from our store
 	if !podAutoscalerInternalFound {
 		if podAutoscaler != nil {
 			// If we don't have an instance locally, we create it. Deletion is handled through setting the `Deleted` flag
 			log.Debugf("Creating internal PodAutoscaler: %s from Kubernetes object", key)
-			c.store.UnlockSet(key, model.NewPodAutoscalerInternal(podAutoscaler), c.ID)
+			pai := model.NewPodAutoscalerInternal(podAutoscaler)
+			item.Upsert(pai, c.ID)
 		} else {
 			// If podAutoscaler == nil, both objects are nil, nothing to do
 			log.Debugf("Reconciling object: %s but object is not present in Kubernetes nor in internal store, nothing to do", key)
-			c.store.Unlock(key)
 		}
 
 		return autoscaling.NoRequeue, nil
 	}
 
+	podAutoscalerInternal := item.Value()
+
 	if podAutoscaler == nil {
 		// Object is not present in Kubernetes
 		// If flagged for deletion, we just need to clear up our store (deletion complete)
 		// Also if object was not owned by remote config, we also need to delete it (deleted by user)
-		if podAutoscalerInternal.Deleted() || podAutoscalerInternal.Spec().Owner != datadoghqcommon.DatadogPodAutoscalerRemoteOwner {
+		if podAutoscalerInternal.Deleted() || (!podAutoscalerInternal.IsProfileManaged() && podAutoscalerInternal.Spec().Owner != datadoghqcommon.DatadogPodAutoscalerRemoteOwner) {
 			log.Infof("Object %s not present in Kubernetes and flagged for deletion (remote) or owner == local, clearing internal store", key)
-			c.store.UnlockDelete(key, c.ID)
+			item.Delete(c.ID)
 			return autoscaling.NoRequeue, nil
 		}
 
 		// Object is not flagged for deletion and owned by remote config, we need to create it in Kubernetes
 		log.Infof("Object %s has remote owner and not present in Kubernetes, creating it", key)
-		err := c.createPodAutoscaler(ctx, podAutoscalerInternal)
+		createdGeneration, creationTimestamp, err := c.createPodAutoscaler(ctx, podAutoscalerInternal)
+		if err != nil {
+			return autoscaling.Requeue, err
+		}
 
-		c.store.Unlock(key)
-		return autoscaling.Requeue, err
+		podAutoscalerInternal.SetGeneration(createdGeneration)
+		podAutoscalerInternal.UpdateCreationTimestamp(creationTimestamp)
+		if podAutoscalerInternal.IsProfileManaged() {
+			podAutoscalerInternal.MarkProfileTemplateApplied()
+		}
+
+		item.Upsert(podAutoscalerInternal, c.ID)
+		return autoscaling.NoRequeue, nil
 	}
 
 	// Object is present in both our store and Kubernetes, we need to sync depending on ownership.
@@ -232,14 +279,13 @@ func (c *Controller) syncPodAutoscaler(ctx context.Context, key, ns, name string
 			log.Infof("Remote owned PodAutoscaler with Deleted flag, deleting object: %s", key)
 			err := c.deletePodAutoscaler(ns, name)
 			// In case of not found, it means the object is gone but informer cache is not updated yet, we can safely delete it from our store
-			if err != nil && errors.IsNotFound(err) {
+			if err != nil && k8serrors.IsNotFound(err) {
 				log.Debugf("Object %s not found in Kubernetes during deletion, clearing internal store", key)
-				c.store.UnlockDelete(key, c.ID)
+				item.Delete(c.ID)
 				return autoscaling.NoRequeue, nil
 			}
 
 			// In all other cases, we requeue and wait for the object to be deleted from store with next reconcile
-			c.store.Unlock(key)
 			return autoscaling.Requeue, err
 		}
 
@@ -248,66 +294,130 @@ func (c *Controller) syncPodAutoscaler(ctx context.Context, key, ns, name string
 		if podAutoscalerInternal.Spec().RemoteVersion != nil &&
 			podAutoscaler.Spec.RemoteVersion != nil &&
 			*podAutoscalerInternal.Spec().RemoteVersion > *podAutoscaler.Spec.RemoteVersion {
-			err := c.updatePodAutoscalerSpec(ctx, podAutoscalerInternal, podAutoscaler)
+			updatedGeneration, err := c.updatePodAutoscalerSpec(ctx, podAutoscalerInternal, podAutoscaler)
+			if err != nil {
+				return autoscaling.Requeue, err
+			}
 
-			// When doing an external update, we stop and requeue the object to not have multiple changes at once.
-			c.store.Unlock(key)
-			return autoscaling.Requeue, err
+			// Update generation to avoid infinite loop with different hashes
+			podAutoscalerInternal.SetGeneration(updatedGeneration)
+
+			// When doing an external update, we stop and wait for requeue to come from informer
+			item.Upsert(podAutoscalerInternal, c.ID)
+			return autoscaling.NoRequeue, err
 		}
 
 		// If Generation != podAutoscaler.Generation, we should compute `.Spec` hash
 		// and compare it with the one in the PodAutoscaler. If they differ, we should update the PodAutoscaler
 		// otherwise store the Generation
+		// TODO: Currently, due to CRD defaulting, the Hash may never match. We'll need to revisit this logic.
 		if podAutoscalerInternal.Generation() != podAutoscaler.Generation {
+			if podAutoscalerInternal.CreationTimestamp().IsZero() {
+				podAutoscalerInternal.UpdateCreationTimestamp(podAutoscaler.CreationTimestamp.Time)
+			}
+
 			localHash, err := autoscaling.ObjectHash(podAutoscalerInternal.Spec())
 			if err != nil {
-				c.store.Unlock(key)
 				return autoscaling.Requeue, fmt.Errorf("Failed to compute Spec hash for PodAutoscaler: %s/%s, err: %v", ns, name, err)
 			}
 
 			remoteHash, err := autoscaling.ObjectHash(&podAutoscaler.Spec)
 			if err != nil {
-				c.store.Unlock(key)
 				return autoscaling.Requeue, fmt.Errorf("Failed to compute Spec hash for PodAutoscaler: %s/%s, err: %v", ns, name, err)
 			}
 
 			if localHash != remoteHash {
-				err := c.updatePodAutoscalerSpec(ctx, podAutoscalerInternal, podAutoscaler)
+				updatedGeneration, err := c.updatePodAutoscalerSpec(ctx, podAutoscalerInternal, podAutoscaler)
+				if err != nil {
+					return autoscaling.Requeue, err
+				}
 
-				// When doing an external update, we stop and requeue the object to not have multiple changes at once.
-				c.store.Unlock(key)
-				return autoscaling.Requeue, err
+				// Update generation to avoid infinite loop with different hashes
+				podAutoscalerInternal.SetGeneration(updatedGeneration)
+
+				// When doing an external update, we stop and wait for requeue to come from informer
+				item.Upsert(podAutoscalerInternal, c.ID)
+				return autoscaling.NoRequeue, nil
 			}
 
 			podAutoscalerInternal.SetGeneration(podAutoscaler.Generation)
-			if podAutoscalerInternal.CreationTimestamp().IsZero() {
-				podAutoscalerInternal.UpdateCreationTimestamp(podAutoscaler.CreationTimestamp.Time)
-			}
 		}
 	}
 
-	// Implement sync logic for local ownership, source of truth is Kubernetes
-	if podAutoscalerInternal.Spec().Owner == datadoghqcommon.DatadogPodAutoscalerLocalOwner {
-		if podAutoscalerInternal.Generation() != podAutoscaler.Generation {
-			podAutoscalerInternal.UpdateFromPodAutoscaler(podAutoscaler)
+	// Detect if customer orphaned a profile-managed DPA by removing the
+	// profile label from the K8s object. Clear the internal profile state so
+	// the DPA falls through to the local-owner path below and continues
+	// operating as a standalone autoscaler.
+	if podAutoscalerInternal.IsProfileManaged() {
+		if _, hasLabel := podAutoscaler.Labels[model.ProfileLabelKey]; !hasLabel {
+			log.Infof("Profile label removed from DPA %s, orphaning from profile %s", key, podAutoscalerInternal.ProfileName())
+			podAutoscalerInternal.SetProfileName("")
 		}
+	}
+
+	// Profile-managed path: store is source of truth (like remote-owner).
+	if podAutoscalerInternal.IsProfileManaged() {
+		if podAutoscalerInternal.Deleted() {
+			log.Infof("Profile-managed PodAutoscaler with Deleted flag, deleting object: %s", key)
+			err := c.deletePodAutoscaler(ns, name)
+			if err != nil && k8serrors.IsNotFound(err) {
+				item.Delete(c.ID)
+				return autoscaling.NoRequeue, nil
+			}
+			return autoscaling.Requeue, err
+		}
+
+		// Hash-based spec sync: compare the desired profile template hash
+		// (set by the syncer) with the hash we last applied to Kubernetes.
+		desiredHash := podAutoscalerInternal.DesiredProfileTemplateHash()
+		if desiredHash != "" && desiredHash != podAutoscalerInternal.AppliedProfileHash() {
+			updatedGeneration, err := c.updatePodAutoscalerSpec(ctx, podAutoscalerInternal, podAutoscaler)
+			if err != nil {
+				return autoscaling.Requeue, err
+			}
+
+			podAutoscalerInternal.MarkProfileTemplateApplied()
+			podAutoscalerInternal.SetGeneration(updatedGeneration)
+			item.Upsert(podAutoscalerInternal, c.ID)
+			return autoscaling.NoRequeue, nil
+		}
+
+		// No template change — sync generation if CRD defaulting caused a drift.
+		if podAutoscalerInternal.Generation() != podAutoscaler.Generation {
+			if podAutoscalerInternal.CreationTimestamp().IsZero() {
+				podAutoscalerInternal.UpdateCreationTimestamp(podAutoscaler.CreationTimestamp.Time)
+			}
+			podAutoscalerInternal.SetGeneration(podAutoscaler.Generation)
+		}
+
+		// Fall through to normal scaling logic.
+	} else if podAutoscalerInternal.Spec().Owner == datadoghqcommon.DatadogPodAutoscalerLocalOwner {
+		// Sync logic for local ownership: Kubernetes is the source of truth.
+		podAutoscalerInternal.UpdateFromPodAutoscaler(podAutoscaler)
 	}
 
 	// Reaching this point, we had no errors in processing, clearing up global error
 	podAutoscalerInternal.SetError(nil)
 
+	// Helper functions for non-retryable errors, clear state to avoid misleading status.
+	handleNonRetryableError := func(err error) (autoscaling.ProcessResult, error) {
+		podAutoscalerInternal.SetError(err)
+		podAutoscalerInternal.ClearCurrentReplicas()
+		podAutoscalerInternal.ClearHorizontalState()
+		podAutoscalerInternal.ClearVerticalState()
+		return c.updateAutoscalerStatusAndUpsert(ctx, item, ns, name, nil, podAutoscalerInternal, podAutoscaler)
+	}
+
 	// Validate autoscaler requirements
 	validationErr := c.validateAutoscaler(podAutoscalerInternal)
 	if validationErr != nil {
-		podAutoscalerInternal.SetError(validationErr)
-		return autoscaling.NoRequeue, c.updateAutoscalerStatusAndUnlock(ctx, key, ns, name, validationErr, podAutoscalerInternal, podAutoscaler)
+		return handleNonRetryableError(validationErr)
 	}
 
 	// Get autoscaler target
 	targetGVK, targetErr := podAutoscalerInternal.TargetGVK()
 	if targetErr != nil {
-		podAutoscalerInternal.SetError(targetErr)
-		return autoscaling.NoRequeue, c.updateAutoscalerStatusAndUnlock(ctx, key, ns, name, targetErr, podAutoscalerInternal, podAutoscaler)
+		return handleNonRetryableError(targetErr)
 	}
 	target := NamespacedPodOwner{
 		Namespace: podAutoscalerInternal.Namespace(),
@@ -315,8 +425,22 @@ func (c *Controller) syncPodAutoscaler(ctx context.Context, key, ns, name string
 		Kind:      targetGVK.Kind,
 	}
 
+	// Check if target exists through Scale subresource
+	scale, gr, getScaleErr := c.scaler.get(ctx, target.Namespace, target.Name, targetGVK)
+	if getScaleErr != nil && k8serrors.IsNotFound(getScaleErr) {
+		notFoundErr := autoscaling.NewConditionError(autoscaling.ConditionReasonTargetNotFound,
+			fmt.Errorf("target %s %s/%s not found", targetGVK.Kind, target.Namespace, target.Name))
+		return handleNonRetryableError(notFoundErr)
+	}
+
+	// The PodWatcher starts lazily and may not have indexed pods yet.
+	if !c.podWatcher.HasSynced() {
+		log.Debugf("PodWatcher not synced yet, requeuing %s in %s", key, podWatcherSyncRequeueAfter)
+		return autoscaling.Requeue.After(podWatcherSyncRequeueAfter), nil
+	}
+
 	// Now that everything is synced, we can perform the actual processing
-	result, scalingErr := c.handleScaling(ctx, podAutoscaler, &podAutoscalerInternal, targetGVK, target)
+	result, scalingErr := c.handleScaling(ctx, podAutoscaler, &podAutoscalerInternal, targetGVK, target, scale, gr, getScaleErr)
 
 	// Update current replicas
 	pods := c.podWatcher.GetPodsForOwner(target)
@@ -324,18 +448,21 @@ func (c *Controller) syncPodAutoscaler(ctx context.Context, key, ns, name string
 	podAutoscalerInternal.SetCurrentReplicas(int32(currentReplicas))
 
 	// Update status based on latest state
-	return result, c.updateAutoscalerStatusAndUnlock(ctx, key, ns, name, scalingErr, podAutoscalerInternal, podAutoscaler)
+	statusResult, statusErr := c.updateAutoscalerStatusAndUpsert(ctx, item, ns, name, scalingErr, podAutoscalerInternal, podAutoscaler)
+	return result.Merge(statusResult), statusErr
 }
 
-func (c *Controller) handleScaling(ctx context.Context, podAutoscaler *datadoghq.DatadogPodAutoscaler, podAutoscalerInternal *model.PodAutoscalerInternal, targetGVK schema.GroupVersionKind, target NamespacedPodOwner) (autoscaling.ProcessResult, error) {
+func (c *Controller) handleScaling(ctx context.Context, podAutoscaler *datadoghq.DatadogPodAutoscaler, podAutoscalerInternal *model.PodAutoscalerInternal, targetGVK schema.GroupVersionKind, target NamespacedPodOwner, scale *autoscalingv1.Scale, gr schema.GroupResource, scaleErr error) (autoscaling.ProcessResult, error) {
+	currentTime := c.clock.Now()
+
 	// Update the scaling values based on the staleness of recommendations
-	desiredHorizontalScalingSource, desiredVerticalScalingSource := getActiveScalingSources(c.clock.Now(), podAutoscalerInternal)
-	podAutoscalerInternal.MergeScalingValues(desiredHorizontalScalingSource, desiredVerticalScalingSource)
+	desiredHorizontalScalingSource, desiredVerticalScalingSource := getActiveScalingSources(currentTime, podAutoscalerInternal)
+	podAutoscalerInternal.SetActiveScalingValues(currentTime, desiredHorizontalScalingSource, desiredVerticalScalingSource)
 	c.updateLocalFallbackEnabled(podAutoscalerInternal, desiredHorizontalScalingSource)
 
 	// TODO: While horizontal scaling is in progress we should not start vertical scaling
 	// While vertical scaling is in progress we should only allow horizontal scale up
-	horizontalRes, err := c.horizontalController.sync(ctx, podAutoscaler, podAutoscalerInternal)
+	horizontalRes, err := c.horizontalController.sync(ctx, podAutoscaler, podAutoscalerInternal, scale, gr, scaleErr)
 	if err != nil {
 		return horizontalRes, err
 	}
@@ -348,7 +475,7 @@ func (c *Controller) handleScaling(ctx context.Context, podAutoscaler *datadoghq
 	return horizontalRes.Merge(verticalRes), nil
 }
 
-func (c *Controller) createPodAutoscaler(ctx context.Context, podAutoscalerInternal model.PodAutoscalerInternal) error {
+func (c *Controller) createPodAutoscaler(ctx context.Context, podAutoscalerInternal model.PodAutoscalerInternal) (int64, time.Time, error) {
 	log.Infof("Creating PodAutoscaler Spec: %s/%s", podAutoscalerInternal.Namespace(), podAutoscalerInternal.Name())
 	autoscalerObj := &datadoghq.DatadogPodAutoscaler{
 		TypeMeta: podAutoscalerMeta,
@@ -359,22 +486,43 @@ func (c *Controller) createPodAutoscaler(ctx context.Context, podAutoscalerInter
 		Spec:   *podAutoscalerInternal.Spec().DeepCopy(),
 		Status: podAutoscalerInternal.BuildStatus(metav1.NewTime(c.clock.Now()), nil),
 	}
-	trackPodAutoscalerStatus(autoscalerObj)
+
+	if podAutoscalerInternal.IsProfileManaged() {
+		autoscalerObj.Labels = map[string]string{
+			model.ProfileLabelKey: podAutoscalerInternal.ProfileName(),
+		}
+		if h := podAutoscalerInternal.DesiredProfileTemplateHash(); h != "" {
+			autoscalerObj.Annotations = map[string]string{
+				model.ProfileTemplateHashAnnotation: h,
+			}
+		}
+		if autoscalerObj.Annotations == nil {
+			autoscalerObj.Annotations = make(map[string]string)
+		}
+		// Forward preview annotation from the profile transparently.
+		// The profile owns this annotation for profile-managed DPAs; it entirely
+		// overrides whatever was previously set (profiles are injective: no merging).
+		if raw := podAutoscalerInternal.PreviewAnnotation(); raw != "" {
+			autoscalerObj.Annotations[model.PreviewAnnotationKey] = raw
+		} else {
+			delete(autoscalerObj.Annotations, model.PreviewAnnotationKey)
+		}
+	}
 
 	obj, err := autoscaling.ToUnstructured(autoscalerObj)
 	if err != nil {
-		return err
+		return 0, time.Time{}, err
 	}
 
-	_, err = c.Client.Resource(podAutoscalerGVR).Namespace(podAutoscalerInternal.Namespace()).Create(ctx, obj, metav1.CreateOptions{})
+	createdObj, err := c.Client.Resource(podAutoscalerGVR).Namespace(podAutoscalerInternal.Namespace()).Create(ctx, obj, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("Unable to create PodAutoscaler: %s/%s, err: %v", podAutoscalerInternal.Namespace(), podAutoscalerInternal.Name(), err)
+		return 0, time.Time{}, fmt.Errorf("Unable to create PodAutoscaler: %s/%s, err: %v", podAutoscalerInternal.Namespace(), podAutoscalerInternal.Name(), err)
 	}
 
-	return nil
+	return createdObj.GetGeneration(), createdObj.GetCreationTimestamp().Time, nil
 }
 
-func (c *Controller) updatePodAutoscalerSpec(ctx context.Context, podAutoscalerInternal model.PodAutoscalerInternal, podAutoscaler *datadoghq.DatadogPodAutoscaler) error {
+func (c *Controller) updatePodAutoscalerSpec(ctx context.Context, podAutoscalerInternal model.PodAutoscalerInternal, podAutoscaler *datadoghq.DatadogPodAutoscaler) (int64, error) {
 	log.Infof("Updating PodAutoscaler Spec: %s/%s", podAutoscalerInternal.Namespace(), podAutoscalerInternal.Name())
 	autoscalerObj := &datadoghq.DatadogPodAutoscaler{
 		TypeMeta:   podAutoscalerMeta,
@@ -382,17 +530,40 @@ func (c *Controller) updatePodAutoscalerSpec(ctx context.Context, podAutoscalerI
 		Spec:       *podAutoscalerInternal.Spec().DeepCopy(),
 	}
 
+	if podAutoscalerInternal.IsProfileManaged() {
+		if autoscalerObj.Labels == nil {
+			autoscalerObj.Labels = make(map[string]string)
+		}
+		autoscalerObj.Labels[model.ProfileLabelKey] = podAutoscalerInternal.ProfileName()
+
+		if h := podAutoscalerInternal.DesiredProfileTemplateHash(); h != "" {
+			if autoscalerObj.Annotations == nil {
+				autoscalerObj.Annotations = make(map[string]string)
+			}
+			autoscalerObj.Annotations[model.ProfileTemplateHashAnnotation] = h
+		}
+		if autoscalerObj.Annotations == nil {
+			autoscalerObj.Annotations = make(map[string]string)
+		}
+		// Forward preview annotation from the profile transparently.
+		if raw := podAutoscalerInternal.PreviewAnnotation(); raw != "" {
+			autoscalerObj.Annotations[model.PreviewAnnotationKey] = raw
+		} else {
+			delete(autoscalerObj.Annotations, model.PreviewAnnotationKey)
+		}
+	}
+
 	obj, err := autoscaling.ToUnstructured(autoscalerObj)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	_, err = c.Client.Resource(podAutoscalerGVR).Namespace(podAutoscalerInternal.Namespace()).Update(ctx, obj, metav1.UpdateOptions{})
+	updatedObj, err := c.Client.Resource(podAutoscalerGVR).Namespace(podAutoscalerInternal.Namespace()).Update(ctx, obj, metav1.UpdateOptions{})
 	if err != nil {
-		return fmt.Errorf("Unable to update PodAutoscaler Spec: %s/%s, err: %w", podAutoscalerInternal.Namespace(), podAutoscalerInternal.Name(), err)
+		return 0, fmt.Errorf("Unable to update PodAutoscaler Spec: %s/%s, err: %w", podAutoscalerInternal.Namespace(), podAutoscalerInternal.Name(), err)
 	}
 
-	return nil
+	return updatedObj.GetGeneration(), nil
 }
 
 func (c *Controller) updatePodAutoscalerStatus(ctx context.Context, podAutoscalerInternal model.PodAutoscalerInternal, podAutoscaler *datadoghq.DatadogPodAutoscaler) error {
@@ -408,7 +579,6 @@ func (c *Controller) updatePodAutoscalerStatus(ctx context.Context, podAutoscale
 		ObjectMeta: podAutoscaler.ObjectMeta,
 		Status:     newStatus,
 	}
-	trackPodAutoscalerStatus(autoscalerObj)
 
 	obj, err := autoscaling.ToUnstructured(autoscalerObj)
 	if err != nil {
@@ -436,7 +606,7 @@ func (c *Controller) validateAutoscaler(podAutoscalerInternal model.PodAutoscale
 	// Check that we are within the limit of 100 DatadogPodAutoscalers
 	key := podAutoscalerInternal.ID()
 	if !c.limitHeap.Exists(key) {
-		return fmt.Errorf("Autoscaler disabled as maximum number per cluster reached (%d)", c.limitHeap.MaxSize())
+		return autoscaling.NewConditionErrorf(autoscaling.ConditionReasonClusterAutoscalerLimitReached, "Autoscaler disabled as maximum number per cluster reached (%d)", c.limitHeap.MaxSize())
 	}
 
 	// Check that targetRef is not set to the cluster agent
@@ -448,25 +618,40 @@ func (c *Controller) validateAutoscaler(podAutoscalerInternal model.PodAutoscale
 
 	var resourceName string
 	switch owner := podAutoscalerInternal.Spec().TargetRef.Kind; owner {
-	case "Deployment":
+	case kubernetes.DeploymentKind:
 		resourceName = kubernetes.ParseDeploymentForPodName(clusterAgentPodName)
-	case "ReplicaSet":
+	case kubernetes.ReplicaSetKind:
 		resourceName = kubernetes.ParseReplicaSetForPodName(clusterAgentPodName)
+	default:
+		// We don't support other ways to deploy the Cluster Agent
+		return nil
 	}
 
-	clusterAgentNs := common.GetMyNamespace()
+	clusterAgentNs := namespace.GetMyNamespace()
 
 	if podAutoscalerInternal.Namespace() == clusterAgentNs && podAutoscalerInternal.Spec().TargetRef.Name == resourceName {
-		return fmt.Errorf("Autoscaling target cannot be set to the cluster agent")
+		return autoscaling.NewConditionErrorf(autoscaling.ConditionReasonInvalidTarget, "Autoscaling target cannot be set to the cluster agent")
+	}
+
+	if err := model.ValidateAutoscalerSpec(podAutoscalerInternal.Spec()); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (c *Controller) updateAutoscalerStatusAndUnlock(ctx context.Context, key, ns, name string, err error, podAutoscalerInternal model.PodAutoscalerInternal, podAutoscaler *datadoghq.DatadogPodAutoscaler) error {
+func (c *Controller) updateAutoscalerStatusAndUpsert(ctx context.Context, item *autoscalingstore.LockedItem[model.PodAutoscalerInternal], ns, name string, err error, podAutoscalerInternal model.PodAutoscalerInternal, podAutoscaler *datadoghq.DatadogPodAutoscaler) (autoscaling.ProcessResult, error) {
 	// Update status based on latest state
+	result := autoscaling.NoRequeue
 	statusErr := c.updatePodAutoscalerStatus(ctx, podAutoscalerInternal, podAutoscaler)
 	if statusErr != nil {
 		log.Errorf("Failed to update status for PodAutoscaler: %s/%s, err: %v", ns, name, statusErr)
+
+		// Requeue so a subsequent reconcile restarts the full process: it re-reads the
+		// object from the informer cache (which will have observed the concurrent write
+		// that caused a conflict) and retries the status update with a fresh
+		// resourceVersion. The workqueue rate-limiter backs off between attempts and
+		// Process() caps them at maxRetry.
+		result = autoscaling.Requeue
 
 		// We want to return the status error if none to count in the requeue retries.
 		if err == nil {
@@ -474,16 +659,20 @@ func (c *Controller) updateAutoscalerStatusAndUnlock(ctx context.Context, key, n
 		}
 	}
 
-	c.store.UnlockSet(key, podAutoscalerInternal, c.ID)
-	return err
+	item.Upsert(podAutoscalerInternal, c.ID)
+	return result, err
 }
 
-func (c *Controller) updateLocalFallbackEnabled(podAutoscalerInternal *model.PodAutoscalerInternal, activeHorizontalSource *datadoghqcommon.DatadogPodAutoscalerValueSource) {
+func (c *Controller) updateLocalFallbackEnabled(_ *model.PodAutoscalerInternal, activeHorizontalSource *datadoghqcommon.DatadogPodAutoscalerValueSource) {
 	if activeHorizontalSource == nil {
 		return
 	}
 
-	// Logic when local fallback is activated/deactivated for horizontal scaling
+	// Logic when local fallback is activated/deactivated for horizontal scaling.
+	// Multiple worker goroutines call Process() concurrently, so guard the
+	// read-modify-write of isFallbackEnabled.
+	c.fallbackMu.Lock()
+	defer c.fallbackMu.Unlock()
 	if c.isFallbackEnabled && *activeHorizontalSource == datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource {
 		log.Debugf("Product horizontal scaling values are no longer stale, deactivating local fallback")
 		c.isFallbackEnabled = false
@@ -491,13 +680,11 @@ func (c *Controller) updateLocalFallbackEnabled(podAutoscalerInternal *model.Pod
 		log.Debugf("Product horizontal scaling values are stale, activating local fallback")
 		c.isFallbackEnabled = true
 	}
-
-	trackLocalFallbackEnabled(*activeHorizontalSource, *podAutoscalerInternal)
 }
 
 func getActiveScalingSources(currentTime time.Time, podAutoscalerInternal *model.PodAutoscalerInternal) (*datadoghqcommon.DatadogPodAutoscalerValueSource, *datadoghqcommon.DatadogPodAutoscalerValueSource) {
 	// Set default vertical scaling source
-	activeVerticalSource := (*datadoghqcommon.DatadogPodAutoscalerValueSource)(nil)
+	var activeVerticalSource *datadoghqcommon.DatadogPodAutoscalerValueSource
 	if podAutoscalerInternal.MainScalingValues().Vertical != nil {
 		activeVerticalSource = pointer.Ptr(podAutoscalerInternal.MainScalingValues().Vertical.Source)
 	}
@@ -516,29 +703,35 @@ func getActiveScalingSources(currentTime time.Time, podAutoscalerInternal *model
 	mainHorizontalScalingValues := podAutoscalerInternal.MainScalingValues().Horizontal
 	fallbackHorizontalScalingValues := podAutoscalerInternal.FallbackScalingValues().Horizontal
 
+	staleTimestampThreshold := defaultStaleTimestampThreshold
+	if podAutoscalerInternal.Spec() != nil && podAutoscalerInternal.Spec().Fallback != nil {
+		staleTimestampThreshold = time.Second * time.Duration(int64(podAutoscalerInternal.Spec().Fallback.Horizontal.Triggers.StaleRecommendationThresholdSeconds))
+	}
+
 	// If main scaling values are not stale, use those
-	if mainHorizontalScalingValues != nil && !isTimestampStale(currentTime, mainHorizontalScalingValues.Timestamp) {
+	if mainHorizontalScalingValues != nil && !isTimestampStale(currentTime, mainHorizontalScalingValues.Timestamp, staleTimestampThreshold) {
 		return pointer.Ptr(datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource), activeVerticalSource
 	}
 
 	// Check if one of the following conditions are met:
 	// 1. Main scaling values are stale
 	// 2. No main scaling values have been received, and last scaling values (updated from status in event of leader election change) are stale
-	// 3. No main scaling values have been received, no scaling values have been received from status, and the pod autoscaler was created more than 3 minutes ago
-	if (mainHorizontalScalingValues != nil && isTimestampStale(currentTime, mainHorizontalScalingValues.Timestamp)) ||
-		(mainHorizontalScalingValues == nil && currentHorizontalScalingValues != nil && isTimestampStale(currentTime, currentHorizontalScalingValues.Timestamp)) ||
-		(mainHorizontalScalingValues == nil && currentHorizontalScalingValues == nil && isTimestampStale(currentTime, podAutoscalerInternal.CreationTimestamp())) {
+	// 3. No main scaling values have been received, no scaling values have been received from status, and the pod autoscaler was created more than (threshold) minutes ago
+	if (mainHorizontalScalingValues != nil && isTimestampStale(currentTime, mainHorizontalScalingValues.Timestamp, staleTimestampThreshold)) ||
+		(mainHorizontalScalingValues == nil && currentHorizontalScalingValues != nil && isTimestampStale(currentTime, currentHorizontalScalingValues.Timestamp, staleTimestampThreshold)) ||
+		(mainHorizontalScalingValues == nil && currentHorizontalScalingValues == nil && isTimestampStale(currentTime, podAutoscalerInternal.CreationTimestamp(), staleTimestampThreshold)) {
+
 		// If local fallback values are usable, activate local fallback
-		if fallbackHorizontalScalingValues != nil && !isTimestampStale(currentTime, fallbackHorizontalScalingValues.Timestamp) {
+		if fallbackHorizontalScalingValues != nil && !isTimestampStale(currentTime, fallbackHorizontalScalingValues.Timestamp, staleTimestampThreshold) {
 			return pointer.Ptr(datadoghqcommon.DatadogPodAutoscalerLocalValueSource), activeVerticalSource
 		}
 	}
 
 	// When creating a new pod autoscaler internal from a Kubernetes CR, we update the ScalingValues directly from the status
 	// If we do not have any new generated recommendations, we want to keep the previous scaling values so we return nil
-	return nil, nil
+	return nil, activeVerticalSource
 }
 
-func isTimestampStale(currentTime, receivedTime time.Time) bool {
+func isTimestampStale(currentTime, receivedTime time.Time, staleTimestampThreshold time.Duration) bool {
 	return currentTime.Sub(receivedTime) > staleTimestampThreshold
 }

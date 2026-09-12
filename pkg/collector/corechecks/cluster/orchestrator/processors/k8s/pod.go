@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	model "github.com/DataDog/agent-payload/v5/process"
+
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
@@ -25,7 +26,7 @@ import (
 	podtagprovider "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s/pod_tag_provider"
 	k8sTransformers "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/transformers/k8s"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
-	"github.com/DataDog/datadog-agent/pkg/orchestrator/redact"
+	"github.com/DataDog/datadog-agent/pkg/redact"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
 	corev1 "k8s.io/api/core/v1"
@@ -67,8 +68,8 @@ func (h *PodHandlers) BeforeMarshalling(ctx processors.ProcessorContext, resourc
 	return
 }
 
-// BeforeCacheCheck is a handler called before cache lookup.
-func (h *PodHandlers) BeforeCacheCheck(ctx processors.ProcessorContext, resource, resourceModel interface{}) (skip bool) {
+// EnrichModel is a handler called before cache lookup.
+func (h *PodHandlers) EnrichModel(ctx processors.ProcessorContext, resource, resourceModel interface{}) (skip bool) {
 	pctx := ctx.(*processors.K8sProcessorContext)
 	r := resource.(*corev1.Pod)
 	m := resourceModel.(*model.Pod)
@@ -93,7 +94,7 @@ func (h *PodHandlers) BeforeCacheCheck(ctx processors.ProcessorContext, resource
 	m.Tags = append(m.Tags, taggerTags...)
 
 	// additional tags
-	m.Tags = append(m.Tags, fmt.Sprintf("pod_status:%s", strings.ToLower(m.Status)))
+	m.Tags = append(m.Tags, "pod_status:"+strings.ToLower(m.Status))
 
 	// tags that should be on the tagger
 	if len(taggerTags) == 0 {
@@ -108,7 +109,7 @@ func (h *PodHandlers) BeforeCacheCheck(ctx processors.ProcessorContext, resource
 
 	// Custom resource version to work around kubelet issues.
 	if err := k8sTransformers.FillK8sPodResourceVersion(m); err != nil {
-		log.Warnc(fmt.Sprintf("Failed to compute pod resource version: %s", err.Error()), orchestrator.ExtraLogContext)
+		log.Warnc("Failed to compute pod resource version: "+err.Error(), orchestrator.ExtraLogContext...)
 		skip = true
 		return
 	}
@@ -136,6 +137,7 @@ func (h *PodHandlers) BuildMessageBody(ctx processors.ProcessorContext, resource
 		Tags:         util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
 		Info:         pctx.SystemInfo,
 		IsTerminated: ctx.IsTerminatedResources(),
+		AgentVersion: ctx.GetAgentVersion(),
 	}
 }
 
@@ -156,10 +158,26 @@ func (h *PodHandlers) ResourceList(ctx processors.ProcessorContext, list interfa
 	resources = make([]interface{}, 0, len(resourceList))
 
 	for _, resource := range resourceList {
-		resources = append(resources, resource.DeepCopy())
+		resources = append(resources, resource)
 	}
 
 	return resources
+}
+
+// CloneResource returns a deep copy of the resource.
+//
+//nolint:revive
+func (h *PodHandlers) CloneResource(resource interface{}) interface{} {
+	return resource.(*corev1.Pod).DeepCopy()
+}
+
+// ResourceVersionFromRaw returns an empty string because Pod uses a custom
+// resource version hash computed from the extracted model, not the native
+// Kubernetes ResourceVersion.
+//
+//nolint:revive
+func (h *PodHandlers) ResourceVersionFromRaw(_ processors.ProcessorContext, _ interface{}) string {
+	return ""
 }
 
 // ResourceUID is a handler called to retrieve the resource UID.
@@ -206,4 +224,10 @@ func (h *PodHandlers) ScrubBeforeMarshalling(ctx processors.ProcessorContext, re
 	if pctx.Cfg.IsScrubbingEnabled {
 		redact.ScrubPod(r, pctx.Cfg.Scrubber)
 	}
+}
+
+// GetNodeName is used to get the node name from the resource.
+func (h *PodHandlers) GetNodeName(_ processors.ProcessorContext, resource interface{}) string {
+	r := resource.(*corev1.Pod)
+	return r.Spec.NodeName
 }

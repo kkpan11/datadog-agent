@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -27,6 +27,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster"
+	"github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
@@ -95,16 +96,16 @@ func newCheck() check.Check {
 		CheckBase:         core.NewCheckBase(CheckName),
 		instance:          &checkConfig{},
 		store:             newReleasesStore(),
-		runLeaderElection: !pkgconfigsetup.IsCLCRunner(pkgconfigsetup.Datadog()),
+		runLeaderElection: !helper.IsCLCRunner(pkgconfigsetup.Datadog()),
 		eventsManager:     &eventsManager{},
 	}
 }
 
 // Configure configures the Helm check
-func (hc *HelmCheck) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, config, initConfig integration.Data, source string) error {
+func (hc *HelmCheck) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, config, initConfig integration.Data, source string, provider string) error {
 	hc.BuildID(integrationConfigDigest, config, initConfig)
 
-	err := hc.CommonConfigure(senderManager, initConfig, config, source)
+	err := hc.CommonConfigure(senderManager, initConfig, config, source, provider)
 	if err != nil {
 		return err
 	}
@@ -238,14 +239,14 @@ func (hc *HelmCheck) tagsForMetricsAndEvents(release *release, includeRevision b
 		helmChartTag := fmt.Sprintf("helm_chart:%s-%s", release.Chart.Metadata.Name, escapedVersion)
 		tags = append(
 			tags,
-			fmt.Sprintf("helm_chart_version:%s", release.Chart.Metadata.Version),
-			fmt.Sprintf("helm_app_version:%s", release.Chart.Metadata.AppVersion),
+			"helm_chart_version:"+release.Chart.Metadata.Version,
+			"helm_app_version:"+release.Chart.Metadata.AppVersion,
 			helmChartTag,
 		)
 	}
 
 	if release.Info != nil {
-		tags = append(tags, fmt.Sprintf("helm_status:%s", release.Info.Status))
+		tags = append(tags, "helm_status:"+release.Info.Status)
 	}
 
 	for helmValue, tagName := range hc.instance.HelmValuesAsTags {
@@ -254,7 +255,7 @@ func (hc *HelmCheck) tagsForMetricsAndEvents(release *release, includeRevision b
 			log.Tracef("Value for %s specified in helm_values_as_tags not found", helmValue)
 			continue
 		}
-		tags = append(tags, fmt.Sprintf("%s:%s", tagName, value))
+		tags = append(tags, tagName+":"+value)
 	}
 
 	return tags
@@ -265,19 +266,19 @@ func (hc *HelmCheck) tagsForMetricsAndEvents(release *release, includeRevision b
 // revisions
 func commonTags(release *release, storageDriver helmStorage) []string {
 	tags := []string{
-		fmt.Sprintf("helm_release:%s", release.Name),
-		fmt.Sprintf("helm_storage:%s", storageDriver),
-		fmt.Sprintf("kube_namespace:%s", release.Namespace),
+		"helm_release:" + release.Name,
+		"helm_storage:" + string(storageDriver),
+		"kube_namespace:" + release.Namespace,
 
 		// "helm_namespace" is just an alias for "kube_namespace".
 		// "kube_namespace" is a better name and consistent with the rest of
 		// checks, but in the first release of the check we had "helm_namespace"
 		// so we need to keep it for backwards-compatibility.
-		fmt.Sprintf("helm_namespace:%s", release.Namespace),
+		"helm_namespace:" + release.Namespace,
 	}
 
 	if release.Chart != nil && release.Chart.Metadata != nil {
-		tags = append(tags, fmt.Sprintf("helm_chart_name:%s", release.Chart.Metadata.Name))
+		tags = append(tags, "helm_chart_name:"+release.Chart.Metadata.Name)
 	}
 
 	return tags
@@ -447,6 +448,17 @@ func (hc *HelmCheck) deleteRelease(encodedRelease string, storageDriver helmStor
 	// one when there are no more revisions left.
 	if hc.instance.CollectEvents && !moreRevisionsLeft {
 		tags := hc.allTags(decodedRelease, storageDriver, false)
+
+		// The "helm_status" tag contains the last known status before
+		// uninstalling. Since the release is now deleted, we can set the status
+		// to "uninstalled".
+		for i, tag := range tags {
+			if strings.HasPrefix(tag, "helm_status:") {
+				tags[i] = "helm_status:uninstalled"
+				break
+			}
+		}
+
 		hc.eventsManager.addEventForDeletedRelease(decodedRelease, tags)
 	}
 }

@@ -10,6 +10,7 @@ package compliance
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,13 +21,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/DataDog/datadog-go/v5/statsd"
+	"go.uber.org/atomic"
+
 	"github.com/DataDog/datadog-agent/pkg/compliance/metrics"
 	"github.com/DataDog/datadog-agent/pkg/compliance/scap"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
-	"github.com/DataDog/datadog-agent/pkg/util/executable"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/version"
-	"github.com/DataDog/datadog-go/v5/statsd"
 )
 
 const (
@@ -62,7 +64,7 @@ var (
 )
 
 type oscapIO struct {
-	cmd      *exec.Cmd
+	cmd      *atomic.Pointer[exec.Cmd]
 	File     string
 	RuleCh   chan *oscapIORule
 	ResultCh chan *oscapIOResult
@@ -70,18 +72,9 @@ type oscapIO struct {
 	DoneCh   chan bool
 }
 
-// From pkg/collector/corechecks/embed/process_agent.go.
-func getOSCAPIODefaultBinPath() (string, error) {
-	here, _ := executable.Folder()
-	binPath := filepath.Join(here, "..", "..", "embedded", "bin", "oscap-io")
-	if _, err := os.Stat(binPath); err == nil {
-		return binPath, nil
-	}
-	return binPath, fmt.Errorf("Can't access the default oscap-io binary at %s", binPath)
-}
-
 func newOSCAPIO(file string) *oscapIO {
 	return &oscapIO{
+		cmd:      atomic.NewPointer[exec.Cmd](nil),
 		File:     file,
 		RuleCh:   make(chan *oscapIORule),
 		ResultCh: make(chan *oscapIOResult),
@@ -93,14 +86,15 @@ func newOSCAPIO(file string) *oscapIO {
 func (p *oscapIO) Run(ctx context.Context) error {
 	defer p.Stop()
 
+	var oscapProbeRoot string
+
 	if env.IsContainerized() {
 		hostRoot := os.Getenv("HOST_ROOT")
 		if hostRoot == "" {
 			hostRoot = "/host"
 		}
 
-		os.Setenv("OSCAP_PROBE_ROOT", hostRoot)
-		defer os.Unsetenv("OSCAP_PROBE_ROOT")
+		oscapProbeRoot = hostRoot
 	}
 
 	args := []string{}
@@ -109,14 +103,14 @@ func (p *oscapIO) Run(ctx context.Context) error {
 	}
 	args = append(args, p.File)
 
-	binPath, err := getOSCAPIODefaultBinPath()
-	if err != nil {
-		return err
-	}
-
-	cmd := exec.CommandContext(ctx, binPath, args...)
+	// Build command: /proc/self/exe compliance oscap-exec [args...]
+	execArgs := append([]string{"compliance", "oscap-exec"}, args...)
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", execArgs...)
 	cmd.Dir = filepath.Dir(p.File)
-	p.cmd = cmd
+	cmd.Env = os.Environ()
+	if oscapProbeRoot != "" {
+		cmd.Env = append(cmd.Env, "OSCAP_PROBE_ROOT="+oscapProbeRoot)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -141,6 +135,7 @@ func (p *oscapIO) Run(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	p.cmd.Store(cmd)
 
 	r := bufio.NewReader(stdout)
 	go func() {
@@ -248,7 +243,15 @@ func (p *oscapIO) Stop() {
 }
 
 func (p *oscapIO) Kill() error {
-	if err := p.cmd.Process.Kill(); err != nil {
+	// p.cmd is Stored asynchronously by Run only after the oscap-io process has started
+	// successfully. Kill may be called before that happens (for example from
+	// FinishXCCDFBenchmark on context cancellation), in which case cmd is
+	// still nil and there is no process to kill.
+	cmd := p.cmd.Load()
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	if err := cmd.Process.Kill(); err != nil {
 		return err
 	}
 	// Wait for the oscap-io process to terminate.
@@ -348,10 +351,10 @@ func evaluateXCCDFRule(ctx context.Context, hostname string, statsdClient statsd
 			case XCCDF_RESULT_FAIL:
 				event = NewCheckEvent(XCCDFEvaluator, CheckFailed, ruleResult.Data, hostname, "host", rule, benchmark)
 			case XCCDF_RESULT_ERROR, XCCDF_RESULT_UNKNOWN:
-				errReason := fmt.Errorf("XCCDF_RESULT_ERROR")
+				errReason := errors.New("XCCDF_RESULT_ERROR")
 				event = NewCheckError(XCCDFEvaluator, errReason, hostname, "host", rule, benchmark)
 			case XCCDF_RESULT_NOT_APPLICABLE:
-				skipReason := fmt.Errorf("XCCDF_RESULT_NOT_APPLICABLE")
+				skipReason := errors.New("XCCDF_RESULT_NOT_APPLICABLE")
 				event = NewCheckSkipped(XCCDFEvaluator, skipReason, hostname, "host", rule, benchmark)
 			case XCCDF_RESULT_NOT_CHECKED, XCCDF_RESULT_NOT_SELECTED:
 			}

@@ -20,11 +20,6 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 )
 
-const (
-	// debuggerIntakeURLTemplate specifies the template for obtaining the intake URL along with the site.
-	debuggerIntakeURLTemplate = "https://debugger-intake.%s/api/v2/debugger"
-)
-
 // symDBProxyHandler returns an http.Handler proxying requests to the logs intake. If the logs intake url cannot be
 // parsed, the returned handler will always return http.StatusInternalServerError with a clarifying message.
 func (r *HTTPReceiver) symDBProxyHandler() http.Handler {
@@ -32,7 +27,7 @@ func (r *HTTPReceiver) symDBProxyHandler() http.Handler {
 	if orch := r.conf.FargateOrchestrator; orch != config.OrchestratorUnknown {
 		hostTags = hostTags + ",orchestrator:fargate_" + strings.ToLower(string(orch))
 	}
-	intake := fmt.Sprintf(debuggerIntakeURLTemplate, r.conf.Site)
+	intake := fmt.Sprintf(debuggerIntakeURLTemplate, r.conf.Site) // debuggerIntakeURLTemplate comes from debugger.go
 	if v := r.conf.SymDBProxy.DDURL; v != "" {
 		intake = v
 	} else if site := r.conf.Site; site != "" {
@@ -48,7 +43,7 @@ func (r *HTTPReceiver) symDBProxyHandler() http.Handler {
 		apiKey = strings.TrimSpace(k)
 	}
 	transport := newMeasuringForwardingTransport(
-		r.conf.NewHTTPTransport(), target, apiKey, r.conf.SymDBProxy.AdditionalEndpoints, "datadog.trace_agent.debugger.", []string{}, r.statsd)
+		r.conf.NewHTTPTransport(), target, apiKey, r.conf.SymDBProxy.AdditionalEndpoints, r.conf.MaxRequestBytes, "datadog.trace_agent.debugger.", []string{}, r.statsd)
 	return newSymDBProxy(r.conf, transport, hostTags)
 }
 
@@ -62,32 +57,33 @@ func symDBErrorHandler(err error) http.Handler {
 
 // newSymDBProxy returns a new httputil.ReverseProxy proxying and augmenting requests with headers containing the tags.
 func newSymDBProxy(conf *config.AgentConfig, transport http.RoundTripper, hostTags string) *httputil.ReverseProxy {
-	cidProvider := NewIDProvider(conf.ContainerProcRoot, conf.ContainerIDFromOriginInfo)
+	cidProvider := NewContainerIDProviderFromConfig(conf)
 	logger := log.NewThrottled(5, 10*time.Second) // limit to 5 messages every 10 seconds
 	return &httputil.ReverseProxy{
-		Director:  getSymDBDirector(hostTags, cidProvider, conf.ContainerTags),
+		Rewrite:   getSymDBRewrite(hostTags, cidProvider, conf.ContainerTags),
 		ErrorLog:  stdlog.New(logger, "symdb.Proxy: ", 0),
 		Transport: transport,
 	}
 }
 
-func getSymDBDirector(hostTags string, cidProvider IDProvider, containerTags func(string) ([]string, error)) func(*http.Request) {
-	return func(req *http.Request) {
-		req.Header.Set("DD-REQUEST-ID", uuid.New().String())
-		req.Header.Set("DD-EVP-ORIGIN", "agent-symdb")
-		q := req.URL.Query()
-		containerID := cidProvider.GetContainerID(req.Context(), req.Header)
+func getSymDBRewrite(hostTags string, cidProvider IDProvider, containerTags func(string) ([]string, error)) func(*httputil.ProxyRequest) {
+	return func(req *httputil.ProxyRequest) {
+		req.SetXForwarded()
+		req.Out.Header.Set("DD-REQUEST-ID", uuid.New().String())
+		req.Out.Header.Set("DD-EVP-ORIGIN", "agent-symdb")
+		q := req.Out.URL.Query()
+		containerID := cidProvider.GetContainerID(req.In.Context(), req.In.Header)
 		tags := hostTags
 		if ctags := getContainerTags(containerTags, containerID); ctags != "" {
 			tags = fmt.Sprintf("%s,%s", tags, ctags)
 		}
-		if htags := req.Header.Get("X-Datadog-Additional-Tags"); htags != "" {
+		if htags := req.In.Header.Get("X-Datadog-Additional-Tags"); htags != "" {
 			tags = fmt.Sprintf("%s,%s", tags, htags)
 		}
 		if qtags := q.Get("ddtags"); qtags != "" {
 			tags = fmt.Sprintf("%s,%s", tags, qtags)
 		}
-		req.Header.Set("X-Datadog-Additional-Tags", tags)
+		req.Out.Header.Set("X-Datadog-Additional-Tags", tags)
 		log.Debugf("Setting header X-Datadog-Additional-Tags=%s for symdb proxy", tags)
 	}
 }

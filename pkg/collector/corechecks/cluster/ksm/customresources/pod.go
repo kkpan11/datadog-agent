@@ -9,6 +9,7 @@ package customresources
 
 import (
 	"context"
+	"maps"
 
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
@@ -79,6 +80,16 @@ func (f *extendedPodFactory) MetricFamilyGenerators() []generator.FamilyGenerato
 			}),
 		),
 		*generator.NewFamilyGeneratorWithStability(
+			"kube_pod_container_effective_resource_requests",
+			"The effective CPU and memory requests for a container, accounting for in-place vertical scaling.",
+			metric.Gauge,
+			basemetrics.ALPHA,
+			"",
+			wrapPodFunc(func(p *v1.Pod) *metric.Family {
+				return effectiveContainerResourceRequestsMetricFamily(p)
+			}),
+		),
+		*generator.NewFamilyGeneratorWithStability(
 			"kube_pod_container_extended_resource_limits",
 			"The number of additional requested limit resource by a container, which otherwise might have been filtered out by kube-state-metrics.",
 			metric.Gauge,
@@ -95,7 +106,7 @@ func (f *extendedPodFactory) MetricFamilyGenerators() []generator.FamilyGenerato
 			basemetrics.ALPHA,
 			"",
 			wrapPodFunc(func(p *v1.Pod) *metric.Family {
-				return f.customResourceOwnerGenerator(p, resourceRequests)
+				return f.customResourceOwnerGenerator(p, resourceRequests, Standard)
 			}),
 		),
 		*generator.NewFamilyGeneratorWithStability(
@@ -105,75 +116,172 @@ func (f *extendedPodFactory) MetricFamilyGenerators() []generator.FamilyGenerato
 			basemetrics.ALPHA,
 			"",
 			wrapPodFunc(func(p *v1.Pod) *metric.Family {
-				return f.customResourceOwnerGenerator(p, resourcelimits)
+				return f.customResourceOwnerGenerator(p, resourcelimits, Standard)
+			}),
+		),
+		*generator.NewFamilyGeneratorWithStability(
+			"kube_pod_init_container_resource_with_owner_tag_requests",
+			"The number of requested request resource by an init container, including pod owner information.",
+			metric.Gauge,
+			basemetrics.ALPHA,
+			"",
+			wrapPodFunc(func(p *v1.Pod) *metric.Family {
+				return f.customResourceOwnerGenerator(p, resourceRequests, Init)
+			}),
+		),
+		*generator.NewFamilyGeneratorWithStability(
+			"kube_pod_init_container_resource_with_owner_tag_limits",
+			"The number of requested limit resource by an init container, including pod owner information.",
+			metric.Gauge,
+			basemetrics.ALPHA,
+			"",
+			wrapPodFunc(func(p *v1.Pod) *metric.Family {
+				return f.customResourceOwnerGenerator(p, resourcelimits, Init)
 			}),
 		),
 	}
 }
 
+func effectiveContainerResourceRequestsMetricFamily(p *v1.Pod) *metric.Family {
+	containerStatuses := make(map[string]*v1.ContainerStatus, len(p.Status.ContainerStatuses))
+	for i := range p.Status.ContainerStatuses {
+		containerStatuses[p.Status.ContainerStatuses[i].Name] = &p.Status.ContainerStatuses[i]
+	}
+
+	ms := []*metric.Metric{}
+	for _, c := range p.Spec.Containers {
+		requests := effectiveContainerResourceRequests(c.Resources.Requests, containerStatuses[c.Name])
+		for _, resourceName := range []v1.ResourceName{v1.ResourceCPU, v1.ResourceMemory} {
+			value, found := requests[resourceName]
+			if !found {
+				continue
+			}
+
+			unit := constant.UnitByte
+			metricValue := float64(value.Value())
+			if resourceName == v1.ResourceCPU {
+				unit = constant.UnitCore
+				metricValue = float64(value.MilliValue()) / 1000
+			}
+
+			ms = append(ms, &metric.Metric{
+				LabelKeys:   []string{"container", "node", "resource", "unit"},
+				LabelValues: []string{c.Name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(unit)},
+				Value:       metricValue,
+			})
+		}
+	}
+
+	return &metric.Family{Metrics: ms}
+}
+
+// effectiveContainerResourceRequests overlays the requests enacted by the
+// kubelet on top of the pod spec. Clusters before Kubernetes 1.33 do not
+// populate status.resources, so they retain the previous spec-based behavior.
+func effectiveContainerResourceRequests(specRequests v1.ResourceList, status *v1.ContainerStatus) v1.ResourceList {
+	if status == nil || status.Resources == nil || len(status.Resources.Requests) == 0 {
+		return specRequests
+	}
+	if len(specRequests) == 0 {
+		return status.Resources.Requests
+	}
+
+	requests := make(v1.ResourceList, len(specRequests)+len(status.Resources.Requests))
+	maps.Copy(requests, specRequests)
+	maps.Copy(requests, status.Resources.Requests)
+	return requests
+}
+
+// containerResourceOwnerGenerator builds a metric with for a single container (init or standard) and adds extra tags extracted
+// from the pod spec and the container spec.
+func containerResourceOwnerGenerator(c v1.Container, p *v1.Pod, resourceType string) []*metric.Metric {
+	var resources v1.ResourceList
+	switch resourceType {
+	case resourceRequests:
+		resources = c.Resources.Requests
+	case resourcelimits:
+		resources = c.Resources.Limits
+	default:
+		log.Warnf("unknown resource type requested for pod container resources: %s", resourceType)
+	}
+	var kind, name string
+
+	owners := p.GetOwnerReferences()
+	if len(owners) == 0 {
+		kind = "<none>"
+		name = "<none>"
+	}
+
+	for _, owner := range owners {
+		kind = owner.Kind
+		name = owner.Name
+		if owner.Controller != nil {
+			break
+		}
+	}
+
+	// because of the way we handle aggregation (based on labels), if we want to drop the job / replicaset tag in the
+	// final metric being pushed up, then we should do it here. Otherwise, each job or replicaset will not be combined
+	// properly
+	switch kind {
+	case kubernetes.JobKind:
+		if cronjob, _ := kubernetes.ParseCronJobForJob(name); cronjob != "" {
+			kind = kubernetes.CronJobKind
+			name = cronjob
+		}
+	case kubernetes.ReplicaSetKind:
+		if deployment := kubernetes.ParseDeploymentForReplicaSet(name); deployment != "" {
+			kind = kubernetes.DeploymentKind
+			name = deployment
+		}
+	}
+
+	ms := []*metric.Metric{}
+	for resourceName, val := range resources {
+		if resourceName == v1.ResourceCPU {
+			ms = append(ms, &metric.Metric{
+				LabelValues: []string{c.Name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitCore), kind, name},
+				Value:       float64(val.MilliValue()) / 1000,
+			})
+		} else if resourceName == v1.ResourceMemory {
+			ms = append(ms, &metric.Metric{
+				LabelValues: []string{c.Name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitByte), kind, name},
+				Value:       float64(val.Value()),
+			})
+		}
+	}
+
+	return ms
+}
+
 // customResourceOwnerGenerator is used to generate metrics related to resource requests or limits, tagged by the top-most
 // owner of the pod.
-func (f *extendedPodFactory) customResourceOwnerGenerator(p *v1.Pod, resourceType string) *metric.Family {
+func (f *extendedPodFactory) customResourceOwnerGenerator(p *v1.Pod, resourceType string, contType ContainerType) *metric.Family {
 	// We want to omit pods that have succeeded, as those no longer count towards resource allocation
-	if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed {
+	// We also skip Pods that are not scheduled yet as their request/limits value are not actually allocated yet
+	if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed || p.Spec.NodeName == "" {
 		return &metric.Family{}
 	}
 
 	ms := []*metric.Metric{}
 
-	for _, c := range p.Spec.Containers {
-		var resources v1.ResourceList
-		switch resourceType {
-		case resourceRequests:
-			resources = c.Resources.Requests
-		case resourcelimits:
-			resources = c.Resources.Limits
-		default:
-			log.Warnf("unknown resource type requested for pod container resources: %s", resourceType)
-		}
-		var kind, name string
+	// gather the right resources (requests/limits) either for standard container or init containers
+	switch contType {
+	case Standard:
+		for _, c := range p.Spec.Containers {
+			containerMetrics := containerResourceOwnerGenerator(c, p, resourceType)
 
-		owners := p.GetOwnerReferences()
-		if len(owners) == 0 {
-			kind = "<none>"
-			name = "<none>"
+			ms = append(ms, containerMetrics...)
 		}
 
-		for _, owner := range owners {
-			kind = owner.Kind
-			name = owner.Name
-			if owner.Controller != nil {
-				break
-			}
-		}
+	case Init:
+		for _, c := range p.Spec.InitContainers {
+			// we only want the resource for init containers that are configured like a sidecar.
+			// these are identified by: pod.spec.Initcontainer.RestartPolicy == "always"
+			if c.RestartPolicy != nil && *c.RestartPolicy == v1.ContainerRestartPolicyAlways {
+				initContainerMetrics := containerResourceOwnerGenerator(c, p, resourceType)
 
-		// because of the way we handle aggregation (based on labels), if we want to drop the job / replicaset tag in the
-		// final metric being pushed up, then we should do it here. Otherwise, each job or replicaset will not be combined
-		// properly
-		switch kind {
-		case kubernetes.JobKind:
-			if cronjob, _ := kubernetes.ParseCronJobForJob(name); cronjob != "" {
-				kind = kubernetes.CronJobKind
-				name = cronjob
-			}
-		case kubernetes.ReplicaSetKind:
-			if deployment := kubernetes.ParseDeploymentForReplicaSet(name); deployment != "" {
-				kind = kubernetes.DeploymentKind
-				name = deployment
-			}
-		}
-
-		for resourceName, val := range resources {
-			if resourceName == v1.ResourceCPU {
-				ms = append(ms, &metric.Metric{
-					LabelValues: []string{c.Name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitCore), kind, name},
-					Value:       float64(val.MilliValue()) / 1000,
-				})
-			} else if resourceName == v1.ResourceMemory {
-				ms = append(ms, &metric.Metric{
-					LabelValues: []string{c.Name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitByte), kind, name},
-					Value:       float64(val.Value()),
-				})
+				ms = append(ms, initContainerMetrics...)
 			}
 		}
 	}
@@ -247,13 +355,12 @@ func (f *extendedPodFactory) ExpectedType() interface{} {
 // ListWatch returns a ListerWatcher for v1.Pod
 func (f *extendedPodFactory) ListWatch(customResourceClient interface{}, ns string, fieldSelector string) cache.ListerWatcher {
 	client := customResourceClient.(clientset.Interface)
-	ctx := context.Background()
 	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 			opts.FieldSelector = fieldSelector
 			return client.CoreV1().Pods(ns).List(ctx, opts)
 		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			opts.FieldSelector = fieldSelector
 			return client.CoreV1().Pods(ns).Watch(ctx, opts)
 		},

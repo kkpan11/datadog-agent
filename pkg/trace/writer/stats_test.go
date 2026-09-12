@@ -7,8 +7,10 @@ package writer
 
 import (
 	"compress/gzip"
+	"errors"
 	"math"
 	"net/url"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -20,6 +22,7 @@ import (
 
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
+	containertagsbuffer "github.com/DataDog/datadog-agent/pkg/trace/containertags"
 	"github.com/DataDog/datadog-agent/pkg/trace/info"
 	"github.com/DataDog/datadog-agent/pkg/trace/stats"
 	"github.com/DataDog/datadog-agent/pkg/trace/telemetry"
@@ -27,6 +30,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/trace/timing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -35,7 +39,8 @@ const (
 	testEnv      = "testing"
 )
 
-func assertPayload(assert *assert.Assertions, testSets []*pb.StatsPayload, payloads []*payload) {
+func assertPayload(t *testing.T, testSets []*pb.StatsPayload, payloads []*payload) {
+	t.Helper()
 	expectedHeaders := map[string]string{
 		"X-Datadog-Reported-Languages": strings.Join(info.Languages(), "|"),
 		"Content-Type":                 "application/msgpack",
@@ -46,11 +51,11 @@ func assertPayload(assert *assert.Assertions, testSets []*pb.StatsPayload, paylo
 	for _, p := range payloads {
 		var statsPayload pb.StatsPayload
 		r, err := gzip.NewReader(p.body)
-		assert.NoError(err)
-		err = msgp.Decode(r, &statsPayload)
-		assert.NoError(err)
+		require.NoError(t, err, "payload body is not valid gzip")
+		require.NoError(t, msgp.Decode(r, &statsPayload))
+		require.NoError(t, r.Close())
 		for k, v := range expectedHeaders {
-			assert.Equal(v, p.headers[k])
+			assert.Equal(t, v, p.headers[k])
 		}
 		decoded = append(decoded, &statsPayload)
 	}
@@ -59,13 +64,12 @@ func assertPayload(assert *assert.Assertions, testSets []*pb.StatsPayload, paylo
 		return decoded[i].AgentEnv < decoded[j].AgentEnv
 	})
 	for i, p := range decoded {
-		assert.Equal(testSets[i].String(), p.String())
+		assert.Equal(t, testSets[i].String(), p.String())
 	}
 }
 
 func TestStatsWriter(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
-		assert := assert.New(t)
 		sw, srv := testStatsWriter()
 		go sw.Run()
 
@@ -102,7 +106,7 @@ func TestStatsWriter(t *testing.T) {
 		sw.Write(testSets[0])
 		sw.Write(testSets[1])
 		sw.Stop()
-		assertPayload(assert, testSets, srv.Payloads())
+		assertPayload(t, testSets, srv.Payloads())
 	})
 
 	t.Run("race", func(_ *testing.T) {
@@ -332,12 +336,18 @@ func TestStatsResetBuffer(t *testing.T) {
 }
 
 func TestStatsSyncWriter(t *testing.T) {
+	if os.Getenv("CI") == "true" && runtime.GOOS == "darwin" {
+		t.Skip("TestStatsSyncWriter is known to fail on the macOS Gitlab runners.")
+	}
+
 	t.Run("ok", func(t *testing.T) {
 		assert := assert.New(t)
 		sw, srv := testStatsSyncWriter()
 		go sw.Run()
 		testSets := []*pb.StatsPayload{
 			{
+				AgentHostname: "1",
+				AgentEnv:      "1",
 				Stats: []*pb.ClientStatsPayload{{
 					Hostname: testHostname,
 					Env:      testEnv,
@@ -349,6 +359,8 @@ func TestStatsSyncWriter(t *testing.T) {
 				}},
 			},
 			{
+				AgentHostname: "2",
+				AgentEnv:      "2",
 				Stats: []*pb.ClientStatsPayload{{
 					Hostname: testHostname,
 					Env:      testEnv,
@@ -366,11 +378,10 @@ func TestStatsSyncWriter(t *testing.T) {
 		assert.Nil(err)
 		sw.Stop()
 		srv.Close()
-		assertPayload(assert, testSets, srv.Payloads())
+		assertPayload(t, testSets, srv.Payloads())
 	})
 
 	t.Run("stop", func(t *testing.T) {
-		assert := assert.New(t)
 		sw, srv := testStatsSyncWriter()
 		go sw.Run()
 
@@ -402,7 +413,7 @@ func TestStatsSyncWriter(t *testing.T) {
 		sw.Write(testSets[1])
 		sw.Stop()
 		srv.Close()
-		assertPayload(assert, testSets, srv.Payloads())
+		assertPayload(t, testSets, srv.Payloads())
 	})
 }
 
@@ -416,15 +427,15 @@ func TestStatsWriterUpdateAPIKey(t *testing.T) {
 	assert.NoError(err)
 
 	assert.Len(sw.senders, 1)
-	assert.Equal("123", sw.senders[0].cfg.apiKey)
+	assert.Equal("123", sw.senders[0].apiKeyManager.Get())
 	assert.Equal(url, sw.senders[0].cfg.url)
 
 	sw.UpdateAPIKey("invalid", "foo")
-	assert.Equal("123", sw.senders[0].cfg.apiKey)
+	assert.Equal("123", sw.senders[0].apiKeyManager.Get())
 	assert.Equal(url, sw.senders[0].cfg.url)
 
 	sw.UpdateAPIKey("123", "foo")
-	assert.Equal("foo", sw.senders[0].cfg.apiKey)
+	assert.Equal("foo", sw.senders[0].apiKeyManager.Get())
 	assert.Equal(url, sw.senders[0].cfg.url)
 	srv.Close()
 }
@@ -473,7 +484,7 @@ func TestStatsWriterInfo(t *testing.T) {
 	err := sw.FlushSync()
 	assert.Nil(err)
 
-	assertPayload(assert, testSets, srv.Payloads())
+	assertPayload(t, testSets, srv.Payloads())
 
 	assert.NotEmpty(sw.statsLastMinute.Bytes.Load())
 	assert.Empty(sw.statsLastMinute.Errors.Load())
@@ -487,6 +498,133 @@ func TestStatsWriterInfo(t *testing.T) {
 	sw.Stop()
 }
 
+func TestContainerTagsBufferManyTracerPayload(t *testing.T) {
+	cid1 := "container-1"
+	cid2 := "container-2"
+	tags1 := []string{"app:foo"}
+	tags2 := []string{"app:bar"}
+
+	expectedTagsMap := map[string][]string{
+		cid1: tags1,
+		cid2: tags2,
+	}
+
+	tests := []struct {
+		name          string
+		bufferEnabled bool
+		bufferPending bool
+		expectTags    bool
+	}{
+		{
+			name:          "pending true",
+			bufferEnabled: true,
+			bufferPending: true,
+			expectTags:    true,
+		},
+		{
+			name:          "buffer disabled",
+			bufferEnabled: false,
+			bufferPending: true,
+			expectTags:    false,
+		},
+		{
+			name:          "pending false",
+			bufferEnabled: true,
+			bufferPending: false,
+			expectTags:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			payload := &pb.StatsPayload{
+				Stats: []*pb.ClientStatsPayload{
+					{
+						Hostname:    "host-1",
+						ContainerID: cid1,
+						Stats:       []*pb.ClientStatsBucket{testutil.RandomBucket(1)},
+					},
+					{
+						Hostname:    "host-no-container",
+						ContainerID: "",
+						Stats:       []*pb.ClientStatsBucket{testutil.RandomBucket(1)},
+					},
+					{
+						Hostname:    "host-2",
+						ContainerID: cid2,
+						Stats:       []*pb.ClientStatsBucket{testutil.RandomBucket(1)},
+					},
+				},
+			}
+
+			mockBuf := &mockContainerTagsBuffer{
+				enabled: tc.bufferEnabled,
+				pending: tc.bufferPending,
+				returnTags: map[string][]string{
+					cid1: tags1,
+					cid2: tags2,
+				},
+			}
+
+			sw, srv := testStatsWriterWithBuffer(mockBuf)
+			go sw.Run()
+			defer sw.Stop()
+
+			sw.Write(payload)
+
+			// wait for result
+			require.Eventually(t, func() bool { return len(srv.Payloads()) == 1 }, 5*time.Second, 10*time.Millisecond)
+
+			var statsPayload pb.StatsPayload
+			r, err := gzip.NewReader(srv.Payloads()[0].body)
+			require.NoError(t, err)
+			require.NoError(t, msgp.Decode(r, &statsPayload))
+
+			receivedStats := statsPayload.Stats
+			assert.Equal(3, len(receivedStats))
+
+			for _, s := range receivedStats {
+				if !tc.expectTags {
+					assert.Empty(s.Tags)
+				} else {
+					wantTags := expectedTagsMap[s.ContainerID]
+					assert.Equal(wantTags, s.Tags)
+				}
+			}
+		})
+	}
+}
+
+type mockContainerTagsBuffer struct {
+	containertagsbuffer.NoOpTagsBuffer
+	enabled    bool
+	returnTags map[string][]string
+	returnErr  map[string]string
+	pending    bool
+}
+
+func (m *mockContainerTagsBuffer) IsEnabled() bool {
+	return m.enabled
+}
+
+func (m *mockContainerTagsBuffer) AsyncEnrichment(containerID string, cb func([]string, error, *containertagsbuffer.DebugInfo), _ int64) bool {
+	returnTags := m.returnTags[containerID]
+	var returnErr error
+	if retErrStr := m.returnErr[containerID]; retErrStr != "" {
+		returnErr = errors.New(retErrStr)
+	}
+	cb(returnTags, returnErr, nil)
+	return m.pending
+}
+
+func testStatsWriterWithBuffer(buffer containertagsbuffer.ContainerTagsBuffer) (*DatadogStatsWriter, *testServer) {
+	writer, srv := testStatsWriter()
+	writer.containerTagsBuffer = buffer
+	return writer, srv
+}
+
 func testStatsWriter() (*DatadogStatsWriter, *testServer) {
 	srv := newTestServer()
 	cfg := &config.AgentConfig{
@@ -494,7 +632,7 @@ func testStatsWriter() (*DatadogStatsWriter, *testServer) {
 		StatsWriter:   &config.WriterConfig{ConnectionLimit: 20, QueueSize: 20},
 		ContainerTags: func(_ string) ([]string, error) { return nil, nil },
 	}
-	return NewStatsWriter(cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}), srv
+	return NewStatsWriter(cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}, &containertagsbuffer.NoOpTagsBuffer{}), srv
 }
 
 func testStatsSyncWriter() (*DatadogStatsWriter, *testServer) {
@@ -504,7 +642,7 @@ func testStatsSyncWriter() (*DatadogStatsWriter, *testServer) {
 		StatsWriter:         &config.WriterConfig{ConnectionLimit: 20, QueueSize: 20},
 		SynchronousFlushing: true,
 	}
-	return NewStatsWriter(cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}), srv
+	return NewStatsWriter(cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}, &containertagsbuffer.NoOpTagsBuffer{}), srv
 }
 
 type key struct {

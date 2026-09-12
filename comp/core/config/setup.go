@@ -13,17 +13,17 @@ import (
 	"runtime"
 	"strings"
 
+	delegatedauth "github.com/DataDog/datadog-agent/comp/core/delegatedauth/def"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 )
 
-// setupConfig is copied from cmd/agent/common/helpers.go.
-func setupConfig(config pkgconfigmodel.Config, deps configDependencies) (*pkgconfigmodel.Warnings, error) {
-	p := deps.getParams()
-
+// setupConfig loads additional configuration data from yaml files, fleet policies, and command-line options
+func setupConfig(config pkgconfigmodel.BuildableConfig, secretComp secrets.Component, delegatedAuthComp delegatedauth.Component, p Params) error {
 	confFilePath := p.ConfFilePath
 	configName := p.configName
-	failOnMissingFile := !p.configMissingOK
 	defaultConfPath := p.defaultConfPath
 
 	if configName != "" {
@@ -31,7 +31,7 @@ func setupConfig(config pkgconfigmodel.Config, deps configDependencies) (*pkgcon
 	}
 
 	// set the paths where a config file is expected
-	if len(confFilePath) != 0 {
+	if confFilePath != "" {
 		// if the configuration file path was supplied on the command line,
 		// add that first so it's first in line
 		config.AddConfigPath(confFilePath)
@@ -46,21 +46,13 @@ func setupConfig(config pkgconfigmodel.Config, deps configDependencies) (*pkgcon
 
 	// load extra config file paths
 	if err := config.AddExtraConfigPaths(p.ExtraConfFilePath); err != nil {
-		return nil, err
+		return err
 	}
 
 	// load the configuration
-	var err error
-	var warnings *pkgconfigmodel.Warnings
-	if resolver, ok := deps.getSecretResolver(); ok {
-		warnings, err = pkgconfigsetup.LoadWithSecret(config, resolver, pkgconfigsetup.SystemProbe().GetEnvVars())
-	} else {
-		warnings, err = pkgconfigsetup.LoadWithoutSecret(config, pkgconfigsetup.SystemProbe().GetEnvVars())
-	}
+	err := pkgconfigsetup.LoadDatadog(config, secretComp, delegatedAuthComp, pkgconfigsetup.SystemProbe().GetEnvVars())
 
-	// If `!failOnMissingFile`, do not issue an error if we cannot find the default config file.
-	var e pkgconfigmodel.ConfigFileNotFoundError
-	if err != nil && (failOnMissingFile || !errors.As(err, &e) || confFilePath != "") {
+	if err != nil && (!errors.Is(err, pkgconfigmodel.ErrConfigFileNotFound) || confFilePath != "") {
 		// special-case permission-denied with a clearer error message
 		if errors.Is(err, fs.ErrPermission) {
 			if runtime.GOOS == "windows" {
@@ -71,7 +63,7 @@ func setupConfig(config pkgconfigmodel.Config, deps configDependencies) (*pkgcon
 		} else {
 			err = fmt.Errorf("unable to load Datadog config file: %w", err)
 		}
-		return warnings, err
+		return err
 	}
 
 	// Load the remote configuration
@@ -82,19 +74,29 @@ func setupConfig(config pkgconfigmodel.Config, deps configDependencies) (*pkgcon
 		// Main config file
 		err := config.MergeFleetPolicy(path.Join(p.FleetPoliciesDirPath, "datadog.yaml"))
 		if err != nil {
-			return warnings, err
+			return err
 		}
 		if p.configLoadSecurityAgent {
 			err := config.MergeFleetPolicy(path.Join(p.FleetPoliciesDirPath, "security-agent.yaml"))
 			if err != nil {
-				return warnings, err
+				return err
 			}
 		}
+		// Fleet policies are merged after LoadDatadog's override pass, so re-run
+		// ADP overrides that depend on values fleet policies may set.
+		pkgconfigsetup.ApplyUseDogstatsdSuppression(config)
+		pkgconfigsetup.ComputeDataPlaneStopTimeout(config)
+		pkgconfigsetup.SanitizeDataPlaneConfig(config)
 	}
 
 	for k, v := range p.cliOverride {
 		config.Set(k, v, pkgconfigmodel.SourceCLI)
 	}
 
-	return warnings, nil
+	return nil
+}
+
+// GetInstallPath returns the install path for the agent
+func GetInstallPath() string {
+	return defaultpaths.GetInstallPath()
 }

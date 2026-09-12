@@ -9,47 +9,56 @@
 package windowsevent
 
 import (
-	"github.com/DataDog/datadog-agent/pkg/util/log"
+	"sync"
 
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+	winevtapi "github.com/DataDog/datadog-agent/pkg/util/winutil/eventlog/api/windows"
+
+	"github.com/DataDog/datadog-agent/comp/logs-library/pipeline"
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
 	auditor "github.com/DataDog/datadog-agent/comp/logs/auditor/def"
+	publishermetadatacachedef "github.com/DataDog/datadog-agent/comp/publishermetadatacache/def"
 	"github.com/DataDog/datadog-agent/pkg/logs/launchers"
-	"github.com/DataDog/datadog-agent/pkg/logs/pipeline"
 	"github.com/DataDog/datadog-agent/pkg/logs/sources"
 	"github.com/DataDog/datadog-agent/pkg/logs/tailers"
 	"github.com/DataDog/datadog-agent/pkg/logs/tailers/windowsevent"
 	"github.com/DataDog/datadog-agent/pkg/util/startstop"
+	publishermetadatacache "github.com/DataDog/datadog-agent/pkg/util/winutil/eventlog/publishermetadatacache"
 )
 
 type tailer interface {
-	Start(bookmark string)
+	Start()
 	startstop.Stoppable
 	Identifier() string
 }
 
 // Launcher is in charge of starting and stopping windows event logs tailers
 type Launcher struct {
-	sources          chan *sources.LogSource
-	pipelineProvider pipeline.Provider
-	registry         auditor.Registry
-	tailers          map[string]tailer
-	stop             chan struct{}
+	sources                chan *sources.LogSource
+	sourcesDone            chan struct{}
+	pipelineProvider       pipeline.Provider
+	registry               auditor.Registry
+	tailers                map[string]tailer
+	stop                   chan struct{}
+	publisherMetadataCache publishermetadatacachedef.Component
+	stopOnce               sync.Once
 }
 
 // NewLauncher returns a new Launcher.
 func NewLauncher() *Launcher {
+	cache := publishermetadatacache.New(winevtapi.New())
 	return &Launcher{
-		tailers: make(map[string]tailer),
-		stop:    make(chan struct{}),
+		tailers:                make(map[string]tailer),
+		sourcesDone:            make(chan struct{}),
+		stop:                   make(chan struct{}),
+		publisherMetadataCache: cache,
 	}
 }
 
-// Start starts the launcher.
-//
-//nolint:revive // TODO(WINA) Fix revive linter
-func (l *Launcher) Start(sourceProvider launchers.SourceProvider, pipelineProvider pipeline.Provider, registry auditor.Registry, tracker *tailers.TailerTracker) {
+// Start starts the launcher by setting up Windows event log sources and beginning to tail them.
+func (l *Launcher) Start(sourceProvider launchers.SourceProvider, pipelineProvider pipeline.Provider, registry auditor.Registry, _ *tailers.TailerTracker) {
 	l.pipelineProvider = pipelineProvider
-	l.sources = sourceProvider.GetAddedForType(config.WindowsEventType)
+	l.sources = sourceProvider.GetAddedForType(config.WindowsEventType, l.sourcesDone)
 	l.registry = registry
 	availableChannels, err := EnumerateChannels()
 	if err != nil {
@@ -84,13 +93,17 @@ func (l *Launcher) run() {
 
 // Stop stops all active tailers
 func (l *Launcher) Stop() {
-	l.stop <- struct{}{}
-	stopper := startstop.NewParallelStopper()
-	for _, tailer := range l.tailers {
-		stopper.Add(tailer)
-		delete(l.tailers, tailer.Identifier())
-	}
-	stopper.Stop()
+	l.stopOnce.Do(func() {
+		close(l.sourcesDone)
+		l.stop <- struct{}{}
+		stopper := startstop.NewParallelStopper()
+		for _, tailer := range l.tailers {
+			stopper.Add(tailer)
+			delete(l.tailers, tailer.Identifier())
+		}
+		stopper.Stop()
+		l.publisherMetadataCache.Flush()
+	})
 }
 
 // sanitizedConfig sets default values for the config
@@ -114,8 +127,7 @@ func (l *Launcher) setupTailer(source *sources.LogSource) (tailer, error) {
 		Query:             sanitizedConfig.Query,
 		ProcessRawMessage: sanitizedConfig.ProcessRawMessage,
 	}
-	t := windowsevent.NewTailer(nil, source, config, l.pipelineProvider.NextPipelineChan())
-	bookmark := l.registry.GetOffset(t.Identifier())
-	t.Start(bookmark)
+	t := windowsevent.NewTailer(nil, source, config, l.pipelineProvider.NextPipelineChan(), l.registry, l.publisherMetadataCache)
+	t.Start()
 	return t, nil
 }

@@ -6,6 +6,7 @@
 package metrics
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
 )
 
@@ -20,6 +21,8 @@ type HistogramBucket struct {
 	Host            string
 	Timestamp       float64
 	FlushFirstValue bool
+	// MultipleBuckets tells check sampler to expect more buckets for the given context.
+	MultipleBuckets bool
 	Source          MetricSource
 }
 
@@ -36,7 +39,7 @@ func (m *HistogramBucket) GetHost() string {
 }
 
 // GetTags returns the bucket tags.
-func (m *HistogramBucket) GetTags(_, metricBuffer tagset.TagsAccumulator, _ EnrichTagsfn) {
+func (m *HistogramBucket) GetTags(_, metricBuffer tagset.TagsAccumulator, _ tagger.Component) {
 	// Other 'GetTags' methods for metrics support origin detections. Since
 	// HistogramBucket only come, for now, from checks we can simply return
 	// tags.

@@ -6,7 +6,7 @@ import os
 
 from invoke import task
 
-from tasks.build_tags import get_default_build_tags
+from tasks.build_tags import compute_build_tags_for_flavor
 from tasks.cluster_agent_helpers import build_common, clean_common, refresh_assets_common, version_common
 
 # constants
@@ -14,17 +14,34 @@ BIN_PATH = os.path.join(".", "bin", "datadog-cluster-agent-cloudfoundry")
 
 
 @task
-def build(ctx, rebuild=False, build_include=None, build_exclude=None, race=False, development=True, skip_assets=False):
+def build(
+    ctx,
+    rebuild=False,
+    build_include=None,
+    build_exclude=None,
+    race=False,
+    development=True,
+    skip_assets=False,
+    enable_bazel=False,
+):
     """
     Build Cluster Agent for Cloud Foundry
 
      Example invokation:
         dda inv cluster-agent-cloudfoundry.build
     """
+    if enable_bazel:
+        if race:
+            raise NotImplementedError("--enable-bazel does not support --race.")
+        if build_include is not None or build_exclude is not None:
+            raise NotImplementedError("--enable-bazel does not support --build-include/--build-exclude.")
+
     build_common(
         ctx,
         BIN_PATH,
-        get_default_build_tags(build="cluster-agent-cloudfoundry"),
+        compute_build_tags_for_flavor(
+            build="cluster-agent-cloudfoundry", build_include=build_include, build_exclude=build_exclude
+        ),
         "-cloudfoundry",
         rebuild,
         build_include,
@@ -32,6 +49,7 @@ def build(ctx, rebuild=False, build_include=None, build_exclude=None, race=False
         race,
         development,
         skip_assets,
+        enable_bazel=enable_bazel,
     )
 
 
@@ -44,7 +62,7 @@ def refresh_assets(ctx, development=True):
 
 
 @task
-def integration_tests(ctx, race=False, remote_docker=False):  # noqa: U100
+def integration_tests(ctx, race=False):  # noqa: U100
     """
     Run integration tests for cluster-agent-cloudfoundry
     """

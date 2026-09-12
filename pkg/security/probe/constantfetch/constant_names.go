@@ -26,11 +26,19 @@ const (
 	OffsetNameLinuxBinprmArgc           = "linux_binprm_argc_offset"
 	OffsetNameLinuxBinprmEnvc           = "linux_binprm_envc_offset"
 	OffsetNameVMAreaStructFlags         = "vm_area_struct_flags_offset"
+	OffsetNameVMAreaStructVMStart       = "vm_area_struct_vm_start_offset"
+	OffsetNameVMAreaStructVMEnd         = "vm_area_struct_vm_end_offset"
 	OffsetNameKernelCloneArgsExitSignal = "kernel_clone_args_exit_signal_offset"
 	OffsetNameFileFinode                = "file_f_inode_offset"
 	OffsetNameFileFpath                 = "file_f_path_offset"
 	OffsetNameDentryDSb                 = "dentry_d_sb_offset"
 	OffsetNameMountMntID                = "mount_id_offset"
+	OffsetNameMountMntIDUnique          = "mount_id_unique_offset"
+	OffsetNameMountMntNs                = "mount_ns_offset"
+	OffsetNameMountParent               = "mount_parent_offset"
+	OffsetNameMountMountpoint           = "mount_mountpoint_offset"
+	OffsetNameMntNamespaceNs            = "mnt_namespace_ns"
+	OffsetNameNsCommonInum              = "ns_common_inum_offset"
 	OffsetNameSbDev                     = "sb_dev_offset"
 	OffsetNameDentryDInode              = "dentry_d_inode_offset"
 	OffsetNamePathDentry                = "path_dentry_offset"
@@ -43,10 +51,14 @@ const (
 	OffsetNameVfsmountMntSb             = "vfsmount_mnt_sb_offset"
 	OffsetNameSuperblockSType           = "super_block_s_type_offset"
 	OffsetNameDentryDName               = "dentry_d_name_offset"
+	OffsetNameQstrName                  = "qstr_name_offset"
+	OffsetNameDentryDParent             = "dentry_d_parent_offset"
 
 	// inode
 	OffsetInodeIno   = "inode_ino_offset"
 	OffsetInodeNlink = "inode_nlink_offset"
+	OffsetInodeMode  = "inode_mode_offset"
+	OffsetInodeUID   = "inode_uid_offset"
 	OffsetInodeGid   = "inode_gid_offset"
 	OffsetInodeMtime = "inode_mtime_offset"
 	OffsetInodeCtime = "inode_ctime_offset"
@@ -77,12 +89,17 @@ const (
 	OffsetNameBPFProgAuxStructName            = "bpf_prog_aux_name_offset"
 
 	// namespace nr offsets
-	OffsetNamePIDStructLevel    = "pid_level_offset"
-	OffsetNamePIDStructNumbers  = "pid_numbers_offset"
-	OffsetNameDentryStructDSB   = "dentry_sb_offset"
-	OffsetNameTaskStructPID     = "task_struct_pid_offset"      // kernels >= 4.19
-	OffsetNameTaskStructPIDLink = "task_struct_pid_link_offset" // kernels < 4.19
-	OffsetNamePIDLinkStructPID  = "pid_link_pid_offset"         // kernels < 4.19
+	OffsetNamePIDStructLevel       = "pid_level_offset"
+	OffsetNamePIDStructNumbers     = "pid_numbers_offset"
+	OffsetNameDentryStructDSB      = "dentry_sb_offset"
+	OffsetNameTaskStructPID        = "task_struct_pid_offset"      // kernels >= 4.19
+	OffsetNameTaskStructPIDLink    = "task_struct_pid_link_offset" // kernels < 4.19
+	OffsetNamePIDLinkStructPID     = "pid_link_pid_offset"         // kernels < 4.19
+	OffsetNameTaskStructRealParent = "task_struct_real_parent_offset"
+	OffsetNameTaskStructTGID       = "task_struct_tgid_offset"
+	OffsetNameTaskStructCred       = "task_struct_cred_offset"
+	OffsetNameTaskStructRealCred   = "task_struct_real_cred_offset"
+	OffsetNameTaskStructSignal     = "task_struct_signal_offset"
 
 	// splice event
 	OffsetNamePipeInodeInfoStructBufs     = "pipe_inode_info_bufs_offset"
@@ -102,20 +119,49 @@ const (
 	OffsetNameSockCommonStructSKCNet    = "sock_common_skc_net_offset"
 	OffsetNameSocketStructSK            = "socket_sock_offset"
 	OffsetNameNFConnStructCTNet         = "nf_conn_ct_net_offset"
+	OffsetNameNFConnStructTuplehash     = "nf_conn_tuplehash_offset"
 	OffsetNameSockCommonStructSKCFamily = "sock_common_skc_family_offset"
 	OffsetNameSockCommonStructSKCNum    = "sock_common_skc_num_offset"
 	OffsetNameFlowI4StructSADDR         = "flowi4_saddr_offset"
 	OffsetNameFlowI6StructSADDR         = "flowi6_saddr_offset"
 	OffsetNameFlowI4StructULI           = "flowi4_uli_offset"
 	OffsetNameFlowI6StructULI           = "flowi6_uli_offset"
-
+	OffsetNameSockStructSKProtocol      = "sock_sk_protocol_offset" // kernel >= 5.6
 	// TODO: needed for l4_protocol resolution, see network/flow.h
 	OffsetNameFlowI4StructProto = "flowi4_proto_offset"
 	OffsetNameFlowI6StructProto = "flowi6_proto_offset"
+	OffsetNameRtnlLinkOpsKind   = "rtnl_link_ops_kind_offset"
+
+	// nsproxy offsets
+	OffsetNameNsproxyMntNs = "nsproxy_mnt_ns_offset"
+	OffsetNameNsproxyNetNs = "nsproxy_net_ns_offset"
+
+	// OTel TLSDESC thread pointer offsets.
+	// Used to read the thread pointer from task_struct for OTel Thread Local Context Record support.
+	// x86_64: task_struct->thread.fsbase
+	// ARM64:  task_struct->thread.uw.tp_value (tp_value is first member of uw, offset within uw = 0)
+	OffsetNameTaskStructThread = "task_struct_thread_offset"
+	OffsetNameThreadStructTp   = "thread_struct_tp_offset"
 
 	// Interpreter constants
-	OffsetNameLinuxBinprmStructFile = "binprm_file_offset"
+	OffsetNameLinuxBinprmStructFile     = "binprm_file_offset"
+	OffsetNameLinuxBinprmStructFilename = "linux_binprm_filename_offset"
+	OffsetNameLinuxBinprmStructInterp   = "linux_binprm_interp_offset"
+
+	// module constants
+	OffsetNameModuleName = "module_name_offset"
+
+	OffsetNameKernfsOpenFileFile = "kernfs_open_file_file_offset"
 
 	// iouring constants
-	OffsetNameIoKiocbStructCtx = "iokiocb_ctx_offset"
+	OffsetNameIoKiocbStructCtx    = "iokiocb_ctx_offset"
+	OffsetNameIoKiocbStructOpcode = "iokiocb_opcode_offset"
+
+	// iouring io_socket (IORING_OP_SOCKET) command field offsets
+	OffsetNameIoSocketStructDomain   = "io_socket_domain_offset"
+	OffsetNameIoSocketStructType     = "io_socket_type_offset"
+	OffsetNameIoSocketStructProtocol = "io_socket_protocol_offset"
+
+	// setsockopt event
+	OffsetNameSocketType = "socket_type_offset"
 )

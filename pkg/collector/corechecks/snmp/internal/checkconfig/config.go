@@ -8,8 +8,8 @@ package checkconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/DataDog/datadog-agent/comp/remote-config/rcclient"
 	"hash/fnv"
 	"net"
 	"sort"
@@ -17,7 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	rcclient "github.com/DataDog/datadog-agent/comp/remote-config/rcclient/def"
+
+	"go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/pkg/collector/check/defaults"
@@ -84,17 +86,21 @@ type DeviceDigest string
 // InitConfig is used to deserialize integration init config
 type InitConfig struct {
 	Profiles              profile.ProfileConfigMap          `yaml:"profiles"`
-	UseRCProfiles         bool                              `yaml:"use_remote_config_profiles"`
+	UseRCProfiles         Boolean                           `yaml:"use_remote_config_profiles"`
 	GlobalMetrics         []profiledefinition.MetricsConfig `yaml:"global_metrics"`
 	OidBatchSize          Number                            `yaml:"oid_batch_size"`
 	BulkMaxRepetitions    Number                            `yaml:"bulk_max_repetitions"`
 	CollectDeviceMetadata Boolean                           `yaml:"collect_device_metadata"`
 	CollectTopology       Boolean                           `yaml:"collect_topology"`
+	CollectVPN            Boolean                           `yaml:"collect_vpn"`
 	UseDeviceIDAsHostname Boolean                           `yaml:"use_device_id_as_hostname"`
-	MinCollectionInterval int                               `yaml:"min_collection_interval"`
-	Namespace             string                            `yaml:"namespace"`
-	PingConfig            snmpintegration.PackedPingConfig  `yaml:"ping"`
-	Loader                string                            `yaml:"loader"`
+	// DeviceTagsSource controls where the device tags on metrics come from: the backend
+	// enrichment (`resource`, default), the Agent (`agent`), or both.
+	DeviceTagsSource      string                           `yaml:"device_tags_source"`
+	MinCollectionInterval int                              `yaml:"min_collection_interval"`
+	Namespace             string                           `yaml:"namespace"`
+	PingConfig            snmpintegration.PackedPingConfig `yaml:"ping"`
+	Loader                string                           `yaml:"loader"`
 }
 
 // InstanceConfig is used to deserialize integration instance config
@@ -118,9 +124,13 @@ type InstanceConfig struct {
 	UseGlobalMetrics      bool                                `yaml:"use_global_metrics"`
 	CollectDeviceMetadata *Boolean                            `yaml:"collect_device_metadata"`
 	CollectTopology       *Boolean                            `yaml:"collect_topology"`
+	CollectVPN            *Boolean                            `yaml:"collect_vpn"`
 	UseDeviceIDAsHostname *Boolean                            `yaml:"use_device_id_as_hostname"`
-	PingConfig            snmpintegration.PackedPingConfig    `yaml:"ping"`
-	Loader                string                              `yaml:"loader"`
+	// DeviceTagsSource overrides the init config value for this instance.
+	DeviceTagsSource string                           `yaml:"device_tags_source"`
+	PingConfig       snmpintegration.PackedPingConfig `yaml:"ping"`
+	Loader           string                           `yaml:"loader"`
+	UseRCProfiles    *Boolean                         `yaml:"use_remote_config_profiles"`
 
 	// ExtraTags is a workaround to pass tags from snmp listener to snmp integration via AD template
 	// (see cmd/agent/dist/conf.d/snmp.d/auto_conf.yaml) that only works with strings.
@@ -183,7 +193,12 @@ type CheckConfig struct {
 	InstanceTags          []string
 	CollectDeviceMetadata bool
 	CollectTopology       bool
+	CollectVPN            bool
 	UseDeviceIDAsHostname bool
+	// DeviceTagsSource reports where the device tags on metrics come from. Forced to
+	// `both` when CollectDeviceMetadata is false, since there is no metadata payload to
+	// enrich from and the legacy device tags must be kept on metrics.
+	DeviceTagsSource      snmpintegration.DeviceTagsSource
 	DeviceID              string
 	DeviceIDTags          []string
 	ResolvedSubnetName    string
@@ -200,6 +215,8 @@ type CheckConfig struct {
 
 	PingEnabled bool
 	PingConfig  pinger.Config
+
+	UseUnconnectedUDPSocket bool
 }
 
 // UpdateDeviceIDAndTags updates DeviceID and DeviceIDTags
@@ -221,13 +238,11 @@ func (c *CheckConfig) GetStaticTags() []string {
 		tags = append(tags, deviceIDTagKey+":"+c.DeviceID)
 	}
 
-	if c.UseDeviceIDAsHostname {
-		hname, err := hostname.Get(context.TODO())
-		if err != nil {
-			log.Warnf("Error getting the hostname: %v", err)
-		} else {
-			tags = append(tags, "agent_host:"+hname)
-		}
+	hname, err := hostname.Get(context.TODO())
+	if err != nil {
+		log.Warnf("Error getting the hostname: %v", err)
+	} else {
+		tags = append(tags, "agent_host:"+hname)
 	}
 	return tags
 }
@@ -299,11 +314,11 @@ func NewCheckConfig(rawInstance integration.Data, rawInitConfig integration.Data
 	c.Network = instance.Network
 
 	if c.IPAddress == "" && c.Network == "" {
-		return nil, fmt.Errorf("`ip_address` or `network` config must be provided")
+		return nil, errors.New("`ip_address` or `network` config must be provided")
 	}
 
 	if c.IPAddress != "" && c.Network != "" {
-		return nil, fmt.Errorf("`ip_address` and `network` cannot be used at the same time")
+		return nil, errors.New("`ip_address` and `network` cannot be used at the same time")
 	}
 	if c.Network != "" {
 		_, _, err = net.ParseCIDR(c.Network)
@@ -324,10 +339,31 @@ func NewCheckConfig(rawInstance integration.Data, rawInitConfig integration.Data
 		c.CollectTopology = bool(initConfig.CollectTopology)
 	}
 
+	if instance.CollectVPN != nil {
+		c.CollectVPN = bool(*instance.CollectVPN)
+	} else {
+		c.CollectVPN = bool(initConfig.CollectVPN)
+	}
+
 	if instance.UseDeviceIDAsHostname != nil {
 		c.UseDeviceIDAsHostname = bool(*instance.UseDeviceIDAsHostname)
 	} else {
 		c.UseDeviceIDAsHostname = bool(initConfig.UseDeviceIDAsHostname)
+	}
+
+	rawDeviceTagsSource := instance.DeviceTagsSource
+	if rawDeviceTagsSource == "" {
+		rawDeviceTagsSource = initConfig.DeviceTagsSource
+	}
+	deviceTagsSource, sourceErr := snmpintegration.ParseDeviceTagsSource(rawDeviceTagsSource)
+	if sourceErr != nil {
+		log.Warnf("%s", sourceErr)
+	}
+	c.DeviceTagsSource = deviceTagsSource
+	if !c.CollectDeviceMetadata {
+		// Without a metadata payload there is nothing for the backend to enrich from, so the
+		// device tags must stay on the metrics whatever the configured source is.
+		c.DeviceTagsSource = snmpintegration.DeviceTagsSourceBoth
 	}
 
 	if instance.ExtraTags != "" {
@@ -435,9 +471,16 @@ func NewCheckConfig(rawInstance integration.Data, rawInitConfig integration.Data
 		return nil, err
 	}
 
-	if initConfig.UseRCProfiles {
+	var useRCProfiles bool
+	if instance.UseRCProfiles != nil {
+		useRCProfiles = bool(*instance.UseRCProfiles)
+	} else {
+		useRCProfiles = bool(initConfig.UseRCProfiles)
+	}
+
+	if useRCProfiles {
 		if rcClient == nil {
-			return nil, fmt.Errorf("rc client not initialized, cannot use rc profiles")
+			return nil, errors.New("rc client not initialized, cannot use rc profiles")
 		}
 		if len(initConfig.Profiles) > 0 {
 			// We don't support merging inline profiles with profiles fetched via remote
@@ -452,15 +495,22 @@ func NewCheckConfig(rawInstance integration.Data, rawInitConfig integration.Data
 			return nil, err
 		}
 	} else {
-		var haveLegacyProfile bool
-		c.ProfileProvider, haveLegacyProfile, err = profile.GetProfileProvider(initConfig.Profiles)
+		var legacyProfiles []string
+		c.ProfileProvider, legacyProfiles, err = profile.GetProfileProvider(initConfig.Profiles)
 		if err != nil {
 			return nil, err
 		}
-		if haveLegacyProfile || profiledefinition.IsLegacyMetrics(instance.Metrics) {
-			if initConfig.Loader == "" && instance.Loader == "" {
-				return nil, fmt.Errorf("legacy profile detected with no loader specified, falling back to the Python loader")
-			}
+		// The Core loader cannot handle the legacy Python metric syntax, so a config relying on
+		// it is handed over to the Python loader unless a loader was explicitly requested.
+		var legacySources []string
+		if len(legacyProfiles) > 0 {
+			legacySources = append(legacySources, "profile(s) "+strings.Join(legacyProfiles, ", "))
+		}
+		if profiledefinition.IsLegacyMetrics(instance.Metrics) {
+			legacySources = append(legacySources, "the instance metrics")
+		}
+		if len(legacySources) > 0 && initConfig.Loader == "" && instance.Loader == "" {
+			return nil, fmt.Errorf("legacy profile detected with no loader specified, falling back to the Python loader; legacy syntax found in %s", strings.Join(legacySources, " and "))
 		}
 	}
 
@@ -556,16 +606,16 @@ func (c *CheckConfig) getResolvedSubnetName() string {
 func (c *CheckConfig) DeviceDigest(address string) DeviceDigest {
 	h := fnv.New64()
 	// Hash write never returns an error
-	h.Write([]byte(address))                   //nolint:errcheck
-	h.Write([]byte(fmt.Sprintf("%d", c.Port))) //nolint:errcheck
-	h.Write([]byte(c.SnmpVersion))             //nolint:errcheck
-	h.Write([]byte(c.CommunityString))         //nolint:errcheck
-	h.Write([]byte(c.User))                    //nolint:errcheck
-	h.Write([]byte(c.AuthKey))                 //nolint:errcheck
-	h.Write([]byte(c.AuthProtocol))            //nolint:errcheck
-	h.Write([]byte(c.PrivKey))                 //nolint:errcheck
-	h.Write([]byte(c.PrivProtocol))            //nolint:errcheck
-	h.Write([]byte(c.ContextName))             //nolint:errcheck
+	h.Write([]byte(address))                                //nolint:errcheck
+	h.Write([]byte(strconv.FormatUint(uint64(c.Port), 10))) //nolint:errcheck
+	h.Write([]byte(c.SnmpVersion))                          //nolint:errcheck
+	h.Write([]byte(c.CommunityString))                      //nolint:errcheck
+	h.Write([]byte(c.User))                                 //nolint:errcheck
+	h.Write([]byte(c.AuthKey))                              //nolint:errcheck
+	h.Write([]byte(c.AuthProtocol))                         //nolint:errcheck
+	h.Write([]byte(c.PrivKey))                              //nolint:errcheck
+	h.Write([]byte(c.PrivProtocol))                         //nolint:errcheck
+	h.Write([]byte(c.ContextName))                          //nolint:errcheck
 
 	// Sort the addresses to get a stable digest
 	addresses := make([]string, 0, len(c.IgnoredIPAddresses))
@@ -617,7 +667,9 @@ func (c *CheckConfig) Copy() *CheckConfig {
 	newConfig.InstanceTags = netutils.CopyStrings(c.InstanceTags)
 	newConfig.CollectDeviceMetadata = c.CollectDeviceMetadata
 	newConfig.CollectTopology = c.CollectTopology
+	newConfig.CollectVPN = c.CollectVPN
 	newConfig.UseDeviceIDAsHostname = c.UseDeviceIDAsHostname
+	newConfig.DeviceTagsSource = c.DeviceTagsSource
 	newConfig.DeviceID = c.DeviceID
 
 	newConfig.DeviceIDTags = netutils.CopyStrings(c.DeviceIDTags)
@@ -631,6 +683,8 @@ func (c *CheckConfig) Copy() *CheckConfig {
 	newConfig.PingConfig.Timeout = c.PingConfig.Timeout
 	newConfig.PingConfig.Count = c.PingConfig.Count
 	newConfig.PingConfig.UseRawSocket = c.PingConfig.UseRawSocket
+
+	newConfig.UseUnconnectedUDPSocket = c.UseUnconnectedUDPSocket
 
 	return &newConfig
 }

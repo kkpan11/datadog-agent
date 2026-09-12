@@ -12,15 +12,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/DataDog/datadog-agent/cmd/installer/command"
-	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/pid"
-	"github.com/DataDog/datadog-agent/comp/updater/localapi"
-	"github.com/DataDog/datadog-agent/comp/updater/telemetry"
-	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/judwhite/go-svc"
 	"go.uber.org/fx"
+
+	"github.com/DataDog/datadog-agent/cmd/installer/command"
+	"github.com/DataDog/datadog-agent/comp/core/config"
+	pid "github.com/DataDog/datadog-agent/comp/core/pid/def"
+	localapi "github.com/DataDog/datadog-agent/comp/updater/localapi/def"
+	telemetry "github.com/DataDog/datadog-agent/comp/updater/telemetry/def"
+	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 type windowsService struct {
@@ -124,6 +125,8 @@ func (s *windowsService) gracefullyExitIfDisabled() {
 		// For more information see runTimeExitGate in servicemain.go
 		time.Sleep(5 * time.Second)
 		// go-svc will call Stop() once we cancel the context
-		s.cancel()
+		if s != nil && s.cancel != nil {
+			s.cancel()
+		}
 	}
 }

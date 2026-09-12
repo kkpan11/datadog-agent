@@ -114,7 +114,7 @@ func Test_resourcequotaTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -188,7 +188,7 @@ func Test_cronJobNextScheduleTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := tt.args.now()
@@ -233,7 +233,7 @@ func Test_cronJobLastScheduleTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := tt.args.now()
@@ -278,7 +278,7 @@ func Test_cronJobLastSuccessfulTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := tt.args.now()
@@ -354,7 +354,7 @@ func Test_jobCompleteTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -430,7 +430,7 @@ func Test_jobDurationTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -521,7 +521,7 @@ func Test_jobFailedTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -603,7 +603,7 @@ func Test_jobStatusSucceededTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -813,7 +813,7 @@ func Test_jobStatusFailedTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -870,7 +870,7 @@ func Test_pvPhaseTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -929,7 +929,7 @@ func Test_serviceTypeTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -988,7 +988,7 @@ func Test_podPhaseTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -1158,7 +1158,7 @@ func Test_containerWaitingReasonTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -1244,7 +1244,7 @@ func Test_containerTerminatedReasonTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -1333,7 +1333,7 @@ func Test_limitrangeTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -1406,7 +1406,7 @@ func Test_nodeUnschedulableTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -1738,7 +1738,7 @@ func Test_nodeConditionTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -1840,6 +1840,73 @@ func Test_validateJob(t *testing.T) {
 	}
 }
 
+func Test_initContainerResourceRequestsTransformer(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     args
+		expected *metricsExpected
+	}{
+		{
+			name: "memory",
+			args: args{
+				name: "kube_pod_init_container_resource_requests",
+				metric: ksmstore.DDMetric{
+					Val: 50000000,
+					Labels: map[string]string{
+						"resource": "memory",
+						"unit":     "byte",
+					},
+				},
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+			expected: &metricsExpected{
+				name:     "kubernetes_state.initcontainer.memory_requested",
+				val:      50000000,
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+		},
+		{
+			name: "cpu",
+			args: args{
+				name: "kube_pod_init_container_resource_requests",
+				metric: ksmstore.DDMetric{
+					Val: 2,
+					Labels: map[string]string{
+						"resource": "cpu",
+						"unit":     "core",
+					},
+				},
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+			expected: &metricsExpected{
+				name:     "kubernetes_state.initcontainer.cpu_requested",
+				val:      2,
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		s := mocksender.NewMockSender(t, "ksm")
+		s.SetupAcceptAll()
+		t.Run(tt.name, func(t *testing.T) {
+			currentTime := time.Now()
+			initContainerResourceRequestsTransformer(s, tt.args.name, tt.args.metric, tt.args.hostname, tt.args.tags, currentTime)
+			if tt.expected != nil {
+				s.AssertMetric(t, "Gauge", tt.expected.name, tt.expected.val, tt.args.hostname, tt.expected.tags)
+				s.AssertNumberOfCalls(t, "Gauge", 1)
+			} else {
+				s.AssertNotCalled(t, "Gauge")
+			}
+		})
+	}
+
+}
+
 func Test_containerResourceRequestsTransformer(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1849,7 +1916,7 @@ func Test_containerResourceRequestsTransformer(t *testing.T) {
 		{
 			name: "memory",
 			args: args{
-				name: "kube_pod_container_resource_requests",
+				name: "kube_pod_container_effective_resource_requests",
 				metric: ksmstore.DDMetric{
 					Val: 50000000,
 					Labels: map[string]string{
@@ -1870,7 +1937,7 @@ func Test_containerResourceRequestsTransformer(t *testing.T) {
 		{
 			name: "cpu",
 			args: args{
-				name: "kube_pod_container_resource_requests",
+				name: "kube_pod_container_effective_resource_requests",
 				metric: ksmstore.DDMetric{
 					Val: 2,
 					Labels: map[string]string{
@@ -1891,7 +1958,7 @@ func Test_containerResourceRequestsTransformer(t *testing.T) {
 		{
 			name: "kubernetes_io_network_bandwidth",
 			args: args{
-				name: "kube_pod_container_resource_requests",
+				name: "kube_pod_container_extended_resource_requests",
 				metric: ksmstore.DDMetric{
 					Val: 2,
 					Labels: map[string]string{
@@ -1912,13 +1979,10 @@ func Test_containerResourceRequestsTransformer(t *testing.T) {
 		{
 			name: "no resource label",
 			args: args{
-				name: "kube_pod_container_resource_requests",
+				name: "kube_pod_container_effective_resource_requests",
 				metric: ksmstore.DDMetric{
-					Val: 2,
-					Labels: map[string]string{
-						"resource": "cpu",
-						"unit":     "core",
-					},
+					Val:    2,
+					Labels: map[string]string{"unit": "core"},
 				},
 				tags: []string{"foo:bar"},
 			},
@@ -1926,11 +1990,135 @@ func Test_containerResourceRequestsTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
 			containerResourceRequestsTransformer(s, tt.args.name, tt.args.metric, tt.args.hostname, tt.args.tags, currentTime)
+			if tt.expected != nil {
+				s.AssertMetric(t, "Gauge", tt.expected.name, tt.expected.val, tt.args.hostname, tt.expected.tags)
+				s.AssertNumberOfCalls(t, "Gauge", 1)
+			} else {
+				s.AssertNotCalled(t, "Gauge")
+			}
+		})
+	}
+}
+
+func Test_podTerminatingTransformer(t *testing.T) {
+	s := mocksender.NewMockSender(t, "ksm")
+	s.SetupAcceptAll()
+	tags := []string{"pod_name:test-pod", "kube_namespace:test-namespace"}
+
+	podTerminatingTransformer(s, "kube_pod_deletion_timestamp", ksmstore.DDMetric{Val: 12345}, "", tags, time.Time{})
+
+	s.AssertMetric(t, "Gauge", "kubernetes_state.pod.terminating", 1, "", tags)
+	s.AssertNumberOfCalls(t, "Gauge", 1)
+}
+
+func Test_containerSpecResourceRequestsTransformer(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource string
+		expected *metricsExpected
+	}{
+		{
+			name:     "cpu is emitted from effective requests instead",
+			resource: "cpu",
+		},
+		{
+			name:     "memory is emitted from effective requests instead",
+			resource: "memory",
+		},
+		{
+			name:     "spec-only resource is preserved",
+			resource: "nvidia_com_gpu",
+			expected: &metricsExpected{
+				name:     "kubernetes_state.container.gpu_requested",
+				val:      1,
+				tags:     []string{"foo:bar"},
+				hostname: "foo",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := mocksender.NewMockSender(t, "ksm")
+			s.SetupAcceptAll()
+			metric := ksmstore.DDMetric{
+				Val:    1,
+				Labels: map[string]string{"resource": tt.resource},
+			}
+
+			containerSpecResourceRequestsTransformer(s, "kube_pod_container_resource_requests", metric, "foo", []string{"foo:bar"}, time.Time{})
+			if tt.expected == nil {
+				s.AssertNotCalled(t, "Gauge")
+				return
+			}
+
+			s.AssertMetric(t, "Gauge", tt.expected.name, tt.expected.val, tt.expected.hostname, tt.expected.tags)
+			s.AssertNumberOfCalls(t, "Gauge", 1)
+		})
+	}
+}
+
+func Test_initContainerResourceLimitsTransformer(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     args
+		expected *metricsExpected
+	}{
+		{
+			name: "memory",
+			args: args{
+				name: "kube_pod_init_container_resource_limits",
+				metric: ksmstore.DDMetric{
+					Val: 50000000,
+					Labels: map[string]string{
+						"resource": "memory",
+						"unit":     "byte",
+					},
+				},
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+			expected: &metricsExpected{
+				name:     "kubernetes_state.initcontainer.memory_limit",
+				val:      50000000,
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+		},
+		{
+			name: "cpu",
+			args: args{
+				name: "kube_pod_init_container_resource_limits",
+				metric: ksmstore.DDMetric{
+					Val: 2,
+					Labels: map[string]string{
+						"resource": "cpu",
+						"unit":     "core",
+					},
+				},
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+			expected: &metricsExpected{
+				name:     "kubernetes_state.initcontainer.cpu_limit",
+				val:      2,
+				tags:     []string{"cluster_name:rick-sanchez"},
+				hostname: "garage",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		s := mocksender.NewMockSender(t, "ksm")
+		s.SetupAcceptAll()
+		t.Run(tt.name, func(t *testing.T) {
+			currentTime := time.Now()
+			initContainerResourceLimitsTransformer(s, tt.args.name, tt.args.metric, tt.args.hostname, tt.args.tags, currentTime)
 			if tt.expected != nil {
 				s.AssertMetric(t, "Gauge", tt.expected.name, tt.expected.val, tt.args.hostname, tt.expected.tags)
 				s.AssertNumberOfCalls(t, "Gauge", 1)
@@ -2111,7 +2299,7 @@ func Test_containerResourceLimitsTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -2338,7 +2526,7 @@ func Test_nodeAllocatableTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -2565,7 +2753,7 @@ func Test_nodeCapacityTransformer(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -2619,7 +2807,7 @@ func Test_timestampTransformers(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := argsTemplate.now()
@@ -2654,7 +2842,7 @@ func Test_removeSecret(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s := mocksender.NewMockSender("ksm")
+		s := mocksender.NewMockSender(t, "ksm")
 		s.SetupAcceptAll()
 		t.Run(tt.name, func(t *testing.T) {
 			currentTime := time.Now()
@@ -2668,4 +2856,66 @@ func Test_removeSecret(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_endpointAddressTransformer_emitsZeroForOppositeReadyState(t *testing.T) {
+	stripped := []string{"kube_namespace:default", "kube_endpoint:nginx", "ip:10.0.0.1"}
+
+	tests := []struct {
+		name           string
+		ready          string
+		omitReady      bool
+		wantAvailable  *float64
+		wantNotReady   *float64
+		wantGaugeCalls int
+	}{
+		{
+			name:           "ready address also reports not_ready as 0",
+			ready:          "true",
+			wantAvailable:  floatPtr(1),
+			wantNotReady:   floatPtr(0),
+			wantGaugeCalls: 2,
+		},
+		{
+			name:           "not-ready address also reports available as 0",
+			ready:          "false",
+			wantAvailable:  floatPtr(0),
+			wantNotReady:   floatPtr(1),
+			wantGaugeCalls: 2,
+		},
+		{
+			name:           "missing ready label emits nothing",
+			omitReady:      true,
+			wantGaugeCalls: 0,
+		},
+		{
+			name:           "unknown ready label emits nothing",
+			ready:          "unknown",
+			wantGaugeCalls: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := mocksender.NewMockSender(t, "ksm")
+			s.SetupAcceptAll()
+			labels := map[string]string{"namespace": "default", "endpoint": "nginx", "ip": "10.0.0.1"}
+			inputTags := []string{"kube_namespace:default", "kube_endpoint:nginx", "ip:10.0.0.1"}
+			if !tt.omitReady {
+				labels["ready"] = tt.ready
+				inputTags = append(inputTags, "ready:"+tt.ready)
+			}
+			endpointAddressTransformer(s, "kube_endpoint_address", ksmstore.DDMetric{Val: 1, Labels: labels}, "host", inputTags, time.Now())
+			if tt.wantAvailable != nil {
+				s.AssertMetric(t, "Gauge", "kubernetes_state.endpoint.address_available", *tt.wantAvailable, "host", stripped)
+			}
+			if tt.wantNotReady != nil {
+				s.AssertMetric(t, "Gauge", "kubernetes_state.endpoint.address_not_ready", *tt.wantNotReady, "host", stripped)
+			}
+			s.AssertNumberOfCalls(t, "Gauge", tt.wantGaugeCalls)
+		})
+	}
+}
+
+func floatPtr(v float64) *float64 {
+	return &v
 }

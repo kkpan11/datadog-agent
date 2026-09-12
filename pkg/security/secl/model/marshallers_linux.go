@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+const (
+	// PidCacheEntrySize is the size of the pid_cache_t
+	PidCacheEntrySize = 96
+)
+
 // BinaryMarshaler interface implemented by every event type
 type BinaryMarshaler interface {
 	MarshalBinary(data []byte) (int, error)
@@ -73,26 +78,25 @@ func (e *FileFields) MarshalBinary(data []byte) (int, error) {
 // MarshalProcCache marshals a binary representation of itself
 func (e *Process) MarshalProcCache(data []byte, bootTime time.Time) (int, error) {
 	// Marshal proc_cache_t
-	if len(data) < ContainerIDLen {
+
+	// marshal cgroup_context/path_key of size 16
+	if len(data) < PathKeySize {
 		return 0, ErrNotEnoughSpace
 	}
+	e.CGroup.CGroupPathKey.Write(data)
+	written := PathKeySize
 
-	copy(data[0:ContainerIDLen], []byte(e.ContainerID))
-	binary.NativeEndian.PutUint64(data[ContainerIDLen:ContainerIDLen+8], uint64(e.CGroup.CGroupFlags))
-
-	written := ContainerIDLen + 8
-
-	// process without cgroup should be mainly pid 1
-	// TODO: fix empty cgroup path key for not-pid-1 processes
-	e.CGroup.CGroupFile.Write(data[written:])
-	written += PathKeySize
-
+	// marshal file_t executable of size 72
+	if len(data[written:]) < 72 {
+		return 0, ErrNotEnoughSpace
+	}
 	added, err := MarshalBinary(data[written:], &e.FileEvent)
 	if err != nil {
 		return 0, err
 	}
 	written += added
 
+	// marshal exec_timestamp / tty_name / comm, total size of 88 (8 + 64 + 16)
 	if len(data[written:]) < 88 {
 		return 0, ErrNotEnoughSpace
 	}
@@ -134,18 +138,18 @@ func (e *Credentials) MarshalBinary(data []byte) (int, error) {
 // MarshalPidCache marshals a binary representation of itself
 func (e *Process) MarshalPidCache(data []byte, bootTime time.Time) (int, error) {
 	// Marshal pid_cache_t
-	if len(data) < 88 {
+	if len(data) < PidCacheEntrySize {
 		return 0, ErrNotEnoughSpace
 	}
 	binary.NativeEndian.PutUint64(data[0:8], e.Cookie)
-	binary.NativeEndian.PutUint32(data[8:12], e.PPid)
 
-	// padding
-
-	marshalTime(data[16:24], e.ForkTime.Sub(bootTime))
-	marshalTime(data[24:32], e.ExitTime.Sub(bootTime))
-	binary.NativeEndian.PutUint64(data[32:40], e.UserSession.ID)
-	written := 40
+	marshalTime(data[8:16], e.ForkTime.Sub(bootTime))
+	marshalTime(data[16:24], e.ExitTime.Sub(bootTime))
+	binary.NativeEndian.PutUint64(data[24:32], e.UserSession.K8SSessionID)
+	binary.NativeEndian.PutUint64(data[32:40], e.ForkFlags)
+	binary.NativeEndian.PutUint32(data[40:44], e.PIDContext.SID)
+	binary.NativeEndian.PutUint32(data[44:48], 0) // padding
+	written := 48
 
 	n, err := MarshalBinary(data[written:], &e.Credentials)
 	if err != nil {
@@ -158,7 +162,7 @@ func (e *Process) MarshalPidCache(data []byte, bootTime time.Time) (int, error) 
 
 // MarshalBinary marshals a binary representation of itself
 func (adlc *ActivityDumpLoadConfig) MarshalBinary() ([]byte, error) {
-	raw := make([]byte, 56)
+	raw := make([]byte, 48)
 
 	var eventMask uint64
 	for _, evt := range adlc.TracedEventTypes {
@@ -172,8 +176,6 @@ func (adlc *ActivityDumpLoadConfig) MarshalBinary() ([]byte, error) {
 	binary.NativeEndian.PutUint16(raw[40:42], adlc.Rate)
 	binary.NativeEndian.PutUint16(raw[42:44], 0)
 	binary.NativeEndian.PutUint32(raw[44:48], adlc.Paused)
-	binary.NativeEndian.PutUint32(raw[48:52], uint32(adlc.CGroupFlags))
-	binary.NativeEndian.PutUint32(raw[52:56], 0) // padding
 
 	return raw, nil
 }

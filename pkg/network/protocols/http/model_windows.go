@@ -106,7 +106,7 @@ func (tx *WinHttpTransaction) StaticTags() uint64 {
 //
 //nolint:revive // TODO(WKIT) Fix revive linter
 func (tx *WinHttpTransaction) DynamicTags() []string {
-	tags := make([]string, 0, 6)
+	tags := make([]string, 0, 7)
 
 	if len(tx.AppPool) != 0 || len(tx.SiteName) != 0 {
 		tags = append(tags, fmt.Sprintf("http.iis.site:%v", tx.SiteID))
@@ -116,25 +116,22 @@ func (tx *WinHttpTransaction) DynamicTags() []string {
 		if (len(tx.SiteName)) > 0 {
 			tags = append(tags, fmt.Sprintf("http.iis.sitename:%v", tx.SiteName))
 		}
+		if (len(tx.SubSite)) > 0 {
+			tags = append(tags, fmt.Sprintf("http.iis.subsite:%v", tx.SubSite))
+		}
 	}
 
-	// tag precedence is web.config -> datadog.json
-	if (len(tx.TagsFromConfig.DDEnv)) > 0 {
-		tags = append(tags, fmt.Sprintf("env:%v", tx.TagsFromConfig.DDEnv))
-	} else if (len(tx.TagsFromJson.DDEnv)) > 0 {
-		tags = append(tags, fmt.Sprintf("env:%v", tx.TagsFromJson.DDEnv))
+	// Per-field precedence (matches the .NET tracer): real env (TagsFromAppHost)
+	// > Framework appSettings (TagsFromConfig) > datadog.json (TagsFromJson).
+	merged := tx.TagsFromJson.Overlay(tx.TagsFromConfig).Overlay(tx.TagsFromAppHost)
+	if merged.DDEnv != "" {
+		tags = append(tags, fmt.Sprintf("env:%v", merged.DDEnv))
 	}
-
-	if (len(tx.TagsFromConfig.DDService)) > 0 {
-		tags = append(tags, fmt.Sprintf("service:%v", tx.TagsFromConfig.DDService))
-	} else if (len(tx.TagsFromJson.DDService)) > 0 {
-		tags = append(tags, fmt.Sprintf("service:%v", tx.TagsFromJson.DDService))
+	if merged.DDService != "" {
+		tags = append(tags, fmt.Sprintf("service:%v", merged.DDService))
 	}
-
-	if (len(tx.TagsFromConfig.DDVersion)) > 0 {
-		tags = append(tags, fmt.Sprintf("version:%v", tx.TagsFromConfig.DDVersion))
-	} else if (len(tx.TagsFromJson.DDVersion)) > 0 {
-		tags = append(tags, fmt.Sprintf("version:%v", tx.TagsFromJson.DDVersion))
+	if merged.DDVersion != "" {
+		tags = append(tags, fmt.Sprintf("version:%v", merged.DDVersion))
 	}
 	if len(tags) == 0 {
 		return nil

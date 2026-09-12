@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewReplicaSetCollectorVersions builds the group of collector versions.
-func NewReplicaSetCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewReplicaSetCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewReplicaSetCollector(metadataAsTags),
+		NewReplicaSetCollector(tagger),
 	)
 }
 
@@ -38,11 +39,7 @@ type ReplicaSetCollector struct {
 
 // NewReplicaSetCollector creates a new collector for the Kubernetes ReplicaSet
 // resource.
-func NewReplicaSetCollector(metadataAsTags utils.MetadataAsTags) *ReplicaSetCollector {
-	resourceType := getResourceType(replicaSetName, replicaSetVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewReplicaSetCollector(tagger tagger.Component) *ReplicaSetCollector {
 	return &ReplicaSetCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -50,15 +47,14 @@ func NewReplicaSetCollector(metadataAsTags utils.MetadataAsTags) *ReplicaSetColl
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 replicaSetName,
+			Name:                                 utilTypes.ReplicaSetName,
 			Kind:                                 kubernetes.ReplicaSetKind,
 			NodeType:                             orchestrator.K8sReplicaSet,
-			Version:                              replicaSetVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.ReplicaSetGroup,
+			Version:                              utilTypes.ReplicaSetVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.ReplicaSetHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewReplicaSetHandlers(tagger)),
 	}
 }
 

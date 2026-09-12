@@ -10,15 +10,15 @@ package tracer
 import (
 	"testing"
 
-	"github.com/DataDog/datadog-agent/pkg/network/testutil"
-	sysconfigtypes "github.com/DataDog/datadog-agent/pkg/system-probe/config/types"
+	"github.com/stretchr/testify/suite"
 
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/driver"
+	"github.com/DataDog/datadog-agent/pkg/network/testutil"
 )
 
 func platformInit() {
-	_ = driver.Init(&sysconfigtypes.Config{})
+	_ = driver.Init()
 }
 
 func httpSupported() bool {
@@ -28,6 +28,10 @@ func httpSupported() bool {
 func testConfig() *config.Config {
 	cfg := config.New()
 	return cfg
+}
+
+func TestTracerSuite(t *testing.T) {
+	suite.Run(t, new(TracerSuite))
 }
 
 // nolint:unused   // this function currently unused but will be.

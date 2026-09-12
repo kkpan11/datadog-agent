@@ -9,55 +9,78 @@ package workload
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/clock"
 
 	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
 	datadoghq "github.com/DataDog/datadog-operator/api/datadoghq/v1alpha2"
 
+	k8sclient "k8s.io/client-go/kubernetes"
+
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload/model"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/evictor"
+	workloadpatcher "github.com/DataDog/datadog-agent/pkg/clusteragent/patcher"
 	k8sutil "github.com/DataDog/datadog-agent/pkg/util/kubernetes"
-	le "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/leaderelection/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
+	// rolloutCheckRequeueDelay is the delay between rollout status checks
 	rolloutCheckRequeueDelay = 2 * time.Minute
+	// minDelayBetweenRollouts is the minimum time between bypass rollout triggers to prevent thrashing
+	minDelayBetweenRollouts = 10 * time.Minute
+	// inplaceResizeRequeueDelay is the delay between in-place resize progress checks
+	inplaceResizeRequeueDelay = 30 * time.Second
 )
 
 // verticalController is responsible for updating targetRef objects with the vertical recommendations
 type verticalController struct {
-	clock         clock.Clock
-	eventRecorder record.EventRecorder
-	dynamicClient dynamic.Interface
-	podWatcher    PodWatcher
+	clock                      clock.Clock
+	eventRecorder              record.EventRecorder
+	client                     k8sclient.Interface
+	isLeader                   func() bool
+	patchClient                *workloadpatcher.Patcher
+	podWatcher                 PodWatcher
+	progressTracker            *rolloutProgressTracker
+	inPlaceResizeMu            sync.Mutex
+	inPlaceResizeSupported     *bool
+	inPlaceResizeSupportedTime time.Time
 }
 
 // newVerticalController creates a new *verticalController
-func newVerticalController(clock clock.Clock, eventRecorder record.EventRecorder, cl dynamic.Interface, pw PodWatcher) *verticalController {
-	res := &verticalController{
-		clock:         clock,
-		eventRecorder: eventRecorder,
-		dynamicClient: cl,
-		podWatcher:    pw,
+func newVerticalController(clock clock.Clock, eventRecorder record.EventRecorder, client k8sclient.Interface, isLeader func() bool, patchClient *workloadpatcher.Patcher, pw PodWatcher) *verticalController {
+	return &verticalController{
+		clock:           clock,
+		eventRecorder:   eventRecorder,
+		client:          client,
+		isLeader:        isLeader,
+		patchClient:     patchClient,
+		podWatcher:      pw,
+		progressTracker: newRolloutProgressTracker(),
 	}
-	return res
 }
 
 func (u *verticalController) sync(ctx context.Context, podAutoscaler *datadoghq.DatadogPodAutoscaler, autoscalerInternal *model.PodAutoscalerInternal, targetGVK schema.GroupVersionKind, target NamespacedPodOwner) (autoscaling.ProcessResult, error) {
+	// If vertical scaling is disabled, clear vertical state and exit.
+	if !autoscalerInternal.IsVerticalScalingEnabled() {
+		autoscalerInternal.ClearVerticalState()
+		return autoscaling.NoRequeue, nil
+	}
+
 	scalingValues := autoscalerInternal.ScalingValues()
 
 	// Check if the autoscaler has a vertical scaling recommendation
@@ -67,7 +90,22 @@ func (u *verticalController) sync(ctx context.Context, podAutoscaler *datadoghq.
 		return autoscaling.NoRequeue, nil
 	}
 
-	recomendationID := scalingValues.Vertical.ResourcesHash
+	// Deep-copy to avoid mutating the original recommendation stored in mainScalingValues/fallbackScalingValues.
+	// Without this, clamped values would persist and the VerticalScalingLimited condition would be
+	// cleared on the next sync since constraints re-applied to already-clamped values are no-ops.
+	constrainedVertical := scalingValues.Vertical.DeepCopy()
+	limitErr, err := applyVerticalConstraints(constrainedVertical, autoscalerInternal.Spec().Constraints, autoscalerInternal.IsBurstable())
+	if err != nil {
+		autoscalerInternal.SetConstrainedVerticalScaling(nil, nil)
+		autoscalerInternal.UpdateFromVerticalAction(nil, err)
+		return autoscaling.NoRequeue, err
+	}
+	autoscalerInternal.SetConstrainedVerticalScaling(constrainedVertical, limitErr)
+
+	// recommendationID is the constrained hash; in burstable mode applyVerticalConstraints
+	// already stamped a CPU-limit zero sentinel on each container, so the hash naturally
+	// differs from non-burstable — no extra suffix required.
+	recommendationID := constrainedVertical.ResourcesHash
 
 	// Get the pods for the pod owner
 	pods := u.podWatcher.GetPodsForOwner(target)
@@ -77,12 +115,12 @@ func (u *verticalController) sync(ctx context.Context, podAutoscaler *datadoghq.
 		return autoscaling.ProcessResult{Requeue: true, RequeueAfter: rolloutCheckRequeueDelay}, nil
 	}
 
-	// Compute pods per resourceHash and per owner
-	podsPerRecomendationID := make(map[string]int32)
+	// Compute pods per resourceHash and per owner (needed by the rollout path).
+	podsPerRecommendationID := make(map[string]int32)
 	podsPerDirectOwner := make(map[string]int32)
 	for _, pod := range pods {
 		// PODs without any recommendation will be stored with "" key
-		podsPerRecomendationID[pod.Annotations[model.RecommendationIDAnnotation]] = podsPerRecomendationID[pod.Annotations[model.RecommendationIDAnnotation]] + 1
+		podsPerRecommendationID[pod.Annotations[model.RecommendationIDAnnotation]] = podsPerRecommendationID[pod.Annotations[model.RecommendationIDAnnotation]] + 1
 
 		if len(pod.Owners) == 0 {
 			// This condition should never happen since the pod watcher groups pods by owner
@@ -92,95 +130,327 @@ func (u *verticalController) sync(ctx context.Context, podAutoscaler *datadoghq.
 		podsPerDirectOwner[pod.Owners[0].ID] = podsPerDirectOwner[pod.Owners[0].ID] + 1
 	}
 
-	// Update scaled replicas status
-	autoscalerInternal.SetScaledReplicas(podsPerRecomendationID[recomendationID])
+	// Get the live pod UIDs, prune pod operations for pods that are no longer in the live set.
+	livePodUIDs := make(map[string]struct{}, len(pods))
+	for _, pod := range pods {
+		livePodUIDs[pod.EntityID.ID] = struct{}{}
+	}
+	autoscalerInternal.PrunePodOperations(recommendationID, livePodUIDs)
+
+	// Classify each non-terminating pod by resize status so we can set scaled replicas
+	// (completed pods count) accurately. Pass this slice to syncInternal to avoid
+	// a duplicate call to getPodResizeStatus.
+	podsByResizeStatus := make(map[PodResizeStatus][]classifiedPod)
+	for _, pod := range pods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if autoscalerInternal.HasPendingOperation(pod.EntityID.ID, recommendationID) {
+			podsByResizeStatus[PodResizeStatusEvicting] = append(podsByResizeStatus[PodResizeStatusEvicting], classifiedPod{pod: pod})
+			continue
+		}
+		status, ltt := getPodResizeStatus(pod, recommendationID)
+		podsByResizeStatus[status] = append(podsByResizeStatus[status], classifiedPod{pod: pod, lastTransitionTime: ltt})
+	}
+	autoscalerInternal.SetScaledReplicas(int32(len(podsByResizeStatus[PodResizeStatusCompleted])))
 
 	// Check if we're allowed to rollout, we don't care about the source in this case, so passing most favorable source: manual
 	updateStrategy, reason := getVerticalPatchingStrategy(autoscalerInternal)
 	if updateStrategy == datadoghqcommon.DatadogPodAutoscalerDisabledUpdateStrategy {
-		autoscalerInternal.UpdateFromVerticalAction(nil, errors.New(reason))
+		autoscalerInternal.UpdateFromVerticalAction(nil, autoscaling.NewConditionErrorf(autoscaling.ConditionReasonPolicyRestricted, "%s", reason))
 		return autoscaling.NoRequeue, nil
 	}
 
-	// Check if last action was done in the `rolloutCheckRequeueDelay` window
-	if autoscalerInternal.VerticalLastAction() != nil && autoscalerInternal.VerticalLastAction().Time.Add(rolloutCheckRequeueDelay).After(u.clock.Now()) {
-		log.Debugf("Last action was done less than %s ago for autoscaler: %s, skipping", rolloutCheckRequeueDelay.String(), autoscalerInternal.ID())
-		return autoscaling.ProcessResult{Requeue: true, RequeueAfter: rolloutCheckRequeueDelay}, nil
-	}
-
-	switch targetGVK.Kind {
-	case k8sutil.DeploymentKind:
-		return u.syncDeploymentKind(ctx, podAutoscaler, autoscalerInternal, updateStrategy, target, targetGVK, recomendationID, pods, podsPerRecomendationID, podsPerDirectOwner)
-	default:
-		autoscalerInternal.UpdateFromVerticalAction(nil, fmt.Errorf("automic rollout not available for target Kind: %s. Applying to existing PODs require manual trigger", targetGVK.Kind))
-		return autoscaling.NoRequeue, nil
-	}
+	return u.syncInternal(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, pods, podsPerRecommendationID, podsPerDirectOwner, podsByResizeStatus)
 }
 
-func (u *verticalController) syncDeploymentKind(
+// syncInternal is the internal implementation of the vertical controller.
+func (u *verticalController) syncInternal(
 	ctx context.Context,
 	podAutoscaler *datadoghq.DatadogPodAutoscaler,
 	autoscalerInternal *model.PodAutoscalerInternal,
-	_ datadoghqcommon.DatadogPodAutoscalerUpdateStrategy,
 	target NamespacedPodOwner,
 	targetGVK schema.GroupVersionKind,
 	recommendationID string,
 	pods []*workloadmeta.KubernetesPod,
-	podsPerRecomendationID map[string]int32,
+	podsPerRecommendationID map[string]int32,
 	podsPerDirectOwner map[string]int32,
+	podsByResizeStatus map[PodResizeStatus][]classifiedPod,
 ) (autoscaling.ProcessResult, error) {
-	// Check if we need to rollout, currently basic check with 100% match expected.
-	// TODO: Refine the logic and add backoff for stuck PODs.
-	if podsPerRecomendationID[recommendationID] == int32(len(pods)) {
-		autoscalerInternal.UpdateFromVerticalAction(nil, nil)
+
+	// Fall back to rollout if in-place scaling is not enabled via config, if
+	// TriggerRollout mode is explicitly set, or if the API server does not
+	// support in-place resize (pods/resize subresource unavailable).
+	if isRolloutRequired(autoscalerInternal) || !u.isInPlaceResizeSupported() {
+		switch targetGVK.Kind {
+		case k8sutil.DeploymentKind:
+			return u.syncDeploymentKind(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, pods, podsPerRecommendationID, podsPerDirectOwner)
+		case k8sutil.RolloutKind:
+			return u.syncRolloutKind(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, pods, podsPerRecommendationID, podsPerDirectOwner)
+		case k8sutil.StatefulSetKind:
+			return u.syncStatefulSetKind(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, pods, podsPerRecommendationID)
+		default:
+			autoscalerInternal.UpdateFromVerticalAction(nil, autoscaling.NewConditionErrorf(autoscaling.ConditionReasonUnsupportedTargetKind, "automatic rollout not available for target Kind: %s. Applying to existing PODs require manual trigger", targetGVK.Kind))
+			return autoscaling.NoRequeue, nil
+		}
+	}
+
+	// In-place resize path.
+	// If this is a new recommendation, record the action (regardless of whether the patches
+	// below succeed) and reset the eviction counter for this cycle.
+	var toEvictOnPatchFailure []classifiedPod
+	var patchForbidden bool
+	var disruptionDeferred int
+	if needsPatch := podsByResizeStatus[PodResizeStatusNeedsPatch]; len(needsPatch) > 0 {
+		lastAction := autoscalerInternal.VerticalLastAction()
+		if lastAction == nil || lastAction.Version != recommendationID {
+			autoscalerInternal.UpdateFromVerticalAction(&datadoghqcommon.DatadogPodAutoscalerVerticalAction{
+				Time:    metav1.NewTime(u.clock.Now()),
+				Version: recommendationID,
+				Type:    datadoghqcommon.DatadogPodAutoscalerResizeTriggeredVerticalActionType,
+			}, nil)
+			autoscalerInternal.SetEvictedReplicas(0)
+		}
+
+		// Disruptive resizes restart a container and bypass PDB enforcement, so throttle them to the
+		// disruption tolerance; non-disruptive resizes always patch.
+		recommendation := autoscalerInternal.ScalingValues().Vertical
+		toPatch := make([]classifiedPod, 0, len(needsPatch))
+		var disruptive []classifiedPod
+		for _, cp := range needsPatch {
+			if isDisruptiveResize(cp.pod, recommendation) {
+				disruptive = append(disruptive, cp)
+			} else {
+				toPatch = append(toPatch, cp)
+			}
+		}
+
+		// Unavailable and in-flight resizes count as disrupted. Sort by UID so the subset is deterministic.
+		configured := len(pods)
+		if cr := autoscalerInternal.CurrentReplicas(); cr != nil && int(*cr) > configured {
+			configured = int(*cr)
+		}
+		allowed := allowedDisruptions(configured, countDisruptedPods(podsByResizeStatus))
+		sort.Slice(disruptive, func(i, j int) bool { return disruptive[i].pod.EntityID.ID < disruptive[j].pod.EntityID.ID })
+		if len(disruptive) > allowed {
+			disruptionDeferred = len(disruptive) - allowed
+			disruptive = disruptive[:allowed]
+		}
+		toPatch = append(toPatch, disruptive...)
+
+		for _, cp := range toPatch {
+			if err := u.patchInPlace(ctx, autoscalerInternal, cp.pod, recommendationID); err != nil {
+				if k8serrors.IsNotFound(err) {
+					// Pod is already gone; the pod watcher hasn't caught up yet. Skip eviction.
+					log.Debugf("pod %s/%s not found during resize patch, likely already evicted: %v", cp.pod.Namespace, cp.pod.Name, err)
+					continue
+				}
+				if k8serrors.IsForbidden(err) {
+					patchForbidden = true
+				}
+				log.Warnf("failed to patch pod %s/%s in place: %v", cp.pod.Namespace, cp.pod.Name, err)
+				autoscalerInternal.InPlacePatchErrorInc()
+				toEvictOnPatchFailure = append(toEvictOnPatchFailure, cp)
+			} else {
+				autoscalerInternal.InPlacePatchSuccessInc()
+			}
+		}
+	}
+
+	// Deferred resizes stay in NeedsPatch and retry on the next requeue; the count is surfaced in
+	// the in-place summary event below and tracked for telemetry.
+	if disruptionDeferred > 0 {
+		autoscalerInternal.InPlaceDisruptionThrottledAdd(uint(disruptionDeferred))
+	}
+
+	// Build the list of pods to evict: pods with unresolvable conditions, plus any
+	// pods whose resize patch failed (the API rejected it — e.g. unsupported on this cluster).
+	toEvict := make([]classifiedPod, 0, len(podsByResizeStatus[PodResizeStatusError])+len(podsByResizeStatus[PodResizeStatusInfeasible])+len(toEvictOnPatchFailure))
+	toEvict = append(toEvict, podsByResizeStatus[PodResizeStatusError]...)
+	toEvict = append(toEvict, podsByResizeStatus[PodResizeStatusInfeasible]...)
+	toEvict = append(toEvict, toEvictOnPatchFailure...)
+	now := u.clock.Now()
+	for _, cp := range podsByResizeStatus[PodResizeStatusDeferred] {
+		if shouldEvictDeferred(podAutoscaler, now) {
+			toEvict = append(toEvict, cp)
+		}
+	}
+
+	// Escalate to a full rollout when:
+	//  - the resize patch was rejected as forbidden (e.g. RBAC missing for pods/resize), or
+	//  - any pod is PodResizePending=Infeasible, or
+	//  - any pod has been stuck in an unresolvable state longer than RolloutFallbackDelay.
+	hasInfeasible := len(podsByResizeStatus[PodResizeStatusInfeasible]) > 0
+	if shouldFallbackToRollout(toEvict, hasInfeasible, podAutoscaler, now, patchForbidden) {
+		// Wait for the in-flight rollout to converge rather than restamping the pod template.
+		lastAction := autoscalerInternal.VerticalLastAction()
+		if lastAction != nil &&
+			lastAction.Type == datadoghqcommon.DatadogPodAutoscalerRolloutTriggeredVerticalActionType &&
+			lastAction.Version == recommendationID {
+			return autoscaling.ProcessResult{Requeue: true, RequeueAfter: rolloutCheckRequeueDelay}, nil
+		}
+		switch {
+		case patchForbidden:
+			log.Infof("In-place resize fallback: pods/resize patch forbidden, triggering rollout for autoscaler %s", autoscalerInternal.ID())
+		case hasInfeasible:
+			log.Infof("In-place resize fallback: pod resize Infeasible (exceeds node capacity), triggering rollout for autoscaler %s", autoscalerInternal.ID())
+		default:
+			log.Infof("In-place resize fallback: pods stuck too long, triggering rollout for autoscaler %s", autoscalerInternal.ID())
+		}
+		autoscalerInternal.InPlaceRolloutFallbackInc()
+		return u.triggerRollout(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID)
+	}
+
+	// Evict pods that cannot resize in-place, counting only successful evictions and
+	// stopping on PDB rejection so we don't disrupt more pods than the budget allows.
+	var evictedThisSync, failedEvictions int32
+	var pdbBlocked bool
+	for _, cp := range toEvict {
+		result, err := u.evictPod(ctx, cp.pod)
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				log.Debugf("pod %s/%s not found during eviction", cp.pod.Namespace, cp.pod.Name)
+			} else {
+				log.Warnf("error while evicting pod %s/%s: %v", cp.pod.Namespace, cp.pod.Name, err)
+				failedEvictions++
+				autoscalerInternal.InPlaceEvictionErrorInc()
+				autoscalerInternal.UpdateFromVerticalAction(nil,
+					autoscaling.NewConditionError(autoscaling.ConditionReasonFailedToEvict,
+						fmt.Errorf("error while evicting pod %s/%s: %w", cp.pod.Namespace, cp.pod.Name, err)))
+				autoscalerInternal.VerticalActionErrorInc()
+			}
+		}
+		if result == evictor.Evicted {
+			evictedThisSync++
+			autoscalerInternal.InPlaceEvictionSuccessInc()
+			autoscalerInternal.TrackPodOperation(cp.pod.EntityID.ID, recommendationID)
+		}
+		if result == evictor.PDBLockedOrThrottle || result == evictor.Skipped {
+			pdbBlocked = true
+			autoscalerInternal.InPlacePDBBlockedInc()
+			break
+		}
+	}
+	autoscalerInternal.AddEvictedReplicas(evictedThisSync)
+
+	// Emit a summary of this sync's in-place resize activity: pods evicted as a fallback, plus any
+	// disruptive resizes deferred to stay within the disruption tolerance.
+	if evictedThisSync > 0 || failedEvictions > 0 || pdbBlocked {
+		parts := make([]string, 0, 4)
+		if evictedThisSync > 0 {
+			parts = append(parts, fmt.Sprintf("%d evicted", evictedThisSync))
+		}
+		if failedEvictions > 0 {
+			parts = append(parts, fmt.Sprintf("%d failed", failedEvictions))
+		}
+		if pdbBlocked {
+			parts = append(parts, "PDB blocked further evictions")
+		}
+		if disruptionDeferred > 0 {
+			parts = append(parts, fmt.Sprintf("%d deferred to respect the disruption tolerance", disruptionDeferred))
+		}
+		eventType := corev1.EventTypeNormal
+		reason := model.InPlaceEvictedEventReason
+		if failedEvictions > 0 || pdbBlocked {
+			eventType = corev1.EventTypeWarning
+			reason = model.FailedToEvictEventReason
+		}
+		msg := "In-place resize: " + strings.Join(parts, ", ")
+		if len(toEvict) > 0 {
+			inFlight := len(podsByResizeStatus[PodResizeStatusEvicting])
+			remaining := int(int32(len(toEvict)) - evictedThisSync - failedEvictions)
+			msg += fmt.Sprintf(" (%d remaining", remaining)
+			if inFlight > 0 {
+				msg += fmt.Sprintf(", %d in-flight", inFlight)
+			}
+			msg += ")"
+		}
+		u.eventRecorder.Eventf(podAutoscaler, eventType, reason, "%s", msg)
+	}
+
+	// Terminating pods are excluded from podsByResizeStatus, so summing all bucket lengths
+	// gives the total active pod count. If every active pod is complete, the resize cycle is done.
+	var totalActive int
+	for _, bucket := range podsByResizeStatus {
+		totalActive += len(bucket)
+	}
+	if len(podsByResizeStatus[PodResizeStatusCompleted]) == totalActive {
+		autoscalerInternal.ClearPodOperations()
+		if lastAction := autoscalerInternal.VerticalLastAction(); lastAction != nil &&
+			lastAction.Type == datadoghqcommon.DatadogPodAutoscalerResizeTriggeredVerticalActionType {
+			u.eventRecorder.Eventf(podAutoscaler, corev1.EventTypeNormal, model.ResizeSuccessfulEventReason,
+				"All %d pods resized successfully for autoscaler %s/%s", totalActive, podAutoscaler.Namespace, podAutoscaler.Name)
+			autoscalerInternal.InPlaceResizeCompletedInc()
+			autoscalerInternal.UpdateFromVerticalAction(&datadoghqcommon.DatadogPodAutoscalerVerticalAction{
+				Time:    metav1.NewTime(u.clock.Now()),
+				Version: recommendationID,
+				Type:    datadoghqcommon.DatadogPodAutoscalerResizeCompletedVerticalActionType,
+			}, nil)
+		}
 		return autoscaling.NoRequeue, nil
 	}
+	return autoscaling.ProcessResult{Requeue: true, RequeueAfter: inplaceResizeRequeueDelay}, nil
+}
 
-	// Check if a rollout is already ongoing
-	// TODO: Refine the logic and add backoff for stuck PODs.
-	if len(podsPerDirectOwner) > 1 {
-		log.Debugf("Rollout already ongoing for autoscaler: %s, gvk: %s, name: %s", autoscalerInternal.ID(), targetGVK.String(), autoscalerInternal.Spec().TargetRef.Name)
-		return autoscaling.ProcessResult{Requeue: true, RequeueAfter: rolloutCheckRequeueDelay}, nil
-	}
+// patchInPlace applies the resource recommendation to a single pod via the resize subresource,
+// then updates the pod's RecommendationIDAnnotation to record the applied recommendation.
+func (u *verticalController) patchInPlace(ctx context.Context, autoscalerInternal *model.PodAutoscalerInternal, pod *workloadmeta.KubernetesPod, recommendationID string) error {
+	patchTarget := workloadpatcher.PodTarget(pod.Namespace, pod.Name)
 
-	// Normally we should check updateStrategy here, we currently only support one way, so not required for now.
-
-	// Generate the patch request which adds the scaling hash annotation to the pod template
-	gvr := targetGVK.GroupVersion().WithResource(fmt.Sprintf("%ss", strings.ToLower(targetGVK.Kind)))
-	patchTime := u.clock.Now()
-	patchData, err := json.Marshal(map[string]interface{}{
-		"spec": map[string]interface{}{
-			"template": map[string]interface{}{
-				"metadata": map[string]interface{}{
-					"annotations": map[string]string{
-						model.RolloutTimestampAnnotation: patchTime.Format(time.RFC3339),
-						model.RecommendationIDAnnotation: recommendationID,
-					},
-				},
-			},
-		},
-	})
+	// Patch spec.containers[*].resources via the pods/resize subresource.
+	containersResourcePatches := fromAutoscalerToContainerResourcePatches(autoscalerInternal, pod)
+	intent := workloadpatcher.NewPatchIntent(patchTarget).With(workloadpatcher.SetContainerResources(containersResourcePatches))
+	_, err := u.patchClient.Apply(ctx, intent, workloadpatcher.PatchOptions{Caller: "vpa", Subresource: "resize", PatchType: types.StrategicMergePatchType})
 	if err != nil {
-		autoscalerInternal.UpdateFromVerticalAction(nil, fmt.Errorf("Unable to produce JSONPatch : %v", err))
-		return autoscaling.Requeue, err
+		return fmt.Errorf("failed to patch pod %s/%s resources in place, will evict: %w", pod.Namespace, pod.Name, err)
 	}
+
+	// Record the applied recommendation ID on the pod's own metadata annotations.
+	intent = workloadpatcher.NewPatchIntent(patchTarget).With(workloadpatcher.SetMetadataAnnotations(map[string]interface{}{
+		model.RecommendationIDAnnotation: recommendationID,
+	}))
+	_, err = u.patchClient.Apply(ctx, intent, workloadpatcher.PatchOptions{Caller: "vpa"})
+	if err != nil {
+		return fmt.Errorf("failed to patch pod %s/%s annotations in place, will evict: %w", pod.Namespace, pod.Name, err)
+	}
+
+	return nil
+}
+
+// triggerRollout patches the target workload's pod template to trigger a rollout.
+// This is shared logic used by all workload types that support vertical scaling.
+func (u *verticalController) triggerRollout(
+	ctx context.Context,
+	podAutoscaler *datadoghq.DatadogPodAutoscaler,
+	autoscalerInternal *model.PodAutoscalerInternal,
+	target NamespacedPodOwner,
+	targetGVK schema.GroupVersionKind,
+	recommendationID string,
+) (autoscaling.ProcessResult, error) {
+	// Generate the patch request which adds the scaling hash annotation to the pod template
+	gvr := targetGVK.GroupVersion().WithResource(strings.ToLower(targetGVK.Kind) + "s")
+	patchTime := u.clock.Now()
+	patchTarget := workloadpatcher.Target{GVR: gvr, Namespace: target.Namespace, Name: target.Name}
+	intent := workloadpatcher.NewPatchIntent(patchTarget).
+		With(workloadpatcher.SetPodTemplateAnnotations(map[string]interface{}{
+			model.RolloutTimestampAnnotation: patchTime.Format(time.RFC3339),
+			model.RecommendationIDAnnotation: recommendationID,
+		}))
 
 	// Apply patch to trigger rollout
-	_, err = u.dynamicClient.Resource(gvr).Namespace(target.Namespace).Patch(ctx, target.Name, types.StrategicMergePatchType, patchData, metav1.PatchOptions{})
+	_, err := u.patchClient.Apply(ctx, intent, workloadpatcher.PatchOptions{Caller: "vpa"})
 	if err != nil {
-		err = fmt.Errorf("failed to trigger rollout for gvk: %s, name: %s, err: %v", targetGVK.String(), autoscalerInternal.Spec().TargetRef.Name, err)
-		telemetryVerticalRolloutTriggered.Inc(target.Namespace, target.Name, autoscalerInternal.Name(), "error", le.JoinLeaderValue)
+		err = autoscaling.NewConditionError(autoscaling.ConditionReasonRolloutFailed, fmt.Errorf("failed to trigger rollout for gvk: %s, name: %s, err: %v", targetGVK.String(), autoscalerInternal.Spec().TargetRef.Name, err))
 		autoscalerInternal.UpdateFromVerticalAction(nil, err)
+		autoscalerInternal.VerticalActionErrorInc()
 		u.eventRecorder.Event(podAutoscaler, corev1.EventTypeWarning, model.FailedTriggerRolloutEventReason, err.Error())
-
 		return autoscaling.Requeue, err
 	}
 
 	// Propagating information about the rollout
 	log.Infof("Successfully triggered rollout for autoscaler: %s, gvk: %s, name: %s", autoscalerInternal.ID(), targetGVK.String(), autoscalerInternal.Spec().TargetRef.Name)
-	telemetryVerticalRolloutTriggered.Inc(target.Namespace, target.Name, autoscalerInternal.Name(), "ok", le.JoinLeaderValue)
 	u.eventRecorder.Eventf(podAutoscaler, corev1.EventTypeNormal, model.SuccessfulTriggerRolloutEventReason, "Successfully triggered rollout on target:%s/%s", targetGVK.String(), autoscalerInternal.Spec().TargetRef.Name)
-
+	autoscalerInternal.VerticalActionSuccessInc()
 	autoscalerInternal.UpdateFromVerticalAction(&datadoghqcommon.DatadogPodAutoscalerVerticalAction{
 		Time:    metav1.NewTime(patchTime),
 		Version: recommendationID,
@@ -190,37 +460,121 @@ func (u *verticalController) syncDeploymentKind(
 	return autoscaling.ProcessResult{Requeue: true, RequeueAfter: rolloutCheckRequeueDelay}, nil
 }
 
-// getVerticalPatchingStrategy applied policies to determine effective patching strategy.
-// Return (strategy, reason). Reason is only returned when chosen strategy disables vertical patching.
-func getVerticalPatchingStrategy(autoscalerInternal *model.PodAutoscalerInternal) (datadoghqcommon.DatadogPodAutoscalerUpdateStrategy, string) {
-	// If we don't have spec, we cannot take decisions, should not happen.
-	if autoscalerInternal.Spec() == nil {
-		return datadoghqcommon.DatadogPodAutoscalerDisabledUpdateStrategy, "pod autoscaling hasn't been initialized yet"
-	}
+func (u *verticalController) syncDeploymentKind(
+	ctx context.Context,
+	podAutoscaler *datadoghq.DatadogPodAutoscaler,
+	autoscalerInternal *model.PodAutoscalerInternal,
+	target NamespacedPodOwner,
+	targetGVK schema.GroupVersionKind,
+	recommendationID string,
+	pods []*workloadmeta.KubernetesPod,
+	podsPerRecommendationID map[string]int32,
+	podsPerDirectOwner map[string]int32,
+) (autoscaling.ProcessResult, error) {
+	// For Deployments/Rollouts, multiple direct owners (ReplicaSets) indicate an ongoing rollout
+	rolloutInProgress := len(podsPerDirectOwner) > 1
 
-	// If we don't have a ScalingValue, we cannot take decisions, should not happen.
-	if autoscalerInternal.ScalingValues().Vertical == nil {
-		return datadoghqcommon.DatadogPodAutoscalerDisabledUpdateStrategy, "no scaling values available"
-	}
+	decision := shouldTriggerRollout(
+		recommendationID,
+		pods,
+		podsPerRecommendationID,
+		autoscalerInternal.VerticalLastAction(),
+		rolloutInProgress,
+		autoscalerInternal.ScalingValues().Vertical,
+		u.clock.Now(),
+		minDelayBetweenRollouts,
+		autoscalerInternal.ID(),
+	)
 
-	// By default, policy is to allow all
-	if autoscalerInternal.Spec().ApplyPolicy == nil {
-		return datadoghqcommon.DatadogPodAutoscalerAutoUpdateStrategy, ""
-	}
+	return u.handleRolloutDecision(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, podsPerRecommendationID, decision)
+}
 
-	// We do have policies, checking if they allow this source
-	if !model.ApplyModeAllowSource(autoscalerInternal.Spec().ApplyPolicy.Mode, autoscalerInternal.ScalingValues().Vertical.Source) {
-		return datadoghqcommon.DatadogPodAutoscalerDisabledUpdateStrategy, fmt.Sprintf("vertical scaling disabled due to applyMode: %s not allowing recommendations from source: %s", autoscalerInternal.Spec().ApplyPolicy.Mode, autoscalerInternal.ScalingValues().Vertical.Source)
-	}
+func (u *verticalController) syncRolloutKind(
+	ctx context.Context,
+	podAutoscaler *datadoghq.DatadogPodAutoscaler,
+	autoscalerInternal *model.PodAutoscalerInternal,
+	target NamespacedPodOwner,
+	targetGVK schema.GroupVersionKind,
+	recommendationID string,
+	pods []*workloadmeta.KubernetesPod,
+	podsPerRecommendationID map[string]int32,
+	podsPerDirectOwner map[string]int32,
+) (autoscaling.ProcessResult, error) {
+	// Argo Rollouts use the same pod template structure as Deployments,
+	// so we can reuse the same rollout logic
+	return u.syncDeploymentKind(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, pods, podsPerRecommendationID, podsPerDirectOwner)
+}
 
-	if autoscalerInternal.Spec().ApplyPolicy.Update != nil {
-		if autoscalerInternal.Spec().ApplyPolicy.Update.Strategy == datadoghqcommon.DatadogPodAutoscalerDisabledUpdateStrategy {
-			return datadoghqcommon.DatadogPodAutoscalerDisabledUpdateStrategy, "vertical scaling disabled due to update strategy set to disabled"
+func (u *verticalController) syncStatefulSetKind(
+	ctx context.Context,
+	podAutoscaler *datadoghq.DatadogPodAutoscaler,
+	autoscalerInternal *model.PodAutoscalerInternal,
+	target NamespacedPodOwner,
+	targetGVK schema.GroupVersionKind,
+	recommendationID string,
+	pods []*workloadmeta.KubernetesPod,
+	podsPerRecommendationID map[string]int32,
+) (autoscaling.ProcessResult, error) {
+	// For StatefulSets, different controller-revision-hash labels indicate an ongoing rollout
+	rolloutInProgress := isStatefulSetRolloutInProgress(pods)
+
+	decision := shouldTriggerRollout(
+		recommendationID,
+		pods,
+		podsPerRecommendationID,
+		autoscalerInternal.VerticalLastAction(),
+		rolloutInProgress,
+		autoscalerInternal.ScalingValues().Vertical,
+		u.clock.Now(),
+		minDelayBetweenRollouts,
+		autoscalerInternal.ID(),
+	)
+
+	return u.handleRolloutDecision(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID, podsPerRecommendationID, decision)
+}
+
+// handleRolloutDecision processes the rollout decision and takes appropriate action.
+// This is shared logic used by all workload types.
+func (u *verticalController) handleRolloutDecision(
+	ctx context.Context,
+	podAutoscaler *datadoghq.DatadogPodAutoscaler,
+	autoscalerInternal *model.PodAutoscalerInternal,
+	target NamespacedPodOwner,
+	targetGVK schema.GroupVersionKind,
+	recommendationID string,
+	podsPerRecommendationID map[string]int32,
+	decision rolloutDecision,
+) (autoscaling.ProcessResult, error) {
+	switch decision {
+	case rolloutDecisionComplete:
+		u.progressTracker.Clear(autoscalerInternal.ID())
+		autoscalerInternal.UpdateFromVerticalAction(nil, nil)
+		return autoscaling.NoRequeue, nil
+	case rolloutDecisionWait:
+		// Check if the rollout is stalled (no pod movement for too long)
+		isStalled := u.progressTracker.Update(autoscalerInternal.ID(), recommendationID, podsPerRecommendationID[recommendationID], u.clock.Now())
+		if isStalled {
+			log.Infof("Rollout stalled for autoscaler %s (no pod movement for %s), re-triggering rollout", autoscalerInternal.ID(), rolloutStallTimeout)
+			return u.triggerRollout(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID)
 		}
-
-		return autoscalerInternal.Spec().ApplyPolicy.Update.Strategy, ""
+		return autoscaling.ProcessResult{Requeue: true, RequeueAfter: rolloutCheckRequeueDelay}, nil
+	case rolloutDecisionTrigger:
+		return u.triggerRollout(ctx, podAutoscaler, autoscalerInternal, target, targetGVK, recommendationID)
 	}
 
-	// No update strategy defined, defaulting to auto
-	return datadoghqcommon.DatadogPodAutoscalerAutoUpdateStrategy, ""
+	// This should never happen if all rolloutDecision values are handled above
+	log.Errorf("Unknown rollout decision %d for autoscaler %s", decision, autoscalerInternal.ID())
+	return autoscaling.NoRequeue, nil
+}
+
+func (u *verticalController) evictPod(ctx context.Context, pod *workloadmeta.KubernetesPod) (evictor.EvictResult, error) {
+	evictorClient := evictor.NewClient(u.client, u.isLeader)
+	result, err := evictorClient.Evict(ctx, pod.Namespace, pod.Name)
+	if err != nil {
+		return evictor.Error, err
+	}
+	if result == evictor.Evicted {
+		log.Infof("Successfully evicted pod %s/%s", pod.Namespace, pod.Name)
+	}
+	return result, nil
 }

@@ -8,19 +8,27 @@ package discovery
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	agentmodel "github.com/DataDog/agent-payload/v5/process"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/process"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
+	scenec2 "github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
 
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
 	"github.com/DataDog/datadog-agent/test/fakeintake/aggregator"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awshost "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/host"
 )
 
 //go:embed testdata/config/agent_config.yaml
@@ -29,6 +37,25 @@ var agentConfigStr string
 //go:embed testdata/config/system_probe_config.yaml
 var systemProbeConfigStr string
 
+//go:embed testdata/config/system_probe_config_privileged_logs.yaml
+var systemProbeConfigPrivilegedLogsStr string
+
+//go:embed testdata/config/agent_process_config.yaml
+var agentProcessConfigStr string
+
+//go:embed testdata/config/agent_process_disabled_config.yaml
+var agentProcessDisabledConfigStr string
+
+//go:embed testdata/config/system_probe_config_fallback.yaml
+var systemProbeConfigFallbackStr string
+
+type discoveryMode string
+
+const (
+	discoveryModeSystemProbeLite discoveryMode = "system-probe-lite"
+	discoveryModeSystemProbe     discoveryMode = "system-probe"
+)
+
 type linuxTestSuite struct {
 	e2e.BaseSuite[environments.Host]
 }
@@ -36,6 +63,7 @@ type linuxTestSuite struct {
 var services = []string{
 	"python-svc",
 	"python-instrumented",
+	"python-restricted",
 	"node-json-server",
 	"node-instrumented",
 	"rails-svc",
@@ -47,118 +75,638 @@ func TestLinuxTestSuite(t *testing.T) {
 		agentparams.WithSystemProbeConfig(systemProbeConfigStr),
 	}
 	options := []e2e.SuiteOption{
-		e2e.WithProvisioner(awshost.Provisioner(awshost.WithAgentOptions(agentParams...))),
+		e2e.WithProvisioner(awshost.Provisioner(awshost.WithRunOptions(
+			scenec2.WithAgentOptions(agentParams...),
+			// provision.sh installs packages from apt, pip, npm and gem.
+			scenec2.WithEC2InstanceOptions(scenec2.WithInternetAccess()),
+		))),
 	}
 	e2e.Run(t, &linuxTestSuite{}, options...)
 }
 
 func (s *linuxTestSuite) SetupSuite() {
 	s.BaseSuite.SetupSuite()
+	// SetupSuite needs to defer CleanupOnSetupFailure() if what comes after BaseSuite.SetupSuite() can fail.
+	defer s.CleanupOnSetupFailure()
 
 	s.provisionServer()
 }
 
-func (s *linuxTestSuite) TestServiceDiscoveryCheck() {
+func (s *linuxTestSuite) TestProcessCheckWithServiceDiscovery() {
+	for _, mode := range []discoveryMode{discoveryModeSystemProbeLite, discoveryModeSystemProbe} {
+		s.Run(string(mode), func() {
+			s.testProcessCheckWithServiceDiscovery(agentProcessConfigStr, systemProbeConfigByMode[mode], mode)
+		})
+	}
+}
+
+func (s *linuxTestSuite) TestProcessCheckWithServiceDiscoveryProcessCollectionDisabled() {
+	for _, mode := range []discoveryMode{discoveryModeSystemProbeLite, discoveryModeSystemProbe} {
+		s.Run(string(mode), func() {
+			s.testProcessCheckWithServiceDiscovery(agentProcessDisabledConfigStr, systemProbeConfigByMode[mode], mode)
+		})
+	}
+}
+
+func (s *linuxTestSuite) TestProcessCheckWithServiceDiscoveryPrivilegedLogs() {
+	servicesWithRestricted := []string{
+		"python-restricted",
+	}
+	s.testProcessCheckWithServiceDiscoveryPrivilegedLogs(agentProcessConfigStr, systemProbeConfigPrivilegedLogsStr, servicesWithRestricted)
+}
+
+func (s *linuxTestSuite) testLogs(t *testing.T) {
+	s.Env().RemoteHost.MustExecute("curl -s http://localhost:8082/test")
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		logs, err := s.Env().FakeIntake.Client().FilterLogs("python-svc-dd")
+		assert.NoError(c, err, "failed to get logs from fakeintake")
+
+		assert.NotEmpty(c, logs, "Expected to find logs from python-svc-dd service")
+
+		foundRequestLog := false
+
+		for _, log := range logs {
+			// Print unconditionally since the E2E tests are mostly run in CI
+			// and the extra messages shouldn't be too noisy.
+			t.Logf("Log: %+v", log)
+			assert.Equal(c, "python-svc-dd", log.Service, "Log service should match")
+			assert.Equal(c, "python", log.Source, "Log source should match")
+
+			assert.Contains(c, log.Tags, "service:python-svc-dd")
+			assert.Contains(c, log.Tags, "version:2.1")
+			assert.Contains(c, log.Tags, "env:prod")
+
+			if log.Message == "GET /test" {
+				foundRequestLog = true
+			}
+		}
+
+		assert.True(c, foundRequestLog, "Should find request log message")
+	}, 2*time.Minute, 10*time.Second)
+
+	// Verify discovery check reports permission warnings for restricted log
+	// files.  There is no fake intake for the check status and the check status
+	// is also sent out once every 10 minutes, so check the agent status
+	// instead, which should be good enough.
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		warnings, err := getDiscoveryCheckWarnings(t, s.Env().RemoteHost)
+		assert.NoError(c, err, "failed to get discovery check warnings from agent status")
+
+		foundPermissionWarning := false
+
+		for _, warning := range warnings {
+			t.Logf("Discovery warning: type=%s, error_code=%s, resource=%s, message=%s",
+				warning.Type, warning.ErrorCode, warning.Resource, warning.Message)
+
+			if warning.Type == "log_file" &&
+				warning.ErrorCode == "permission-denied" &&
+				strings.HasPrefix(warning.Resource, "/tmp/python-restricted") &&
+				warning.ErrorString != "" &&
+				warning.Message != "" {
+				foundPermissionWarning = true
+				break
+			}
+		}
+
+		assert.True(c, foundPermissionWarning, "Should find permission warning for restricted log file")
+	}, 2*time.Minute, 10*time.Second)
+}
+
+// sysprobeSocket is the socket on which system-probe serves the discovery
+// endpoints.
+const sysprobeSocket = "/opt/datadog-agent/run/sysprobe.sock"
+
+// logDiagnostic runs a diagnostic command and logs its output.
+//
+// Failures are deliberately tolerated. These only run once a test has already
+// failed, and several of them legitimately exit non-zero in exactly the
+// situations worth debugging: systemctl status for an inactive unit, ps for a
+// process which has since exited (which is what a crash-looping service looks
+// like), curl if the agent is not running.
+//
+// The exit status is swallowed by the remote shell rather than handled here
+// because Execute() returns no output at all once the command fails: it blanks
+// stdout and folds it into the error instead, so the output being collected
+// would only be reachable by formatting an error. The redirect is redundant
+// with the framework's use of CombinedOutput, and only kept so that wanting
+// stderr is stated here rather than relying on that.
+func (s *linuxTestSuite) logDiagnostic(t *testing.T, label, cmd string) {
+	t.Logf("%s:\n%s", label, s.Env().RemoteHost.MustExecute(cmd+" 2>&1 || true"))
+}
+
+func (s *linuxTestSuite) dumpDebugInfo(t *testing.T) {
+	// This is very useful for debugging, but we probably don't want to decode
+	// and assert based on this in this E2E test since this is an internal
+	// interface between the agent and system-probe.
+	s.logDiagnostic(t, "system-probe discovery state",
+		"sudo curl -s --unix-socket "+sysprobeSocket+" http://unix/discovery/state")
+
+	pids := s.fixtureServicePIDs(services)
+	if len(pids) > 0 {
+		// ELAPSED is the first thing to look at: discovery never asks about a
+		// process younger than discovery.service_collection_min_process_age (1
+		// minute by default), so a value below that explains a service which
+		// was never reported, and one which keeps resetting across dumps means
+		// the service is crash-looping rather than starting slowly.
+		s.logDiagnostic(t, "fixture service processes",
+			"sudo ps -o pid,ppid,etimes,comm,args -p "+strings.Join(pids, ","))
+
+		// /discovery/services is the only endpoint which reports what
+		// discovery actually sees. It is caller-driven, so it has to be told
+		// which PIDs to look at, and system-probe-lite serves it for POST only
+		// and rejects a request without an explicit Content-Type.
+		//
+		// The body is built by hand because it is defined by core.Params in
+		// pkg/discovery/core, which belongs to the main module that this one
+		// does not depend on. Keep the field name in sync with it: unknown
+		// fields are ignored without an error, so a rename there would make
+		// this log an empty service list rather than fail visibly.
+		params := fmt.Sprintf(`{"new_pids":[%s]}`, strings.Join(pids, ","))
+		s.logDiagnostic(t, "system-probe discovery services",
+			"sudo curl -s -X POST -H 'Content-Type: application/json' -d '"+params+"'"+
+				" --unix-socket "+sysprobeSocket+" http://unix/discovery/services")
+	}
+
+	s.dumpServiceDiagnostics(t, services)
+
+	s.logDiagnostic(t, "workloadmeta store", "sudo datadog-agent workload-list --verbose")
+	s.logDiagnostic(t, "agent status", "sudo datadog-agent status")
+}
+
+// fixtureServicePIDs returns the PIDs in the cgroup of each of the given
+// services. Using the cgroup rather than the unit's main PID matters because
+// the process the tests match on is not always the main one: node-json-server
+// runs through npm, which spawns the node process that serves the port.
+func (s *linuxTestSuite) fixtureServicePIDs(servicesList []string) []string {
+	var pids []string
+	for _, service := range servicesList {
+		procs := s.Env().RemoteHost.MustExecute(fmt.Sprintf(
+			"cat /sys/fs/cgroup/system.slice/%s.service/cgroup.procs 2>/dev/null || true", service))
+		pids = append(pids, strings.Fields(procs)...)
+	}
+	return pids
+}
+
+// dumpServiceDiagnostics logs the state of the fixture services themselves.
+// The journal is the only place their output ends up, so without this a
+// service which fails to start, or which crash-loops (the units are
+// Restart=always with RestartSec=1), leaves no trace in the test output and is
+// indistinguishable from discovery being slow to report it.
+func (s *linuxTestSuite) dumpServiceDiagnostics(t *testing.T, servicesList []string) {
+	s.logDiagnostic(t, "listening sockets", "sudo ss -ltnp")
+
+	for _, service := range servicesList {
+		s.logDiagnostic(t, service+" systemctl status",
+			"sudo systemctl status --no-pager --full "+service)
+		s.logDiagnostic(t, service+" journal",
+			"sudo journalctl --no-pager -n 100 -u "+service)
+	}
+}
+
+func (s *linuxTestSuite) testProcessCheckWithServiceDiscovery(agentConfigStr string, systemProbeConfigStr string, mode discoveryMode) {
 	t := s.T()
 	s.startServices()
 	defer s.stopServices()
-
+	s.UpdateEnv(awshost.Provisioner(awshost.WithRunOptions(
+		scenec2.WithAgentOptions(
+			agentparams.WithAgentConfig(agentConfigStr),
+			agentparams.WithSystemProbeConfig(systemProbeConfigStr)),
+		scenec2.WithEC2InstanceOptions(scenec2.WithInternetAccess()),
+	)),
+	)
+	s.validateDiscoveryMode(mode)
 	client := s.Env().FakeIntake.Client()
 	err := client.FlushServerAndResetAggregators()
 	require.NoError(t, err)
 
 	assert.EventuallyWithT(t, func(t *assert.CollectT) {
-		assertRunningCheck(t, s.Env().RemoteHost, "service_discovery")
-	}, 2*time.Minute, 10*time.Second)
+		assertNotRunningCheck(t, s.Env().RemoteHost, "service_discovery")
+	}, 1*time.Minute, 10*time.Second)
 
-	// This is very useful for debugging, but we probably don't want to decode
-	// and assert based on this in this E2E test since this is an internal
-	// interface between the agent and system-probe.
-	services := s.Env().RemoteHost.MustExecute("sudo curl -s --unix /opt/datadog-agent/run/sysprobe.sock http://unix/discovery/debug")
-	t.Log("system-probe services", services)
+	for _, tc := range []struct {
+		description      string
+		processName      string
+		runningService   string
+		expectedLanguage agentmodel.Language
+		expectedPortInfo *agentmodel.PortInfo
+		expectedService  *agentmodel.ServiceDiscovery
+	}{
+		{
+			description:      "node-json-server",
+			processName:      "node",
+			expectedLanguage: agentmodel.Language_LANGUAGE_NODE,
+			expectedPortInfo: &agentmodel.PortInfo{
+				Tcp: []int32{8084},
+			},
+			expectedService: &agentmodel.ServiceDiscovery{
+				GeneratedServiceName: &agentmodel.ServiceName{
+					Name:   "json-server",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_NODEJS,
+				},
+			},
+		},
+		{
+			description:      "node-instrumented",
+			processName:      "node",
+			expectedLanguage: agentmodel.Language_LANGUAGE_NODE,
+			expectedPortInfo: &agentmodel.PortInfo{
+				Tcp: []int32{8085},
+			},
+			expectedService: &agentmodel.ServiceDiscovery{
+				ApmInstrumentation: true,
+				GeneratedServiceName: &agentmodel.ServiceName{
+					Name:   "node-instrumented",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_NODEJS,
+				},
+				TracerMetadata: []*agentmodel.TracerMetadata{
+					{
+						ServiceName: "node-instrumented",
+					},
+				},
+			},
+		},
+		{
+			description:      "python-svc",
+			processName:      "/usr/bin/python3",
+			expectedLanguage: agentmodel.Language_LANGUAGE_PYTHON,
+			expectedPortInfo: &agentmodel.PortInfo{
+				Tcp: []int32{8082},
+			},
+			expectedService: &agentmodel.ServiceDiscovery{
+				GeneratedServiceName: &agentmodel.ServiceName{
+					Name:   "python.server",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_PYTHON,
+				},
+				DdServiceName: &agentmodel.ServiceName{
+					Name:   "python-svc-dd",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_DD_SERVICE,
+				},
+			},
+		},
+		{
+			description:      "python-instrumented",
+			processName:      "/usr/bin/python3",
+			expectedLanguage: agentmodel.Language_LANGUAGE_PYTHON,
+			expectedPortInfo: &agentmodel.PortInfo{
+				Tcp: []int32{8083},
+			},
+			expectedService: &agentmodel.ServiceDiscovery{
+				ApmInstrumentation: true,
+				GeneratedServiceName: &agentmodel.ServiceName{
+					Name:   "python.instrumented",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_PYTHON,
+				},
+				DdServiceName: &agentmodel.ServiceName{
+					Name:   "python-instrumented-dd",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_DD_SERVICE,
+				},
+				TracerMetadata: []*agentmodel.TracerMetadata{
+					{
+						ServiceName: "python-instrumented-dd",
+					},
+				},
+			},
+		},
+		{
+			description:      "rails-svc",
+			processName:      "ruby3.0",
+			expectedLanguage: agentmodel.Language_LANGUAGE_RUBY,
+			expectedPortInfo: &agentmodel.PortInfo{
+				Tcp: []int32{7777},
+			},
+			expectedService: &agentmodel.ServiceDiscovery{
+				GeneratedServiceName: &agentmodel.ServiceName{
+					Name:   "rails_hello",
+					Source: agentmodel.ServiceNameSource_SERVICE_NAME_SOURCE_RAILS,
+				},
+			},
+		},
+	} {
+		ok := t.Run(tc.description, func(t *testing.T) {
+			var payloads []*aggregator.ProcessPayload
+			assert.EventuallyWithT(t, func(c *assert.CollectT) {
+				payloads, err = s.Env().FakeIntake.Client().GetProcesses()
+				assert.NoError(c, err, "failed to get process payloads from fakeintake")
+				// Wait for two payloads, as processes must be detected in two check runs to be returned
+				assert.GreaterOrEqual(c, len(payloads), 2, "fewer than 2 payloads returned")
 
-	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		payloads, err := client.GetServiceDiscoveries()
-		require.NoError(t, err)
+				procs := process.FilterProcessPayloadsByName(payloads, tc.processName)
+				assert.NotEmpty(c, procs, "'%s' process not found in payloads: \n%+v", tc.processName, payloads)
+				assert.True(c, matchingProcessServiceDiscoveryData(procs, tc.expectedLanguage, tc.expectedPortInfo, tc.expectedService),
+					"no process was found with the expected service discovery data. processes:\n%+v", procs)
+				// processes that exist < 1 minute are ignored by service discovery and the service collection interval is 1 minute
+				// therefore we should wait for 2 minutes to ensure service discovery is run at least once
+				// start --> process collection, service discovery ignoring
+				// 1 min --> process collection + service discovery collection ignores processes/may capture some
+				// 2 min --> process collection + service discovery collection should capture everything
+				// 3 min --> extra time for the collected data to actually be sent by the process check
+			}, 3*time.Minute, 10*time.Second)
+		})
+		if !ok {
+			s.dumpDebugInfo(t)
+		}
+	}
 
-		foundMap := make(map[string]*aggregator.ServiceDiscoveryPayload)
-		for _, p := range payloads {
-			name := p.Payload.GeneratedServiceName
-			t.Log("RequestType", p.RequestType, "GeneratedServiceName", name)
+	ok := t.Run("logs", s.testLogs)
+	if !ok {
+		s.dumpDebugInfo(t)
+	}
+}
 
-			if p.RequestType == "start-service" {
-				foundMap[name] = p
+func (s *linuxTestSuite) testProcessCheckWithServiceDiscoveryPrivilegedLogs(agentConfigStr string, systemProbeConfigStr string, servicesToStart []string) {
+	t := s.T()
+	s.startServicesFromList(servicesToStart)
+	defer s.stopServicesFromList(servicesToStart)
+	s.UpdateEnv(awshost.Provisioner(awshost.WithRunOptions(
+		scenec2.WithAgentOptions(
+			agentparams.WithAgentConfig(agentConfigStr),
+			agentparams.WithSystemProbeConfig(systemProbeConfigStr)),
+		scenec2.WithEC2InstanceOptions(scenec2.WithInternetAccess()),
+	)),
+	)
+	client := s.Env().FakeIntake.Client()
+	err := client.FlushServerAndResetAggregators()
+	require.NoError(t, err)
+
+	// Trigger log generation in the restricted service
+	s.Env().RemoteHost.MustExecute("curl -s http://localhost:8086/test")
+
+	ok := assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		logs, err := s.Env().FakeIntake.Client().FilterLogs("python-restricted-dd")
+		assert.NoError(c, err, "failed to get logs from fakeintake")
+
+		assert.NotEmpty(c, logs, "Expected to find logs from python-restricted-dd service")
+
+		foundStartupLog := false
+		foundRequestLog := false
+
+		for _, log := range logs {
+			t.Logf("Log: %+v", log)
+			assert.Equal(c, "python-restricted-dd", log.Service, "Log service should match")
+			assert.Equal(c, "python", log.Source, "Log source should match")
+
+			if log.Message == "Server is running on http://0.0.0.0:8086" {
+				foundStartupLog = true
+			}
+			if log.Message == "GET /test" {
+				foundRequestLog = true
 			}
 		}
 
-		s.assertService(t, c, foundMap, serviceExpectedPayload{
-			systemdServiceName:   "node-json-server",
-			instrumentation:      "none",
-			generatedServiceName: "json-server",
-			ddService:            "",
-			serviceNameSource:    "",
-		})
-		s.assertService(t, c, foundMap, serviceExpectedPayload{
-			systemdServiceName:   "node-instrumented",
-			instrumentation:      "provided",
-			generatedServiceName: "node-instrumented",
-			ddService:            "",
-			serviceNameSource:    "",
-		})
-		s.assertService(t, c, foundMap, serviceExpectedPayload{
-			systemdServiceName:   "python-svc",
-			instrumentation:      "none",
-			generatedServiceName: "python.server",
-			ddService:            "python-svc-dd",
-			serviceNameSource:    "provided",
-		})
-		s.assertService(t, c, foundMap, serviceExpectedPayload{
-			systemdServiceName:   "python-instrumented",
-			instrumentation:      "provided",
-			generatedServiceName: "python.instrumented",
-			tracerServiceNames:   []string{"python-instrumented-dd"},
-			ddService:            "python-instrumented-dd",
-			serviceNameSource:    "provided",
-		})
-		s.assertService(t, c, foundMap, serviceExpectedPayload{
-			systemdServiceName:   "rails-svc",
-			instrumentation:      "none",
-			generatedServiceName: "rails_hello",
-			ddService:            "",
-			serviceNameSource:    "",
-		})
+		assert.True(c, foundStartupLog, "Should find startup log message")
+		assert.True(c, foundRequestLog, "Should find request log message")
+		// Wait for more time than the normal test since here we don't wait for the process collection first.
+	}, 4*time.Minute, 10*time.Second)
 
-		assert.Contains(c, foundMap, "json-server")
-	}, 3*time.Minute, 10*time.Second)
+	if !ok {
+		s.dumpDebugInfo(t)
+	}
 }
 
 type checkStatus struct {
-	CheckID           string `json:"CheckID"`
-	CheckName         string `json:"CheckName"`
-	CheckConfigSource string `json:"CheckConfigSource"`
-	ExecutionTimes    []int  `json:"ExecutionTimes"`
+	CheckID           string   `json:"CheckID"`
+	CheckName         string   `json:"CheckName"`
+	CheckConfigSource string   `json:"CheckConfigSource"`
+	ExecutionTimes    []int    `json:"ExecutionTimes"`
+	LastWarnings      []string `json:"LastWarnings"`
 }
 
-type runnerStats struct {
-	Checks map[string]checkStatus `json:"Checks"`
-}
+type (
+	checkName    = string
+	instanceName = string
+	runnerStats  struct {
+		Checks map[checkName]map[instanceName]checkStatus `json:"Checks"`
+	}
+)
 
 type collectorStatus struct {
 	RunnerStats runnerStats `json:"runnerStats"`
 }
 
-func assertCollectorStatusFromJSON(t *assert.CollectT, statusOutput, check string) {
+// Warning represents a structured warning from discovery check
+type Warning struct {
+	Type        string `json:"type"`
+	Version     int    `json:"version"`
+	Resource    string `json:"resource"`
+	ErrorCode   string `json:"error_code"`
+	ErrorString string `json:"error_string"`
+	Message     string `json:"message"`
+}
+
+// getDiscoveryCheckWarnings parses discovery check warnings from agent status
+func getDiscoveryCheckWarnings(t *testing.T, remoteHost *components.RemoteHost) ([]Warning, error) {
+	statusOutput := remoteHost.MustExecute("sudo datadog-agent status collector --json")
+	var status collectorStatus
+	err := json.Unmarshal([]byte(statusOutput), &status)
+	if err != nil {
+		return nil, err
+	}
+
+	instances, exists := status.RunnerStats.Checks["discovery"]
+	if !exists {
+		return []Warning{}, nil
+	}
+
+	discoveryCheck, exists := instances["discovery"]
+	if !exists {
+		return []Warning{}, nil
+	}
+
+	t.Logf("Discovery check warnings: %+v", discoveryCheck.LastWarnings)
+
+	var warnings []Warning
+	for _, warningStr := range discoveryCheck.LastWarnings {
+		var warning Warning
+		if err := json.Unmarshal([]byte(warningStr), &warning); err == nil {
+			warnings = append(warnings, warning)
+		}
+	}
+
+	return warnings, nil
+}
+
+// assertNotRunningCheck asserts that the given agent check is not running
+func assertNotRunningCheck(t *assert.CollectT, remoteHost *components.RemoteHost, check string) {
+	statusOutput := remoteHost.MustExecute("sudo datadog-agent status collector --json")
 	var status collectorStatus
 	err := json.Unmarshal([]byte(statusOutput), &status)
 	require.NoError(t, err, "failed to unmarshal agent status")
-
-	assert.Contains(t, status.RunnerStats.Checks, check)
+	assert.NotContains(t, status.RunnerStats.Checks, check)
 }
 
-// assertRunningCheck asserts that the given process agent check is running
-func assertRunningCheck(t *assert.CollectT, remoteHost *components.RemoteHost, check string) {
-	statusOutput := remoteHost.MustExecute("sudo datadog-agent status collector --json")
-	assertCollectorStatusFromJSON(t, statusOutput, check)
+// matchingProcessServiceDiscoveryData checks that the given processes contain at least 1 process with the expected service discovery data
+// we cannot fail fast because many processes with the same name are not instrumented with service discovery data
+func matchingProcessServiceDiscoveryData(procs []*agentmodel.Process, expectedLanguage agentmodel.Language, expectedPortInfo *agentmodel.PortInfo, expectedServiceDiscovery *agentmodel.ServiceDiscovery) bool {
+	for _, proc := range procs {
+		// check language
+		if proc.Language != expectedLanguage {
+			continue
+		}
+
+		// check port info
+		if !matchingPortInfo(expectedPortInfo, proc.PortInfo) {
+			continue
+		}
+
+		// check service discovery
+		if expectedServiceDiscovery.ApmInstrumentation != proc.ServiceDiscovery.ApmInstrumentation {
+			continue
+		}
+
+		if !matchingServiceName(expectedServiceDiscovery.DdServiceName, proc.ServiceDiscovery.DdServiceName) {
+			continue
+		}
+
+		if !matchingServiceName(expectedServiceDiscovery.GeneratedServiceName, proc.ServiceDiscovery.GeneratedServiceName) {
+			continue
+		}
+
+		if !matchingTracerMetadata(expectedServiceDiscovery.TracerMetadata, proc.ServiceDiscovery.TracerMetadata) {
+			continue
+		}
+
+		if !matchingServiceNames(expectedServiceDiscovery.AdditionalGeneratedNames, proc.ServiceDiscovery.AdditionalGeneratedNames) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func matchingServiceName(a, b *agentmodel.ServiceName) bool {
+	return matchingServiceNames([]*agentmodel.ServiceName{a}, []*agentmodel.ServiceName{b})
+}
+
+func matchingServiceNames(expectedServiceNames []*agentmodel.ServiceName, actualServiceNames []*agentmodel.ServiceName) bool {
+	// Sort by ServiceName so order doesn’t matter
+	sort := cmpopts.SortSlices(func(a, b *agentmodel.ServiceName) bool {
+		// handles cases where ServiceName is the same
+		return a.Name != b.Name && a.Name < b.Name ||
+			a.Source < b.Source
+	})
+	diff := cmp.Diff(expectedServiceNames, actualServiceNames, cmpopts.EquateEmpty(), sort)
+	return diff == ""
+}
+
+func matchingPortInfo(expectedPortInfo *agentmodel.PortInfo, actualPortInfo *agentmodel.PortInfo) bool {
+	if expectedPortInfo == nil {
+		return actualPortInfo == nil
+	} else if actualPortInfo == nil {
+		// expectedPortInfo is not nil so actualPortInfo should not be
+		return false
+	}
+
+	diffTCP := cmp.Diff(expectedPortInfo.Tcp, actualPortInfo.Tcp, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(a, b int32) bool { return a < b }))
+	diffUDP := cmp.Diff(expectedPortInfo.Udp, actualPortInfo.Udp, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(a, b int32) bool { return a < b }))
+	return diffTCP == "" && diffUDP == ""
+}
+
+func matchingTracerMetadata(expectedTracerMetadata []*agentmodel.TracerMetadata, actualTracerMetadata []*agentmodel.TracerMetadata) bool {
+	// tracer metadata contains a uuid (TracerMetadata.RuntimeID), so we ignore it
+	// Sort by ServiceName so order doesn’t matter
+	sortByName := cmpopts.SortSlices(func(a, b *agentmodel.TracerMetadata) bool {
+		// handles cases where ServiceName is the same
+		return a.ServiceName != b.ServiceName && a.ServiceName < b.ServiceName ||
+			a.RuntimeId < b.RuntimeId
+	})
+
+	// Ignore RuntimeID field completely
+	ignoreID := cmpopts.IgnoreFields(agentmodel.TracerMetadata{}, "RuntimeId")
+
+	diff := cmp.Diff(expectedTracerMetadata, actualTracerMetadata, cmpopts.EquateEmpty(), ignoreID, sortByName)
+	return diff == ""
+}
+
+var systemProbeConfigByMode = map[discoveryMode]string{
+	discoveryModeSystemProbeLite: systemProbeConfigStr,
+	discoveryModeSystemProbe:     systemProbeConfigFallbackStr,
+}
+
+func (s *linuxTestSuite) validateDiscoveryMode(mode discoveryMode) {
+	// system-probe execs into system-probe-lite (process replacement), they don't run simultaneously
+	if mode == discoveryModeSystemProbeLite {
+		// In system-probe-lite mode, system-probe execs into system-probe-lite during startup.
+		// Retry because the exec happens after fx initialization completes.
+		require.EventuallyWithT(s.T(), func(c *assert.CollectT) {
+			ps := s.Env().RemoteHost.MustExecuteOn(c, "ps aux | grep 'system-probe' | grep -v grep")
+			s.T().Logf("Process list:\n%s", ps)
+			assert.Contains(c, ps, "system-probe-lite", "system-probe-lite should be running in system-probe-lite mode")
+		}, 1*time.Minute, 5*time.Second)
+		s.T().Logf("Found system-probe-lite process (mode: %s)", mode)
+		s.validateCapabilities()
+	} else if mode == discoveryModeSystemProbe {
+		// In system-probe mode, system-probe should NOT exec into system-probe-lite.
+		// Wait for system-probe to finish startup before checking, to avoid
+		// false success if we check before the (incorrect) exec would happen.
+		time.Sleep(30 * time.Second)
+		ps := s.Env().RemoteHost.MustExecute("ps aux | grep 'system-probe' | grep -v grep")
+		s.T().Logf("Process list:\n%s", ps)
+		require.NotContains(s.T(), ps, "system-probe-lite", "system-probe-lite should not be running in system-probe mode (system-probe should not have exec'd into system-probe-lite)")
+		require.Contains(s.T(), ps, "system-probe", "system-probe should be running in system-probe mode")
+		s.T().Logf("Found system-probe process (mode: %s)", mode)
+	}
+}
+
+// capSysPtrace is the bitmask for CAP_SYS_PTRACE (capability 19).
+const capSysPtrace uint64 = 1 << 19
+
+// capDacReadSearch is the bitmask for CAP_DAC_READ_SEARCH (capability 2).
+const capDacReadSearch uint64 = 1 << 2
+
+// capRequired is the expected capability bitmask for system-probe-lite:
+// CAP_SYS_PTRACE (open /proc/<pid>/root and /proc/<pid>/ files) and
+// CAP_DAC_READ_SEARCH (traverse restricted directories in process root filesystems).
+const capRequired = capSysPtrace | capDacReadSearch
+
+// validateCapabilities asserts that system-probe-lite has been restricted to
+// {CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH} in its effective and permitted sets,
+// and that the inheritable and ambient sets are empty.
+func (s *linuxTestSuite) validateCapabilities() {
+	t := s.T()
+	t.Helper()
+
+	pidStr := strings.TrimSpace(s.Env().RemoteHost.MustExecute("pgrep -f 'system-probe-lite run'"))
+	require.NotEmpty(t, pidStr, "system-probe-lite process not found")
+
+	status := s.Env().RemoteHost.MustExecute(fmt.Sprintf("cat /proc/%s/status", pidStr))
+	t.Logf("system-probe-lite /proc/%s/status cap fields:\n%s", pidStr,
+		func() string {
+			var lines []string
+			for _, l := range strings.Split(status, "\n") {
+				if strings.HasPrefix(l, "Cap") {
+					lines = append(lines, l)
+				}
+			}
+			return strings.Join(lines, "\n")
+		}())
+
+	for _, tc := range []struct {
+		field string
+		want  uint64
+	}{
+		{"CapEff", capRequired},
+		{"CapPrm", capRequired},
+		{"CapInh", 0},
+		{"CapAmb", 0},
+	} {
+		got := parseCapField(t, status, tc.field)
+		assert.Equalf(t, tc.want, got, "%s: expected 0x%016x (CAP_SYS_PTRACE|CAP_DAC_READ_SEARCH), got 0x%016x", tc.field, tc.want, got)
+	}
+}
+
+func parseCapField(t *testing.T, status, field string) uint64 {
+	t.Helper()
+	for _, line := range strings.Split(status, "\n") {
+		if strings.HasPrefix(line, field+":") {
+			hexStr := strings.TrimSpace(strings.TrimPrefix(line, field+":"))
+			val, err := strconv.ParseUint(hexStr, 16, 64)
+			require.NoErrorf(t, err, "failed to parse %s value %q", field, hexStr)
+			return val
+		}
+	}
+	t.Fatalf("%s field not found in /proc/pid/status", field)
+	return 0
 }
 
 func (s *linuxTestSuite) provisionServer() {
@@ -180,53 +728,22 @@ func (s *linuxTestSuite) provisionServer() {
 }
 
 func (s *linuxTestSuite) startServices() {
-	for _, service := range services {
+	s.startServicesFromList(services)
+}
+
+func (s *linuxTestSuite) stopServices() {
+	s.stopServicesFromList(services)
+}
+
+func (s *linuxTestSuite) startServicesFromList(servicesList []string) {
+	for _, service := range servicesList {
 		s.Env().RemoteHost.MustExecute("sudo systemctl start " + service)
 	}
 }
 
-func (s *linuxTestSuite) stopServices() {
-	for i := len(services) - 1; i >= 0; i-- {
-		service := services[i]
+func (s *linuxTestSuite) stopServicesFromList(servicesList []string) {
+	for i := len(servicesList) - 1; i >= 0; i-- {
+		service := servicesList[i]
 		s.Env().RemoteHost.MustExecute("sudo systemctl stop " + service)
-	}
-}
-
-type serviceExpectedPayload struct {
-	systemdServiceName   string
-	instrumentation      string
-	generatedServiceName string
-	ddService            string
-	serviceNameSource    string
-	tracerServiceNames   []string
-}
-
-func (s *linuxTestSuite) assertService(t *testing.T, c *assert.CollectT, foundMap map[string]*aggregator.ServiceDiscoveryPayload, expected serviceExpectedPayload) {
-	t.Helper()
-
-	name := expected.generatedServiceName
-	found := foundMap[name]
-	if assert.NotNil(c, found, "could not find service %q", name) {
-		assert.Equal(c, expected.instrumentation, found.Payload.APMInstrumentation, "service %q: APM instrumentation", name)
-		assert.Equal(c, expected.generatedServiceName, found.Payload.GeneratedServiceName, "service %q: generated service name", name)
-		assert.Equal(c, expected.ddService, found.Payload.DDService, "service %q: DD service", name)
-		assert.Equal(c, expected.serviceNameSource, found.Payload.ServiceNameSource, "service %q: service name source", name)
-		assert.NotZero(c, found.Payload.RSSMemory, "service %q: expected non-zero memory usage", name)
-		if len(expected.tracerServiceNames) > 0 {
-			var foundServiceNames []string
-			var foundRuntimeIDs []string
-			for _, tm := range found.Payload.TracerMetadata {
-				foundServiceNames = append(foundServiceNames, tm.ServiceName)
-				foundRuntimeIDs = append(foundRuntimeIDs, tm.RuntimeID)
-			}
-			assert.Equal(c, expected.tracerServiceNames, foundServiceNames, "service %q: tracer service names", name)
-			assert.Len(c, foundRuntimeIDs, len(expected.tracerServiceNames), "service %q: tracer runtime ids", name)
-		}
-	} else {
-		status := s.Env().RemoteHost.MustExecute("sudo systemctl status " + expected.systemdServiceName)
-		logs := s.Env().RemoteHost.MustExecute("sudo journalctl -u " + expected.systemdServiceName)
-
-		t.Logf("Service %q status:\n:%s", expected.systemdServiceName, status)
-		t.Logf("Service %q logs:\n:%s", expected.systemdServiceName, logs)
 	}
 }

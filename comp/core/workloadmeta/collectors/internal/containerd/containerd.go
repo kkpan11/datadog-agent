@@ -15,18 +15,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd"
-	containerdevents "github.com/containerd/containerd/events"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	containerd "github.com/containerd/containerd/v2/client"
+	containerdevents "github.com/containerd/containerd/v2/core/events"
 	"go.uber.org/fx"
 
+	config "github.com/DataDog/datadog-agent/comp/core/config"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	agentErrors "github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/sbom/scanner"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
 	cutil "github.com/DataDog/datadog-agent/pkg/util/containerd"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -80,14 +80,21 @@ type exitInfo struct {
 	exitTS   time.Time
 }
 
+type dependencies struct {
+	fx.In
+
+	Config      config.Component
+	FilterStore workloadfilter.Component
+}
+
 type collector struct {
-	id                     string
-	store                  workloadmeta.Component
-	catalog                workloadmeta.AgentType
-	containerdClient       cutil.ContainerdItf
-	filterPausedContainers *containers.Filter
-	eventsChan             <-chan *containerdevents.Envelope
-	errorsChan             <-chan error
+	id               string
+	cfg              config.Component
+	store            workloadmeta.Component
+	catalog          workloadmeta.AgentType
+	containerdClient cutil.ContainerdItf
+	eventsChan       <-chan *containerdevents.Envelope
+	errorsChan       <-chan error
 
 	// Container exit info (mainly exit code and exit timestamp) are attached to the corresponding task events.
 	// contToExitInfo caches the exit info of a task to enrich the container deletion event when it's received later.
@@ -104,16 +111,22 @@ type collector struct {
 
 	// SBOM Scanning
 	sbomScanner *scanner.Scanner //nolint: unused
+
+	filterPausedContainers workloadfilter.FilterBundle
+	filterSBOMContainers   workloadfilter.FilterBundle
 }
 
 // NewCollector returns a new containerd collector provider and an error
-func NewCollector() (workloadmeta.CollectorProvider, error) {
+func NewCollector(deps dependencies) (workloadmeta.CollectorProvider, error) {
 	return workloadmeta.CollectorProvider{
 		Collector: &collector{
-			id:             collectorID,
-			catalog:        workloadmeta.NodeAgent | workloadmeta.ProcessAgent,
-			contToExitInfo: make(map[string]*exitInfo),
-			knownImages:    newKnownImages(),
+			id:                     collectorID,
+			cfg:                    deps.Config,
+			catalog:                workloadmeta.NodeAgent,
+			contToExitInfo:         make(map[string]*exitInfo),
+			knownImages:            newKnownImages(),
+			filterPausedContainers: deps.FilterStore.GetContainerPausedFilters(),
+			filterSBOMContainers:   deps.FilterStore.GetContainerSBOMFilters(),
 		},
 	}, nil
 }
@@ -140,13 +153,13 @@ func (c *collector) Start(ctx context.Context, store workloadmeta.Component) err
 		return err
 	}
 
-	c.filterPausedContainers, err = containers.GetPauseContainerFilter()
-	if err != nil {
-		return err
+	errs := c.filterPausedContainers.GetErrors()
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to create container filter: %w", errors.Join(errs...))
 	}
 
 	eventsCtx, cancelEvents := context.WithCancel(ctx)
-	c.eventsChan, c.errorsChan = c.containerdClient.GetEvents().Subscribe(eventsCtx, subscribeFilters()...)
+	c.eventsChan, c.errorsChan = c.containerdClient.GetEvents().Subscribe(eventsCtx, c.subscribeFilters()...)
 
 	err = c.notifyInitialEvents(ctx)
 	if err != nil {
@@ -220,7 +233,7 @@ func (c *collector) notifyInitialEvents(ctx context.Context) error {
 	}
 
 	for _, namespace := range namespaces {
-		if imageMetadataCollectionIsEnabled() {
+		if c.imageMetadataCollectionIsEnabled() {
 			if err := c.notifyInitialImageEvents(ctx, namespace); err != nil {
 				return err
 			}
@@ -356,13 +369,13 @@ func (c *collector) extractContainerFromEvent(ctx context.Context, containerdEve
 	case containerCreationTopic, containerUpdateTopic, containerDeletionTopic:
 		containerID, hasID = containerdEvent.Field([]string{"event", "id"})
 		if !hasID {
-			return "", nil, fmt.Errorf("missing ID in containerd event")
+			return "", nil, errors.New("missing ID in containerd event")
 		}
 
 	case TaskStartTopic, TaskOOMTopic, TaskPausedTopic, TaskResumedTopic, TaskExitTopic, TaskDeleteTopic:
 		containerID, hasID = containerdEvent.Field([]string{"event", "container_id"})
 		if !hasID {
-			return "", nil, fmt.Errorf("missing ID in containerd event")
+			return "", nil, errors.New("missing ID in containerd event")
 		}
 
 	default:
@@ -397,14 +410,16 @@ func (c *collector) ignoreContainer(namespace string, container containerd.Conta
 	}
 
 	// Only the image name is relevant to exclude paused containers
-	return c.filterPausedContainers.IsExcluded(nil, "", info.Image, ""), nil
+	filterableContainer := workloadfilter.CreateContainerImage(info.Image)
+	excluded := c.filterPausedContainers.IsExcluded(filterableContainer)
+	return excluded, nil
 }
 
-func subscribeFilters() []string {
+func (c *collector) subscribeFilters() []string {
 	var filters []string
 
 	for _, topic := range containerdTopics {
-		if isImageTopic(topic) && !imageMetadataCollectionIsEnabled() {
+		if isImageTopic(topic) && !c.imageMetadataCollectionIsEnabled() {
 			continue
 		}
 
@@ -429,6 +444,6 @@ func (c *collector) cacheExitInfo(id string, exitCode *int64, exitTS time.Time) 
 	}
 }
 
-func imageMetadataCollectionIsEnabled() bool {
-	return pkgconfigsetup.Datadog().GetBool("container_image.enabled")
+func (c *collector) imageMetadataCollectionIsEnabled() bool {
+	return c.cfg.GetBool("container_image.enabled")
 }

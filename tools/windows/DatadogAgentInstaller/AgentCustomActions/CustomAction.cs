@@ -1,5 +1,5 @@
 using Datadog.CustomActions;
-using Microsoft.Deployment.WindowsInstaller;
+using WixToolset.Dtf.WindowsInstaller;
 
 namespace Datadog.AgentCustomActions
 {
@@ -59,7 +59,6 @@ namespace Datadog.AgentCustomActions
             return Datadog.CustomActions.SetupInstallerCustomAction.SetupInstaller(session);
         }
 
-
         [CustomAction]
         public static ActionResult ReportFailure(Session session)
         {
@@ -82,6 +81,18 @@ namespace Datadog.AgentCustomActions
         public static ActionResult CleanupFiles(Session session)
         {
             return Datadog.CustomActions.CleanUpFilesCustomAction.CleanupFiles(session);
+        }
+
+        [CustomAction]
+        public static ActionResult RemoveEmptyInstallDirOnRollback(Session session)
+        {
+            return Datadog.CustomActions.CleanUpFilesCustomAction.RemoveEmptyInstallDirOnRollback(session);
+        }
+
+        [CustomAction]
+        public static ActionResult RemoveEmptyInstallDirAfterUninstall(Session session)
+        {
+            return Datadog.CustomActions.CleanUpFilesCustomAction.RemoveEmptyInstallDirAfterUninstall(session);
         }
 
         [CustomAction]
@@ -199,6 +210,18 @@ namespace Datadog.AgentCustomActions
         }
 
         [CustomAction]
+        public static ActionResult EnsureSecureConfigRoot(Session session)
+        {
+            return Datadog.CustomActions.PrerequisitesCustomActions.EnsureSecureConfigRoot(session);
+        }
+
+        [CustomAction]
+        public static ActionResult EnsureSecureConfigRootUI(Session session)
+        {
+            return Datadog.CustomActions.PrerequisitesCustomActions.EnsureSecureConfigRootUI(session);
+        }
+
+        [CustomAction]
         public static ActionResult DoRollback(Session session)
         {
             return Datadog.CustomActions.Rollback.RestoreDaclRollbackCustomAction.DoRollback(session);
@@ -220,6 +243,42 @@ namespace Datadog.AgentCustomActions
         public static ActionResult RollbackOciPackages(Session session)
         {
             return Datadog.CustomActions.InstallOciPackages.RollbackActions(session);
+        }
+
+        [CustomAction]
+        public static ActionResult PurgeOciPackages(Session session)
+        {
+            return Datadog.CustomActions.InstallOciPackages.PurgePackages(session);
+        }
+
+        [CustomAction]
+        public static ActionResult RunPreRemoveHook(Session session)
+        {
+            return Datadog.CustomActions.InstallerHooksCustomAction.RunPreRemoveHook(session);
+        }
+
+        [CustomAction]
+        public static ActionResult RunPostInstallHook(Session session)
+        {
+            return Datadog.CustomActions.InstallerHooksCustomAction.RunPostInstallHook(session);
+        }
+
+        [CustomAction]
+        public static ActionResult ConfigureAutoLogger(Session session)
+        {
+            return Datadog.CustomActions.AutoLoggerCustomAction.ConfigureAutoLogger(session);
+        }
+
+        [CustomAction]
+        public static ActionResult ConfigureAutoLoggerRollback(Session session)
+        {
+            return Datadog.CustomActions.AutoLoggerCustomAction.ConfigureAutoLoggerRollback(session);
+        }
+
+        [CustomAction]
+        public static ActionResult RemoveAutoLogger(Session session)
+        {
+            return Datadog.CustomActions.AutoLoggerCustomAction.RemoveAutoLogger(session);
         }
     }
 }

@@ -19,8 +19,9 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -37,9 +38,9 @@ type EtcdConfigProvider struct {
 }
 
 // NewEtcdConfigProvider creates a client connection to etcd and create a new EtcdConfigProvider
-func NewEtcdConfigProvider(providerConfig *pkgconfigsetup.ConfigurationProviders, _ *telemetry.Store) (ConfigProvider, error) {
+func NewEtcdConfigProvider(providerConfig *constants.ConfigurationProviders, _ *telemetry.Store) (types.ConfigProvider, error) {
 	if providerConfig == nil {
-		providerConfig = &pkgconfigsetup.ConfigurationProviders{}
+		providerConfig = &constants.ConfigurationProviders{}
 	}
 
 	clientCfg := client.Config{
@@ -124,7 +125,13 @@ func (p *EtcdConfigProvider) getTemplates(ctx context.Context, key string) []int
 		return nil
 	}
 
-	return utils.BuildTemplates(key, checkNames, initConfigs, instances, false, "")
+	templates, err := utils.BuildTemplates(key, checkNames, initConfigs, instances, false, "")
+	if err != nil {
+		log.Errorf("Failed to build templates for %s. Error: %s", checkNameKey, err)
+		return nil
+	}
+
+	return templates
 }
 
 // getEtcdValue retrieves content from etcd
@@ -226,6 +233,6 @@ func hasTemplateFields(nodes client.Nodes) bool {
 }
 
 // GetConfigErrors is not implemented for the EtcdConfigProvider
-func (p *EtcdConfigProvider) GetConfigErrors() map[string]ErrorMsgSet {
-	return make(map[string]ErrorMsgSet)
+func (p *EtcdConfigProvider) GetConfigErrors() map[string]types.ErrorMsgSet {
+	return make(map[string]types.ErrorMsgSet)
 }

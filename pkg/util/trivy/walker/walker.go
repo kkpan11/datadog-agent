@@ -9,16 +9,19 @@
 package walker
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"golang.org/x/xerrors"
+	"fmt"
 
 	"github.com/aquasecurity/trivy/pkg/fanal/utils"
 	"github.com/aquasecurity/trivy/pkg/fanal/walker"
 	xio "github.com/aquasecurity/trivy/pkg/x/io"
+	"github.com/samber/lo"
 )
 
 var defaultSkipDirs = []string{
@@ -36,28 +39,84 @@ func NewFSWalker() *FSWalker {
 	return &FSWalker{}
 }
 
+func cleanSkipPaths(root string, skipPaths []string) []string {
+	skipPaths = lo.Map(skipPaths, func(skipPath string, _ int) string {
+		if strings.HasPrefix(skipPath, root) {
+			if relPath, err := filepath.Rel(root, skipPath); err == nil {
+				return relPath
+			}
+		}
+		return skipPath
+	})
+	return utils.CleanSkipPaths(skipPaths)
+}
+
 // Walk walks the filesystem rooted at root, calling fn for each unfiltered file.
-func (w *FSWalker) Walk(root string, opt walker.Option, fn walker.WalkFunc) error {
+// Trivy's static-paths mechanism can invoke Walk with a regular file rather
+// than a directory; in that case the single file is analyzed directly.
+func (w *FSWalker) Walk(ctx context.Context, rootPath string, opt walker.Option, fn walker.WalkFunc) error {
+	info, err := os.Stat(rootPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat root %s: %w", rootPath, err)
+	}
+
+	if !info.IsDir() {
+		return w.walkFile(ctx, rootPath, info, opt, fn)
+	}
+
 	opt.SkipDirs = append(opt.SkipDirs, defaultSkipDirs...)
 
-	opt.SkipDirs = utils.CleanSkipPaths(opt.SkipDirs)
-	opt.SkipFiles = utils.CleanSkipPaths(opt.SkipFiles)
-	opt.OnlyDirs = utils.CleanSkipPaths(opt.OnlyDirs)
+	opt.SkipDirs = cleanSkipPaths(rootPath, opt.SkipDirs)
+	opt.SkipFiles = cleanSkipPaths(rootPath, opt.SkipFiles)
+	opt.OnlyDirs = cleanSkipPaths(rootPath, opt.OnlyDirs)
 
-	walkDirFunc := w.WalkDirFunc(root, fn, opt)
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to open root %s: %w", rootPath, err)
+	}
+	defer root.Close()
+
+	walkDirFunc := w.walkDirFunc(ctx, root, fn, opt)
 	walkDirFunc = w.onError(walkDirFunc, opt)
 
 	// Walk the filesystem
-	if err := fs.WalkDir(os.DirFS(root), ".", walkDirFunc); err != nil {
-		return xerrors.Errorf("walk dir error: %w", err)
+	if err := fs.WalkDir(root.FS(), ".", walkDirFunc); err != nil {
+		return fmt.Errorf("walk dir error: %w", err)
 	}
 
 	return nil
 }
 
-// WalkDirFunc is the type of the function called by [WalkDir] to visit
+func (w *FSWalker) walkFile(ctx context.Context, path string, info os.FileInfo, opt walker.Option, fn walker.WalkFunc) error {
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+
+	// Match upstream Trivy semantics: for a single-file root, filepath.Rel(root, root)
+	// returns "." and that is what gets passed through to the analyzer.
+	const relPath = "."
+
+	opener := func() (xio.ReadSeekCloserAt, error) {
+		return os.Open(path)
+	}
+
+	if err := fn(ctx, relPath, info, opener); err != nil {
+		if opt.ErrorCallback != nil {
+			if cberr := opt.ErrorCallback(relPath, err); cberr == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to analyze file: %w", err)
+	}
+	return nil
+}
+
+// walkDirFunc is the type of the function called by [WalkDir] to visit
 // each file or directory.
-func (w *FSWalker) WalkDirFunc(root string, fn walker.WalkFunc, opt walker.Option) fs.WalkDirFunc {
+func (w *FSWalker) walkDirFunc(ctx context.Context, root *os.Root, fn walker.WalkFunc, opt walker.Option) fs.WalkDirFunc {
 	return func(filePath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) || errors.Is(err, os.ErrNotExist) {
@@ -88,12 +147,11 @@ func (w *FSWalker) WalkDirFunc(root string, fn walker.WalkFunc, opt walker.Optio
 
 		info, err := d.Info()
 		if err != nil {
-			return xerrors.Errorf("file info error: %w", err)
+			return fmt.Errorf("file info error: %w", err)
 		}
 
-		rootedPath := filepath.Join(root, filePath)
-		if err = fn(filePath, info, fileOpener(rootedPath)); err != nil {
-			return xerrors.Errorf("failed to analyze file: %w", err)
+		if err = fn(ctx, filePath, info, fileOpener(root, filePath)); err != nil {
+			return fmt.Errorf("failed to analyze file: %w", err)
 		}
 
 		return nil
@@ -118,15 +176,15 @@ func (w *FSWalker) onError(wrapped fs.WalkDirFunc, opt walker.Option) fs.WalkDir
 				}
 			}
 			// halt traversal on any other error
-			return xerrors.Errorf("unknown error with %s: %w", filePath, err)
+			return fmt.Errorf("unknown error with %s: %w", filePath, err)
 		}
 		return nil
 	}
 }
 
 // fileOpener returns a function opening a file.
-func fileOpener(filePath string) func() (xio.ReadSeekCloserAt, error) {
+func fileOpener(root *os.Root, filePath string) func() (xio.ReadSeekCloserAt, error) {
 	return func() (xio.ReadSeekCloserAt, error) {
-		return os.Open(filePath)
+		return root.Open(filePath)
 	}
 }

@@ -8,7 +8,7 @@
 package k8s
 
 import (
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
 	"k8s.io/apimachinery/pkg/labels"
@@ -19,13 +19,14 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 )
 
 // NewNetworkPolicyCollectorVersions builds the group of collector versions.
-func NewNetworkPolicyCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewNetworkPolicyCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewNetworkPolicyCollector(metadataAsTags),
+		NewNetworkPolicyCollector(tagger),
 	)
 }
 
@@ -39,11 +40,7 @@ type NetworkPolicyCollector struct {
 
 // NewNetworkPolicyCollector creates a new collector for the Kubernetes
 // NetworkPolicy resource.
-func NewNetworkPolicyCollector(metadataAsTags utils.MetadataAsTags) *NetworkPolicyCollector {
-	resourceType := getResourceType(networkPolicyName, networkPolicyVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewNetworkPolicyCollector(tagger tagger.Component) *NetworkPolicyCollector {
 	return &NetworkPolicyCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -51,15 +48,14 @@ func NewNetworkPolicyCollector(metadataAsTags utils.MetadataAsTags) *NetworkPoli
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 networkPolicyName,
+			Name:                                 utilTypes.NetworkPolicyName,
 			Kind:                                 kubernetes.NetworkPolicyKind,
 			NodeType:                             orchestrator.K8sNetworkPolicy,
-			Version:                              networkPolicyVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.NetworkPolicyGroup,
+			Version:                              utilTypes.NetworkPolicyVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.NetworkPolicyHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewNetworkPolicyHandlers(tagger)),
 	}
 }
 

@@ -1,0 +1,122 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+// Package suite contains a base suite for fleet tests
+package suite
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+
+	e2eos "github.com/DataDog/datadog-agent/test/e2e-framework/components/os"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
+
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/fleet/agent"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/fleet/backend"
+	fleethost "github.com/DataDog/datadog-agent/test/new-e2e/tests/fleet/host"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/fleet/installer"
+)
+
+var (
+	// LinuxPlatforms is the list of supported Linux platforms.
+	LinuxPlatforms = []e2eos.Descriptor{
+		e2eos.Ubuntu2404,
+		e2eos.AmazonLinux2,
+		e2eos.Debian12,
+		e2eos.RedHat9,
+		// e2eos.CentOS7,
+		e2eos.Suse15,
+	}
+	// WindowsPlatforms is the list of supported Windows platforms.
+	WindowsPlatforms = []e2eos.Descriptor{
+		e2eos.WindowsServer2016E2E,
+		e2eos.WindowsServer2019E2E,
+		e2eos.WindowsServer2022E2E,
+		e2eos.WindowsServer2025E2E,
+	}
+	// AllPlatforms is the list of all supported platforms.
+	AllPlatforms = append(LinuxPlatforms, WindowsPlatforms...)
+)
+
+// platformGroupEnvVar selects a subset of platforms to run the fleet tests
+// against ("linux" or "windows"). It is used to split the fleet e2e jobs
+// across multiple parallel CI jobs so each platform group runs independently.
+const platformGroupEnvVar = "E2E_FLEET_PLATFORM_GROUP"
+
+// Platforms returns the list of platforms to test.
+//
+// The set of platforms can be narrowed down with the E2E_FLEET_PLATFORM_GROUP
+// environment variable ("linux" or "windows"), which is used to split the
+// fleet e2e jobs across multiple parallel CI jobs. When it is unset, all
+// platforms are returned.
+//
+// Windows platforms are always excluded when the E2E_SKIP_WINDOWS parameter is
+// set to "true".
+func Platforms() []e2eos.Descriptor {
+	skipWindows, err := runner.GetProfile().ParamStore().GetBoolWithDefault(parameters.SkipWindows, false)
+	if err != nil {
+		panic(fmt.Sprintf("failed to get %s parameter %v\n", parameters.SkipWindows, err))
+	}
+
+	switch strings.ToLower(os.Getenv(platformGroupEnvVar)) {
+	case "linux":
+		return LinuxPlatforms
+	case "windows":
+		if skipWindows {
+			return nil
+		}
+		return WindowsPlatforms
+	}
+
+	if skipWindows {
+		return LinuxPlatforms
+	}
+	return AllPlatforms
+}
+
+// FleetSuite is a base suite for fleet tests.
+type FleetSuite struct {
+	e2e.BaseSuite[environments.Host]
+
+	Agent     *agent.Agent
+	Backend   *backend.Backend
+	Host      *fleethost.Host
+	Installer *installer.Installer
+}
+
+// SetupSuite sets up the fleet suite.
+func (s *FleetSuite) SetupSuite() {
+	s.BaseSuite.SetupSuite()
+	// SetupSuite needs to defer s.CleanupOnSetupFailure() if what comes after BaseSuite.SetupSuite() can fail.
+	defer s.CleanupOnSetupFailure()
+
+	s.Agent = agent.New(s.T, s.Env())
+	s.Backend = backend.New(s.T, s.Env())
+	s.Host = fleethost.New(s.Env())
+	s.Installer = installer.New(s.T, s.Env())
+}
+
+// Run runs the fleet suite for the given platforms.
+func Run(t *testing.T, f func() e2e.Suite[environments.Host], platforms []e2eos.Descriptor, opts ...awshost.ProvisionerOption) {
+	for _, platform := range platforms {
+		s := f()
+		t.Run(platform.String(), func(t *testing.T) {
+			t.Parallel()
+			name := regexp.MustCompile("[^a-zA-Z0-9]+").ReplaceAllString(t.Name(), "_")
+			// clone opts and shadow it to avoid race condition when running in parallel
+			opts := append(slices.Clone(opts), awshost.WithRunOptions(ec2.WithEC2InstanceOptions(ec2.WithOS(platform), ec2.WithInternetAccess()), ec2.WithoutAgent()))
+			e2e.Run(t, s, e2e.WithProvisioner(awshost.Provisioner(opts...)), e2e.WithStackName(name))
+		})
+	}
+}

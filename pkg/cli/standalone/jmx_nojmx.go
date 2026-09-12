@@ -8,24 +8,25 @@
 package standalone
 
 import (
-	"fmt"
+	"errors"
 
-	"github.com/DataDog/datadog-agent/comp/agent/jmxlogger"
+	jmxlogger "github.com/DataDog/datadog-agent/comp/agent/jmxlogger/def"
 	internalAPI "github.com/DataDog/datadog-agent/comp/api/api/def"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 )
 
 // ExecJMXCommandConsole is not supported when the 'jmx' build tag isn't included
-func ExecJMXCommandConsole(_ string, _ []string, _ string, _ []integration.Config, _ internalAPI.Component, _ jmxlogger.Component) error {
-	return fmt.Errorf("not supported: the Agent is compiled without the 'jmx' build tag")
+func ExecJMXCommandConsole(_ string, _ []string, _ string, _ []integration.Config, _ internalAPI.Component, _ jmxlogger.Component, _ ipc.Component) error {
+	return errors.New("not supported: the Agent is compiled without the 'jmx' build tag")
 }
 
 // ExecJmxListWithMetricsJSON is not supported when the 'jmx' build tag isn't included
-func ExecJmxListWithMetricsJSON(_ []string, _ string, _ []integration.Config, _ internalAPI.Component, _ jmxlogger.Component) error {
-	return fmt.Errorf("not supported: the Agent is compiled without the 'jmx' build tag")
+func ExecJmxListWithMetricsJSON(_ []string, _ string, _ []integration.Config, _ internalAPI.Component, _ jmxlogger.Component, _ ipc.Component) error {
+	return errors.New("not supported: the Agent is compiled without the 'jmx' build tag")
 }
 
 // ExecJmxListWithRateMetricsJSON is not supported when the 'jmx' build tag isn't included
-func ExecJmxListWithRateMetricsJSON(_ []string, _ string, _ []integration.Config, _ internalAPI.Component, _ jmxlogger.Component) error {
-	return fmt.Errorf("not supported: the Agent is compiled without the 'jmx' build tag")
+func ExecJmxListWithRateMetricsJSON(_ []string, _ string, _ []integration.Config, _ internalAPI.Component, _ jmxlogger.Component, _ ipc.Component) error {
+	return errors.New("not supported: the Agent is compiled without the 'jmx' build tag")
 }

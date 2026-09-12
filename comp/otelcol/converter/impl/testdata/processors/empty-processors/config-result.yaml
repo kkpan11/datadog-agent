@@ -12,15 +12,17 @@ extensions:
   zpages/user-defined:
     endpoint: "localhost:55679"
   ddflare/user-defined:
-    
+  datadog/user-defined:
+
 processors:
+  cumulativetodelta/dd-autoconfigured:
   infraattributes/dd-autoconfigured:
 
 service:
     telemetry:
       metrics:
         level: none
-    extensions: [pprof/user-defined, zpages/user-defined, health_check/user-defined, ddflare/user-defined]
+    extensions: [pprof/user-defined, zpages/user-defined, health_check/user-defined, ddflare/user-defined, datadog/user-defined]
     pipelines:
         traces:
             receivers: [nop]
@@ -28,7 +30,7 @@ service:
             exporters: [datadog]
         metrics:
             receivers: [nop]
-            processors: [infraattributes/dd-autoconfigured]
+            processors: [infraattributes/dd-autoconfigured, cumulativetodelta/dd-autoconfigured]
             exporters: [datadog]
         logs:
             receivers: [nop]

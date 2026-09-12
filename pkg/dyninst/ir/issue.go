@@ -1,0 +1,63 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+package ir
+
+// ProbeIssue is an issue that was encountered while processing a probe.
+type ProbeIssue struct {
+	ProbeDefinition `json:"probe_definition"`
+	Issue           `json:"issue"`
+}
+
+//go:generate go run golang.org/x/tools/cmd/stringer -type=IssueKind -trimprefix=IssueKind
+
+// IssueKind is the kind of issue that was encountered.
+type IssueKind int
+
+const (
+	_ IssueKind = iota
+	// IssueKindInvalidProbeDefinition is an issue that was encountered while
+	// deserializing a probe definition.
+	IssueKindInvalidProbeDefinition
+	// IssueKindTargetNotFoundInBinary is an issue that was encountered while
+	// processing a probe definition and failing to find the target in the
+	// binary.
+	IssueKindTargetNotFoundInBinary
+	// IssueKindUnsupportedFeature is an issue that was encountered while
+	// processing a probe definition that uses a feature that is not supported.
+	IssueKindUnsupportedFeature
+	// IssueKindMalformedExecutable is an issue that was encountered while
+	// processing a probe definition that uses a malformed executable.
+	IssueKindMalformedExecutable
+	// IssueKindInvalidDWARF is an issue that was encountered while processing
+	// a probe definition that uses an invalid DWARF.
+	IssueKindInvalidDWARF
+	// IssueKindDisassemblyFailed is an issue that was encountered while
+	// disassembling an instruction.
+	IssueKindDisassemblyFailed
+	// IssueKindConditionVariableUnavailable is an issue that was encountered
+	// when the variable referenced in a condition expression is not available.
+	IssueKindConditionVariableUnavailable
+	// IssueKindConditionExpressionUnresolvable is an issue that was
+	// encountered when the condition expression's type chain could not be
+	// fully resolved (e.g., unresolved pointee types, missing struct fields).
+	IssueKindConditionExpressionUnresolvable
+	// IssueKindConditionCarryTooLarge is an issue that was encountered
+	// when a split-event-kind condition has more entry-side leaves than
+	// fit in the per-call carry byte (8 bits). The probe is rejected
+	// rather than silently truncated.
+	IssueKindConditionCarryTooLarge
+)
+
+// Issue is an issue that was encountered while processing a probe.
+type Issue struct {
+	Kind    IssueKind
+	Message string
+}
+
+// IsNone returns true if the issue is empty.
+func (i Issue) IsNone() bool {
+	return i == Issue{}
+}

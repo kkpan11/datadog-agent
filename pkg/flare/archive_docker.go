@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -22,14 +23,14 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/docker"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
-	"github.com/docker/docker/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 )
 
 const dockerCommandMaxLength = 29
 
 func getDockerSelfInspect(wmeta option.Option[workloadmeta.Component]) ([]byte, error) {
 	if !env.IsContainerized() {
-		return nil, fmt.Errorf("The Agent is not containerized")
+		return nil, errors.New("The Agent is not containerized")
 	}
 
 	du, err := docker.GetDockerUtil()
@@ -85,7 +86,7 @@ func getDockerPs() ([]byte, error) {
 		log.Debugf("Couldn't reach docker for getting `docker ps`: %s", err)
 		return nil, nil
 	}
-	options := container.ListOptions{All: true, Limit: 500}
+	options := dockerclient.ContainerListOptions{All: true, Limit: 500}
 	containerList, err := du.RawContainerList(context.TODO(), options)
 	if err != nil {
 		return nil, err

@@ -11,13 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/mohae/deepcopy"
 
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	haagent "github.com/DataDog/datadog-agent/comp/haagent/def"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/config/utils"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -32,6 +34,8 @@ var EventPlatformNameTranslations = map[string]string{
 	"dbm-metrics":                "Database Monitoring Query Metrics",
 	"dbm-activity":               "Database Monitoring Activity Samples",
 	"dbm-metadata":               "Database Monitoring Metadata Samples",
+	"dbm-health":                 "Database Monitoring Health Events",
+	"genresources":               "Generic Resources",
 	"network-devices-metadata":   "Network Devices Metadata",
 	"network-devices-netflow":    "Network Devices NetFlow",
 	"network-devices-snmp-traps": "SNMP Traps",
@@ -39,25 +43,27 @@ var EventPlatformNameTranslations = map[string]string{
 }
 
 var (
-	tlmRuns = telemetry.NewCounter("checks", "runs",
+	tlmRuns = telemetryimpl.GetCompatComponent().NewCounter("checks", "runs",
 		[]string{"check_name", "state"}, "Check runs")
-	tlmWarnings = telemetry.NewCounter("checks", "warnings",
+	tlmWarnings = telemetryimpl.GetCompatComponent().NewCounter("checks", "warnings",
 		[]string{"check_name"}, "Check warnings")
-	tlmMetricsSamples = telemetry.NewCounter("checks", "metrics_samples",
+	tlmMetricsSamples = telemetryimpl.GetCompatComponent().NewCounter("checks", "metrics_samples",
 		[]string{"check_name"}, "Metrics count")
-	tlmEvents = telemetry.NewCounter("checks", "events",
+	tlmEvents = telemetryimpl.GetCompatComponent().NewCounter("checks", "events",
 		[]string{"check_name"}, "Events count")
-	tlmServices = telemetry.NewCounter("checks", "services_checks",
+	tlmServices = telemetryimpl.GetCompatComponent().NewCounter("checks", "services_checks",
 		[]string{"check_name"}, "Service checks count")
-	tlmHistogramBuckets = telemetry.NewCounter("checks", "histogram_buckets",
+	tlmHistogramBuckets = telemetryimpl.GetCompatComponent().NewCounter("checks", "histogram_buckets",
 		[]string{"check_name"}, "Histogram buckets count")
-	tlmExecutionTime = telemetry.NewGauge("checks", "execution_time",
+	tlmExecutionTime = telemetryimpl.GetCompatComponent().NewGauge("checks", "execution_time",
 		[]string{"check_name", "check_loader"}, "Check execution time")
-	tlmCheckDelay = telemetry.NewGauge("checks",
+	tlmFirstExecutionTime = telemetryimpl.GetCompatComponent().NewGauge("checks", "first_execution_time",
+		[]string{"check_name", "check_loader"}, "Check first execution time")
+	tlmCheckDelay = telemetryimpl.GetCompatComponent().NewGauge("checks",
 		"delay",
 		[]string{"check_name"},
 		"Check start time delay relative to the previous check run")
-	tlmHaAgentIntegrationRuns = telemetry.NewCounterWithOpts(
+	tlmHaAgentIntegrationRuns = telemetryimpl.GetCompatComponent().NewCounterWithOpts(
 		"ha_agent",
 		"integration_runs",
 		[]string{"integration", "config_id"},
@@ -94,8 +100,8 @@ func (s SenderStats) Copy() (result SenderStats) {
 	return result
 }
 
-// Stats holds basic runtime statistics about check instances
-type Stats struct {
+// stats holds Stats' fields, split out to ease deep-copy without touching the mutex
+type stats struct {
 	CheckName         string
 	CheckVersion      string
 	CheckConfigSource string
@@ -119,17 +125,23 @@ type Stats struct {
 	TotalHistogramBuckets    uint64
 	EventPlatformEvents      map[string]int64
 	TotalEventPlatformEvents map[string]int64
-	ExecutionTimes           [32]int64 // circular buffer of recent run durations, most recent at [(TotalRuns+31) % 32]
-	AverageExecutionTime     int64     // average run duration
-	LastExecutionTime        int64     // most recent run duration, provided for convenience
-	LastSuccessDate          int64     // most recent successful execution date, unix timestamp in seconds
-	LastError                string    // error that occurred in the last run, if any
-	LastDelay                int64     // most recent check start time delay relative to the previous check run, in seconds
-	LastWarnings             []string  // warnings that occurred in the last run, if any
-	UpdateTimestamp          int64     // latest update to this instance, unix timestamp in seconds
-	m                        sync.Mutex
-	Telemetry                bool // do we want telemetry on this Check
+	ExecutionTimes           [32]int64     // circular buffer of recent run durations, most recent at [(TotalRuns+31) % 32]
+	FirstExecutionTime       int64         // duration of the first run in milliseconds
+	AverageExecutionTime     int64         // average run duration
+	LastExecutionTime        time.Duration // most recent run duration, provided for convenience
+	LastSuccessDate          int64         // most recent successful execution date, unix timestamp in seconds
+	LastError                string        // error that occurred in the last run, if any
+	LastDelay                float64       // most recent check start time delay relative to the previous check run, in seconds
+	LastWarnings             []string      // warnings that occurred in the last run, if any
+	UpdateTimestamp          time.Time     // latest update to this instance, unix timestamp in seconds
+	Telemetry                bool          // do we want telemetry on this Check
 	HASupported              bool
+}
+
+// Stats holds basic runtime statistics about check instances
+type Stats struct {
+	stats
+	m sync.Mutex
 }
 
 //nolint:revive
@@ -152,27 +164,29 @@ type StatsCheck interface {
 
 // NewStats returns a new check stats instance
 func NewStats(c StatsCheck) *Stats {
-	stats := Stats{
-		CheckID:                  c.ID(),
-		CheckName:                c.String(),
-		CheckLoader:              c.Loader(),
-		CheckVersion:             c.Version(),
-		CheckConfigSource:        c.ConfigSource(),
-		Interval:                 c.Interval(),
-		Telemetry:                utils.IsCheckTelemetryEnabled(c.String(), pkgconfigsetup.Datadog()),
-		EventPlatformEvents:      make(map[string]int64),
-		TotalEventPlatformEvents: make(map[string]int64),
-		HASupported:              c.IsHASupported(),
+	cs := &Stats{
+		stats: stats{
+			CheckID:                  c.ID(),
+			CheckName:                c.String(),
+			CheckLoader:              c.Loader(),
+			CheckVersion:             c.Version(),
+			CheckConfigSource:        c.ConfigSource(),
+			Interval:                 c.Interval(),
+			Telemetry:                utils.IsCheckTelemetryEnabled(c.String(), pkgconfigsetup.Datadog()),
+			EventPlatformEvents:      make(map[string]int64),
+			TotalEventPlatformEvents: make(map[string]int64),
+			HASupported:              c.IsHASupported(),
+		},
 	}
 
 	// We are interested in a check's run state values even when they are 0 so we
 	// initialize them here explicitly
-	if stats.Telemetry && utils.IsTelemetryEnabled(pkgconfigsetup.Datadog()) {
-		tlmRuns.InitializeToZero(stats.CheckName, runCheckFailureTag)
-		tlmRuns.InitializeToZero(stats.CheckName, runCheckSuccessTag)
+	if cs.Telemetry && utils.IsTelemetryEnabled(pkgconfigsetup.Datadog()) {
+		tlmRuns.InitializeToZero(cs.CheckName, runCheckFailureTag)
+		tlmRuns.InitializeToZero(cs.CheckName, runCheckSuccessTag)
 	}
 
-	return &stats
+	return cs
 }
 
 // Add tracks a new execution time
@@ -182,16 +196,21 @@ func (cs *Stats) Add(t time.Duration, err error, warnings []error, metricStats S
 
 	cs.LastDelay = calculateCheckDelay(time.Now(), cs, t)
 	if cs.Telemetry {
-		tlmCheckDelay.Set(float64(cs.LastDelay), cs.CheckName)
+		tlmCheckDelay.Set(cs.LastDelay, cs.CheckName)
 	}
 
 	// store execution times in Milliseconds
 	tms := t.Nanoseconds() / 1e6
 	cs.LongRunning = metricStats.LongRunningCheck
-	cs.LastExecutionTime = tms
+	cs.LastExecutionTime = t
 	cs.ExecutionTimes[cs.TotalRuns%uint64(len(cs.ExecutionTimes))] = tms
 	cs.TotalRuns++
-	if cs.Telemetry {
+	if cs.TotalRuns == 1 {
+		cs.FirstExecutionTime = tms
+		if cs.Telemetry {
+			tlmFirstExecutionTime.Set(float64(tms), cs.CheckName, cs.CheckLoader)
+		}
+	} else if cs.Telemetry {
 		tlmExecutionTime.Set(float64(tms), cs.CheckName, cs.CheckLoader)
 	}
 	var totalExecutionTime int64
@@ -223,7 +242,7 @@ func (cs *Stats) Add(t time.Duration, err error, warnings []error, metricStats S
 			cs.LastWarnings = append(cs.LastWarnings, w.Error())
 		}
 	}
-	cs.UpdateTimestamp = time.Now().Unix()
+	cs.UpdateTimestamp = time.Now()
 
 	if metricStats.MetricSamples > 0 {
 		cs.MetricSamples = metricStats.MetricSamples
@@ -271,6 +290,14 @@ func (cs *Stats) SetStateCancelling() {
 	cs.m.Lock()
 	defer cs.m.Unlock()
 	cs.Cancelling = true
+}
+
+// Clone returns a copy of the check stats, safe to read after the lock is released.
+func (cs *Stats) Clone() *Stats {
+	cs.m.Lock()
+	defer cs.m.Unlock()
+
+	return &Stats{stats: deepcopy.Copy(cs.stats).(stats)}
 }
 
 type aggStats struct {

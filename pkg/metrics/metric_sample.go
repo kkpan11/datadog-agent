@@ -6,6 +6,7 @@
 package metrics
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	taggertypes "github.com/DataDog/datadog-agent/pkg/tagger/types"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
 )
@@ -37,9 +38,6 @@ var (
 		DistributionType: {},
 	}
 )
-
-// EnrichTagsfn can be used to Enrich tags with origin detection tags.
-type EnrichTagsfn func(tb tagset.TagsAccumulator, origin taggertypes.OriginInfo)
 
 // String returns a string representation of MetricType
 func (m MetricType) String() string {
@@ -81,7 +79,7 @@ type MetricSampleContext interface {
 	// Implementations should call `Append` or `AppendHashed` on the provided accumulators.
 	// Tags from origin detection should be appended to taggerBuffer. Client-provided tags
 	// should be appended to the metricBuffer.
-	GetTags(taggerBuffer, metricBuffer tagset.TagsAccumulator, fn EnrichTagsfn)
+	GetTags(taggerBuffer, metricBuffer tagset.TagsAccumulator, tagger tagger.Component)
 
 	// GetMetricType returns the metric type for this metric.  This is used for telemetry.
 	GetMetricType() MetricType
@@ -93,6 +91,9 @@ type MetricSampleContext interface {
 	GetSource() MetricSource
 }
 
+// UnitMilliseconds is the unit string for timing metrics, as defined by the Datadog API.
+const UnitMilliseconds = "millisecond"
+
 // MetricSample represents a raw metric sample
 type MetricSample struct {
 	Name            string
@@ -102,12 +103,13 @@ type MetricSample struct {
 	Tags            []string
 	Host            string
 	SampleRate      float64
-	Timestamp       float64
+	Timestamp       float64 // Seconds since epoch (accepts fractional seconds)
 	FlushFirstValue bool
 	OriginInfo      taggertypes.OriginInfo
 	ListenerID      string
 	NoIndex         bool
 	Source          MetricSource
+	Unit            string
 }
 
 // Implement the MetricSampleContext interface
@@ -123,9 +125,9 @@ func (m *MetricSample) GetHost() string {
 }
 
 // GetTags returns the metric sample tags
-func (m *MetricSample) GetTags(taggerBuffer, metricBuffer tagset.TagsAccumulator, fn EnrichTagsfn) {
+func (m *MetricSample) GetTags(taggerBuffer, metricBuffer tagset.TagsAccumulator, tagger tagger.Component) {
 	metricBuffer.Append(m.Tags...)
-	fn(taggerBuffer, m.OriginInfo)
+	tagger.EnrichTags(taggerBuffer, m.OriginInfo)
 }
 
 // GetMetricType implements MetricSampleContext#GetMetricType.
@@ -150,4 +152,26 @@ func (m *MetricSample) IsNoIndex() bool {
 // GetSource returns the currently set MetricSource
 func (m *MetricSample) GetSource() MetricSource {
 	return m.Source
+}
+
+// GetValue returns the metric sample value, satisfying observer.MetricView.
+func (m *MetricSample) GetValue() float64 {
+	return m.Value
+}
+
+// GetRawTags returns the metric sample tags, satisfying observer.MetricView.
+// The caller must not retain the slice — it may be returned to a pool.
+func (m *MetricSample) GetRawTags() []string {
+	return m.Tags
+}
+
+// GetTimestampUnix returns the metric sample timestamp in Unix seconds, satisfying observer.MetricView.
+// Returns 0 for un-timestamped samples (standard DogStatsD submissions).
+func (m *MetricSample) GetTimestampUnix() int64 {
+	return int64(m.Timestamp)
+}
+
+// GetSampleRate returns the metric sample rate, satisfying observer.MetricView.
+func (m *MetricSample) GetSampleRate() float64 {
+	return m.SampleRate
 }

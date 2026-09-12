@@ -15,46 +15,52 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/networkdevice/profile/profiledefinition"
 )
 
-// GetProfileProvider returns a Provider that knows the on-disk profiles as well as any overrides from the initConfig.
-func GetProfileProvider(initConfigProfiles ProfileConfigMap) (Provider, bool, error) {
-	profiles, haveLegacyProfile, err := loadProfiles(initConfigProfiles)
+// GetProfileProvider returns a Provider that knows the on-disk profiles as well as any overrides
+// from the initConfig, along with the sorted names of the profiles using the legacy Python syntax.
+func GetProfileProvider(initConfigProfiles ProfileConfigMap) (Provider, []string, error) {
+	profiles, legacyProfiles, err := loadProfiles(initConfigProfiles)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
-	return StaticProvider(profiles), haveLegacyProfile, nil
+	return StaticProvider(profiles), legacyProfiles, nil
 }
 
-func loadProfiles(initConfigProfiles ProfileConfigMap) (ProfileConfigMap, bool, error) {
+func loadProfiles(initConfigProfiles ProfileConfigMap) (ProfileConfigMap, []string, error) {
 	var profiles ProfileConfigMap
-	var haveLegacyProfile bool
+	var legacyProfiles []string
 
 	if len(initConfigProfiles) > 0 {
 		// TODO: [PERFORMANCE] Load init config custom profiles once for all integrations
 		//   There are possibly multiple init configs
-		customProfiles, haveLegacyCustomProfile, err := loadInitConfigProfiles(initConfigProfiles)
+		customProfiles, legacyCustomProfiles, err := loadInitConfigProfiles(initConfigProfiles)
 		if err != nil {
-			return nil, haveLegacyCustomProfile, fmt.Errorf("failed to load profiles from initConfig: %w", err)
+			return nil, legacyCustomProfiles, fmt.Errorf("failed to load profiles from initConfig: %w", err)
 		}
 		profiles = customProfiles
-		haveLegacyProfile = haveLegacyCustomProfile
+		legacyProfiles = legacyCustomProfiles
 	} else {
-		defaultProfiles, haveLegacyYamlProfile, err := loadYamlProfiles()
+		defaultProfiles, legacyYamlProfiles, err := loadYamlProfiles()
 		if err != nil {
-			return nil, haveLegacyYamlProfile, fmt.Errorf("failed to load yaml profiles: %w", err)
+			return nil, legacyYamlProfiles, fmt.Errorf("failed to load yaml profiles: %w", err)
 		}
 		profiles = defaultProfiles
-		haveLegacyProfile = haveLegacyYamlProfile
+		legacyProfiles = legacyYamlProfiles
 	}
 	for _, profileDef := range profiles {
 		profiledefinition.NormalizeMetrics(profileDef.Definition.Metrics)
 	}
 
-	return profiles, haveLegacyProfile, nil
+	return profiles, legacyProfiles, nil
 }
 
 // getProfileForSysObjectID return a profile for a sys object id
 func getProfileForSysObjectID(profiles ProfileConfigMap, sysObjectID string) (*ProfileConfig, error) {
-	tmpSysOidToProfile := map[string]*ProfileConfig{}
+	type profileWithKey struct {
+		nameKey       string
+		profileConfig *ProfileConfig
+	}
+
+	tmpSysOidToProfile := map[string]profileWithKey{}
 	var matchedOIDs []string
 
 	for profileName, profConfig := range profiles {
@@ -68,15 +74,18 @@ func getProfileForSysObjectID(profiles ProfileConfigMap, sysObjectID string) (*P
 				continue
 			}
 			if prevMatchedProfile, ok := tmpSysOidToProfile[oidPattern]; ok {
-				if profiles[prevMatchedProfile.Definition.Name].IsUserProfile && !profConfig.IsUserProfile {
+				if profiles[prevMatchedProfile.nameKey].IsUserProfile && !profConfig.IsUserProfile {
 					continue
 				}
-				if profiles[prevMatchedProfile.Definition.Name].IsUserProfile == profConfig.IsUserProfile {
+				if profiles[prevMatchedProfile.nameKey].IsUserProfile == profConfig.IsUserProfile {
 					return nil, fmt.Errorf("profile %q has the same sysObjectID (%s) as %q", profileName, oidPattern,
-						prevMatchedProfile.Definition.Name)
+						prevMatchedProfile.nameKey)
 				}
 			}
-			tmpSysOidToProfile[oidPattern] = &profConfig
+			tmpSysOidToProfile[oidPattern] = profileWithKey{
+				nameKey:       profileName,
+				profileConfig: &profConfig,
+			}
 			matchedOIDs = append(matchedOIDs, oidPattern)
 		}
 	}
@@ -88,5 +97,5 @@ func getProfileForSysObjectID(profiles ProfileConfigMap, sysObjectID string) (*P
 		return nil, fmt.Errorf("failed to get most specific profile for sysObjectID %q, for matched oids %v: %w",
 			sysObjectID, matchedOIDs, err)
 	}
-	return tmpSysOidToProfile[oid], nil
+	return tmpSysOidToProfile[oid].profileConfig, nil
 }

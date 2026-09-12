@@ -14,14 +14,20 @@ import (
 const (
 	sqlDBSuffix  string = "/storage/db.sql"
 	boltDBSuffix string = "/storage/libpod/bolt_state.db"
+
+	// ContainerRootDirAnnotationKey is the workloadmeta annotation key under which the
+	// Podman collector stores the storage root directory for a container. Other components
+	// (e.g. log collection) can read it to locate per-container files without rescanning
+	// the filesystem.
+	ContainerRootDirAnnotationKey = "com.datadoghq.podman.root_dir"
 )
 
 // ExtractPodmanRootDirFromDBPath extracts the podman base path for the containers directory based on the user-provided `podman_db_path`.
 func ExtractPodmanRootDirFromDBPath(podmanDBPath string) string {
-	if strings.HasSuffix(podmanDBPath, sqlDBSuffix) {
-		return strings.TrimSuffix(podmanDBPath, sqlDBSuffix)
-	} else if strings.HasSuffix(podmanDBPath, boltDBSuffix) {
-		return strings.TrimSuffix(podmanDBPath, boltDBSuffix)
+	if before, ok := strings.CutSuffix(podmanDBPath, sqlDBSuffix); ok {
+		return before
+	} else if before, ok := strings.CutSuffix(podmanDBPath, boltDBSuffix); ok {
+		return before
 	}
 	return ""
 }

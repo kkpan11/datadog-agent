@@ -43,7 +43,7 @@ func (c *Check) Connect() (*sqlx.DB, error) {
 			if c.config.Protocol == "TCPS" {
 				protocolString = "tcps://"
 				if c.config.Wallet != "" {
-					walletString = fmt.Sprintf("?wallet_location=%s", c.config.Wallet)
+					walletString = "?wallet_location=" + c.config.Wallet
 				}
 			}
 			connStr = fmt.Sprintf(`user="%s" password="%s" connectString="%s%s:%d/%s%s"`, c.config.Username, c.config.Password, protocolString, c.config.Server, c.config.Port, c.config.ServiceName, walletString)
@@ -55,10 +55,6 @@ func (c *Check) Connect() (*sqlx.DB, error) {
 			sqlx.BindDriver("oracle", sqlx.NAMED)
 		}
 	}
-	if oracleDriver == common.Godror && c.config.InstanceConfig.OracleClientLibDir != "" {
-		connStr = fmt.Sprintf(`%s libDir="%s"`, connStr, c.config.InstanceConfig.OracleClientLibDir)
-	}
-
 	c.driver = oracleDriver
 
 	log.Infof("%s driver: %s", c.logPrompt, oracleDriver)
@@ -90,7 +86,7 @@ func (c *Check) Connect() (*sqlx.DB, error) {
 		binds := assertBool(c.config.AgentSQLTrace.Binds)
 		waits := assertBool(c.config.AgentSQLTrace.Waits)
 		setEventsStatement := fmt.Sprintf("BEGIN dbms_monitor.session_trace_enable (binds => %t, waits => %t); END;", binds, waits)
-		log.Trace("%s trace statement: %s", c.logPrompt, setEventsStatement)
+		log.Tracef("%s trace statement: %s", c.logPrompt, setEventsStatement)
 		_, err = db.Exec(setEventsStatement)
 		if err != nil {
 			log.Errorf("%s failed to set SQL trace: %v", c.logPrompt, err)

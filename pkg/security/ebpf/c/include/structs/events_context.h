@@ -22,19 +22,28 @@ struct syscall_context_t {
 struct span_context_t {
     u64 span_id;
     u64 trace_id[2];
+    u64 extra_attrs_id; // reserved for extra span attributes; 0 when none are available
+};
+
+// Handle to a set of Go pprof labels stored in the go_labels_ctx ring.
+// Looks the id up and parses the required raw labels in userspace.
+struct go_labels_context_t {
+    u32 id;
+    u32 padding;
 };
 
 struct process_context_t {
     u32 pid;
     u32 tid;
     u32 netns;
+    u32 mntns;
     u32 is_kworker;
+    u32 ppid;
+    u32 sid;
+    u32 padding_sid;
     u64 inode;
+    u64 user_session_id;
 };
-
-typedef char container_id_t[CONTAINER_ID_LEN];
-
-typedef char cgroup_prefix_t[256];
 
 struct ktimeval {
     long tv_sec;
@@ -60,13 +69,7 @@ struct file_t {
 };
 
 struct cgroup_context_t {
-    u64 cgroup_flags;
-    struct path_key_t cgroup_file;
-};
-
-struct container_context_t {
-    container_id_t container_id;
-    struct cgroup_context_t cgroup_context;
+    struct path_key_t path_key;
 };
 
 #endif

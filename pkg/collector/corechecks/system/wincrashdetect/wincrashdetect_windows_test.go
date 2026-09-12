@@ -30,6 +30,8 @@ const (
 	systemProbeTestPipeName = `\\.\pipe\dd_system_probe_wincrash_test`
 )
 
+var mockCallStackFrames = []string{"frame1", "frame2"}
+
 func testSetup(t *testing.T) {
 	// change the hive to hku for the test
 	hive = registry.CURRENT_USER
@@ -46,8 +48,8 @@ func testSetup(t *testing.T) {
 
 func TestWinCrashReporting(t *testing.T) {
 	mockSysProbeConfig := configmock.NewSystemProbe(t)
-	mockSysProbeConfig.SetWithoutSource("system_probe_config.enabled", true)
-	mockSysProbeConfig.SetWithoutSource("system_probe_config.sysprobe_socket", systemProbeTestPipeName)
+	mockSysProbeConfig.SetInTest("system_probe_config.enabled", true)
+	mockSysProbeConfig.SetInTest("system_probe_config.sysprobe_socket", systemProbeTestPipeName)
 
 	// The test named pipe allows the current user.
 	listener, err := server.NewListenerForCurrentUser(systemProbeTestPipeName)
@@ -71,8 +73,8 @@ func TestWinCrashReporting(t *testing.T) {
 	 */
 	var p *probe.WinCrashStatus
 
-	mux.Handle("/windows_crash_detection/check", http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-		utils.WriteAsJSON(rw, p, utils.CompactOutput)
+	mux.Handle("/windows_crash_detection/check", http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		utils.WriteAsJSON(req, rw, p, utils.CompactOutput)
 	}))
 	mux.Handle("/debug/stats", http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 	}))
@@ -88,8 +90,8 @@ func TestWinCrashReporting(t *testing.T) {
 
 		check := newCheck()
 		crashCheck := check.(*WinCrashDetect)
-		mock := mocksender.NewMockSender(crashCheck.ID())
-		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "")
+		mock := mocksender.NewMockSender(t, crashCheck.ID())
+		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "", "")
 		assert.NoError(t, err)
 
 		err = crashCheck.Run()
@@ -102,19 +104,25 @@ func TestWinCrashReporting(t *testing.T) {
 	t.Run("test that a crash is properly reported", func(t *testing.T) {
 		testSetup(t)
 		p = &probe.WinCrashStatus{
-			StatusCode: probe.WinCrashStatusCodeSuccess,
-			FileName:   `c:\windows\memory.dmp`,
-			Type:       probe.DumpTypeAutomatic,
-			DateString: `Fri Jun 30 15:33:05.086 2023 (UTC - 7:00)`,
-			Offender:   `somedriver.sys`,
-			BugCheck:   "0x00000007",
+			StatusCode:   probe.WinCrashStatusCodeSuccess,
+			FileName:     `c:\windows\memory.dmp`,
+			Type:         probe.DumpTypeAutomatic,
+			DateString:   `Fri Jun 30 15:33:05.086 2023 (UTC - 7:00)`,
+			Offender:     `somedriver.sys`,
+			BugCheck:     "0x00000007",
+			BugCheckArg1: "0x1",
+			BugCheckArg2: "0x2",
+			BugCheckArg3: "0x3",
+			BugCheckArg4: "0x4",
+			Frames:       mockCallStackFrames,
 		}
 		check := newCheck()
 		crashCheck := check.(*WinCrashDetect)
-		mock := mocksender.NewMockSender(crashCheck.ID())
-		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "")
+		mock := mocksender.NewMockSender(t, crashCheck.ID())
+		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "", "")
 		assert.NoError(t, err)
 
+		// The text field describes the bugcheck information and callstack.
 		expected := event.Event{
 			Priority:       event.PriorityNormal,
 			SourceTypeName: CheckName,
@@ -165,7 +173,7 @@ func TestWinCrashReporting(t *testing.T) {
 
 		check = newCheck()
 		crashCheck = check.(*WinCrashDetect)
-		err = crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "")
+		err = crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "", "")
 		assert.Nil(t, err)
 		err = crashCheck.Run()
 		assert.Nil(t, err)
@@ -178,8 +186,8 @@ func TestWinCrashReporting(t *testing.T) {
 
 func TestCrashReportingStates(t *testing.T) {
 	mockSysProbeConfig := configmock.NewSystemProbe(t)
-	mockSysProbeConfig.SetWithoutSource("system_probe_config.enabled", true)
-	mockSysProbeConfig.SetWithoutSource("system_probe_config.sysprobe_socket", systemProbeTestPipeName)
+	mockSysProbeConfig.SetInTest("system_probe_config.enabled", true)
+	mockSysProbeConfig.SetInTest("system_probe_config.sysprobe_socket", systemProbeTestPipeName)
 
 	var crashStatus *probe.WinCrashStatus
 
@@ -212,6 +220,11 @@ func TestCrashReportingStates(t *testing.T) {
 		wcs.DateString = crashStatus.DateString
 		wcs.Offender = crashStatus.Offender
 		wcs.BugCheck = crashStatus.BugCheck
+		wcs.BugCheckArg1 = crashStatus.BugCheckArg1
+		wcs.BugCheckArg2 = crashStatus.BugCheckArg2
+		wcs.BugCheckArg3 = crashStatus.BugCheckArg3
+		wcs.BugCheckArg4 = crashStatus.BugCheckArg4
+		wcs.Frames = crashStatus.Frames
 
 		// Signal that the artificial delay is done.
 		wg.Done()
@@ -222,9 +235,9 @@ func TestCrashReportingStates(t *testing.T) {
 		assert.FailNow(t, "Should not parse")
 	}
 
-	mux.Handle("/windows_crash_detection/check", http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+	mux.Handle("/windows_crash_detection/check", http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		results := cp.Get()
-		utils.WriteAsJSON(rw, results, utils.CompactOutput)
+		utils.WriteAsJSON(req, rw, results, utils.CompactOutput)
 	}))
 	mux.Handle("/debug/stats", http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 	}))
@@ -235,18 +248,23 @@ func TestCrashReportingStates(t *testing.T) {
 
 		check := newCheck()
 		crashCheck := check.(*WinCrashDetect)
-		mock := mocksender.NewMockSender(crashCheck.ID())
-		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "")
+		mock := mocksender.NewMockSender(t, crashCheck.ID())
+		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "", "")
 		assert.NoError(t, err)
 
 		crashStatus = &probe.WinCrashStatus{
-			StatusCode: probe.WinCrashStatusCodeSuccess,
-			FileName:   `c:\windows\memory.dmp`,
-			Type:       probe.DumpTypeAutomatic,
-			ErrString:  "",
-			DateString: `Fri Jun 30 15:33:05.086 2023 (UTC - 7:00)`,
-			Offender:   `somedriver.sys`,
-			BugCheck:   "0x00000007",
+			StatusCode:   probe.WinCrashStatusCodeSuccess,
+			FileName:     `c:\windows\memory.dmp`,
+			Type:         probe.DumpTypeAutomatic,
+			ErrString:    "",
+			DateString:   `Fri Jun 30 15:33:05.086 2023 (UTC - 7:00)`,
+			Offender:     `somedriver.sys`,
+			BugCheck:     "0x00000007",
+			BugCheckArg1: "0x1",
+			BugCheckArg2: "0x2",
+			BugCheckArg3: "0x3",
+			BugCheckArg4: "0x4",
+			Frames:       mockCallStackFrames,
 		}
 
 		// Test the 2-check response from crash reporting.
@@ -266,6 +284,7 @@ func TestCrashReportingStates(t *testing.T) {
 		wg.Wait()
 		time.Sleep(4 * time.Second)
 
+		// The text field describes the bugcheck information and callstack.
 		expected := event.Event{
 			Priority:       event.PriorityNormal,
 			SourceTypeName: CheckName,
@@ -292,8 +311,8 @@ func TestCrashReportingStates(t *testing.T) {
 
 		check := newCheck()
 		crashCheck := check.(*WinCrashDetect)
-		mock := mocksender.NewMockSender(crashCheck.ID())
-		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "")
+		mock := mocksender.NewMockSender(t, crashCheck.ID())
+		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "", "")
 		assert.NoError(t, err)
 
 		noCrashStatus := &probe.WinCrashStatus{
@@ -317,8 +336,8 @@ func TestCrashReportingStates(t *testing.T) {
 
 		check := newCheck()
 		crashCheck := check.(*WinCrashDetect)
-		mock := mocksender.NewMockSender(crashCheck.ID())
-		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "")
+		mock := mocksender.NewMockSender(t, crashCheck.ID())
+		err := crashCheck.Configure(mock.GetSenderManager(), 0, nil, nil, "", "")
 		assert.NoError(t, err)
 
 		failedStatus := &probe.WinCrashStatus{

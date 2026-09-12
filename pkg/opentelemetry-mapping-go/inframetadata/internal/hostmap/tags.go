@@ -15,7 +15,10 @@ import (
 	conventions "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
-const hostTagPrefix = "datadog.host.tag."
+const (
+	hostTagPrefix      = "datadog.host.tag."
+	hostAliasAttribute = "datadog.host.aliases"
+)
 
 var hostTagMapping = map[string]string{
 	string(conventions.DeploymentEnvironmentKey): "env",
@@ -62,4 +65,27 @@ func getHostTags(m pcommon.Map) ([]string, error) {
 	// Allow for comparison of tags
 	sort.Strings(tags)
 	return tags, err
+}
+
+// getHostAliases tries to get host aliases from attribute datadog.host.aliases.
+// Returns nil if the attribute is absent, and a non-nil slice (possibly empty)
+// if the attribute is present — callers use nil to mean "attribute not set".
+func getHostAliases(attrs pcommon.Map) []string {
+	var hostAliases []string
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		if k == hostAliasAttribute {
+			if v.Type() != pcommon.ValueTypeSlice {
+				return false
+			}
+			hostAliases = []string{} // non-nil: attribute was present
+			for _, hostAlias := range v.Slice().AsRaw() {
+				if hostAliasStr, ok := hostAlias.(string); ok {
+					hostAliases = append(hostAliases, hostAliasStr)
+				}
+			}
+			return false
+		}
+		return true
+	})
+	return hostAliases
 }

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package events
 
@@ -19,11 +19,16 @@ import (
 	"github.com/cilium/ebpf/features"
 
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
+	"github.com/DataDog/datadog-agent/pkg/ebpf/modifiers"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/names"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/utils"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+)
+
+const (
+	eventsMapSuffix = "_batch_events"
 )
 
 // Configure a given `*manager.Manager` for event processing
@@ -152,7 +157,7 @@ func removeRingBufferHelperCalls(m *manager.Manager) {
 	// TODO: this is not the intended API usage of a `ebpf.Modifier`.
 	// Once we have access to the `ddebpf.Manager`, add this modifier to its list of
 	// `EnabledModifiers` and let it control the execution of the callbacks
-	patcher := ddebpf.NewHelperCallRemover(asm.FnRingbufOutput, asm.FnRingbufQuery, asm.FnRingbufReserve, asm.FnRingbufSubmit, asm.FnRingbufDiscard)
+	patcher := modifiers.NewHelperCallRemover(asm.FnRingbufOutput, asm.FnRingbufQuery, asm.FnRingbufReserve, asm.FnRingbufSubmit, asm.FnRingbufDiscard)
 	err := patcher.BeforeInit(m, names.NewModuleName("usm"), nil)
 
 	if err != nil {
@@ -192,7 +197,7 @@ func alreadySetUp(proto string, m *manager.Manager) bool {
 // handlerByProtocol acts as registry holding a temporary reference to a
 // `ddebpf.Handler` instance for a given protocol. This is done to simplify the
 // usage of this package a little bit, so a call to `events.Configure` can be
-// later linked to a call to `events.NewConsumer` without the need to explicitly
+// later linked to a call to `events.NewBatchConsumer` without the need to explicitly
 // propagate any values. The map is guarded by `handlerMux`.
 var handlerByProtocol map[string]ddebpf.EventHandler
 var handlerMux sync.Mutex

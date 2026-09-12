@@ -22,7 +22,7 @@ type ProcessResult struct {
 	RequeueAfter time.Duration
 }
 
-// ShouldRequeue is small helper to know if we should requeue
+// ShouldRequeue is a small helper to know if we should requeue
 func (p ProcessResult) ShouldRequeue() bool {
 	return p.Requeue || p.RequeueAfter > 0
 }
@@ -62,7 +62,7 @@ type Processor interface {
 	Process(ctx context.Context, key, ns, name string) ProcessResult
 }
 
-// ProcessorPreStart is an interface that can be implemented by the Processor to perform some initialization after informers are synced and before the controller starts
+// ProcessorPreStart is an interface that can be implemented by the Processor to perform some initialization before the informers and workers are started
 type ProcessorPreStart interface {
 	// PreStart is called by the controller before starting workers
 	PreStart(ctx context.Context)

@@ -20,14 +20,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretsmock "github.com/DataDog/datadog-agent/comp/core/secrets/mock"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatform"
-	orchestratorforwarder "github.com/DataDog/datadog-agent/comp/forwarder/orchestrator"
+	filterlistmock "github.com/DataDog/datadog-agent/comp/filterlist/fx-mock"
+	defaultforwardermock "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/mock"
+	eventplatform "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/def"
+	orchestratorforwarder "github.com/DataDog/datadog-agent/comp/forwarder/orchestrator/def"
 	haagent "github.com/DataDog/datadog-agent/comp/haagent/def"
 	haagentmock "github.com/DataDog/datadog-agent/comp/haagent/mock"
 	logscompressionmock "github.com/DataDog/datadog-agent/comp/serializer/logscompression/fx-mock"
@@ -38,7 +43,6 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
-	serializermock "github.com/DataDog/datadog-agent/pkg/serializer/mocks"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
 	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
@@ -85,6 +89,14 @@ func getAggregator(t *testing.T) *BufferedAggregator {
 	return deps.Demultiplexer.Aggregator()
 }
 
+func versionTags() []string {
+	tags := []string{"version:" + version.AgentVersion}
+	if version.AgentPackageVersion != "" {
+		tags = append(tags, "package_version:"+version.AgentPackageVersion)
+	}
+	return tags
+}
+
 func TestRegisterCheckSampler(t *testing.T) {
 	// this test IS USING globals
 	// -
@@ -115,7 +127,7 @@ func TestDeregisterCheckSampler(t *testing.T) {
 	deps := createAggrDeps(t)
 	demux := deps.Demultiplexer
 
-	defer demux.Stop(false)
+	defer demux.Stop()
 
 	agg := demux.Aggregator()
 	agg.checkSamplers = make(map[checkid.ID]*CheckSampler)
@@ -154,7 +166,8 @@ func TestAddServiceCheckDefaultValues(t *testing.T) {
 
 	s := &MockSerializerIterableSerie{}
 	taggerComponent := taggerfxmock.SetupFakeTagger(t)
-	agg := NewBufferedAggregator(s, nil, nil, taggerComponent, "resolved-hostname", DefaultFlushInterval)
+
+	agg := NewBufferedAggregator(s, nil, nil, taggerComponent, "resolved-hostname", DefaultFlushInterval, filterlistmock.NewMockFilterList())
 
 	agg.addServiceCheck(servicecheck.ServiceCheck{
 		// leave Host and Ts fields blank
@@ -187,7 +200,7 @@ func TestAddEventDefaultValues(t *testing.T) {
 
 	s := &MockSerializerIterableSerie{}
 	taggerComponent := taggerfxmock.SetupFakeTagger(t)
-	agg := NewBufferedAggregator(s, nil, nil, taggerComponent, "resolved-hostname", DefaultFlushInterval)
+	agg := NewBufferedAggregator(s, nil, nil, taggerComponent, "resolved-hostname", DefaultFlushInterval, filterlistmock.NewMockFilterList())
 
 	agg.addEvent(event.Event{
 		// only populate required fields
@@ -237,7 +250,7 @@ func TestDefaultData(t *testing.T) {
 
 	s := &MockSerializerIterableSerie{}
 	taggerComponent := taggerfxmock.SetupFakeTagger(t)
-	agg := NewBufferedAggregator(s, nil, haagentmock.NewMockHaAgent(), taggerComponent, "hostname", DefaultFlushInterval)
+	agg := NewBufferedAggregator(s, nil, haagentmock.NewMockHaAgent(), taggerComponent, "hostname", DefaultFlushInterval, filterlistmock.NewMockFilterList())
 
 	start := time.Now()
 
@@ -256,18 +269,10 @@ func TestDefaultData(t *testing.T) {
 	series := metrics.Series{&metrics.Serie{
 		Name:           fmt.Sprintf("datadog.%s.running", flavor.GetFlavor()),
 		Points:         []metrics.Point{{Value: 1, Ts: float64(start.Unix())}},
-		Tags:           tagset.CompositeTagsFromSlice([]string{fmt.Sprintf("version:%s", version.AgentVersion)}),
+		Tags:           tagset.CompositeTagsFromSlice(versionTags()),
 		Host:           agg.hostname,
 		MType:          metrics.APIGaugeType,
 		SourceTypeName: "System",
-	}, &metrics.Serie{
-		Name:           fmt.Sprintf("n_o_i_n_d_e_x.datadog.%s.payload.dropped", flavor.GetFlavor()),
-		Points:         []metrics.Point{{Value: 0, Ts: float64(start.Unix())}},
-		Host:           agg.hostname,
-		Tags:           tagset.CompositeTagsFromSlice([]string{}),
-		MType:          metrics.APIGaugeType,
-		SourceTypeName: "System",
-		NoIndex:        true,
 	}}
 
 	s.On("SendSeries", series).Return(nil).Times(1)
@@ -285,13 +290,13 @@ func TestDefaultSeries(t *testing.T) {
 	taggerComponent := taggerfxmock.SetupFakeTagger(t)
 
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("config_id", "config123")
+	mockConfig.SetInTest("config_id", "config123")
 
 	mockHaAgent := haagentmock.NewMockHaAgent().(haagentmock.Component)
 	mockHaAgent.SetEnabled(true)
 	mockHaAgent.SetState(haagent.Active)
 
-	agg := NewBufferedAggregator(s, nil, mockHaAgent, taggerComponent, "hostname", DefaultFlushInterval)
+	agg := NewBufferedAggregator(s, nil, mockHaAgent, taggerComponent, "hostname", DefaultFlushInterval, filterlistmock.NewMockFilterList())
 
 	start := time.Now()
 
@@ -310,7 +315,7 @@ func TestDefaultSeries(t *testing.T) {
 	expectedSeries := metrics.Series{&metrics.Serie{
 		Name:           fmt.Sprintf("datadog.%s.running", flavor.GetFlavor()),
 		Points:         []metrics.Point{{Value: 1, Ts: float64(start.Unix())}},
-		Tags:           tagset.CompositeTagsFromSlice([]string{"version:" + version.AgentVersion, "config_id:config123"}),
+		Tags:           tagset.CompositeTagsFromSlice(append(versionTags(), "config_id:config123")),
 		Host:           agg.hostname,
 		MType:          metrics.APIGaugeType,
 		SourceTypeName: "System",
@@ -321,14 +326,6 @@ func TestDefaultSeries(t *testing.T) {
 		Host:           agg.hostname,
 		MType:          metrics.APIGaugeType,
 		SourceTypeName: "System",
-	}, &metrics.Serie{
-		Name:           fmt.Sprintf("n_o_i_n_d_e_x.datadog.%s.payload.dropped", flavor.GetFlavor()),
-		Points:         []metrics.Point{{Value: 0, Ts: float64(start.Unix())}},
-		Host:           agg.hostname,
-		Tags:           tagset.CompositeTagsFromSlice([]string{}),
-		MType:          metrics.APIGaugeType,
-		SourceTypeName: "System",
-		NoIndex:        true,
 	}}
 
 	s.On("SendSeries", expectedSeries).Return(nil).Times(1)
@@ -383,10 +380,11 @@ func TestSeriesTooManyTags(t *testing.T) {
 
 			s.On("AreSeriesEnabled").Return(true)
 			s.On("AreSketchesEnabled").Return(true)
-			s.On("SendServiceChecks", mock.Anything).Return(nil).Times(1)
-			s.On("SendIterableSeries", mock.Anything).Return(nil).Times(1)
+			// Stop() performs a final flush, so allow these to be called more than once.
+			s.On("SendServiceChecks", mock.Anything).Return(nil)
+			s.On("SendIterableSeries", mock.Anything).Return(nil)
 
-			demux.ForceFlushToSerializer(start, true)
+			demux.ForceFlushToSerializer(start, true, false)
 			s.AssertNotCalled(t, "SendEvents")
 			s.AssertNotCalled(t, "SendSketch")
 
@@ -399,7 +397,7 @@ func TestSeriesTooManyTags(t *testing.T) {
 			assert.Equal(t, expMap, gotMap)
 
 			// reset telemetry for next tests
-			demux.Stop(false)
+			demux.Stop()
 			recurrentSeries = metrics.Series{}
 			tagsetTlm.reset()
 		}
@@ -455,7 +453,7 @@ func TestDistributionsTooManyTags(t *testing.T) {
 			s.On("SendIterableSeries", mock.Anything).Return(nil).Times(1)
 			s.On("SendSketch", mock.Anything).Return(nil).Times(1)
 
-			demux.ForceFlushToSerializer(start, true)
+			demux.ForceFlushToSerializer(start, true, false)
 			s.AssertNotCalled(t, "SendEvents")
 
 			expMap := map[string]uint64{}
@@ -524,18 +522,10 @@ func TestRecurrentSeries(t *testing.T) {
 	}, &metrics.Serie{
 		Name:           fmt.Sprintf("datadog.%s.running", flavor.GetFlavor()),
 		Points:         []metrics.Point{{Value: 1, Ts: float64(start.Unix())}},
-		Tags:           tagset.CompositeTagsFromSlice([]string{fmt.Sprintf("version:%s", version.AgentVersion)}),
+		Tags:           tagset.CompositeTagsFromSlice(versionTags()),
 		Host:           demux.Aggregator().hostname,
 		MType:          metrics.APIGaugeType,
 		SourceTypeName: "System",
-	}, &metrics.Serie{
-		Name:           fmt.Sprintf("n_o_i_n_d_e_x.datadog.%s.payload.dropped", flavor.GetFlavor()),
-		Points:         []metrics.Point{{Value: 0, Ts: float64(start.Unix())}},
-		Host:           demux.Aggregator().hostname,
-		Tags:           tagset.CompositeTagsFromSlice([]string{}),
-		MType:          metrics.APIGaugeType,
-		SourceTypeName: "System",
-		NoIndex:        true,
 	}}
 
 	// Check only the name for `datadog.agent.up` as the timestamp may not be the same.
@@ -550,7 +540,7 @@ func TestRecurrentSeries(t *testing.T) {
 	})
 
 	s.On("SendServiceChecks", agentUpMatcher).Return(nil).Times(1)
-	demux.ForceFlushToSerializer(start, true)
+	demux.ForceFlushToSerializer(start, true, false)
 	require.EqualValues(t, expectedSeries, s.series)
 	s.series = nil
 
@@ -560,7 +550,7 @@ func TestRecurrentSeries(t *testing.T) {
 	// Assert that recurrentSeries are sent on each flushed
 	// same goes for the service check
 	s.On("SendServiceChecks", agentUpMatcher).Return(nil).Times(1)
-	demux.ForceFlushToSerializer(start, true)
+	demux.ForceFlushToSerializer(start, true, false)
 	require.EqualValues(t, expectedSeries, s.series)
 	s.series = nil
 
@@ -594,7 +584,7 @@ func TestTags(t *testing.T) {
 			agentTags:               func(types.TagCardinality) ([]string, error) { return nil, errors.New("disabled") },
 			globalTags:              func(types.TagCardinality) ([]string, error) { return nil, errors.New("disabled") },
 			withVersion:             true,
-			want:                    []string{"version:" + version.AgentVersion},
+			want:                    versionTags(),
 		},
 		{
 			name:                    "tags disabled, without version",
@@ -612,7 +602,7 @@ func TestTags(t *testing.T) {
 			agentTags:               func(types.TagCardinality) ([]string, error) { return []string{"container_name:agent"}, nil },
 			globalTags:              func(types.TagCardinality) ([]string, error) { return nil, errors.New("disabled") },
 			withVersion:             true,
-			want:                    []string{"container_name:agent", "version:" + version.AgentVersion},
+			want:                    append(versionTags(), "container_name:agent"),
 		},
 		{
 			name:                    "tags enabled, without version",
@@ -630,7 +620,7 @@ func TestTags(t *testing.T) {
 			agentTags:               func(types.TagCardinality) ([]string, error) { return nil, errors.New("no tags") },
 			globalTags:              func(types.TagCardinality) ([]string, error) { return nil, errors.New("disabled") },
 			withVersion:             true,
-			want:                    []string{"version:" + version.AgentVersion},
+			want:                    versionTags(),
 		},
 		{
 			name:                    "tags enabled, with version, with global tags (no hostname)",
@@ -639,7 +629,7 @@ func TestTags(t *testing.T) {
 			agentTags:               func(types.TagCardinality) ([]string, error) { return []string{"container_name:agent"}, nil },
 			globalTags:              func(types.TagCardinality) ([]string, error) { return []string{"kube_cluster_name:foo"}, nil },
 			withVersion:             true,
-			want:                    []string{"container_name:agent", "version:" + version.AgentVersion, "kube_cluster_name:foo"},
+			want:                    append(versionTags(), "container_name:agent", "kube_cluster_name:foo"),
 		},
 		{
 			name:                    "tags enabled, with version, with global tags (hostname present)",
@@ -648,21 +638,21 @@ func TestTags(t *testing.T) {
 			agentTags:               func(types.TagCardinality) ([]string, error) { return []string{"container_name:agent"}, nil },
 			globalTags:              func(types.TagCardinality) ([]string, error) { return []string{"kube_cluster_name:foo"}, nil },
 			withVersion:             true,
-			want:                    []string{"container_name:agent", "version:" + version.AgentVersion, "kube_cluster_name:foo"},
+			want:                    append(versionTags(), "container_name:agent", "kube_cluster_name:foo"),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mockConfig := configmock.New(t)
-			mockConfig.SetWithoutSource("basic_telemetry_add_container_tags", tt.tlmContainerTagsEnabled)
-			mockConfig.SetWithoutSource("config_id", tt.configID)
+			mockConfig.SetInTest("basic_telemetry_add_container_tags", tt.tlmContainerTagsEnabled)
+			mockConfig.SetInTest("config_id", tt.configID)
 
 			taggerComponent := taggerfxmock.SetupFakeTagger(t)
 
 			mockHaAgent := haagentmock.NewMockHaAgent().(haagentmock.Component)
 			mockHaAgent.SetEnabled(tt.haAgentEnabled)
 
-			agg := NewBufferedAggregator(nil, nil, mockHaAgent, taggerComponent, tt.hostname, time.Second)
+			agg := NewBufferedAggregator(nil, nil, mockHaAgent, taggerComponent, tt.hostname, time.Second, filterlistmock.NewMockFilterList())
 			agg.agentTags = tt.agentTags
 			agg.globalTags = tt.globalTags
 			assert.ElementsMatch(t, tt.want, agg.tags(tt.withVersion))
@@ -689,12 +679,12 @@ func TestConfigIDTags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mockConfig := configmock.New(t)
-			mockConfig.SetWithoutSource("config_id", tt.configID)
+			mockConfig.SetInTest("config_id", tt.configID)
 
 			taggerComponent := taggerfxmock.SetupFakeTagger(t)
 			mockHaAgent := haagentmock.NewMockHaAgent().(haagentmock.Component)
 
-			agg := NewBufferedAggregator(nil, nil, mockHaAgent, taggerComponent, "my-hostname", time.Second)
+			agg := NewBufferedAggregator(nil, nil, mockHaAgent, taggerComponent, "my-hostname", time.Second, filterlistmock.NewMockFilterList())
 			assert.ElementsMatch(t, tt.want, agg.configIDTags())
 		})
 	}
@@ -702,7 +692,7 @@ func TestConfigIDTags(t *testing.T) {
 
 func TestTimeSamplerFlush(t *testing.T) {
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("dogstatsd_pipeline_count", 1)
+	mockConfig.SetInTest("dogstatsd_pipeline_count", 1)
 
 	s := &MockSerializerIterableSerie{}
 	s.On("AreSeriesEnabled").Return(true)
@@ -721,12 +711,12 @@ func TestAddDJMRecurrentSeries(t *testing.T) {
 	// this test IS USING globals (recurrentSeries)
 	// -
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("djm_config.enabled", true)
+	mockConfig.SetInTest("djm_config.enabled", true)
 
 	s := &MockSerializerIterableSerie{}
 	// NewBufferedAggregator with DJM enable will create a new recurrentSeries
 	taggerComponent := taggerfxmock.SetupFakeTagger(t)
-	NewBufferedAggregator(s, nil, nil, taggerComponent, "hostname", DefaultFlushInterval)
+	NewBufferedAggregator(s, nil, nil, taggerComponent, "hostname", DefaultFlushInterval, filterlistmock.NewMockFilterList())
 
 	expectedRecurrentSeries := metrics.Series{&metrics.Serie{
 		Name:   "datadog.djm.agent_host",
@@ -738,23 +728,6 @@ func TestAddDJMRecurrentSeries(t *testing.T) {
 
 	// Reset recurrentSeries
 	recurrentSeries = metrics.Series{}
-}
-
-// The implementation of MockSerializer.SendIterableSeries uses `s.Called(series).Error(0)`.
-// It calls internaly `Printf` on each field of the real type of `IterableStreamJSONMarshaler` which is `IterableSeries`.
-// It can lead to a race condition, if another goruntine call `IterableSeries.Append` which modifies `series.count`.
-// MockSerializerIterableSerie overrides `SendIterableSeries` to avoid this issue.
-// It also overrides `SendSeries` for simplificy.
-type MockSerializerIterableSerie struct {
-	series []*metrics.Serie
-	serializermock.MetricSerializer
-}
-
-func (s *MockSerializerIterableSerie) SendIterableSeries(seriesSource metrics.SerieSource) error {
-	for seriesSource.MoveNext() {
-		s.series = append(s.series, seriesSource.Current())
-	}
-	return nil
 }
 
 func flushSomeSamples(demux *AgentDemultiplexer) map[string]*metrics.Serie {
@@ -786,7 +759,7 @@ func flushSomeSamples(demux *AgentDemultiplexer) map[string]*metrics.Serie {
 	// sure all samples have been processed by the sampler
 	time.Sleep(1 * time.Second)
 
-	demux.ForceFlushToSerializer(time.Unix(int64(timeSamplerBucketSize)*3, 0), true)
+	demux.ForceFlushToSerializer(time.Unix(int64(timeSamplerBucketSize)*3, 0), true, false)
 	return expectedSeries
 }
 
@@ -796,8 +769,7 @@ func assertSeriesEqual(t *testing.T, series []*metrics.Serie, expectedSeries map
 	r := require.New(t)
 	for _, serie := range series {
 		// ignore default series automatically sent by the aggregator
-		if serie.Name == fmt.Sprintf("datadog.%s.running", flavor.GetFlavor()) ||
-			serie.Name == fmt.Sprintf("n_o_i_n_d_e_x.datadog.%s.payload.dropped", flavor.GetFlavor()) {
+		if serie.Name == fmt.Sprintf("datadog.%s.running", flavor.GetFlavor()) {
 			// ignore default series
 			continue
 		}
@@ -837,7 +809,16 @@ type aggregatorDeps struct {
 }
 
 func createAggrDeps(t *testing.T) aggregatorDeps {
-	deps := fxutil.Test[TestDeps](t, defaultforwarder.MockModule(), core.MockBundle(), logscompressionmock.MockModule(), metricscompressionmock.MockModule(), haagentmock.Module())
+	deps := fxutil.Test[TestDeps](t,
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		defaultforwardermock.MockModule(),
+		core.MockBundle(),
+		hostnameimpl.MockModule(),
+		logscompressionmock.MockModule(),
+		metricscompressionmock.MockModule(),
+		haagentmock.Module(),
+		filterlistmock.MockModule(),
+	)
 
 	opts := demuxTestOptions()
 	return aggregatorDeps{

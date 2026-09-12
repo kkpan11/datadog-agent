@@ -29,8 +29,22 @@ func BuildTaggerEntityID(entityID workloadmeta.EntityID) types.EntityID {
 		return types.NewEntityID(types.KubernetesDeployment, entityID.ID)
 	case workloadmeta.KindKubernetesMetadata:
 		return types.NewEntityID(types.KubernetesMetadata, entityID.ID)
+	case workloadmeta.KindKubernetesNode:
+		return types.NewEntityID(types.KubernetesNode, entityID.ID)
+	case workloadmeta.KindKubernetesKueueQueue:
+		return types.NewEntityID(types.KubernetesKueueQueue, entityID.ID)
+	case workloadmeta.KindKubernetesKueueResourceFlavor:
+		return types.NewEntityID(types.KueueResourceFlavor, entityID.ID)
+	case workloadmeta.KindKubernetesKueueWorkload:
+		return types.NewEntityID(types.KueueWorkload, entityID.ID)
 	case workloadmeta.KindGPU:
 		return types.NewEntityID(types.GPU, entityID.ID)
+	case workloadmeta.KindKubelet:
+		return types.NewEntityID(types.Kubelet, entityID.ID)
+	case workloadmeta.KindCRD:
+		return types.NewEntityID(types.Crd, entityID.ID)
+	case workloadmeta.KindKubeCapabilities:
+		return types.NewEntityID(types.KubernetesCapabilities, entityID.ID)
 	default:
 		log.Errorf("can't recognize entity %q with kind %q; trying %s://%s as tagger entity",
 			entityID.ID, entityID.Kind, entityID.ID, entityID.Kind)

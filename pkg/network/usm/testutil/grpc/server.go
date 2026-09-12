@@ -16,15 +16,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	pbStream "github.com/pahanini/go-grpc-bidirectional-streaming-example/src/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 	"google.golang.org/grpc/examples/route_guide/routeguide"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/http/testutil"
+	grpcutil "github.com/DataDog/datadog-agent/pkg/util/grpc"
 )
 
 // Server is used to implement helloworld.GreeterServer.
@@ -40,46 +40,11 @@ type Server struct {
 
 	pb.UnimplementedGreeterServer
 	routeguide.UnimplementedRouteGuideServer
-	pbStream.UnimplementedMathServer
 }
 
 // SayHello implements helloworld.GreeterServer.
 func (*Server) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
 	return &pb.HelloReply{Message: "Hello " + in.GetName()}, nil
-}
-
-// Max implements MathServer.
-func (*Server) Max(srv pbStream.Math_MaxServer) error {
-	var max int32
-	for {
-		select {
-		case <-srv.Context().Done():
-			return srv.Context().Err()
-		default:
-		}
-
-		// receive data from stream
-		req, err := srv.Recv()
-		if err == io.EOF {
-			// return will close stream from server side
-			return nil
-		}
-		if err != nil {
-			log.Printf("receive error %v", err)
-			continue
-		}
-
-		if req.Num <= max {
-			continue
-		}
-
-		// update max and send it to stream
-		max = req.Num
-		resp := pbStream.Response{Result: max}
-		if err := srv.Send(&resp); err != nil {
-			log.Printf("send error %v", err)
-		}
-	}
 }
 
 // GetFeature returns the feature at the given point.
@@ -251,17 +216,23 @@ func NewServer(addr string, enableTLS bool) (*Server, error) {
 
 // NewServerWithoutBind returns a new instance of the gRPC server.
 func NewServerWithoutBind(opts ...grpc.ServerOption) *Server {
-	opts = append(opts, grpc.MaxRecvMsgSize(100*1024*1024), grpc.MaxSendMsgSize(100*1024*1024))
+	// Start with metrics interceptors first
+	metricsOpts := grpcutil.ServerOptionsWithMetrics(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+
+	// Then add any additional options
+	metricsOpts = append(metricsOpts, opts...)
+
 	server := &Server{
-		grpcSrv:    grpc.NewServer(opts...),
+		grpcSrv:    grpc.NewServer(metricsOpts...),
 		routeNotes: make(map[string][]*routeguide.RouteNote),
 	}
 
 	server.loadFeatures()
 	pb.RegisterGreeterServer(server.grpcSrv, server)
 	routeguide.RegisterRouteGuideServer(server.grpcSrv, server)
-	pbStream.RegisterMathServer(server.grpcSrv, server)
-
 	return server
 }
 

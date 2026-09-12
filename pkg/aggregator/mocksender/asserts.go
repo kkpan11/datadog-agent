@@ -49,6 +49,12 @@ func (m *MockSender) AssertMonotonicCount(t *testing.T, method string, metric st
 	return m.Mock.AssertCalled(t, method, metric, value, hostname, MatchTagsContains(tags), flushFirstValue)
 }
 
+// AssertOpenmetricsBucket allows to assert an openmetrics bucket was emitted with given parameters.
+// Additional tags over the ones specified don't make it fail
+func (m *MockSender) AssertOpenmetricsBucket(t *testing.T, method string, metric string, value int64, lowerBound float64, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool) bool {
+	return m.Mock.AssertCalled(t, method, metric, value, lowerBound, upperBound, monotonic, hostname, tags, flushFirstValue)
+}
+
 // AssertHistogramBucket allows to assert a histogram bucket was emitted with given parameters.
 // Additional tags over the ones specified don't make it fail
 func (m *MockSender) AssertHistogramBucket(t *testing.T, method string, metric string, value int64, lowerBound float64, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool) bool {
@@ -86,7 +92,14 @@ func (m *MockSender) AssertMetricMissing(t *testing.T, method string, metric str
 // AssertEvent assert the expectedEvent was emitted with the following values:
 // AggregationKey, Priority, SourceTypeName, EventType, Host and a Ts range weighted with the parameter allowedDelta
 func (m *MockSender) AssertEvent(t *testing.T, expectedEvent event.Event, allowedDelta time.Duration) bool {
-	return m.Mock.AssertCalled(t, "Event", MatchEventLike(expectedEvent, allowedDelta))
+	return m.Mock.AssertCalled(t, "Event", MatchEventLikeWithCompare(expectedEvent, allowedDelta, nil))
+}
+
+// AssertEventWithCompareFunc assert the expectedEvent was emitted with the following values:
+// AggregationKey, Priority, SourceTypeName, EventType, Host and a Ts range weighted with the parameter allowedDelta
+// In addition to these standard checks, this variant accepts a compare function for comparing texts
+func (m *MockSender) AssertEventWithCompareFunc(t *testing.T, expectedEvent event.Event, allowedDelta time.Duration, compare EventCompareFunc) bool {
+	return m.Mock.AssertCalled(t, "Event", MatchEventLikeWithCompare(expectedEvent, allowedDelta, compare))
 }
 
 // AssertEventPlatformEvent assert the expected event was emitted with the following values
@@ -97,7 +110,7 @@ func (m *MockSender) AssertEventPlatformEvent(t *testing.T, expectedRawEvent []b
 // AssertEventMissing assert the expectedEvent was never emitted with the following values:
 // AggregationKey, Priority, SourceTypeName, EventType, Host and a Ts range weighted with the parameter allowedDelta
 func (m *MockSender) AssertEventMissing(t *testing.T, expectedEvent event.Event, allowedDelta time.Duration) bool {
-	return m.Mock.AssertNotCalled(t, "Event", MatchEventLike(expectedEvent, allowedDelta))
+	return m.Mock.AssertNotCalled(t, "Event", MatchEventLikeWithCompare(expectedEvent, allowedDelta, nil))
 }
 
 // AnythingBut match everything except the argument
@@ -132,11 +145,15 @@ func AssertFloatInRange(min float64, max float64) interface{} {
 	})
 }
 
-// MatchEventLike is a mock.argumentMatcher builder to be used in asserts.
+// EventCompareFunc lets tests define extra comparison
+type EventCompareFunc func(expected, actual event.Event) bool
+
+// MatchEventLikeWithCompare is a mock.argumentMatcher builder with a pluggable comparator to be used in asserts.
 // It allows to check if an event is Equal on the following Event elements:
 // AggregationKey, Priority, SourceTypeName, EventType, Host and Tag list
 // Also do a timestamp comparison with a tolerance defined by allowedDelta
-func MatchEventLike(expected event.Event, allowedDelta time.Duration) interface{} {
+// The provided compare function enables additional, test-specific validation logic
+func MatchEventLikeWithCompare(expected event.Event, allowedDelta time.Duration, compare EventCompareFunc) interface{} {
 	return mock.MatchedBy(func(actual event.Event) bool {
 		expectedTime := time.Unix(expected.Ts, 0)
 		actualTime := time.Unix(actual.Ts, 0)
@@ -144,7 +161,13 @@ func MatchEventLike(expected event.Event, allowedDelta time.Duration) interface{
 		if dt < -allowedDelta || dt > allowedDelta {
 			return false
 		}
-		return eventLike(expected, actual)
+		if !eventLike(expected, actual) {
+			return false
+		}
+		if compare != nil && !compare(expected, actual) {
+			return false
+		}
+		return true
 	})
 }
 

@@ -1,0 +1,26 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load(":template_expand_test.bzl", "template_test_suite")
+
+sh_binary(
+    name = "replace_prefix",
+    srcs = ["replace_prefix.sh"],
+    args = select({
+        "@platforms//os:linux": [
+            "--patchelf",
+            "$(location @patchelf)",
+        ],
+        "@platforms//os:macos": [
+            "--install-name-tool",
+            "$(location @llvm_toolchain_llvm//:install-name-tool)",
+        ],
+        "//conditions:default": [],
+    }),
+    data = select({
+        "@platforms//os:linux": ["@patchelf"],
+        "@platforms//os:macos": ["@llvm_toolchain_llvm//:install-name-tool"],
+        "//conditions:default": [],
+    }),
+    tags = ["manual"],
+)
+
+template_test_suite(name = "_dd_agent_expand_template_tests")

@@ -22,9 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/handlers"
-	"github.com/gorilla/mux"
-	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	"google.golang.org/grpc"
 
 	"github.com/DataDog/datadog-agent/cmd/cluster-agent/api/agent"
@@ -32,17 +30,20 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/cluster-agent/api/v1/languagedetection"
 	"github.com/DataDog/datadog-agent/cmd/cluster-agent/api/v2/series"
 	"github.com/DataDog/datadog-agent/comp/api/grpcserver/helpers"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
+	autodiscovery "github.com/DataDog/datadog-agent/comp/core/autodiscovery/def"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	diagnose "github.com/DataDog/datadog-agent/comp/core/diagnose/def"
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
-	"github.com/DataDog/datadog-agent/comp/core/settings"
+	settings "github.com/DataDog/datadog-agent/comp/core/settings/def"
 	"github.com/DataDog/datadog-agent/comp/core/status"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	taggerserver "github.com/DataDog/datadog-agent/comp/core/tagger/server"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	dcametadata "github.com/DataDog/datadog-agent/comp/metadata/clusteragent/def"
+	clusterchecksmetadata "github.com/DataDog/datadog-agent/comp/metadata/clusterchecks/def"
+	apiMiddleware "github.com/DataDog/datadog-agent/pkg/api/middleware"
+
 	"github.com/DataDog/datadog-agent/pkg/api/util"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
@@ -53,18 +54,19 @@ import (
 
 var (
 	listener  net.Listener
-	router    *mux.Router
-	apiRouter *mux.Router
+	router    *http.ServeMux
+	apiRouter *http.ServeMux
 )
 
 // StartServer creates the router and starts the HTTP server
-func StartServer(ctx context.Context, w workloadmeta.Component, taggerComp tagger.Component, ac autodiscovery.Component, statusComponent status.Component, settings settings.Component, cfg config.Component, ipc ipc.Component, diagnoseComponent diagnose.Component, dcametadataComp dcametadata.Component, telemetry telemetry.Component) error {
+func StartServer(ctx context.Context, w workloadmeta.Component, taggerComp tagger.Component, ac autodiscovery.Component, statusComponent status.Component, settings settings.Component, cfg config.Component, ipc ipc.Component, diagnoseComponent diagnose.Component, dcametadataComp dcametadata.Component, clusterChecksMetadataComp clusterchecksmetadata.Component, telemetry telemetry.Component) error {
 	// create the root HTTP router
-	router = mux.NewRouter()
-	apiRouter = router.PathPrefix("/api/v1").Subrouter()
+	router = http.NewServeMux()
+	apiRouter = http.NewServeMux()
+	router.Handle("/api/v1/", http.StripPrefix("/api/v1", apiRouter))
 
 	// IPC REST API server
-	agent.SetupHandlers(router, w, ac, statusComponent, settings, taggerComp, diagnoseComponent, dcametadataComp)
+	agent.SetupHandlers(router, w, ac, statusComponent, settings, taggerComp, diagnoseComponent, dcametadataComp, clusterChecksMetadataComp, ipc)
 
 	// API V1 Metadata APIs
 	v1.InstallMetadataEndpoints(apiRouter, w)
@@ -73,11 +75,12 @@ func StartServer(ctx context.Context, w workloadmeta.Component, taggerComp tagge
 	languagedetection.InstallLanguageDetectionEndpoints(ctx, apiRouter, w, cfg)
 
 	// API V2 Series APIs
-	v2ApiRouter := router.PathPrefix("/api/v2").Subrouter()
+	v2ApiRouter := http.NewServeMux()
+	router.Handle("/api/v2/", http.StripPrefix("/api/v2", v2ApiRouter))
 	series.InstallNodeMetricsEndpoints(ctx, v2ApiRouter, cfg)
 
 	// Validate token for every request
-	router.Use(validateToken)
+	httpHandler := validateToken(ipc)(router)
 
 	// get the transport we're going to use under HTTP
 	var err error
@@ -111,18 +114,22 @@ func StartServer(ctx context.Context, w workloadmeta.Component, taggerComp tagge
 	})
 
 	maxMessageSize := cfg.GetInt("cluster_agent.cluster_tagger.grpc_max_message_size")
-	opts := []grpc.ServerOption{
-		grpc.StreamInterceptor(grpc_auth.StreamServerInterceptor(authInterceptor)),
-		grpc.UnaryInterceptor(grpc_auth.UnaryServerInterceptor(authInterceptor)),
+
+	// Use the convenience function that chains metrics and auth interceptors
+	opts := grpcutil.ServerOptionsWithMetricsAndAuth(
+		grpc_auth.UnaryServerInterceptor(authInterceptor),
+		grpc_auth.StreamServerInterceptor(authInterceptor),
 		grpc.MaxSendMsgSize(maxMessageSize),
 		grpc.MaxRecvMsgSize(maxMessageSize),
-	}
+	)
 
 	grpcSrv := grpc.NewServer(opts...)
 	// event size should be small enough to fit within the grpc max message size
 	maxEventSize := maxMessageSize / 2
+
 	pb.RegisterAgentSecureServer(grpcSrv, &serverSecure{
-		taggerServer: taggerserver.NewServer(taggerComp, telemetry, maxEventSize, cfg.GetInt("remote_tagger.max_concurrent_sync")),
+		taggerServer:       taggerserver.NewServer(taggerComp, telemetry, maxEventSize, cfg.GetInt("remote_tagger.max_concurrent_sync")),
+		kubeMetadataServer: startKubeMetadataStreamer(ctx, w),
 	})
 
 	timeout := pkgconfigsetup.Datadog().GetDuration("cluster_agent.server.idle_timeout_seconds") * time.Second
@@ -133,10 +140,7 @@ func StartServer(ctx context.Context, w workloadmeta.Component, taggerComp tagge
 		grpcSrv,
 		// Use a recovery handler to log panics if they happen.
 		// The client will receive a 500 error.
-		handlers.RecoveryHandler(
-			handlers.PrintRecoveryStack(true),
-			handlers.RecoveryLogger(errorLog),
-		)(router),
+		apiMiddleware.RecoveryHandler(errorLog)(httpHandler),
 		timeout,
 	)
 	srv.ErrorLog = errorLog
@@ -148,8 +152,13 @@ func StartServer(ctx context.Context, w workloadmeta.Component, taggerComp tagge
 }
 
 // ModifyAPIRouter allows to pass in a function to modify router used in server
-func ModifyAPIRouter(f func(*mux.Router)) {
+func ModifyAPIRouter(f func(*http.ServeMux)) {
 	f(apiRouter)
+}
+
+// ModifyRootRouter allows to pass in a function to modify the root router used in server
+func ModifyRootRouter(f func(*http.ServeMux)) {
+	f(router)
 }
 
 // StopServer closes the connection and the server
@@ -162,22 +171,28 @@ func StopServer() {
 
 // We only want to maintain 1 API and expose an external route to serve the cluster level metadata.
 // As we have 2 different tokens for the validation, we need to validate accordingly.
-func validateToken(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.String()
-		var isValid bool
-		if !isExternalPath(path) {
-			if err := util.Validate(w, r); err == nil {
-				isValid = true
+func validateToken(ipc ipc.Component) func(http.Handler) http.Handler {
+	dcaTokenValidator := util.TokenValidator(util.GetDCAAuthToken)
+	localTokenGetter := util.TokenValidator(ipc.GetAuthToken)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.String()
+			var isValid bool
+			// If communication is intra-pod
+			if !isExternalPath(path) {
+				if err := localTokenGetter(w, r); err == nil {
+					isValid = true
+				}
 			}
-		}
-		if !isValid {
-			if err := util.ValidateDCARequest(w, r); err != nil {
-				return
+			if !isValid {
+				if err := dcaTokenValidator(w, r); err != nil {
+					return
+				}
 			}
-		}
-		next.ServeHTTP(w, r)
-	})
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // isExternal returns whether the path is an endpoint used by Node Agents.
@@ -194,9 +209,11 @@ func isExternalPath(path string) bool {
 		strings.HasPrefix(path, "/api/v1/cluster/id") && len(strings.Split(path, "/")) == 5 ||
 		strings.HasPrefix(path, "/api/v1/clusterchecks/") && len(strings.Split(path, "/")) == 6 ||
 		strings.HasPrefix(path, "/api/v1/endpointschecks/") && len(strings.Split(path, "/")) == 6 ||
+		strings.HasPrefix(path, "/api/v1/instrumentation/") && len(strings.Split(path, "/")) == 5 ||
 		strings.HasPrefix(path, "/api/v1/metadata/namespace/") && len(strings.Split(path, "/")) == 6 ||
 		strings.HasPrefix(path, "/api/v1/tags/cf/apps/") && len(strings.Split(path, "/")) == 7 ||
 		strings.HasPrefix(path, "/api/v1/tags/namespace/") && len(strings.Split(path, "/")) == 6 ||
 		strings.HasPrefix(path, "/api/v1/tags/node/") && len(strings.Split(path, "/")) == 6 ||
-		strings.HasPrefix(path, "/api/v1/tags/pod/") && (len(strings.Split(path, "/")) == 6 || len(strings.Split(path, "/")) == 8)
+		strings.HasPrefix(path, "/api/v1/tags/pod/") && (len(strings.Split(path, "/")) == 6 || len(strings.Split(path, "/")) == 8) ||
+		strings.HasPrefix(path, "/api/v1/uid/node/") && len(strings.Split(path, "/")) == 6
 }

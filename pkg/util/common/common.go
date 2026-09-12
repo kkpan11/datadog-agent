@@ -7,6 +7,7 @@
 package common
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -83,7 +84,7 @@ func valueToInterface(value reflect.Value) interface{} {
 	case reflect.Struct:
 		return StructToMap(value.Interface())
 
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if !value.IsNil() {
 			return valueToInterface(value.Elem())
 		}
@@ -121,7 +122,7 @@ func GetSliceOfStringMap(slice []interface{}) ([]map[string]string, error) {
 	for _, e := range slice {
 		value, ok := e.(map[interface{}]interface{})
 		if !ok {
-			return nil, fmt.Errorf("unexpected type for slice value")
+			return nil, errors.New("unexpected type for slice value")
 		}
 		entry := map[string]string{}
 		for k, v := range value {

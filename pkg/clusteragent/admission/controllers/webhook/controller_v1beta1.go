@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	admissioninformers "k8s.io/client-go/informers/admissionregistration/v1beta1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -25,11 +26,16 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/DataDog/datadog-agent/comp/aggregator/demultiplexer"
+	demultiplexer "github.com/DataDog/datadog-agent/comp/aggregator/demultiplexer/def"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/common"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/mutate/autoinstrumentation/libraryinjection"
+	clusterspot "github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/cluster/spot"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/instrumentation"
+	rcclient "github.com/DataDog/datadog-agent/pkg/config/remote/client"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/certificate"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -48,19 +54,7 @@ type ControllerV1beta1 struct {
 }
 
 // NewControllerV1beta1 returns a new Webhook Controller using admissionregistration/v1beta1.
-func NewControllerV1beta1(
-	client kubernetes.Interface,
-	secretInformer coreinformers.SecretInformer,
-	validatingWebhookInformer admissioninformers.ValidatingWebhookConfigurationInformer,
-	mutatingWebhookInformer admissioninformers.MutatingWebhookConfigurationInformer,
-	isLeaderFunc func() bool,
-	leadershipStateNotif <-chan struct{},
-	config Config,
-	wmeta workloadmeta.Component,
-	pa workload.PodPatcher,
-	datadogConfig config.Component,
-	demultiplexer demultiplexer.Component,
-) *ControllerV1beta1 {
+func NewControllerV1beta1(client kubernetes.Interface, secretInformer coreinformers.SecretInformer, validatingWebhookInformer admissioninformers.ValidatingWebhookConfigurationInformer, mutatingWebhookInformer admissioninformers.MutatingWebhookConfigurationInformer, isLeaderFunc func() bool, leadershipStateNotif <-chan struct{}, config Config, wmeta workloadmeta.Component, pp workload.PodPatcher, sh clusterspot.PodHandler, datadogConfig config.Component, rcClient *rcclient.Client, demultiplexer demultiplexer.Component, filterStore workloadfilter.Component, handlers []instrumentation.Handler, informerFactory dynamicinformer.DynamicSharedInformerFactory, csiDriverWatcher libraryinjection.CSIDriverWatcher) *ControllerV1beta1 {
 	controller := &ControllerV1beta1{}
 	controller.clientSet = client
 	controller.config = config
@@ -77,7 +71,7 @@ func NewControllerV1beta1(
 	)
 	controller.isLeaderFunc = isLeaderFunc
 	controller.leadershipStateNotif = leadershipStateNotif
-	controller.webhooks = controller.generateWebhooks(wmeta, pa, datadogConfig, demultiplexer)
+	controller.webhooks = controller.generateWebhooks(datadogConfig, wmeta, rcClient, demultiplexer, pp, sh, filterStore, handlers, informerFactory, csiDriverWatcher)
 	controller.generateTemplates()
 
 	if _, err := secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -369,6 +363,7 @@ func (c *ControllerV1beta1) generateTemplates() {
 				nsSelector,
 				objSelector,
 				convertMatchConditions(webhook.MatchConditions()),
+				webhook.Timeout(),
 			),
 		)
 	}
@@ -392,17 +387,40 @@ func (c *ControllerV1beta1) generateTemplates() {
 				nsSelector,
 				objSelector,
 				convertMatchConditions(webhook.MatchConditions()),
+				webhook.Timeout(),
 			),
 		)
 	}
+
+	if c.config.probeEnabled && len(mutatingWebhooks) > 0 {
+		probeEndpoint := *mutatingWebhooks[0].ClientConfig.Service.Path
+		mutatingWebhooks = append(mutatingWebhooks, c.getMutatingWebhookSkeleton(
+			"probe",
+			probeEndpoint,
+			[]admiv1beta1.OperationType{admiv1beta1.Create},
+			[]common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"configmaps"}}},
+			c.getProbeNamespaceSelector(),
+			&metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					common.ProbeLabelKey: "true",
+				},
+			},
+			nil,
+			0,
+		))
+	}
+
 	c.mutatingWebhookTemplates = mutatingWebhooks
 }
 
-func (c *ControllerV1beta1) getValidatingWebhookSkeleton(nameSuffix, path string, operations []admiv1beta1.OperationType, resourcesMap map[string][]string, namespaceSelector, objectSelector *metav1.LabelSelector, matchConditions []admiv1beta1.MatchCondition) admiv1beta1.ValidatingWebhook {
+func (c *ControllerV1beta1) getValidatingWebhookSkeleton(nameSuffix, path string, operations []admiv1beta1.OperationType, resources []common.WebhookResourceRule, namespaceSelector, objectSelector *metav1.LabelSelector, matchConditions []admiv1beta1.MatchCondition, timeout int32) admiv1beta1.ValidatingWebhook {
+	namespaceSelector = common.EnsureAKSSelectors(namespaceSelector)
 	matchPolicy := admiv1beta1.Exact
 	sideEffects := admiv1beta1.SideEffectClassNone
 	port := c.config.getServicePort()
-	timeout := c.config.getTimeout()
+	if timeout == 0 {
+		timeout = c.config.getTimeout()
+	}
 	failurePolicy := c.getFailurePolicy()
 
 	webhook := admiv1beta1.ValidatingWebhook{
@@ -425,27 +443,28 @@ func (c *ControllerV1beta1) getValidatingWebhookSkeleton(nameSuffix, path string
 		MatchConditions:         matchConditions,
 	}
 
-	for group, resources := range resourcesMap {
-		for _, resource := range resources {
-			webhook.Rules = append(webhook.Rules, admiv1beta1.RuleWithOperations{
-				Operations: operations,
-				Rule: admiv1beta1.Rule{
-					APIGroups:   []string{group},
-					APIVersions: []string{"v1"},
-					Resources:   []string{resource},
-				},
-			})
-		}
+	for _, rule := range resources {
+		webhook.Rules = append(webhook.Rules, admiv1beta1.RuleWithOperations{
+			Operations: operations,
+			Rule: admiv1beta1.Rule{
+				APIGroups:   []string{rule.APIGroup},
+				APIVersions: []string{rule.APIVersion},
+				Resources:   rule.Resources,
+			},
+		})
 	}
 
 	return webhook
 }
 
-func (c *ControllerV1beta1) getMutatingWebhookSkeleton(nameSuffix, path string, operations []admiv1beta1.OperationType, resourcesMap map[string][]string, namespaceSelector, objectSelector *metav1.LabelSelector, matchConditions []admiv1beta1.MatchCondition) admiv1beta1.MutatingWebhook {
+func (c *ControllerV1beta1) getMutatingWebhookSkeleton(nameSuffix, path string, operations []admiv1beta1.OperationType, resources []common.WebhookResourceRule, namespaceSelector, objectSelector *metav1.LabelSelector, matchConditions []admiv1beta1.MatchCondition, timeout int32) admiv1beta1.MutatingWebhook {
+	namespaceSelector = common.EnsureAKSSelectors(namespaceSelector)
 	matchPolicy := admiv1beta1.Exact
 	sideEffects := admiv1beta1.SideEffectClassNone
 	port := c.config.getServicePort()
-	timeout := c.config.getTimeout()
+	if timeout == 0 {
+		timeout = c.config.getTimeout()
+	}
 	failurePolicy := c.getFailurePolicy()
 	reinvocationPolicy := c.getReinvocationPolicy()
 
@@ -470,17 +489,15 @@ func (c *ControllerV1beta1) getMutatingWebhookSkeleton(nameSuffix, path string, 
 		MatchConditions:         matchConditions,
 	}
 
-	for group, resources := range resourcesMap {
-		for _, resource := range resources {
-			webhook.Rules = append(webhook.Rules, admiv1beta1.RuleWithOperations{
-				Operations: operations,
-				Rule: admiv1beta1.Rule{
-					APIGroups:   []string{group},
-					APIVersions: []string{"v1"},
-					Resources:   []string{resource},
-				},
-			})
-		}
+	for _, rule := range resources {
+		webhook.Rules = append(webhook.Rules, admiv1beta1.RuleWithOperations{
+			Operations: operations,
+			Rule: admiv1beta1.Rule{
+				APIGroups:   []string{rule.APIGroup},
+				APIVersions: []string{rule.APIVersion},
+				Resources:   rule.Resources,
+			},
+		})
 	}
 
 	return webhook

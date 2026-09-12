@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewStatefulSetCollectorVersions builds the group of collector versions.
-func NewStatefulSetCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewStatefulSetCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewStatefulSetCollector(metadataAsTags),
+		NewStatefulSetCollector(tagger),
 	)
 }
 
@@ -38,11 +39,7 @@ type StatefulSetCollector struct {
 
 // NewStatefulSetCollector creates a new collector for the Kubernetes
 // StatefulSet resource.
-func NewStatefulSetCollector(metadataAsTags utils.MetadataAsTags) *StatefulSetCollector {
-	resourceType := getResourceType(statefulSetName, statefulSetVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewStatefulSetCollector(tagger tagger.Component) *StatefulSetCollector {
 	return &StatefulSetCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -50,15 +47,14 @@ func NewStatefulSetCollector(metadataAsTags utils.MetadataAsTags) *StatefulSetCo
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 statefulSetName,
+			Name:                                 utilTypes.StatefulSetName,
 			Kind:                                 kubernetes.StatefulSetKind,
 			NodeType:                             orchestrator.K8sStatefulSet,
-			Version:                              statefulSetVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.StatefulSetGroup,
+			Version:                              utilTypes.StatefulSetVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.StatefulSetHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewStatefulSetHandlers(tagger)),
 	}
 }
 

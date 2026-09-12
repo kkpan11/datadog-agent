@@ -7,6 +7,7 @@ package containers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"testing"
@@ -16,12 +17,14 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
 	workloadmetamock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/mock"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics/mock"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics/provider"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
@@ -50,8 +53,8 @@ func TestGetContainers(t *testing.T) {
 
 	// Finally, container provider
 	testTime := time.Now()
-	filter, err := containers.GetPauseContainerFilter()
-	assert.NoError(t, err)
+	filterStore := workloadfilterfxmock.SetupMockFilter(t)
+	filter := filterStore.GetContainerSharedMetricFilters()
 	containerProvider := NewContainerProvider(metricsProvider, metadataProvider, filter, fakeTagger)
 
 	// Containers:
@@ -709,6 +712,189 @@ func TestGetContainers(t *testing.T) {
 	}, pidToCid)
 }
 
+func TestGetContainersExcludesFilteredContainers(t *testing.T) {
+	// Metrics provider
+	metricsCollector := mock.NewCollector("foo")
+	metricsProvider := mock.NewMetricsProvider()
+	metricsProvider.RegisterConcreteCollector(provider.NewRuntimeMetadata(string(provider.RuntimeNameContainerd), ""), metricsCollector)
+
+	// Workload meta + tagger
+	metadataProvider := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
+		core.MockBundle(),
+		fx.Supply(context.Background()),
+		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
+	))
+	fakeTagger := taggerfxmock.SetupFakeTagger(t)
+
+	testTime := time.Now()
+
+	// Configure container exclusion by name
+	mockConfig := configmock.New(t)
+	mockConfig.SetInTest("container_exclude", []string{"name:excluded-container-name"})
+
+	filterStore := workloadfilterfxmock.SetupMockFilter(t)
+	filter := filterStore.GetContainerSharedMetricFilters()
+	containerProvider := NewContainerProvider(metricsProvider, metadataProvider, filter, fakeTagger)
+
+	// Create an included container
+	includedMetrics := mock.GetFullSampleContainerEntry()
+	includedMetrics.ContainerStats.Timestamp = testTime
+	includedMetrics.NetworkStats.Timestamp = testTime
+	includedMetrics.PIDs = []int{1, 2}
+	metricsCollector.SetContainerEntry("included-id", includedMetrics)
+	metadataProvider.Set(&workloadmeta.Container{
+		EntityID: workloadmeta.EntityID{
+			Kind: workloadmeta.KindContainer,
+			ID:   "included-id",
+		},
+		EntityMeta: workloadmeta.EntityMeta{
+			Name:      "included-container",
+			Namespace: "default",
+		},
+		Runtime: workloadmeta.ContainerRuntimeContainerd,
+		State: workloadmeta.ContainerState{
+			Running:   true,
+			Status:    workloadmeta.ContainerStatusRunning,
+			CreatedAt: testTime,
+			StartedAt: testTime,
+		},
+	})
+	fakeTagger.SetTags(types.NewEntityID(types.ContainerID, "included-id"), "fake", []string{"env:test"}, nil, nil, nil)
+
+	// Create an excluded container (excluded by name)
+	excludedMetrics := mock.GetFullSampleContainerEntry()
+	excludedMetrics.ContainerStats.Timestamp = testTime
+	excludedMetrics.NetworkStats.Timestamp = testTime
+	excludedMetrics.PIDs = []int{3, 4}
+	metricsCollector.SetContainerEntry("excluded-id", excludedMetrics)
+	metadataProvider.Set(&workloadmeta.Container{
+		EntityID: workloadmeta.EntityID{
+			Kind: workloadmeta.KindContainer,
+			ID:   "excluded-id",
+		},
+		EntityMeta: workloadmeta.EntityMeta{
+			Name:      "excluded-container-name",
+			Namespace: "default",
+		},
+		Runtime: workloadmeta.ContainerRuntimeContainerd,
+		State: workloadmeta.ContainerState{
+			Running:   true,
+			Status:    workloadmeta.ContainerStatusRunning,
+			CreatedAt: testTime,
+			StartedAt: testTime,
+		},
+	})
+	fakeTagger.SetTags(types.NewEntityID(types.ContainerID, "excluded-id"), "fake", []string{"env:test"}, nil, nil, nil)
+
+	// Create a container excluded via pod annotation
+	podExcludedMetrics := mock.GetFullSampleContainerEntry()
+	podExcludedMetrics.ContainerStats.Timestamp = testTime
+	podExcludedMetrics.NetworkStats.Timestamp = testTime
+	podExcludedMetrics.PIDs = []int{5, 6}
+	metricsCollector.SetContainerEntry("pod-excluded-id", podExcludedMetrics)
+	metadataProvider.Set(&workloadmeta.KubernetesPod{
+		EntityID: workloadmeta.EntityID{
+			Kind: workloadmeta.KindKubernetesPod,
+			ID:   "excluded-pod",
+		},
+		EntityMeta: workloadmeta.EntityMeta{
+			Name:      "excluded-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"ad.datadoghq.com/pod-excluded-container.exclude": "true",
+			},
+		},
+		Containers: []workloadmeta.OrchestratorContainer{
+			{
+				ID:   "pod-excluded-id",
+				Name: "pod-excluded-container",
+			},
+		},
+	})
+	metadataProvider.Set(&workloadmeta.Container{
+		EntityID: workloadmeta.EntityID{
+			Kind: workloadmeta.KindContainer,
+			ID:   "pod-excluded-id",
+		},
+		EntityMeta: workloadmeta.EntityMeta{
+			Name:      "pod-excluded-container",
+			Namespace: "default",
+		},
+		Runtime: workloadmeta.ContainerRuntimeContainerd,
+		State: workloadmeta.ContainerState{
+			Running:   true,
+			Status:    workloadmeta.ContainerStatusRunning,
+			CreatedAt: testTime,
+			StartedAt: testTime,
+		},
+		Owner: &workloadmeta.EntityID{
+			Kind: workloadmeta.KindKubernetesPod,
+			ID:   "excluded-pod",
+		},
+	})
+	fakeTagger.SetTags(types.NewEntityID(types.ContainerID, "pod-excluded-id"), "fake", []string{"env:test"}, nil, nil, nil)
+
+	// Get containers
+	processContainers, lastRates, pidToCid, err := containerProvider.GetContainers(0, nil)
+	assert.NoError(t, err)
+
+	// Verify only the included container is returned
+	assert.Len(t, processContainers, 1, "Expected only 1 container (the included one)")
+	assert.Equal(t, "included-id", processContainers[0].Id, "Expected only the included container")
+
+	// Verify rate metrics only contain the included container
+	assert.Len(t, lastRates, 1, "Expected rate metrics for only 1 container")
+	assert.Contains(t, lastRates, "included-id", "Expected rate metrics for included container")
+	assert.NotContains(t, lastRates, "excluded-id", "Should not have rate metrics for excluded container")
+	assert.NotContains(t, lastRates, "pod-excluded-id", "Should not have rate metrics for pod-excluded container")
+
+	// Verify PID mapping only contains PIDs from the included container
+	assert.Equal(t, map[int]string{
+		1: "included-id",
+		2: "included-id",
+	}, pidToCid, "PID mapping should only contain PIDs from included container")
+}
+
+// erroringTagger wraps a tagger.Component and forces Tag to return an error,
+// to exercise the error-logging path in GetContainers.
+type erroringTagger struct {
+	tagger.Component
+}
+
+func (erroringTagger) Tag(types.EntityID, types.TagCardinality) ([]string, error) {
+	return nil, errors.New("forced tag error")
+}
+
+// TestGetContainersDoesNotPanicOnShortID ensures GetContainers does not panic
+// when a container has an ID shorter than the short-ID length (here, empty) and
+// the tagger returns an error, which previously triggered a slice-out-of-range
+// panic from container.ID[:12].
+func TestGetContainersDoesNotPanicOnShortID(t *testing.T) {
+	metadataProvider := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
+		core.MockBundle(),
+		fx.Supply(context.Background()),
+		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
+	))
+
+	// Force the tagger to error so the error-logging branch runs.
+	errTagger := erroringTagger{Component: taggerfxmock.SetupFakeTagger(t)}
+	filter := workloadfilterfxmock.SetupMockFilter(t).GetContainerSharedMetricFilters()
+	containerProvider := NewContainerProvider(mock.NewMetricsProvider(), metadataProvider, filter, errTagger)
+
+	// A running container with an empty ID is enough: the panic happened while
+	// logging the tagger error, before any metrics were gathered.
+	metadataProvider.Set(&workloadmeta.Container{
+		EntityID: workloadmeta.EntityID{Kind: workloadmeta.KindContainer, ID: ""},
+		Runtime:  workloadmeta.ContainerRuntimeContainerd,
+		State:    workloadmeta.ContainerState{Running: true, Status: workloadmeta.ContainerStatusRunning},
+	})
+
+	assert.NotPanics(t, func() {
+		_, _, _, err := containerProvider.GetContainers(0, nil)
+		assert.NoError(t, err)
+	})
+}
+
 func compareResults(a, b interface{}) string {
 	return cmp.Diff(a, b,
 		cmpopts.SortSlices(func(x, y interface{}) bool {
@@ -718,4 +904,45 @@ func compareResults(a, b interface{}) string {
 			return math.Abs(float64(x-y)) < 0.1
 		}),
 	)
+}
+
+func TestConvertContainerRuntime(t *testing.T) {
+	tests := []struct {
+		name     string
+		runtime  workloadmeta.ContainerRuntime
+		expected string
+	}{
+		{
+			name:     "ECSFargate should be converted to ECS",
+			runtime:  workloadmeta.ContainerRuntimeECSFargate,
+			expected: "ECS",
+		},
+		{
+			name:     "ECSManagedInstances should not be overridden (when in sidecar)",
+			runtime:  workloadmeta.ContainerRuntimeECSManagedInstances,
+			expected: "ecsmanagedinstances",
+		},
+		{
+			name:     "containerd should not be overridden",
+			runtime:  workloadmeta.ContainerRuntimeContainerd,
+			expected: "containerd",
+		},
+		{
+			name:     "docker should not be overridden",
+			runtime:  workloadmeta.ContainerRuntimeDocker,
+			expected: "docker",
+		},
+		{
+			name:     "garden should not be overridden",
+			runtime:  workloadmeta.ContainerRuntimeGarden,
+			expected: "garden",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertContainerRuntime(tt.runtime)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
 }

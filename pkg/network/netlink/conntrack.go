@@ -5,6 +5,8 @@
 
 //go:build linux
 
+//go:generate go run go.uber.org/mock/mockgen -source=$GOFILE -package=$GOPACKAGE -destination=mock_conntrack.go -build_constraint "bpf && test"
+
 package netlink
 
 import (
@@ -99,7 +101,7 @@ func (c *conntrack) Exists(conn *Con) (bool, error) {
 		return true, nil
 	}
 
-	return false, fmt.Errorf("no replies received from netlink call")
+	return false, errors.New("no replies received from netlink call")
 }
 
 func (c *conntrack) Close() error {

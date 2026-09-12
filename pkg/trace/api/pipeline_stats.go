@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/trace/api/apiutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 	"github.com/DataDog/datadog-go/v5/statsd"
@@ -33,7 +34,7 @@ func pipelineStatsEndpoints(cfg *config.AgentConfig) (urls []*url.URL, apiKeys [
 	}
 	for _, e := range cfg.Endpoints {
 		urlStr := e.Host + pipelineStatsURLSuffix
-		log.Debug("[pipeline_stats] Intake URL %s", urlStr)
+		log.Debugf("[pipeline_stats] Intake URL %s", urlStr)
 		url, err := url.Parse(urlStr)
 		if err != nil {
 			return nil, nil, fmt.Errorf("error parsing pipeline stats intake URL %q: %v", urlStr, err)
@@ -54,7 +55,7 @@ func (r *HTTPReceiver) pipelineStatsProxyHandler() http.Handler {
 	}
 	tags := fmt.Sprintf("host:%s,default_env:%s,agent_version:%s", r.conf.Hostname, r.conf.DefaultEnv, r.conf.AgentVersion)
 	if orch := r.conf.FargateOrchestrator; orch != config.OrchestratorUnknown {
-		tag := fmt.Sprintf("orchestrator:fargate_%s", strings.ToLower(string(orch)))
+		tag := "orchestrator:fargate_" + strings.ToLower(string(orch))
 		tags = tags + "," + tag
 	}
 	return newPipelineStatsProxy(r.conf, urls, apiKeys, tags, r.statsd)
@@ -71,30 +72,25 @@ func pipelineStatsErrorHandler(err error) http.Handler {
 // The tags will be added as a header to all proxied requests.
 func newPipelineStatsProxy(conf *config.AgentConfig, urls []*url.URL, apiKeys []string, tags string, statsd statsd.ClientInterface) *httputil.ReverseProxy {
 	log.Debug("[pipeline_stats] Creating reverse proxy")
-	cidProvider := NewIDProvider(conf.ContainerProcRoot, conf.ContainerIDFromOriginInfo)
-	director := func(req *http.Request) {
-		req.Header.Set("Via", fmt.Sprintf("trace-agent %s", conf.AgentVersion))
-		if _, ok := req.Header["User-Agent"]; !ok {
-			// explicitly disable User-Agent so it's not set to the default value
-			// that net/http gives it: Go-http-client/1.1
-			// See https://codereview.appspot.com/7532043
-			req.Header.Set("User-Agent", "")
-		}
-		containerID := cidProvider.GetContainerID(req.Context(), req.Header)
+	cidProvider := NewContainerIDProviderFromConfig(conf)
+	rewrite := func(req *httputil.ProxyRequest) {
+		req.SetXForwarded()
+		req.Out.Header.Set("Via", "trace-agent "+conf.AgentVersion)
+		containerID := cidProvider.GetContainerID(req.In.Context(), req.In.Header)
 		if ctags := getContainerTags(conf.ContainerTags, containerID); ctags != "" {
 			ctagsHeader := normalizeHTTPHeader(ctags)
-			req.Header.Set("X-Datadog-Container-Tags", ctagsHeader)
+			req.Out.Header.Set("X-Datadog-Container-Tags", ctagsHeader)
 			log.Debugf("Setting header X-Datadog-Container-Tags=%s for pipeline stats proxy", ctagsHeader)
 		}
-		req.Header.Set("X-Datadog-Additional-Tags", tags)
+		req.Out.Header.Set("X-Datadog-Additional-Tags", tags)
 		log.Debugf("Setting header X-Datadog-Additional-Tags=%s for pipeline stats proxy", tags)
 		_ = statsd.Count("datadog.trace_agent.pipelines_stats", 1, nil, 1)
 	}
 	logger := log.NewThrottled(5, 10*time.Second) // limit to 5 messages every 10 seconds
 	return &httputil.ReverseProxy{
-		Director:  director,
+		Rewrite:   rewrite,
 		ErrorLog:  stdlog.New(logger, "pipeline_stats.Proxy: ", 0),
-		Transport: &multiDataStreamsTransport{rt: conf.NewHTTPTransport(), targets: urls, keys: apiKeys},
+		Transport: &multiDataStreamsTransport{rt: conf.NewHTTPTransport(), targets: urls, keys: apiKeys, maxRequestBytes: conf.MaxRequestBytes},
 	}
 }
 
@@ -105,9 +101,10 @@ func newPipelineStatsProxy(conf *config.AgentConfig, urls []*url.URL, apiKeys []
 // response is discarded. There is no de-duplication done between endpoint
 // hosts or api keys.
 type multiDataStreamsTransport struct {
-	rt      http.RoundTripper
-	targets []*url.URL
-	keys    []string
+	rt              http.RoundTripper
+	targets         []*url.URL
+	keys            []string
+	maxRequestBytes int64
 }
 
 func (m *multiDataStreamsTransport) RoundTrip(req *http.Request) (rresp *http.Response, rerr error) {
@@ -127,6 +124,7 @@ func (m *multiDataStreamsTransport) RoundTrip(req *http.Request) (rresp *http.Re
 
 		return rresp, rerr
 	}
+	req.Body = apiutil.NewLimitedReader(req.Body, m.maxRequestBytes)
 	slurp, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err

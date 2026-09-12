@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/events"
+	"github.com/moby/moby/api/types/events"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -134,7 +134,7 @@ func TestUnbundledEventsTransform(t *testing.T) {
 		fakeTagger.SetTags(
 			types.NewEntityID(types.ContainerID, ev.ContainerID),
 			"docker",
-			[]string{fmt.Sprintf("image_name:%s", ev.ImageName), fmt.Sprintf("container_name:%s", ev.ContainerName)},
+			[]string{"image_name:" + ev.ImageName, "container_name:" + ev.ContainerName},
 			[]string{},
 			[]string{},
 			[]string{},

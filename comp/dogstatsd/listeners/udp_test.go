@@ -8,10 +8,8 @@ package listeners
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"slices"
-	"strconv"
 	"testing"
 	"time"
 
@@ -20,11 +18,11 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry/telemetryimpl"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	mocktelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/mock"
 	"github.com/DataDog/datadog-agent/comp/dogstatsd/packets"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap/pidmapimpl"
+	pidmap "github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap/def"
+	pidmapfx "github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap/fx"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
@@ -38,20 +36,19 @@ type listenerDeps struct {
 
 func fulfillDepsWithConfig(t testing.TB, overrides map[string]interface{}) listenerDeps {
 	return fxutil.Test[listenerDeps](t, fx.Options(
-		telemetryimpl.MockModule(),
-		config.MockModule(),
-		pidmapimpl.Module(),
-		fx.Replace(config.MockParams{Overrides: overrides}),
+		mocktelemetry.Module(),
+		fx.Provide(func() config.Component { return config.NewMockWithOverrides(t, overrides) }),
+		pidmapfx.Module(),
 	))
 }
 
 func newPacketPoolManagerUDP(cfg config.Component, packetsTelemetryStore *packets.TelemetryStore) *packets.PoolManager[packets.Packet] {
-	packetPoolUDP := packets.NewPool(cfg.GetInt("dogstatsd_buffer_size"), packetsTelemetryStore)
+	packetPoolUDP := packets.NewPool(cfg, cfg.GetInt("dogstatsd_buffer_size"), packetsTelemetryStore)
 	return packets.NewPoolManager[packets.Packet](packetPoolUDP)
 }
 
 func TestNewUDPListener(t *testing.T) {
-	deps := fulfillDepsWithConfig(t, map[string]interface{}{"dogstatsd_port": "__random__"})
+	deps := fulfillDepsWithConfig(t, map[string]interface{}{"dogstatsd_port": RandomPortName})
 	telemetryStore := NewTelemetryStore(nil, deps.Telemetry)
 	packetsTelemetryStore := packets.NewTelemetryStore(nil, deps.Telemetry)
 	s, err := NewUDPListener(nil, newPacketPoolManagerUDP(deps.Config, packetsTelemetryStore), deps.Config, nil, telemetryStore, packetsTelemetryStore)
@@ -63,10 +60,8 @@ func TestNewUDPListener(t *testing.T) {
 }
 
 func TestUDPListenerTelemetry(t *testing.T) {
-	port, err := getAvailableUDPPort()
-	require.Nil(t, err)
 	cfg := map[string]interface{}{}
-	cfg["dogstatsd_port"] = port
+	cfg["dogstatsd_port"] = RandomPortName
 	cfg["dogstatsd_non_local_traffic"] = false
 
 	packetChannel := make(chan packets.Packets)
@@ -108,11 +103,9 @@ func TestUDPListenerTelemetry(t *testing.T) {
 
 func TestUDPReceive(t *testing.T) {
 	var contents = []byte("daemon:666|g|#sometag1:somevalue1,sometag2:somevalue2")
-	port, err := getAvailableUDPPort()
-	require.Nil(t, err)
 
 	cfg := map[string]interface{}{}
-	cfg["dogstatsd_port"] = port
+	cfg["dogstatsd_port"] = RandomPortName
 
 	packetChannel := make(chan packets.Packets)
 	deps := fulfillDepsWithConfig(t, cfg)
@@ -159,9 +152,7 @@ func TestUDPReceive(t *testing.T) {
 
 // Reproducer for https://github.com/DataDog/datadog-agent/issues/6803
 func TestNewUDPListenerWhenBusyWithSoRcvBufSet(t *testing.T) {
-	port, err := getAvailableUDPPort()
-	assert.Nil(t, err)
-	address, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	address, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	conn, err := net.ListenUDP("udp", address)
 	assert.NotNil(t, conn)
 	assert.Nil(t, err)
@@ -169,7 +160,7 @@ func TestNewUDPListenerWhenBusyWithSoRcvBufSet(t *testing.T) {
 
 	cfg := map[string]interface{}{}
 	cfg["dogstatsd_so_rcvbuf"] = 1
-	cfg["dogstatsd_port"] = port
+	cfg["dogstatsd_port"] = conn.LocalAddr().(*net.UDPAddr).Port
 	cfg["dogstatsd_non_local_traffic"] = false
 
 	deps := fulfillDepsWithConfig(t, cfg)
@@ -178,26 +169,6 @@ func TestNewUDPListenerWhenBusyWithSoRcvBufSet(t *testing.T) {
 	s, err := NewUDPListener(nil, newPacketPoolManagerUDP(deps.Config, packetsTelemetryStore), deps.Config, nil, telemetryStore, packetsTelemetryStore)
 	assert.Nil(t, s)
 	assert.NotNil(t, err)
-}
-
-// getAvailableUDPPort requests a random port number and makes sure it is available
-func getAvailableUDPPort() (int, error) {
-	conn, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return -1, fmt.Errorf("can't find an available udp port: %s", err)
-	}
-	defer conn.Close()
-
-	_, portString, err := net.SplitHostPort(conn.LocalAddr().String())
-	if err != nil {
-		return -1, fmt.Errorf("can't find an available udp port: %s", err)
-	}
-	portInt, err := strconv.Atoi(portString)
-	if err != nil {
-		return -1, fmt.Errorf("can't convert udp port: %s", err)
-	}
-
-	return portInt, nil
 }
 
 // getLocalIP returns the first non loopback local IPv4 on that host

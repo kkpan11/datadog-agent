@@ -12,6 +12,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 
 	model "github.com/DataDog/agent-payload/v5/process"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
@@ -57,6 +59,11 @@ func NewClusterProcessor() *ClusterProcessor {
 // Process is used to process a list of node resources forming a cluster.
 func (p *ClusterProcessor) Process(ctx processors.ProcessorContext, list interface{}) (processResult processors.ProcessResult, processed int, err error) {
 	processed = -1
+
+	processResult = processors.ProcessResult{
+		MetadataMessages: []model.MessageBody{},
+		ManifestMessages: []model.MessageBody{},
+	}
 
 	defer processors.RecoverOnPanic()
 
@@ -163,11 +170,12 @@ func (p *ClusterProcessor) Process(ctx processors.ProcessorContext, list interfa
 
 	metadataMessages := []model.MessageBody{
 		&model.CollectorCluster{
-			ClusterName: pctx.Cfg.KubeClusterName,
-			ClusterId:   pctx.ClusterID,
-			GroupId:     pctx.MsgGroupID,
-			Cluster:     clusterModel,
-			Tags:        util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
+			ClusterName:  pctx.Cfg.KubeClusterName,
+			ClusterId:    pctx.ClusterID,
+			GroupId:      pctx.MsgGroupID,
+			Cluster:      clusterModel,
+			Tags:         util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
+			AgentVersion: ctx.GetAgentVersion(),
 		},
 	}
 	manifestMessages := []model.MessageBody{
@@ -189,7 +197,9 @@ func (p *ClusterProcessor) Process(ctx processors.ProcessorContext, list interfa
 					Tags: pctx.GetCollectorTags(),
 				},
 			},
-			Tags: pctx.Cfg.ExtraTags,
+			Tags:            pctx.Cfg.ExtraTags,
+			AgentVersion:    ctx.GetAgentVersion(),
+			OriginCollector: model.OriginCollector_datadogAgent,
 		},
 	}
 	processResult = processors.ProcessResult{
@@ -201,6 +211,13 @@ func (p *ClusterProcessor) Process(ctx processors.ProcessorContext, list interfa
 }
 
 func fillClusterResourceVersion(c *model.Cluster) error {
+	// Nodes are collected from an informer-backed map whose iteration order is
+	// not stable. Canonicalize the slice before hashing it so an unchanged
+	// cluster always produces the same resource version and payload.
+	sort.Slice(c.NodesInfo, func(i, j int) bool {
+		return c.NodesInfo[i].GetName() < c.NodesInfo[j].GetName()
+	})
+
 	marshaller := jsoniter.ConfigCompatibleWithStandardLibrary
 	jsonClustermodel, err := marshaller.Marshal(c)
 	if err != nil {
@@ -208,7 +225,7 @@ func fillClusterResourceVersion(c *model.Cluster) error {
 	}
 
 	version := murmur3.Sum64(jsonClustermodel)
-	c.ResourceVersion = fmt.Sprint(version)
+	c.ResourceVersion = strconv.FormatUint(version, 10)
 
 	return nil
 }

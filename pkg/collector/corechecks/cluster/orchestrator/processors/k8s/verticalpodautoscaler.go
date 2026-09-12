@@ -12,16 +12,48 @@ import (
 	v1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 
 	model "github.com/DataDog/agent-payload/v5/process"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	taggertypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	wmutil "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/util"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/common"
 	k8sTransformers "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/transformers/k8s"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
-	"github.com/DataDog/datadog-agent/pkg/orchestrator/redact"
+	"github.com/DataDog/datadog-agent/pkg/redact"
 )
 
 // VerticalPodAutoscalerHandlers implements the Handlers interface for Kuberenetes VPAs
 type VerticalPodAutoscalerHandlers struct {
 	common.BaseHandlers
+	tagger tagger.Component
+}
+
+// NewVerticalPodAutoscalerHandlers creates a new VerticalPodAutoscalerHandlers.
+func NewVerticalPodAutoscalerHandlers(tagger tagger.Component) *VerticalPodAutoscalerHandlers {
+	return &VerticalPodAutoscalerHandlers{tagger: tagger}
+}
+
+// EnrichModel is a handler called before cache lookup.
+//
+//nolint:revive
+func (h *VerticalPodAutoscalerHandlers) EnrichModel(ctx processors.ProcessorContext, resource, resourceModel interface{}) (skip bool) {
+	r := resource.(*v1.VerticalPodAutoscaler)
+	m := resourceModel.(*model.VerticalPodAutoscaler)
+
+	entityID := taggertypes.NewEntityID(
+		taggertypes.KubernetesMetadata,
+		string(wmutil.GenerateKubeMetadataEntityID(ctx.GetCollectorGroup(), ctx.GetCollectorName(), r.Namespace, r.Name)),
+	)
+	taggerTags, err := h.tagger.Tag(entityID, taggertypes.HighCardinality)
+	if err != nil {
+		log.Debugf("Could not retrieve tags for verticalpodautoscaler %s/%s: %s", r.Namespace, r.Name, err)
+		return
+	}
+
+	m.Tags = append(m.Tags, taggerTags...)
+	return
 }
 
 // AfterMarshalling is a handler called after resource marshalling.
@@ -60,6 +92,7 @@ func (h *VerticalPodAutoscalerHandlers) BuildMessageBody(ctx processors.Processo
 		GroupSize:              int32(groupSize),
 		VerticalPodAutoscalers: models,
 		Tags:                   util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
+		AgentVersion:           ctx.GetAgentVersion(),
 	}
 }
 
@@ -80,10 +113,24 @@ func (h *VerticalPodAutoscalerHandlers) ResourceList(ctx processors.ProcessorCon
 	resources = make([]interface{}, 0, len(resourceList))
 
 	for _, resource := range resourceList {
-		resources = append(resources, resource.DeepCopy())
+		resources = append(resources, resource)
 	}
 
 	return resources
+}
+
+// CloneResource returns a deep copy of the resource.
+//
+//nolint:revive
+func (h *VerticalPodAutoscalerHandlers) CloneResource(resource interface{}) interface{} {
+	return resource.(*v1.VerticalPodAutoscaler).DeepCopy()
+}
+
+// ResourceVersionFromRaw returns the resource version from the raw resource.
+//
+//nolint:revive
+func (h *VerticalPodAutoscalerHandlers) ResourceVersionFromRaw(_ processors.ProcessorContext, resource interface{}) string {
+	return resource.(*v1.VerticalPodAutoscaler).ResourceVersion
 }
 
 // ResourceUID is a handler called to retrieve the resource UID.

@@ -16,12 +16,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/compliance"
 	"github.com/DataDog/datadog-agent/pkg/compliance/dbconfig"
+	"github.com/DataDog/datadog-agent/pkg/compliance/statusregistry"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/api/module"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/config"
 	sysconfigtypes "github.com/DataDog/datadog-agent/pkg/system-probe/config/types"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/utils"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	"github.com/DataDog/datadog-agent/pkg/util/startstop"
 )
 
 func init() { registerModule(ComplianceModule) }
@@ -33,22 +36,59 @@ func init() { registerModule(ComplianceModule) }
 // For instance, being able to run cross-container checks at runtime by directly
 // accessing the /proc/<pid>/root mount point.
 var ComplianceModule = &module.Factory{
-	Name:             config.ComplianceModule,
-	ConfigNamespaces: []string{},
-	Fn: func(_ *sysconfigtypes.Config, _ module.FactoryDependencies) (module.Module, error) {
-		return &complianceModule{}, nil
-	},
+	Name: config.ComplianceModule,
+	Fn:   newComplianceModule,
 	NeedsEBPF: func() bool {
 		return false
 	},
 }
 
+func newComplianceModule(_ *sysconfigtypes.Config, deps module.FactoryDependencies) (module.Module, error) {
+	stopper := startstop.NewSerialStopper()
+
+	var complianceAgent *compliance.Agent
+
+	enabled := deps.CoreConfig.GetBool("compliance_config.enabled")
+	runInSystemProbe := deps.CoreConfig.GetBool("compliance_config.run_in_system_probe")
+
+	if enabled && runInSystemProbe {
+		hostnameCtx, hostnameCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer hostnameCancel()
+		hostnameDetected, err := deps.Hostname.Get(hostnameCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		sysProbeClient := &compliance.LocalSysProbeClient{}
+
+		// start compliance agent
+		complianceAgent, err = compliance.StartCompliance(deps.Log, deps.CoreConfig, hostnameDetected, stopper, deps.Statsd, deps.WMeta, deps.FilterStore, deps.Compression, sysProbeClient, deps.Secrets)
+		if err != nil {
+			return nil, err
+		}
+
+		if complianceAgent != nil {
+			log.Debug("compliance: registering status renderer for remote agent")
+			statusregistry.Set(complianceAgent.RenderStatusText)
+		}
+	}
+
+	return &complianceModule{
+		stopper: stopper,
+		agent:   complianceAgent,
+	}, nil
+}
+
 type complianceModule struct {
+	agent   *compliance.Agent
+	stopper startstop.Stopper
+
 	performedChecks atomic.Uint64
 }
 
-// Close is a noop (implements module.Module)
-func (*complianceModule) Close() {
+// Close stops the compliance module (implements module.Module)
+func (m *complianceModule) Close() {
+	m.stopper.Stop()
 }
 
 // GetStats returns statistics related to the compliance module (implements module.Module)

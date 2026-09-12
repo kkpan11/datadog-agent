@@ -11,14 +11,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/DataDog/datadog-agent/comp/remote-config/rcclient"
-
 	"go.uber.org/atomic"
 
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	diagnose "github.com/DataDog/datadog-agent/comp/core/diagnose/def"
-
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	rcclient "github.com/DataDog/datadog-agent/comp/remote-config/rcclient/def"
+	snmpscanmanager "github.com/DataDog/datadog-agent/comp/snmpscanmanager/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
@@ -49,6 +48,7 @@ type Check struct {
 	sessionFactory             session.Factory
 	workerRunDeviceCheckErrors *atomic.Uint64
 	agentConfig                config.Component
+	scanManager                snmpscanmanager.Component
 }
 
 // Run executes the check
@@ -126,7 +126,7 @@ func (c *Check) runCheckDevice(deviceCk *devicecheck.DeviceCheck) error {
 }
 
 // Configure configures the snmp checks
-func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, rawInstance integration.Data, rawInitConfig integration.Data, source string) error {
+func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, rawInstance integration.Data, rawInitConfig integration.Data, source string, provider string) error {
 	var err error
 	c.config, err = checkconfig.NewCheckConfig(rawInstance, rawInitConfig, c.rcClient)
 	if err != nil {
@@ -153,18 +153,27 @@ func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigD
 	// Must be called before c.CommonConfigure
 	c.BuildID(integrationConfigDigest, rawInstance, rawInitConfig)
 
-	err = c.CommonConfigure(senderManager, rawInitConfig, rawInstance, source)
+	err = c.CommonConfigure(senderManager, rawInitConfig, rawInstance, source, provider)
 	if err != nil {
 		return fmt.Errorf("common configure failed: %s", err)
 	}
 
 	if c.config.IsDiscovery() {
-		c.discovery = discovery.NewDiscovery(c.config, c.sessionFactory, c.agentConfig)
+		c.discovery = discovery.NewDiscovery(c.config, c.sessionFactory, c.agentConfig, c.scanManager)
 		c.discovery.Start()
 	} else {
-		c.singleDeviceCk, err = devicecheck.NewDeviceCheck(c.config, c.config.IPAddress, c.sessionFactory, c.agentConfig)
+		connMgr := devicecheck.NewConnectionManager(c.config, c.sessionFactory)
+		c.singleDeviceCk, err = devicecheck.NewDeviceCheck(c.config, connMgr, c.agentConfig)
 		if err != nil {
 			return fmt.Errorf("failed to create device check: %s", err)
+		}
+
+		if c.scanManager == nil {
+			log.Errorf("SNMP scan manager not initialized, could not request device scan for '%s'", c.singleDeviceCk.GetIPAddress())
+		} else {
+			c.scanManager.RequestScan(snmpscanmanager.ScanRequest{
+				DeviceIP: c.singleDeviceCk.GetIPAddress(),
+			}, false)
 		}
 	}
 	return nil
@@ -205,18 +214,19 @@ func (c *Check) IsHASupported() bool {
 }
 
 // Factory creates a new check factory
-func Factory(agentConfig config.Component, rcClient rcclient.Component) option.Option[func() check.Check] {
+func Factory(agentConfig config.Component, rcClient rcclient.Component, scanManager snmpscanmanager.Component) option.Option[func() check.Check] {
 	return option.New(func() check.Check {
-		return newCheck(agentConfig, rcClient)
+		return newCheck(agentConfig, rcClient, scanManager)
 	})
 }
 
-func newCheck(agentConfig config.Component, rcClient rcclient.Component) check.Check {
+func newCheck(agentConfig config.Component, rcClient rcclient.Component, scanManager snmpscanmanager.Component) check.Check {
 	return &Check{
 		rcClient:                   rcClient,
 		CheckBase:                  core.NewCheckBase(common.SnmpIntegrationName),
 		sessionFactory:             session.NewGosnmpSession,
 		workerRunDeviceCheckErrors: atomic.NewUint64(0),
 		agentConfig:                agentConfig,
+		scanManager:                scanManager,
 	}
 }

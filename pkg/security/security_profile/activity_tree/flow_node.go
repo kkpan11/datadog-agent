@@ -9,48 +9,38 @@
 package activitytree
 
 import (
+	"unsafe"
+
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 )
 
 // FlowNode is used to store a flow node
 type FlowNode struct {
-	ImageTags      []string
+	NodeBase
 	GenerationType NodeGenerationType
+	Flow           model.Flow
+}
 
-	Flow model.Flow
+// size approximates this node's heap footprint
+func (fn *FlowNode) size() int64 {
+	return int64(unsafe.Sizeof(*fn)) + seenBytes(fn.NodeBase)
 }
 
 // NewFlowNode returns a new FlowNode instance
-func NewFlowNode(flow model.Flow, generationType NodeGenerationType, imageTag string) *FlowNode {
+func NewFlowNode(flow model.Flow, event *model.Event, generationType NodeGenerationType, imageTagID uint64) *FlowNode {
 	node := &FlowNode{
 		GenerationType: generationType,
 		Flow:           flow,
 	}
-	node.appendImageTag(imageTag)
+	node.NodeBase = NewNodeBase()
+	node.AppendImageTagID(imageTagID, event.ResolveEventTime())
 	return node
 }
 
-func (node *FlowNode) appendImageTag(imageTag string) {
-	node.ImageTags, _ = AppendIfNotPresent(node.ImageTags, imageTag)
-}
-
-func (node *FlowNode) evictImageTag(imageTag string) bool {
-	imageTags, removed := removeImageTagFromList(node.ImageTags, imageTag)
-	if removed {
-		if len(imageTags) == 0 {
-			return true
-		}
-		node.ImageTags = imageTags
-	}
-	return false
-}
-
-func (node *FlowNode) addFlow(flow model.Flow, imageTag string) {
-	if imageTag != "" {
-		node.appendImageTag(imageTag)
-	}
+func (fn *FlowNode) addFlow(flow model.Flow, event *model.Event, imageTagID uint64) {
+	fn.AppendImageTagID(imageTagID, event.ResolveEventTime())
 
 	// add metrics
-	node.Flow.Egress.Add(flow.Egress)
-	node.Flow.Ingress.Add(flow.Ingress)
+	fn.Flow.Egress.Add(flow.Egress)
+	fn.Flow.Ingress.Add(flow.Ingress)
 }

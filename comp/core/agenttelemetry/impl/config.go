@@ -6,13 +6,14 @@
 package agenttelemetryimpl
 
 import (
+	_ "embed"
 	"fmt"
 	"strings"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
 )
 
 const (
@@ -61,12 +62,13 @@ type ExcludeMetricConfig struct {
 // MetricConfig is a list of metric selecting subset of telemetry.Gather() metrics to be included in agent
 type MetricConfig struct {
 	Name           string   `yaml:"name"` // required
-	AggregateTags  []string `yaml:"aggregate_tags,omitempty"`
+	PreserveTags   []string `yaml:"preserve_tags,omitempty"`
+	AggregateTags  []string `yaml:"aggregate_tags,omitempty"` // deprecated: use preserve_tags
 	AggregateTotal bool     `yaml:"aggregate_total"`
 
 	// compiled
-	aggregateTagsExists bool
-	aggregateTagsMap    map[string]any
+	preserveTagsExists bool
+	preserveTagsMap    map[string]any
 }
 
 // Schedule is a schedule for agent telemetry payloads to be generated and emitted
@@ -112,28 +114,26 @@ type Event struct {
 // corresponds to the "name" parameter. Do not use the "Options.NoDoubleUnderscoreSep" option
 // in these APIs, as it is not supported in agent telemetry.
 //
-// profiles[].metric.metrics[].aggregate_tags (optional)
+// profiles[].metric.metrics[].preserve_tags (optional)
 // -----------------------------------------------------
-// List of tags to be used for metric aggregation. If not specified, or [] is specified,
-// metric will be aggregated without any tags. If specified, metric will be aggregated using
-// the specified tags. Unspecified tags
-//   * will not be used and effectively will be removed from the metric's JSON object
-//   * their timeseries value will be summed up according to the remaining metric tags
-//   * in case if no tags a specified, all timeseries will be summed up and no tags will be
-//     reported in the metric's JSON object
-//   * in case none of the tags matches to the aggregateTags time series will be fremoved
-//     from the metric's JSON object
-// The primary goal of such aggregation is not actually to reduce the number of timeseries
-// and the amount of data to be sent to the backend, although it is welcome side-effect,
-// but to make sure that no privacy leak will happen by accident, by enforcing requirement
-// for explicit tag specification.
+// Every emitted metric includes the mandatory system tag "emitter". preserve_tags allowlists
+// additional user labels to keep during aggregation. If omitted or empty, timeseries aggregate
+// by emitter alone. If specified, only emitter and the listed labels are emitted; timeseries
+// missing every listed label are removed from the metric's JSON object. Listing emitter remains
+// accepted for compatibility but is a no-op because emitter is always included.
+// The primary goal is to prevent accidental privacy leaks by requiring explicit tag allowlists.
+//
+// profiles[].metric.metrics[].aggregate_tags (deprecated alias for preserve_tags)
+// ---------------------------------------------------------------------------------
+// Accepted for backward compatibility with existing custom configurations. If both
+// preserve_tags and aggregate_tags are present, preserve_tags takes precedence.
+// New configurations should use preserve_tags instead.
 //
 // profiles[].metric.metrics[].aggregate_total (optional)
 // -----------------------------------------------------
-// When included, specifies whether the metric should be aggregated as a total. A
-// special tag "total" will be added to the metric's JSON object (accordingly "total is
-// reserved tag"). If not specified, specified, default value of `false` will be used.
-// It is useful only if "aggregate_tags" is also specified and will be ignored otherwise.
+// When included, emits one total independently for each emitter. A special tag "total"
+// containing that emitter's source-timeseries count is added to the metric's JSON object
+// (accordingly "total" is a reserved tag).
 //
 // profiles[].schedule (optional)
 // --------------------------------
@@ -183,117 +183,11 @@ type Event struct {
 // -------------------------------------
 // The value is required and used in the corresponding payload
 
-// ----------------------------------------------------------------------------------
-//
 // Default agent telemetry profiles config if not specified in the agent config file.
-// Note: If "aggregate_tags" are not specified, metric will be aggregated without any tags.
-var defaultProfiles = `
-  profiles:
-  - name: checks
-    metric:
-      metrics:
-        - name: checks.execution_time
-          aggregate_tags:
-            - check_name
-            - check_loader
-        - name: pymem.inuse
-    schedule:
-      start_after: 30
-      iterations: 0
-      period: 900
-  - name: logs-and-metrics
-    metric:
-      exclude:
-        zero_metric: true
-      metrics:
-        - name: dogstatsd.udp_packets_bytes
-        - name: dogstatsd.uds_packets_bytes
-        - name: logs.bytes_missed
-        - name: logs.bytes_sent
-        - name: logs.decoded
-        - name: logs.dropped
-        - name: logs.encoded_bytes_sent
-          aggregate_tags:
-            - compression_kind
-        - name: logs.sender_latency
-        - name: logs.auto_multi_line_aggregator_flush
-          aggregate_tags:
-            - truncated
-            - line_type
-        - name: logs_destination.destination_workers
-        - name: point.sent
-        - name: point.dropped
-        - name: transactions.input_count
-        - name: transactions.requeued
-        - name: transactions.retries
-    schedule:
-      start_after: 30
-      iterations: 0
-      period: 900
-  - name: database
-    metric:
-      exclude:
-        zero_metric: true
-      metrics:
-        - name: oracle.activity_samples_count
-        - name: oracle.activity_latency
-        - name: oracle.statement_metrics
-        - name: oracle.statement_plan_errors
-        - name: postgres.collect_activity_snapshot_ms
-        - name: postgres.collect_relations_autodiscovery_ms
-        - name: postgres.collect_statement_samples_ms
-        - name: postgres.collect_statement_samples_count
-        - name: postgres.collect_stat_autodiscovery_ms
-        - name: postgres.get_active_connections_ms
-        - name: postgres.get_active_connections_count
-        - name: postgres.get_new_pg_stat_activity_count
-        - name: postgres.get_new_pg_stat_activity_ms
-        - name: postgres.schema_tables_elapsed_ms
-        - name: postgres.schema_tables_count
-    schedule:
-      start_after: 30
-      iterations: 0
-      period: 900
-  - name: api
-    metric:
-      exclude:
-        zero_metric: true
-      metrics:
-        - name: api_server.request_duration_seconds
-          aggregate_tags:
-            - servername
-            - status_code
-            - method
-            - path
-            - auth
-    schedule:
-      start_after: 600
-      iterations: 0
-      period: 14400
-  - name: ondemand
-    events:
-      - name: agentbsod
-        request_type: agent-bsod
-        payload_key: agent_bsod
-        message: 'Agent BSOD'
-  - name: status
-    metric:
-      exclude:
-        zero_metric: true
-      metrics:
-        - name: status.dce_render_errors
-          aggregate_tags:
-            - kind
-            - template_name
-  - name: service-discovery
-    metric:
-      metrics:
-        - name: service_discovery.discovered_services
-    schedule:
-      start_after: 30
-      iterations: 0
-      period: 900
-`
+// Note: If "preserve_tags" are not specified, metric will be aggregated by emitter only.
+//
+//go:embed defaultProfiles.yaml
+var defaultProfiles string
 
 func compileMetricsExclude(p *Profile) error {
 	if p.Metric.Exclude == nil {
@@ -350,22 +244,36 @@ func compileMetric(p *Profile, m *MetricConfig) error {
 		return fmt.Errorf("profile '%s' 'metrics[].name' '(%s)' attribute should have two elements separated by '.'", p.Name, m.Name)
 	}
 
-	// Converts a Datadog metric name to a Prometheus metric name for quicker matching. Prometheus metrics
-	// (from the "telemetry" package) must be declared without setting Options.NoDoubleUnderscoreSep to true,
-	// ensuring the full metric name includes double underscores ("__"); otherwise, matching will fail.
-	promName := fmt.Sprintf("%s__%s", names[0], names[1])
+	// Converts a Datadog metric name to a Prometheus-style name for quicker matching.
+	// We store with a single "_" separator so the lookup site (transformMetricFamily)
+	// can normalize "__" to "_" and match metrics declared with or without
+	// Options.NoDoubleUnderscoreSep.
+	promName := fmt.Sprintf("%s_%s", names[0], names[1])
 	p.metricsMap[promName] = m
 
-	// Compile aggregate tags (optional)
-	if len(m.AggregateTags) == 0 {
-		m.aggregateTagsExists = false
-	} else {
-		m.aggregateTagsExists = true
-		m.aggregateTagsMap = make(map[string]any)
-		for _, t := range m.AggregateTags {
-			m.aggregateTagsMap[t] = struct{}{}
+	// Compile preserve tags (optional). AggregateTags is a deprecated alias for PreserveTags;
+	// if both are set, PreserveTags takes precedence.
+	tags := m.PreserveTags
+	if len(tags) == 0 {
+		tags = m.AggregateTags
+	}
+	// AggregateTotal synthesizes total=<timeseries count>; preserving a source
+	// total tag could emit two series with the same metric name and tags.
+	if m.AggregateTotal {
+		for _, tag := range tags {
+			if tag == "total" {
+				return fmt.Errorf("profile '%s' metric '%s' cannot preserve reserved tag 'total' when aggregate_total is enabled", p.Name, m.Name)
+			}
 		}
 	}
+	m.preserveTagsMap = make(map[string]any)
+	for _, tag := range tags {
+		if tag == emitterTagName {
+			continue
+		}
+		m.preserveTagsMap[tag] = struct{}{}
+	}
+	m.preserveTagsExists = len(m.preserveTagsMap) > 0
 
 	return nil
 }
@@ -485,7 +393,7 @@ func compileConfig(cfg *Config) error {
 // Parse agent telemetry config
 func parseConfig(cfg config.Component) (*Config, error) {
 	// Is it enabled?
-	if !pkgconfigsetup.IsAgentTelemetryEnabled(cfg) {
+	if !configutils.IsAgentTelemetryEnabled(cfg) {
 		return &Config{
 			Enabled: false,
 		}, nil
@@ -497,7 +405,7 @@ func parseConfig(cfg config.Component) (*Config, error) {
 	atCfgMap := cfg.GetStringMap("agent_telemetry")
 	if len(atCfgMap) > 0 {
 		// Reconvert to string and back to object.
-		// Config.UnmarshalKey() is better but it did not work in some cases
+		// structure.UnmarshalKey() is better but it did not work in some cases
 		atCfgBytes, err := yaml.Marshal(atCfgMap)
 		if err != nil {
 			return nil, err

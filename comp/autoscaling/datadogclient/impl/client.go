@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"sync"
 
+	"gopkg.in/zorkian/go-datadog-api.v2"
+
 	datadogclient "github.com/DataDog/datadog-agent/comp/autoscaling/datadogclient/def"
 	configComponent "github.com/DataDog/datadog-agent/comp/core/config"
 	logComp "github.com/DataDog/datadog-agent/comp/core/log/def"
 	"github.com/DataDog/datadog-agent/comp/core/status"
+	"github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/config/structure"
-	"gopkg.in/zorkian/go-datadog-api.v2"
 )
 
 // Requires defines the dependencies for the datadogclient component
@@ -65,7 +67,7 @@ func NewComponent(reqs Requires) (Provides, error) {
 		log:               reqs.Log,
 	}
 	// Register a callback to refresh the client when the api_key or app_key changes
-	reqs.Config.OnUpdate(func(setting string, _, _ any) {
+	reqs.Config.OnUpdate(func(setting string, _ model.Source, _, _ any, _ uint64, _ model.Source) {
 		if setting == "api_key" || setting == "app_key" {
 			dc.refreshClient()
 		}
@@ -119,7 +121,7 @@ func (d *datadogClientWrapper) refreshClient() {
 }
 
 func createDatadogClient(cfg configComponent.Component, logger logComp.Component) (datadogclient.Component, error) {
-	if cfg.IsSet(metricsRedundantEndpointConfig) {
+	if cfg.IsConfigured(metricsRedundantEndpointConfig) {
 		var endpoints []endpoint
 		if err := structure.UnmarshalKey(cfg, metricsRedundantEndpointConfig, &endpoints); err != nil {
 			return nil, fmt.Errorf("could not parse %s: %v", metricsRedundantEndpointConfig, err)

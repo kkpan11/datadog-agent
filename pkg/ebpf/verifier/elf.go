@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // This file uses the DWARF and cilium/ebpf libraries to build a source map for an eBPF object file.
 // This map links each instruction in the program to the source line in the original C code. This task
@@ -75,7 +75,7 @@ func getLineReader(dwarfData *dwarf.Data) (*dwarf.LineReader, error) {
 			return lineReader, nil
 		}
 	}
-	return nil, fmt.Errorf("no line reader found in DWARF data")
+	return nil, errors.New("no line reader found in DWARF data")
 }
 
 // progStartPoint defines a possible start point for a program: section index + address
@@ -90,7 +90,7 @@ func buildProgStartMap(dwarfData *dwarf.Data, symToSeq map[string]int) (map[prog
 	progStartLines := make(map[progStartPoint]string)
 	entryReader := dwarfData.Reader()
 	if entryReader == nil {
-		return nil, fmt.Errorf("cannot get dwarf reader")
+		return nil, errors.New("cannot get dwarf reader")
 	}
 
 	for {

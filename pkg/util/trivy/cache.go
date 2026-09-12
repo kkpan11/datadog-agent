@@ -9,11 +9,10 @@
 package trivy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -33,21 +32,9 @@ const cacheSize = 1600
 // telemetryTick is the frequency at which the cache usage metrics are collected.
 var telemetryTick = 1 * time.Minute
 
-// defaultCacheDir returns/creates the default cache-dir to be used for trivy operations
-func defaultCacheDir() string {
-	tmpDir, err := os.UserCacheDir()
-	if err != nil {
-		tmpDir = os.TempDir()
-	}
-	return filepath.Join(tmpDir, "trivy")
-}
-
 // NewCustomBoltCache returns a BoltDB cache using an LRU algorithm with a
 // maximum disk size and garbage collection of unused images with its custom cleaner.
 func NewCustomBoltCache(wmeta option.Option[workloadmeta.Component], cacheDir string, maxDiskSize int) (CacheWithCleaner, error) {
-	if cacheDir == "" {
-		cacheDir = defaultCacheDir()
-	}
 	db, err := NewBoltDB(cacheDir)
 	if err != nil {
 		return nil, err
@@ -145,7 +132,7 @@ func (c *ScannerCache) setKeysForEntity(entity string, cachedKeys []string) {
 }
 
 // MissingBlobs implements cache.Cache#MissingBlobs
-func (c *ScannerCache) MissingBlobs(artifactID string, blobIDs []string) (bool, []string, error) {
+func (c *ScannerCache) MissingBlobs(_ context.Context, artifactID string, blobIDs []string) (bool, []string, error) {
 	var missingBlobIDs []string
 	for _, blobID := range blobIDs {
 		if ok := c.cache.Contains(blobID); !ok {
@@ -159,23 +146,23 @@ func (c *ScannerCache) MissingBlobs(artifactID string, blobIDs []string) (bool, 
 }
 
 // PutArtifact implements cache.Cache#PutArtifact
-func (c *ScannerCache) PutArtifact(artifactID string, artifactInfo types.ArtifactInfo) error {
+func (c *ScannerCache) PutArtifact(_ context.Context, artifactID string, artifactInfo types.ArtifactInfo) error {
 	return trivyCachePut(c, artifactID, artifactInfo)
 }
 
 // PutBlob implements cache.Cache#PutBlob
-func (c *ScannerCache) PutBlob(blobID string, blobInfo types.BlobInfo) error {
+func (c *ScannerCache) PutBlob(_ context.Context, blobID string, blobInfo types.BlobInfo) error {
 	return trivyCachePut(c, blobID, blobInfo)
 }
 
 // DeleteBlobs implements cache.Cache#DeleteBlobs does nothing because the cache cleaning logic is
 // managed by CacheCleaner
-func (c *ScannerCache) DeleteBlobs([]string) error {
+func (c *ScannerCache) DeleteBlobs(_ context.Context, _ []string) error {
 	return nil
 }
 
 // Clear implements cache.Cache#Clear
-func (c *ScannerCache) Clear() error {
+func (c *ScannerCache) Clear(_ context.Context) error {
 	return c.cache.Clear()
 }
 
@@ -185,12 +172,12 @@ func (c *ScannerCache) Close() error {
 }
 
 // GetArtifact implements cache.Cache#GetArtifact
-func (c *ScannerCache) GetArtifact(id string) (types.ArtifactInfo, error) {
+func (c *ScannerCache) GetArtifact(_ context.Context, id string) (types.ArtifactInfo, error) {
 	return trivyCacheGet[types.ArtifactInfo](c, id)
 }
 
 // GetBlob implements cache.Cache#GetBlob
-func (c *ScannerCache) GetBlob(id string) (types.BlobInfo, error) {
+func (c *ScannerCache) GetBlob(_ context.Context, id string) (types.BlobInfo, error) {
 	return trivyCacheGet[types.BlobInfo](c, id)
 }
 
@@ -202,6 +189,9 @@ type persistentCache struct {
 	currentCachedObjectTotalSize int
 	maximumCachedObjectSize      int
 	lastEvicted                  string
+	stop                         chan struct{}
+	stopped                      chan struct{}
+	closeOnce                    sync.Once
 }
 
 // newPersistentCache creates a new instance of persistentCache and returns a pointer to it.
@@ -214,6 +204,8 @@ func newPersistentCache(
 		db:                           localDB,
 		currentCachedObjectTotalSize: 0,
 		maximumCachedObjectSize:      maxCachedObjectSize,
+		stop:                         make(chan struct{}),
+		stopped:                      make(chan struct{}),
 	}
 
 	lruCache, err := simplelru.NewLRU(cacheSize, func(key string, _ struct{}) {
@@ -240,15 +232,7 @@ func newPersistentCache(
 		return nil, err
 	}
 
-	go func() {
-		ticker := time.NewTicker(telemetryTick)
-		for {
-			for range ticker.C {
-				persistentCache.collectTelemetry()
-			}
-			// TODO: add database compaction. BoltDB deletes the old pages but does not shrink the file.
-		}
-	}()
+	go persistentCache.collectTelemetryLoop()
 
 	return persistentCache, nil
 }
@@ -297,7 +281,7 @@ func (c *persistentCache) Clear() error {
 func (c *persistentCache) removeOldest() error {
 	key, ok := c.removeOldestKeyFromMemory()
 	if !ok {
-		return fmt.Errorf("in-memory cache is empty")
+		return errors.New("in-memory cache is empty")
 	}
 
 	evicted := 0
@@ -331,16 +315,20 @@ func (c *persistentCache) reduceSize(target int) error {
 		}
 		if prev == c.currentCachedObjectTotalSize {
 			// if c.currentCachedObjectTotalSize is not updated by removeOldest then an item is stored in the lrucache without being stored in the local storage
-			return fmt.Errorf("cache and db are out of sync")
+			return errors.New("cache and db are out of sync")
 		}
 	}
 	return nil
 }
 
-// Close closes the database.
+// Close stops the telemetry collection and closes the database.
 func (c *persistentCache) Close() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	c.closeOnce.Do(func() {
+		close(c.stop)
+		<-c.stopped
+	})
 	return c.db.Close()
 }
 
@@ -388,7 +376,7 @@ func (c *persistentCache) Set(key string, value []byte) error {
 func (c *persistentCache) Get(key string) ([]byte, error) {
 	ok := c.Contains(key)
 	if !ok {
-		return nil, fmt.Errorf("key not found")
+		return nil, errors.New("key not found")
 	}
 
 	res, err := c.db.Get(key)
@@ -468,6 +456,24 @@ func (c *persistentCache) collectTelemetry() {
 	telemetry.SBOMCacheDiskSize.Set(float64(diskSize))
 }
 
+// collectTelemetryLoop collects the database's size until the cache is closed.
+// TODO: add database compaction. BoltDB deletes the old pages but does not shrink the file.
+func (c *persistentCache) collectTelemetryLoop() {
+	defer close(c.stopped)
+
+	ticker := time.NewTicker(telemetryTick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.collectTelemetry()
+		case <-c.stop:
+			return
+		}
+	}
+}
+
 func newMemoryCache() *memoryCache {
 	return &memoryCache{
 		blobs:     make(map[string]types.BlobInfo),
@@ -481,39 +487,39 @@ type memoryCache struct {
 	lastBlobID string
 }
 
-func (c *memoryCache) MissingBlobs(artifactID string, blobIDs []string) (missingArtifact bool, missingBlobIDs []string, err error) {
+func (c *memoryCache) MissingBlobs(ctx context.Context, artifactID string, blobIDs []string) (missingArtifact bool, missingBlobIDs []string, err error) {
 	for _, blobID := range blobIDs {
-		if _, err := c.GetBlob(blobID); err != nil {
+		if _, err := c.GetBlob(ctx, blobID); err != nil {
 			missingBlobIDs = append(missingBlobIDs, blobID)
 		}
 	}
 
-	if _, err := c.GetArtifact(artifactID); err != nil {
+	if _, err := c.GetArtifact(ctx, artifactID); err != nil {
 		missingArtifact = true
 	}
 
 	return
 }
 
-func (c *memoryCache) PutArtifact(artifactID string, artifactInfo types.ArtifactInfo) error {
+func (c *memoryCache) PutArtifact(_ context.Context, artifactID string, artifactInfo types.ArtifactInfo) error {
 	c.artifacts[artifactID] = artifactInfo
 	return nil
 }
 
-func (c *memoryCache) PutBlob(blobID string, blobInfo types.BlobInfo) error {
+func (c *memoryCache) PutBlob(_ context.Context, blobID string, blobInfo types.BlobInfo) error {
 	c.blobs[blobID] = blobInfo
 	c.lastBlobID = blobID
 	return nil
 }
 
-func (c *memoryCache) DeleteBlobs(blobIDs []string) error {
+func (c *memoryCache) DeleteBlobs(_ context.Context, blobIDs []string) error {
 	for _, id := range blobIDs {
 		delete(c.blobs, id)
 	}
 	return nil
 }
 
-func (c *memoryCache) GetArtifact(artifactID string) (types.ArtifactInfo, error) {
+func (c *memoryCache) GetArtifact(_ context.Context, artifactID string) (types.ArtifactInfo, error) {
 	art, ok := c.artifacts[artifactID]
 	if !ok {
 		return types.ArtifactInfo{}, errors.New("not found")
@@ -521,7 +527,7 @@ func (c *memoryCache) GetArtifact(artifactID string) (types.ArtifactInfo, error)
 	return art, nil
 }
 
-func (c *memoryCache) GetBlob(blobID string) (types.BlobInfo, error) {
+func (c *memoryCache) GetBlob(_ context.Context, blobID string) (types.BlobInfo, error) {
 	b, ok := c.blobs[blobID]
 	if !ok {
 		return types.BlobInfo{}, errors.New("not found")
@@ -535,7 +541,7 @@ func (c *memoryCache) Close() (err error) {
 	return nil
 }
 
-func (c *memoryCache) Clear() (err error) {
+func (c *memoryCache) Clear(_ context.Context) (err error) {
 	return c.Close()
 }
 func (c *memoryCache) clean() error                      { return nil }

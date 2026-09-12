@@ -14,6 +14,8 @@ import (
 const (
 	// DatadogAgentPackage is the datadog agent package
 	DatadogAgentPackage string = "datadog-agent"
+	// DatadogAgentDDOTPackage is the datadog agent ddot package
+	DatadogAgentDDOTPackage string = "datadog-ddot"
 	// DatadogAPMInjectPackage is the datadog apm inject package
 	DatadogAPMInjectPackage string = "datadog-apm-inject"
 	// DatadogAPMLibraryJavaPackage is the datadog apm library java package
@@ -28,11 +30,22 @@ const (
 	DatadogAPMLibraryDotNetPackage string = "datadog-apm-library-dotnet"
 	// DatadogAPMLibraryPHPPackage is the datadog apm library php package
 	DatadogAPMLibraryPHPPackage string = "datadog-apm-library-php"
+	// DatadogAPMLibraryNginxPackage is the datadog apm library nginx package
+	DatadogAPMLibraryNginxPackage string = "datadog-apm-library-nginx"
+	// DatadogAPMLibraryIISPackage is the datadog apm library iis package
+	DatadogAPMLibraryIISPackage string = "datadog-apm-library-iis"
+	// DatadogAPMLibraryIISRumPackage is the datadog apm library iis rum package
+	DatadogAPMLibraryIISRumPackage string = "datadog-apm-library-iis-rum"
+	// DatadogAPMLibraryHttpdPackage is the datadog apm library httpd package
+	DatadogAPMLibraryHttpdPackage string = "datadog-apm-library-httpd"
+	// DatadogAPMLibraryCPackage is the datadog apm library c package
+	DatadogAPMLibraryCPackage string = "datadog-apm-library-c"
 )
 
 var (
 	order = []string{
 		DatadogAgentPackage,
+		DatadogAgentDDOTPackage,
 		DatadogAPMInjectPackage,
 		DatadogAPMLibraryJavaPackage,
 		DatadogAPMLibraryPythonPackage,
@@ -40,9 +53,16 @@ var (
 		DatadogAPMLibraryJSPackage,
 		DatadogAPMLibraryDotNetPackage,
 		DatadogAPMLibraryPHPPackage,
+		DatadogAPMLibraryNginxPackage,
+		DatadogAPMLibraryIISPackage,
+		DatadogAPMLibraryIISRumPackage,
+		DatadogAPMLibraryHttpdPackage,
+		DatadogAPMLibraryCPackage,
 	}
 
-	// ApmLibraries is a list of all the apm libraries
+	// ApmLibraries is the list of apm libraries selectable via the setup
+	// default script (DD_APM_INSTRUMENTATION_LIBRARIES), including by the
+	// "all" / install-all-when-empty fallback.
 	ApmLibraries = []string{
 		DatadogAPMLibraryJavaPackage,
 		DatadogAPMLibraryPythonPackage,
@@ -50,6 +70,19 @@ var (
 		DatadogAPMLibraryJSPackage,
 		DatadogAPMLibraryDotNetPackage,
 		DatadogAPMLibraryPHPPackage,
+		DatadogAPMLibraryNginxPackage,
+	}
+
+	// ExplicitOnlyApmLibraries are apm libraries that must be named in
+	// DD_APM_INSTRUMENTATION_LIBRARIES to be installed via the setup default
+	// script. They are excluded from "all" and the empty-libraries fallback
+	// because the underlying packages are pre-registered and gated on remote
+	// updates.
+	ExplicitOnlyApmLibraries = []string{
+		DatadogAPMLibraryIISPackage,
+		DatadogAPMLibraryIISRumPackage,
+		DatadogAPMLibraryHttpdPackage,
+		DatadogAPMLibraryCPackage,
 	}
 )
 
@@ -72,12 +105,14 @@ func resolvePackages(env *env.Env, packages Packages) []packageWithVersion {
 
 // Packages is a list of packages to install
 type Packages struct {
-	install map[string]packageWithVersion
+	install          map[string]packageWithVersion
+	copyInstallerSSI bool
 }
 
 type packageWithVersion struct {
-	name    string
-	version string
+	name         string
+	version      string
+	forceInstall bool
 }
 
 // Install marks a package to be installed
@@ -86,4 +121,10 @@ func (p *Packages) Install(pkg string, version string) {
 		name:    pkg,
 		version: version,
 	}
+}
+
+// WriteSSIInstaller marks that the installer should be copied to /opt/datadog-packages/run/datadog-installer-ssi
+// Use this when installing SSI without the agent, so that the installer can be used later to remove the packages.
+func (p *Packages) WriteSSIInstaller() {
+	p.copyInstallerSSI = true
 }

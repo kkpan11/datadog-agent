@@ -2,7 +2,7 @@ using Datadog.CustomActions.Extensions;
 using Datadog.CustomActions.Interfaces;
 using Datadog.CustomActions.Native;
 using Datadog.CustomActions.Rollback;
-using Microsoft.Deployment.WindowsInstaller;
+using WixToolset.Dtf.WindowsInstaller;
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
@@ -48,6 +48,30 @@ namespace Datadog.CustomActions
             {
                 _rollbackDataStore = new RollbackDataStore(_session, rollbackDataName, _fileSystemServices, _serviceController);
             }
+        }
+
+        public static bool IsServiceDoesNotExistError(Exception exception)
+        {
+            // Walk the exception chain to find a Win32Exception with ERROR_SERVICE_DOES_NOT_EXIST (1060)
+            var current = exception;
+            while (current != null)
+            {
+                if (current is System.ComponentModel.Win32Exception wex && wex.NativeErrorCode == 1060)
+                {
+                    return true;
+                }
+                // Fallback: some ServiceController operations surface as InvalidOperationException with a descriptive message
+                // System.ComponentModel.Win32Exception: The specified service does not exist as an installed service
+                if (current is InvalidOperationException ioe &&
+                    ioe.Message != null &&
+                    // string.Contains doesn't have a ignore-case option
+                    ioe.Message.IndexOf("does not exist", StringComparison.InvariantCultureIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+                current = current.InnerException;
+            }
+            return false;
         }
 
         public ServiceCustomAction(ISession session)
@@ -140,11 +164,15 @@ namespace Datadog.CustomActions
             return ActionResult.Success;
         }
 
-        private void ConfigureServiceUsers(string ddAgentUserName, SecurityIdentifier ddAgentUserSID)
+        internal void ConfigureServiceUsers(string ddAgentUserName, SecurityIdentifier ddAgentUserSID)
         {
             var ddAgentUserPassword = _session.Property("DDAGENTUSER_PROCESSED_PASSWORD");
             var isServiceAccount = _nativeMethods.IsServiceAccount(ddAgentUserSID);
-            if (!isServiceAccount && string.IsNullOrEmpty(ddAgentUserPassword))
+            // No password to give the services. Only reachable for domain accounts: local accounts
+            // always get a generated password, and IsServiceAccount covers gMSA and the well known
+            // accounts.
+            var passwordNotProvided = !isServiceAccount && string.IsNullOrEmpty(ddAgentUserPassword);
+            if (passwordNotProvided)
             {
                 _session.Log("Password not provided, will not change service user password");
                 // set to null so we don't modify the service config
@@ -185,6 +213,15 @@ namespace Datadog.CustomActions
             }
             _serviceController.SetCredentials(Constants.AgentServiceName, ddAgentUserName, ddAgentUserPassword);
             _serviceController.SetCredentials(Constants.TraceAgentServiceName, ddAgentUserName, ddAgentUserPassword);
+            if (_serviceController.ServiceExists(Constants.PrivateActionRunnerServiceName))
+            {
+                _serviceController.SetCredentials(Constants.PrivateActionRunnerServiceName, ddAgentUserName, ddAgentUserPassword);
+            }
+            _serviceController.SetCredentials(Constants.ProcmgrServiceName, ddAgentUserName, ddAgentUserPassword);
+            // When procmgr moves back to LocalSystem, replace this with an unconditional enable rather
+            // than deleting it. passwordNotProvided describes the Agent user, and a disabled start type
+            // survives an upgrade, so hosts disabled here would otherwise stay disabled forever.
+            ConfigureProcmgrStartType(passwordNotProvided);
 
             // SYSTEM
             // LocalSystem is a SCM specific shorthand that doesn't need to be localized
@@ -193,6 +230,41 @@ namespace Datadog.CustomActions
             _serviceController.SetCredentials(Constants.InstallerServiceName, "LocalSystem", "");
 
             _serviceController.SetCredentials(Constants.SecurityAgentServiceName, ddAgentUserName, ddAgentUserPassword);
+        }
+
+        /// <summary>
+        /// dd-procmgr-service runs as ddagentuser and is a new service. If we do not have the password
+        /// and it is not in the LSA store, the service cannot log on, and the SCM retries the failing
+        /// logon until the account is locked out. Disable the service in that case so that it is never
+        /// started, and set it back to demand start once a password is available again.
+        /// </summary>
+        private void ConfigureProcmgrStartType(bool passwordNotProvided)
+        {
+            ServiceStartMode startType;
+            if (passwordNotProvided)
+            {
+                startType = ServiceStartMode.Disabled;
+                _session.Log(
+                    $"The Agent user password is not available, setting {Constants.ProcmgrServiceName} start type to " +
+                    "disabled so that it does not repeatedly fail to log on, which can lock out the account. " +
+                    "Reinstall the Agent with the DDAGENTUSER_NAME and DDAGENTUSER_PASSWORD options provided " +
+                    "to enable the Datadog Process Manager service.");
+            }
+            else
+            {
+                startType = ServiceStartMode.Manual;
+                _session.Log($"Setting {Constants.ProcmgrServiceName} start type to {startType}");
+            }
+
+            try
+            {
+                _serviceController.SetStartType(Constants.ProcmgrServiceName, startType);
+            }
+            catch (Exception e) when (IsServiceDoesNotExistError(e))
+            {
+                // If the service does not exist there is nothing that can fail to log on.
+                _session.Log($"Service {Constants.ProcmgrServiceName} not found, not changing its start type");
+            }
         }
 
         private void UpdateAndLogAccessControl(string serviceName, CommonSecurityDescriptor securityDescriptor)
@@ -223,7 +295,12 @@ namespace Datadog.CustomActions
                 Constants.TraceAgentServiceName,
                 Constants.AgentServiceName,
                 Constants.InstallerServiceName,
+                Constants.ProcmgrServiceName,
             };
+            if (_serviceController.ServiceExists(Constants.PrivateActionRunnerServiceName))
+            {
+                services.Add(Constants.PrivateActionRunnerServiceName);
+            }
 
             services.Add(Constants.SecurityAgentServiceName);
 
@@ -289,7 +366,7 @@ namespace Datadog.CustomActions
         /// Stop any existing datadog services
         /// </summary>
         /// <returns></returns>
-        private ActionResult StopDDServices(bool continueOnError)
+        public ActionResult StopDDServices(bool continueOnError)
         {
             try
             {
@@ -339,6 +416,8 @@ namespace Datadog.CustomActions
                     Constants.NpmServiceName,
                     Constants.ProcmonServiceName,       // might not exist depending on compile time options**
                     Constants.SecurityAgentServiceName, // might not exist depending on compile time options**
+                    Constants.PrivateActionRunnerServiceName,
+                    Constants.ProcmgrServiceName,
                     Constants.ProcessAgentServiceName,
                     Constants.TraceAgentServiceName,
                     Constants.InstallerServiceName,
@@ -375,6 +454,11 @@ namespace Datadog.CustomActions
                             _session.Log($"Service {service} not found");
                         }
                     }
+                    catch (Exception e) when (IsServiceDoesNotExistError(e))
+                    {
+                        _session.Log($"Service {service} not found");
+                        continue;
+                    }
                     catch (Exception e)
                     {
                         if (!continueOnError)
@@ -402,6 +486,14 @@ namespace Datadog.CustomActions
 
         private ActionResult StartDDServices()
         {
+            // Check if DD_INSTALL_ONLY flag is set
+            var installOnly = _session.Property("DD_INSTALL_ONLY");
+            if (!string.IsNullOrEmpty(installOnly) && (installOnly == "1" || installOnly.ToLower() == "true"))
+            {
+                _session.Log("DD_INSTALL_ONLY is set, skipping service start.");
+                return ActionResult.Success;
+            }
+
             try
             {
                 var ddservices = new[]

@@ -1,0 +1,98 @@
+load("@@//bazel/rules/dd_packaging:dd_cc_packaged.bzl", "dd_cc_packaged")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_license//rules:license.bzl", "license")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_filegroup", "pkg_files")
+
+package(default_package_metadata = [":license"])
+
+license(
+    name = "license",
+    license_kinds = ["@rules_license//licenses/spdx:MIT"],
+    license_text = "COPYING",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "libpopt",
+    srcs = [
+        "src/popt.c",
+        "src/poptconfig.c",
+        "src/popthelp.c",
+        "src/poptint.c",
+        "src/poptint.h",
+        "src/poptparse.c",
+        "src/system.h",
+    ],
+    textual_hdrs = [
+        "src/lookup3.c",
+    ],
+    hdrs = [
+        "src/popt.h",
+    ],
+    copts = [
+        "-std=gnu99",
+        "-O2",
+    ],
+    local_defines = [
+        "_GNU_SOURCE",
+        "HAVE_STPCPY",
+        "HAVE_STRERROR",
+        "HAVE_GETUID",
+        "HAVE_GETEUID",
+        "HAVE_MTRACE",
+        "HAVE_SECURE_GETENV",
+        "HAVE_SETUID",
+        "HAVE_VASPRINTF",
+        "HAVE_SRANDOM",
+        "HAVE_GLOB_PATTERN_P",
+        "HAVE_MBSRTOWCS",
+        "HAVE_FNMATCH_H",
+        "HAVE_GLOB_H",
+        "HAVE_LANGINFO_H",
+        "HAVE_MCHECK_H",
+        "HAVE_STDALIGN_H",
+        'PACKAGE=\\"popt\\"',
+        'POPT_SYSCONFDIR=\\"/etc/\\"',
+    ],
+    strip_include_prefix = "src",
+    visibility = ["//visibility:public"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+cc_shared_library(
+    name = "popt",
+    deps = [
+        ":libpopt",
+    ],
+    additional_linker_inputs = [
+        "src/libpopt.vers",
+    ],
+    user_link_flags = [
+        "-Wl,--no-undefined",
+        "-Wl,--version-script=$(location src/libpopt.vers)",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+pkg_files(
+    name = "hdr_files",
+    srcs = glob(["src/popt.h"]),
+    prefix = "include",
+)
+
+dd_cc_packaged(
+    name = "popt_pkg",
+    input = ":popt",
+    version = "0.0.2",
+    installed_files = [":hdr_files"],
+    visibility = ["//visibility:public"],
+)
+
+pkg_filegroup(
+    name = "all_files",
+    srcs = [
+        ":hdr_files",
+    ],
+    prefix = "embedded",
+    visibility = ["@@//deps/openscap:__pkg__", "@@//packages:__subpackages__"],
+)

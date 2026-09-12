@@ -10,18 +10,23 @@ package tags
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
+	"github.com/DataDog/datadog-agent/pkg/config/env"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
 	"github.com/DataDog/datadog-agent/pkg/util/cache"
+	pkgec2 "github.com/DataDog/datadog-agent/pkg/util/ec2"
 	ec2internal "github.com/DataDog/datadog-agent/pkg/util/ec2/internal"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -32,6 +37,10 @@ var (
 	infoCacheKey = cache.BuildAgentKey("ec2", "GetInstanceInfo")
 
 	imdsTags = "/tags/instance"
+
+	// for testing purposes
+	fetchContainerInstanceARN = getContainerInstanceARN
+	isSpotInstance            = pkgec2.IsSpotInstance
 )
 
 func isTagExcluded(tag string) bool {
@@ -46,8 +55,8 @@ func isTagExcluded(tag string) bool {
 // GetInstanceInfo collects information about the EC2 instance as host tags. This mimic the tags set by the AWS
 // integration in Datadog backend allowing customer to collect those information without having to enable the crawler.
 func GetInstanceInfo(ctx context.Context) ([]string, error) {
-	if !pkgconfigsetup.IsCloudProviderEnabled(ec2internal.CloudProviderName, pkgconfigsetup.Datadog()) {
-		return nil, fmt.Errorf("cloud provider is disabled by configuration")
+	if !configutils.IsCloudProviderEnabled(ec2internal.CloudProviderName, pkgconfigsetup.Datadog()) {
+		return nil, errors.New("cloud provider is disabled by configuration")
 	}
 
 	if !pkgconfigsetup.Datadog().GetBool("collect_ec2_instance_info") {
@@ -72,7 +81,7 @@ func GetInstanceInfo(ctx context.Context) ([]string, error) {
 		if val, ok := info[infoName]; ok {
 			tags = append(tags, fmt.Sprintf("%s:%s", tagName, val))
 		} else {
-			tags = append(tags, fmt.Sprintf("%s:unavailable", tagName))
+			tags = append(tags, tagName+":unavailable")
 		}
 	}
 
@@ -81,6 +90,29 @@ func GetInstanceInfo(ctx context.Context) ([]string, error) {
 	getAndSet("accountId", "aws_account")
 	getAndSet("imageId", "image")
 	getAndSet("availabilityZone", "availability-zone")
+
+	// Add container instance ARN when running on ECS EC2
+	if env.IsFeaturePresent(env.ECSEC2) {
+		const ciaTagName = "container_instance_arn"
+		if !isTagExcluded(ciaTagName) {
+			arn, err := fetchContainerInstanceARN(ctx)
+			if err != nil || arn == "" {
+				log.Debugf("could not fetch container instance ARN: %v", err)
+			} else {
+				tags = append(tags, fmt.Sprintf("%s:%s", ciaTagName, arn))
+			}
+		}
+	}
+
+	// Add capacity-type:spot when running on a Spot instance
+	const capacityTypeTagName = "capacity-type"
+	if !isTagExcluded(capacityTypeTagName) {
+		if isSpot, err := isSpotInstance(ctx); err != nil {
+			log.Debugf("could not determine spot instance status: %v", err)
+		} else if isSpot {
+			tags = append(tags, capacityTypeTagName+":spot")
+		}
+	}
 
 	// save tags to the cache in case we exceed quotas later
 	cache.Cache.Set(infoCacheKey, tags, cache.NoExpiration)
@@ -133,46 +165,53 @@ func fetchEc2TagsFromIMDS(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
+func createEC2Client(ctx context.Context, region string, creds aws.CredentialsProvider) (*ec2.Client, error) {
+	opts := []func(*config.LoadOptions) error{config.WithRegion(region)}
+	if creds != nil {
+		opts = append(opts, config.WithCredentialsProvider(creds))
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("unable to load AWS SDK config: %w", err)
+	}
+	return ec2.NewFromConfig(cfg), nil
+}
+
 func fetchEc2TagsFromAPI(ctx context.Context) ([]string, error) {
 	instanceIdentity, err := ec2internal.GetInstanceIdentity(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// First, try automatic credentials detection. This works in most scenarios,
-	// except when a more specific role (e.g. task role in ECS) does not have
-	// EC2:DescribeTags permission, but a more general role (e.g. instance role)
-	// does have it.
-	tags, err := getTagsWithCreds(ctx, instanceIdentity, nil)
-	if err == nil {
-		return tags, nil
-	}
-	log.Debugf("unable to get tags using default credentials (falling back to instance role): %s", err)
-
-	// If the above fails, for backward compatibility, fall back to our legacy
-	// behavior, where we explicitly query instance role to get credentials.
-	iamParams, err := getSecurityCreds(ctx)
+	// default client chain (IRSA/ECS/env/instance-profile chain)
+	ec2Client, err := createEC2ClientFunc(ctx, instanceIdentity.Region, nil)
 	if err != nil {
-		return nil, err
+		log.Debugf("unable to create EC2 client with default credentials (falling back to instance role): %s", err)
+
+		// If the above fails, for backward compatibility, fall back to our legacy
+		// behavior, where we explicitly query instance role to get credentials.
+		iamParams, err := getSecurityCreds(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		awsCreds := credentials.NewStaticCredentialsProvider(iamParams.AccessKeyID, iamParams.SecretAccessKey, iamParams.Token)
+		// legacy client
+		ec2Client, err = createEC2ClientFunc(ctx, instanceIdentity.Region, awsCreds)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	awsCreds := credentials.NewStaticCredentialsProvider(iamParams.AccessKeyID, iamParams.SecretAccessKey, iamParams.Token)
-	return getTagsWithCreds(ctx, instanceIdentity, awsCreds)
+	return getTagsWithClientFunc(ctx, ec2Client, instanceIdentity)
 }
 
-func getTagsWithCreds(ctx context.Context, instanceIdentity *ec2internal.EC2Identity, awsCreds aws.CredentialsProvider) ([]string, error) {
-	connection := ec2.New(ec2.Options{
-		Region:      instanceIdentity.Region,
-		Credentials: awsCreds,
-	})
-
-	// We want to use 'ec2_metadata_timeout' here instead of current context. 'ctx' comes from the agent main and will
-	// only be canceled if the agent is stopped. The default timeout for the AWS SDK is 1 minutes (20s timeout with
-	// 3 retries). Since we call getTagsWithCreds twice in a row, it can be a 2 minutes latency.
+func getTagsWithClient(ctx context.Context, client *ec2.Client, instanceIdentity *ec2internal.EC2Identity) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, pkgconfigsetup.Datadog().GetDuration("ec2_metadata_timeout")*time.Millisecond)
 	defer cancel()
 
-	ec2Tags, err := connection.DescribeTags(ctx,
+	describeTagsOutput, err := client.DescribeTags(ctx,
 		&ec2.DescribeTagsInput{
 			Filters: []types.Filter{{
 				Name: aws.String("resource-id"),
@@ -188,7 +227,7 @@ func getTagsWithCreds(ctx context.Context, instanceIdentity *ec2internal.EC2Iden
 	}
 
 	tags := []string{}
-	for _, tag := range ec2Tags.Tags {
+	for _, tag := range describeTagsOutput.Tags {
 		if isTagExcluded(*tag.Key) {
 			continue
 		}
@@ -199,10 +238,12 @@ func getTagsWithCreds(ctx context.Context, instanceIdentity *ec2internal.EC2Iden
 
 // for testing purposes
 var fetchTags = fetchEc2Tags
+var getTagsWithClientFunc = getTagsWithClient
+var createEC2ClientFunc = createEC2Client
 
 func fetchTagsFromCache(ctx context.Context) ([]string, error) {
-	if !pkgconfigsetup.IsCloudProviderEnabled(ec2internal.CloudProviderName, pkgconfigsetup.Datadog()) {
-		return nil, fmt.Errorf("cloud provider is disabled by configuration")
+	if !configutils.IsCloudProviderEnabled(ec2internal.CloudProviderName, pkgconfigsetup.Datadog()) {
+		return nil, errors.New("cloud provider is disabled by configuration")
 	}
 
 	tags, err := fetchTags(ctx)

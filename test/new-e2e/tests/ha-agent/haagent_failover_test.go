@@ -9,24 +9,29 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"testing"
 	"time"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client/agentclient"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client/agentclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/agent"
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agent"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
 
-	componentsOs "github.com/DataDog/test-infra-definitions/components/os"
+	componentsOs "github.com/DataDog/datadog-agent/test/e2e-framework/components/os"
 
-	"github.com/DataDog/test-infra-definitions/resources/aws"
-	"github.com/DataDog/test-infra-definitions/scenarios/aws/ec2"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/resources/aws"
+	fakeintakescenario "github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/fakeintake"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+
+	"github.com/DataDog/datadog-agent/pkg/remoteconfig/state"
+
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
 )
 
 //go:embed fixtures/snmp_conf.yaml
@@ -36,31 +41,37 @@ var snmpConfig string
 var ciscoAciConfig string
 
 type multiVMEnv struct {
-	Host1  *components.RemoteHost
-	Host2  *components.RemoteHost
-	Agent1 *components.RemoteHostAgent
-	Agent2 *components.RemoteHostAgent
+	Host1      *components.RemoteHost
+	Host2      *components.RemoteHost
+	Agent1     *components.RemoteHostAgent
+	Agent2     *components.RemoteHostAgent
+	FakeIntake *components.FakeIntake
 }
 
-func multiVMEnvProvisioner() provisioners.PulumiEnvRunFunc[multiVMEnv] {
+const (
+	agent1Hostname = "test-e2e-agent1"
+	agent2Hostname = "test-e2e-agent2"
+)
+
+func multiVMEnvProvisioner(configID string) provisioners.PulumiEnvRunFunc[multiVMEnv] {
 	return func(ctx *pulumi.Context, env *multiVMEnv) error {
 
 		// language=yaml
-		agentConfig1 := `
-hostname: test-e2e-agent1
+		agentConfig1 := fmt.Sprintf(`
+hostname: %s
 ha_agent:
     enabled: true
-config_id: ci-e2e-ha-failover
+config_id: %s
 log_level: debug
-`
+`, agent1Hostname, configID)
 
-		agentConfig2 := `
-hostname: test-e2e-agent2
+		agentConfig2 := fmt.Sprintf(`
+hostname: %s
 ha_agent:
     enabled: true
-config_id: ci-e2e-ha-failover
+config_id: %s
 log_level: debug
-`
+`, agent2Hostname, configID)
 
 		awsEnv, err := aws.NewEnvironment(ctx)
 		if err != nil {
@@ -79,13 +90,23 @@ log_level: debug
 		}
 		host2.Export(ctx, &env.Host2.HostOutput)
 
-		agent1, err := agent.NewHostAgent(&awsEnv, host1, agentparams.WithAgentConfig(agentConfig1), agentparams.WithIntegration("snmp.d", snmpConfig), agentparams.WithIntegration("cisco_aci.d", ciscoAciConfig))
+		// Share a single fakeintake between both agents so RC can be driven from the
+		// test instead of relying on the real Datadog backend to elect a leader.
+		fakeIntake, err := fakeintakescenario.NewECSFargateInstance(awsEnv, "ha-failover")
+		if err != nil {
+			return err
+		}
+		if err := fakeIntake.Export(ctx, &env.FakeIntake.FakeintakeOutput); err != nil {
+			return err
+		}
+
+		agent1, err := agent.NewHostAgent(&awsEnv, host1, agentparams.WithFakeintake(fakeIntake), agentparams.WithAgentConfig(agentConfig1), agentparams.WithIntegration("snmp.d", snmpConfig), agentparams.WithIntegration("cisco_aci.d", ciscoAciConfig))
 		if err != nil {
 			return err
 		}
 		agent1.Export(ctx, &env.Agent1.HostAgentOutput)
 
-		agent2, err := agent.NewHostAgent(&awsEnv, host2, agentparams.WithAgentConfig(agentConfig2), agentparams.WithIntegration("snmp.d", snmpConfig), agentparams.WithIntegration("cisco_aci.d", ciscoAciConfig))
+		agent2, err := agent.NewHostAgent(&awsEnv, host2, agentparams.WithFakeintake(fakeIntake), agentparams.WithAgentConfig(agentConfig2), agentparams.WithIntegration("snmp.d", snmpConfig), agentparams.WithIntegration("cisco_aci.d", ciscoAciConfig))
 		if err != nil {
 			return err
 		}
@@ -97,10 +118,26 @@ log_level: debug
 
 type testHAAgentFailoverSuite struct {
 	e2e.BaseSuite[multiVMEnv]
+
+	configID string
 }
 
 func TestHAAgentFailoverSuite(t *testing.T) {
-	e2e.Run(t, &testHAAgentFailoverSuite{}, e2e.WithPulumiProvisioner(multiVMEnvProvisioner(), nil))
+	// Generate a random config_id (0-9) to avoid conflicts when tests run in parallel
+	configID := fmt.Sprintf("ci-e2e-ha-failover-%d", rand.Intn(10))
+
+	e2e.Run(t, &testHAAgentFailoverSuite{configID: configID}, e2e.WithPulumiProvisioner(multiVMEnvProvisioner(configID), nil))
+}
+
+// setActiveAgent pushes an HA_AGENT Remote Config payload to fakeintake, electing
+// activeHostname as the active agent. This replaces the automatic failover decision
+// that the real Datadog backend would otherwise make based on agent liveness.
+func (v *testHAAgentFailoverSuite) setActiveAgent(activeHostname string) {
+	fakeClient := v.Env().FakeIntake.Client()
+
+	payload := fmt.Sprintf(`{"config_id":%q,"active_agent":%q}`, v.configID, activeHostname)
+	err := fakeClient.RCAddConfig("", state.ProductHaAgent, "ha-failover", "leader", []byte(payload))
+	require.NoError(v.T(), err)
 }
 
 type haAgentMetadata struct {
@@ -137,6 +174,10 @@ func (v *testHAAgentFailoverSuite) assertCheckIsNotRunning(c *assert.CollectT, a
 func (v *testHAAgentFailoverSuite) TestHAFailover() {
 	v.Env().Host2.Execute("sudo systemctl stop datadog-agent")
 
+	// Elect agent1 as active via Remote Config, simulating the backend's failover
+	// decision now that agent2 is down.
+	v.setActiveAgent(agent1Hostname)
+
 	// Wait for the agent1 to be active
 	v.EventuallyWithT(func(c *assert.CollectT) {
 		v.T().Log("try assert agent1 state is active")
@@ -151,7 +192,12 @@ func (v *testHAAgentFailoverSuite) TestHAFailover() {
 		v.assertCheckIsRunning(c, v.Env().Agent1, "cpu")
 	}, 5*time.Minute, 10*time.Second)
 
-	v.Env().Host2.Execute("sudo systemctl start datadog-agent")
+	// Restart through the Agent client so its readiness state is reset. The next
+	// client command will then wait for the Agent API to become available.
+	require.NoError(v.T(), v.Env().Agent2.Client.Restart())
+
+	// agent2 comes back up, polls Remote Config, and picks up the existing
+	// "agent1 active" config, so it settles into standby on its own.
 
 	// Wait for the agent2 to be standby
 	v.EventuallyWithT(func(c *assert.CollectT) {
@@ -169,6 +215,10 @@ func (v *testHAAgentFailoverSuite) TestHAFailover() {
 
 	v.Env().Host1.Execute("sudo systemctl stop datadog-agent")
 
+	// Elect agent2 as active via Remote Config, simulating the backend's failover
+	// decision now that agent1 is down.
+	v.setActiveAgent(agent2Hostname)
+
 	// Wait for the agent2 to be active
 	v.EventuallyWithT(func(c *assert.CollectT) {
 		v.T().Log("try assert agent2 state is active")
@@ -183,7 +233,12 @@ func (v *testHAAgentFailoverSuite) TestHAFailover() {
 		v.assertCheckIsRunning(c, v.Env().Agent2, "cpu")
 	}, 5*time.Minute, 10*time.Second)
 
-	v.Env().Host1.Execute("sudo systemctl start datadog-agent")
+	// Restart through the Agent client so its readiness state is reset. Without
+	// this, the cached ready state makes the next command race Agent startup.
+	require.NoError(v.T(), v.Env().Agent1.Client.Restart())
+
+	// agent1 comes back up, polls Remote Config, and picks up the existing
+	// "agent2 active" config, so it settles into standby on its own.
 
 	// Wait for the agent1 to be standby
 	v.EventuallyWithT(func(c *assert.CollectT) {

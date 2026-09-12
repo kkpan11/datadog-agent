@@ -11,6 +11,7 @@ package tests
 import (
 	"os"
 	"path"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -24,20 +25,19 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
 )
 
+var _ = declare(TestDentryPathERPC, testOpts{disableMapDentryResolution: true})
+
 func TestDentryPathERPC(t *testing.T) {
 	SkipIfNotAvailable(t)
 
 	// generate a basename up to the current limit of the agent
-	var basename string
-	for i := 0; i < model.MaxSegmentLength; i++ {
-		basename += "a"
-	}
+	basename := strings.Repeat("a", model.MaxSegmentLength)
 	rule := &rules.RuleDefinition{
 		ID:         "test_erpc_path_rule",
 		Expression: `open.flags & (O_CREAT|O_NOCTTY|O_NOFOLLOW) != 0 && process.file.name == "testsuite"`,
 	}
 
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule}, withStaticOpts(testOpts{disableMapDentryResolution: true}))
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,16 +59,14 @@ func TestDentryPathERPC(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	test.WaitSignal(t, func() error {
+	test.WaitSignalFromRule(t, func() error {
 		file, err := os.OpenFile(testFile, os.O_CREATE|unix.O_NOCTTY|unix.O_NOFOLLOW, 0666)
 		if err != nil {
 			return err
 		}
 		file.Close()
 		return nil
-	}, func(event *model.Event, rule *rules.Rule) {
-		assertTriggeredRule(t, rule, "test_erpc_path_rule")
-
+	}, func(event *model.Event, _ *rules.Rule) {
 		basename := path.Base(testFile)
 
 		res, err := p.Resolvers.DentryResolver.Resolve(event.Open.File.PathKey, true)
@@ -88,23 +86,22 @@ func TestDentryPathERPC(t *testing.T) {
 
 		key = metrics.MetricDentryResolverHits + ":" + metrics.KernelMapsTag
 		assert.Empty(t, test.statsdClient.Get(key))
-	})
+	}, "test_erpc_path_rule")
 }
+
+var _ = declare(TestDentryPathMap, testOpts{disableERPCDentryResolution: true})
 
 func TestDentryPathMap(t *testing.T) {
 	SkipIfNotAvailable(t)
 
 	// generate a basename up to the current limit of the agent
-	var basename string
-	for i := 0; i < model.MaxSegmentLength; i++ {
-		basename += "a"
-	}
+	basename := strings.Repeat("a", model.MaxSegmentLength)
 	rule := &rules.RuleDefinition{
 		ID:         "test_map_path_rule",
 		Expression: `open.flags & (O_CREAT|O_NOCTTY|O_NOFOLLOW) != 0 && process.file.name == "testsuite"`,
 	}
 
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule}, withStaticOpts(testOpts{disableERPCDentryResolution: true}))
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,16 +123,14 @@ func TestDentryPathMap(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	test.WaitSignal(t, func() error {
+	test.WaitSignalFromRule(t, func() error {
 		file, err := os.OpenFile(testFile, os.O_CREATE|unix.O_NOCTTY|unix.O_NOFOLLOW, 0666)
 		if err != nil {
 			return err
 		}
 		file.Close()
 		return nil
-	}, func(event *model.Event, rule *rules.Rule) {
-		assertTriggeredRule(t, rule, "test_map_path_rule")
-
+	}, func(event *model.Event, _ *rules.Rule) {
 		basename := path.Base(testFile)
 
 		res, err := p.Resolvers.DentryResolver.Resolve(event.Open.File.PathKey, true)
@@ -155,17 +150,14 @@ func TestDentryPathMap(t *testing.T) {
 
 		key = metrics.MetricDentryResolverHits + ":" + metrics.KernelMapsTag
 		assert.NotEmpty(t, test.statsdClient.Get(key))
-	})
+	}, "test_map_path_rule")
 }
 
 func TestDentryName(t *testing.T) {
 	SkipIfNotAvailable(t)
 
 	// generate a basename up to the current limit of the agent
-	var basename string
-	for i := 0; i < model.MaxSegmentLength; i++ {
-		basename += "a"
-	}
+	basename := strings.Repeat("a", model.MaxSegmentLength)
 	rule := &rules.RuleDefinition{
 		ID:         "test_dentry_name_rule",
 		Expression: `open.flags & (O_CREAT|O_NOCTTY|O_NOFOLLOW) != 0 && process.file.name == "testsuite"`,
@@ -193,28 +185,119 @@ func TestDentryName(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	test.WaitSignal(t, func() error {
+	test.WaitSignalFromRule(t, func() error {
 		file, err := os.OpenFile(testFile, os.O_CREATE|unix.O_NOCTTY|unix.O_NOFOLLOW, 0666)
 		if err != nil {
 			return err
 		}
 		file.Close()
 		return nil
-	}, func(event *model.Event, rule *rules.Rule) {
-		assertTriggeredRule(t, rule, "test_dentry_name_rule")
-
+	}, func(event *model.Event, _ *rules.Rule) {
 		basename := path.Base(testFile)
 
 		// check that the path is now available from the cache
-		res := p.Resolvers.DentryResolver.ResolveName(event.Open.File.PathKey)
+		res := p.Resolvers.DentryResolver.ResolveName(event.Open.File.PathKey, true)
 		assert.Equal(test.t, basename, res)
 
 		// check that the path is now available from the cache
 		res, err = p.Resolvers.DentryResolver.ResolveNameFromCache(event.Open.File.PathKey)
 		assert.NoError(test.t, err)
 		assert.Equal(test.t, basename, path.Base(res))
-	})
+	}, "test_dentry_name_rule")
 }
+
+var _ = declare(TestDentryInvalidation, testOpts{disableMapDentryResolution: true})
+
+func TestDentryInvalidation(t *testing.T) {
+	SkipIfNotAvailable(t)
+
+	// generate a basename up to the current limit of the agent
+	basename := "test123"
+	rule := &rules.RuleDefinition{
+		ID:         "test_erpc_path_rule",
+		Expression: `open.flags & (O_CREAT|O_NOCTTY|O_NOFOLLOW) != 0 && process.file.name == "testsuite"`,
+	}
+
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer test.Close()
+
+	p, ok := test.probe.PlatformProbe.(*sprobe.EBPFProbe)
+	if !ok {
+		t.Skip("not supported")
+	}
+
+	testFile, _, err := test.Path("parent/" + basename)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := path.Dir(testFile)
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		t.Fatalf("failed to create directory: %s", err)
+	}
+	defer os.RemoveAll(dir)
+
+	var origPathKey model.PathKey
+
+	test.WaitSignalFromRule(t, func() error {
+		file, err := os.OpenFile(testFile, os.O_CREATE|unix.O_NOCTTY|unix.O_NOFOLLOW, 0666)
+		if err != nil {
+			return err
+		}
+		file.Close()
+		return nil
+	}, func(event *model.Event, _ *rules.Rule) {
+		basename := path.Base(testFile)
+
+		res, err := p.Resolvers.DentryResolver.Resolve(event.Open.File.PathKey, true)
+		assert.NoError(test.t, err)
+		assert.Equal(test.t, basename, path.Base(res))
+
+		// check that the path is now available from the cache
+		res, err = p.Resolvers.DentryResolver.ResolveFromCache(event.Open.File.PathKey)
+		assert.NoError(test.t, err)
+		assert.Equal(test.t, basename, path.Base(res))
+
+		origPathKey = event.Open.File.PathKey
+	}, "test_erpc_path_rule")
+
+	// rename the file, which should invalidate the path
+	newFile, _, err := test.Path("parent/test456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = os.Rename(testFile, newFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	test.WaitSignalFromRule(t, func() error {
+		file, err := os.OpenFile(newFile, os.O_CREATE|unix.O_NOCTTY|unix.O_NOFOLLOW, 0666)
+		if err != nil {
+			return err
+		}
+		file.Close()
+		return nil
+	}, func(event *model.Event, _ *rules.Rule) {
+		basename := path.Base(newFile)
+
+		res, err := p.Resolvers.DentryResolver.Resolve(event.Open.File.PathKey, true)
+		assert.NoError(test.t, err)
+		assert.Equal(test.t, basename, path.Base(res))
+
+		// check that the path is now available from the cache
+		res, err = p.Resolvers.DentryResolver.ResolveFromCache(event.Open.File.PathKey)
+		assert.NoError(test.t, err)
+		assert.Equal(test.t, basename, path.Base(res))
+
+		assert.NotEqual(test.t, origPathKey, event.Open.File.PathKey)
+	}, "test_erpc_path_rule")
+}
+
+var _ = declare(BenchmarkERPCDentryResolutionPath, testOpts{disableMapDentryResolution: true})
 
 func BenchmarkERPCDentryResolutionPath(b *testing.B) {
 	rule := &rules.RuleDefinition{
@@ -222,7 +305,7 @@ func BenchmarkERPCDentryResolutionPath(b *testing.B) {
 		Expression: `open.file.path == "{{.Root}}/aa/bb/cc/dd/ee" && open.flags & O_CREAT != 0`,
 	}
 
-	test, err := newTestModule(b, nil, []*rules.RuleDefinition{rule}, withStaticOpts(testOpts{disableMapDentryResolution: true}))
+	test, err := newTestModule(b, nil, []*rules.RuleDefinition{rule})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -262,7 +345,7 @@ func BenchmarkERPCDentryResolutionPath(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	if err := resolver.Start(p.Manager); err != nil {
+	if err := resolver.Start(p.Manager.Get()); err != nil {
 		b.Fatal(err)
 	}
 	f, err := resolver.ResolveFromERPC(pathKey, true)
@@ -285,13 +368,15 @@ func BenchmarkERPCDentryResolutionPath(b *testing.B) {
 	test.Close()
 }
 
+var _ = declare(BenchmarkMapDentryResolutionSegment, testOpts{disableERPCDentryResolution: true})
+
 func BenchmarkMapDentryResolutionSegment(b *testing.B) {
 	rule := &rules.RuleDefinition{
 		ID:         "test_rule",
 		Expression: `open.file.path == "{{.Root}}/aa/bb/cc/dd/ee" && open.flags & O_CREAT != 0`,
 	}
 
-	test, err := newTestModule(b, nil, []*rules.RuleDefinition{rule}, withStaticOpts(testOpts{disableERPCDentryResolution: true}))
+	test, err := newTestModule(b, nil, []*rules.RuleDefinition{rule})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -331,10 +416,10 @@ func BenchmarkMapDentryResolutionSegment(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	if err := resolver.Start(p.Manager); err != nil {
+	if err := resolver.Start(p.Manager.Get()); err != nil {
 		b.Fatal(err)
 	}
-	name, err := resolver.ResolveNameFromMap(pathKey)
+	name, err := resolver.ResolveNameFromMap(pathKey, true)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -342,7 +427,7 @@ func BenchmarkMapDentryResolutionSegment(b *testing.B) {
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		name, err = resolver.ResolveNameFromMap(pathKey)
+		name, err = resolver.ResolveNameFromMap(pathKey, true)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -354,13 +439,15 @@ func BenchmarkMapDentryResolutionSegment(b *testing.B) {
 	test.Close()
 }
 
+var _ = declare(BenchmarkMapDentryResolutionPath, testOpts{disableERPCDentryResolution: true})
+
 func BenchmarkMapDentryResolutionPath(b *testing.B) {
 	rule := &rules.RuleDefinition{
 		ID:         "test_rule",
 		Expression: `open.file.path == "{{.Root}}/aa/bb/cc/dd/ee" && open.flags & O_CREAT != 0`,
 	}
 
-	test, err := newTestModule(b, nil, []*rules.RuleDefinition{rule}, withStaticOpts(testOpts{disableERPCDentryResolution: true}))
+	test, err := newTestModule(b, nil, []*rules.RuleDefinition{rule})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -399,7 +486,7 @@ func BenchmarkMapDentryResolutionPath(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	if err := resolver.Start(p.Manager); err != nil {
+	if err := resolver.Start(p.Manager.Get()); err != nil {
 		b.Fatal(err)
 	}
 	f, err := resolver.ResolveFromMap(pathKey, true)

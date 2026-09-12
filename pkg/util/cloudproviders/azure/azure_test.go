@@ -12,13 +12,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 )
+
+var expectedAPIVersion = GetMetadataAPIVersion()
 
 func TestGetAlias(t *testing.T) {
 	ctx := context.Background()
@@ -38,7 +42,7 @@ func TestGetAlias(t *testing.T) {
 	require.Len(t, aliases, 1)
 	assert.Equal(t, expected, aliases[0])
 	assert.Equal(t, lastRequest.URL.Path, "/metadata/instance/compute/vmId")
-	assert.Equal(t, lastRequest.URL.RawQuery, "api-version=2017-04-02&format=text")
+	assert.Equal(t, lastRequest.URL.RawQuery, expectedAPIVersion+"&format=text")
 }
 
 func TestGetClusterName(t *testing.T) {
@@ -82,7 +86,42 @@ func TestGetClusterName(t *testing.T) {
 			assert.Equal(t, tt.wantErr, (err != nil))
 			assert.Equal(t, tt.want, got)
 			assert.Equal(t, lastRequest.URL.Path, "/metadata/instance/compute/resourceGroupName")
-			assert.Equal(t, lastRequest.URL.RawQuery, "api-version=2017-08-01&format=text")
+			assert.Equal(t, lastRequest.URL.RawQuery, expectedAPIVersion+"&format=text")
+		})
+	}
+}
+
+func TestParseClusterNameFromResourceGroup(t *testing.T) {
+	tests := []struct {
+		name    string
+		rgName  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "uppercase prefix",
+			rgName:  "MC_aks-kenafeh_aks-kenafeh-eu_westeurope",
+			want:    "aks-kenafeh-eu",
+			wantErr: false,
+		},
+		{
+			name:    "lowercase prefix",
+			rgName:  "mc_foo-bar-aks-k8s-rg_foo-bar-aks-k8s_westeurope",
+			want:    "foo-bar-aks-k8s",
+			wantErr: false,
+		},
+		{
+			name:    "invalid",
+			rgName:  "unexpected-resource-group-name-format",
+			want:    "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseClusterNameFromResourceGroup(tt.rgName)
+			assert.Equal(t, tt.wantErr, (err != nil))
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -100,7 +139,7 @@ func TestGetNTPHosts(t *testing.T) {
 	mockConfig := configmock.New(t)
 
 	metadataURL = ts.URL
-	mockConfig.SetWithoutSource("cloud_provider_metadata", []string{"azure"})
+	mockConfig.SetInTest("cloud_provider_metadata", []string{"azure"})
 	actualHosts := GetNTPHosts(ctx)
 
 	assert.Equal(t, expectedHosts, actualHosts)
@@ -135,11 +174,72 @@ func TestGetHostname(t *testing.T) {
 	mockConfig := configmock.New(t)
 
 	for _, tt := range cases {
-		mockConfig.SetWithoutSource(hostnameStyleSetting, tt.style)
+		mockConfig.SetInTest(hostnameStyleSetting, tt.style)
 		hostname, err := getHostnameWithConfig(ctx, mockConfig)
 		assert.Equal(t, tt.value, hostname)
 		assert.Equal(t, tt.err, (err != nil))
 	}
+}
+
+func TestGetHostnameSkipsRetryWhenProviderDisabled(t *testing.T) {
+	ctx := context.Background()
+
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	metadataURL = ts.URL
+	instanceMetaFetcher.Reset()
+	t.Cleanup(func() { instanceMetaFetcher.Reset() })
+
+	mockConfig := configmock.New(t)
+	mockConfig.SetInTest("cloud_provider_metadata", []string{"aws"})
+	mockConfig.SetInTest(hostnameStyleSetting, "name_and_resource_group")
+
+	start := time.Now()
+	_, err := getHostnameWithConfig(ctx, mockConfig)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Zero(t, atomic.LoadInt32(&calls), "IMDS should not be hit when Azure provider is disabled")
+	require.Less(t, elapsed, hostnameFetchMaxElapsedTime, "must short-circuit instead of burning the full retry window")
+}
+
+func TestGetHostnameRetriesTransientIMDSFailure(t *testing.T) {
+	ctx := context.Background()
+
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&calls, 1) <= 2 {
+			http.Error(w, "transient", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{
+			"name": "vm-name",
+			"resourceGroupName": "my-resource-group",
+			"subscriptionId": "2370ac56-5683-45f8-a2d4-d1054292facb",
+			"vmId": "b33fa46-6aff-4dfa-be0a-9e922ca3ac6d"
+		}`)
+	}))
+	defer ts.Close()
+
+	metadataURL = ts.URL
+	instanceMetaFetcher.Reset()
+	t.Cleanup(func() { instanceMetaFetcher.Reset() })
+
+	mockConfig := configmock.New(t)
+	mockConfig.SetInTest("cloud_provider_metadata", []string{"azure"})
+	mockConfig.SetInTest(hostnameStyleSetting, "name_and_resource_group")
+
+	hostname, err := getHostnameWithConfig(ctx, mockConfig)
+	require.NoError(t, err)
+	require.Equal(t, "vm-name.my-resource-group", hostname)
+	require.GreaterOrEqual(t, atomic.LoadInt32(&calls), int32(3),
+		"expected IMDS to be retried past the initial failure")
 }
 
 func TestGetHostnameWithInvalidMetadata(t *testing.T) {
@@ -162,7 +262,7 @@ func TestGetHostnameWithInvalidMetadata(t *testing.T) {
 
 		t.Run(fmt.Sprintf("with response '%s'", response), func(t *testing.T) {
 			for _, style := range styles {
-				mockConfig.SetWithoutSource(hostnameStyleSetting, style)
+				mockConfig.SetInTest(hostnameStyleSetting, style)
 				hostname, err := getHostnameWithConfig(ctx, mockConfig)
 				assert.Empty(t, hostname)
 				assert.NotNil(t, err)
@@ -198,4 +298,45 @@ func TestGetPublicIPv4(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, expected, val)
 	assert.True(t, strings.HasPrefix(lastRequest.URL.Path, pathPrefix))
+}
+
+func TestGetCCRID(t *testing.T) {
+	ctx := context.Background()
+	fakeResponse := "/subscriptions/1234abcd-78ef-ab12-cd45-10abc2345def/resourceGroups/MYRESOURCES/providers/Microsoft.Compute/virtualMachines/my-vm-name"
+	expected := strings.ToLower(fakeResponse)
+
+	var lastRequest *http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, fakeResponse)
+		lastRequest = r
+	}))
+	defer ts.Close()
+	metadataURL = ts.URL
+
+	ccrid, err := GetHostCCRID(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, expected, ccrid)
+	assert.Equal(t, "/metadata/instance/compute/resourceId", lastRequest.URL.Path)
+	assert.Equal(t, expectedAPIVersion+"&format=text", lastRequest.URL.RawQuery)
+}
+
+func TestInstanceType(t *testing.T) {
+	ctx := context.Background()
+	expected := "Standard_E2s_v3"
+
+	var lastRequest *http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, expected)
+		lastRequest = r
+	}))
+	defer ts.Close()
+	metadataURL = ts.URL
+
+	instanceType, err := GetInstanceType(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, expected, instanceType)
+	assert.Equal(t, "/metadata/instance/compute/vmSize", lastRequest.URL.Path)
+	assert.Equal(t, expectedAPIVersion+"&format=text", lastRequest.URL.RawQuery)
 }

@@ -15,8 +15,10 @@ import (
 // VariableProvider is the interface implemented by SECL variable providers
 // (Should be named VariableValueProvider)
 type VariableProvider interface {
-	NewSECLVariable(name string, value interface{}, opts eval.VariableOpts) (eval.SECLVariable, error)
+	NewSECLVariable(name string, value interface{}, scope string, opts eval.VariableOpts) (eval.SECLVariable, error)
 	CleanupExpiredVariables()
+	GetScopedVariables(name string) map[eval.ScopeHashKey]eval.Variable
+	CopyInheritedVariables(scope eval.VariableScope)
 }
 
 // VariableProviderFactory describes a function called to instantiate a variable provider
@@ -35,6 +37,7 @@ type Opts struct {
 	StateScopes                map[Scope]VariableProviderFactory
 	Logger                     log.Logger
 	ruleActionPerformedCb      RuleActionPerformedCb
+	RuleCacheEnabled           bool
 }
 
 // WithSupportedDiscarders set supported discarders
@@ -85,12 +88,18 @@ func (o *Opts) WithRuleActionPerformedCb(cb RuleActionPerformedCb) *Opts {
 	return o
 }
 
+// WithRuleCacheEnabled sets the rule cache enabled
+func (o *Opts) WithRuleCacheEnabled(ruleCacheEnabled bool) *Opts {
+	o.RuleCacheEnabled = ruleCacheEnabled
+	return o
+}
+
 // NewRuleOpts returns rule options
 func NewRuleOpts(eventTypeEnabled map[eval.EventType]bool) *Opts {
 	var ruleOpts Opts
 	ruleOpts.
 		WithEventTypeEnabled(eventTypeEnabled).
-		WithStateScopes(getStateScopes())
+		WithStateScopes(DefaultStateScopes())
 
 	return &ruleOpts
 }

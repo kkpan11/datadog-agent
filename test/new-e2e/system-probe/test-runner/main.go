@@ -96,7 +96,7 @@ func getEBPFBuildDir() (string, error) {
 		arch = "arm64"
 	}
 
-	return fmt.Sprintf("pkg/ebpf/bytecode/build/%s", arch), nil
+	return "pkg/ebpf/bytecode/build/" + arch, nil
 }
 
 func glob(dir, filePattern string, filterFn func(path string) bool) ([]string, error) {
@@ -138,6 +138,7 @@ func buildCommandArgs(pkg string, xmlpath string, jsonpath string, testArgs []st
 		"--jsonfile", jsonpath,
 		fmt.Sprintf("--rerun-fails=%d", testConfig.retryCount),
 		"--rerun-fails-max-failures=100",
+		"--rerun-fails-abort-on-data-race",
 		"--raw-command", "--",
 		filepath.Join(testConfig.testingTools, "go/bin/test2json"), "-t", "-p", pkg,
 	}
@@ -212,7 +213,6 @@ func collectEnvVars(testConfig *testConfig, bpfDir string) []string {
 	env = append(env, baseEnv...)
 	env = append(env,
 		"DD_SYSTEM_PROBE_BPF_DIR="+bpfDir,
-		"DD_SERVICE_MONITORING_CONFIG_TLS_JAVA_DIR="+filepath.Join(testConfig.testDirRoot, "pkg/network/protocols/tls/java"),
 	)
 
 	if testConfig.extraEnv != "" {
@@ -220,6 +220,15 @@ func collectEnvVars(testConfig *testConfig, bpfDir string) []string {
 	}
 
 	env = append(env, testConfig.AdditionalEnvVars...)
+
+	if jobEnv, err := os.ReadFile("/job_env.txt"); err == nil {
+		for line := range strings.SplitSeq(string(jobEnv), "\n") {
+			name, val, ok := strings.Cut(line, "=")
+			if ok {
+				env = append(env, fmt.Sprintf("%s=%s", name, val))
+			}
+		}
+	}
 
 	return env
 }
@@ -273,30 +282,34 @@ func testPass(testConfig *testConfig, props map[string]string) error {
 			return fmt.Errorf("could not get relative path for %s: %w", testsuite, err)
 		}
 		junitfilePrefix := strings.ReplaceAll(pkg, "/", "-")
-		xmlpath := filepath.Join(xmlDir, fmt.Sprintf("%s.xml", junitfilePrefix))
-		jsonpath := filepath.Join(jsonDir, fmt.Sprintf("%s.json", junitfilePrefix))
 
 		testsuiteArgs := []string{testsuite}
 		if testContainer != nil {
 			testsuiteArgs = testContainer.buildDockerExecArgs(testsuite, envVars)
 		}
 
-		args := buildCommandArgs(pkg, xmlpath, jsonpath, testsuiteArgs, testConfig)
-		cmd := exec.Command(filepath.Join(testConfig.testingTools, "go/bin/gotestsum"), args...)
+		for _, group := range testPasses(pkg, testsuiteArgs, envVars, filepath.Dir(testsuite)) {
+			suffix, groupArgs := groupPass(testsuiteArgs, group)
+			xmlpath := filepath.Join(xmlDir, junitfilePrefix+suffix+".xml")
+			jsonpath := filepath.Join(jsonDir, junitfilePrefix+suffix+".json")
 
-		cmd.Env = append(cmd.Environ(), envVars...)
+			args := buildCommandArgs(pkg, xmlpath, jsonpath, groupArgs, testConfig)
+			cmd := exec.Command(filepath.Join(testConfig.testingTools, "go/bin/gotestsum"), args...)
 
-		cmd.Dir = filepath.Dir(testsuite)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+			cmd.Env = append(cmd.Environ(), envVars...)
 
-		if err := cmd.Run(); err != nil {
-			// log but do not return error
-			fmt.Fprintf(os.Stderr, "cmd run %s: %s\n", testsuite, err)
-		}
+			cmd.Dir = filepath.Dir(testsuite)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
 
-		if err := addProperties(xmlpath, props); err != nil {
-			return fmt.Errorf("xml add props: %s", err)
+			if err := cmd.Run(); err != nil {
+				// log but do not return error
+				fmt.Fprintf(os.Stderr, "cmd run %s: %s\n", strings.Join(cmd.Args, " "), err)
+			}
+
+			if err := addProperties(xmlpath, props); err != nil {
+				return fmt.Errorf("xml add props: %s", err)
+			}
 		}
 	}
 

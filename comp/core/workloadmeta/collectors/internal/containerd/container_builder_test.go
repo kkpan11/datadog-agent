@@ -9,15 +9,15 @@ package containerd
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
@@ -180,7 +180,7 @@ func TestBuildWorkloadMetaContainer(t *testing.T) {
 					return image, nil
 				},
 				mockTask: func() (containerd.Task, error) {
-					return nil, fmt.Errorf("no task found")
+					return nil, errors.New("no task found")
 				},
 			},
 			expected: workloadmeta.Container{
@@ -247,7 +247,7 @@ func TestBuildWorkloadMetaContainer(t *testing.T) {
 	// Create a workload meta global store containing image metadata
 	workloadmetaStore := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
 		fx.Provide(func() log.Component { return logmock.New(t) }),
-		config.MockModule(),
+		fx.Provide(func() config.Component { return config.NewMock(t) }),
 		fx.Supply(context.Background()),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 	))

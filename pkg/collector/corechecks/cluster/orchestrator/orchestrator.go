@@ -15,13 +15,15 @@ import (
 	"time"
 
 	"go.uber.org/atomic"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 	"k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	vpai "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/informers/externalversions"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
+
+	model "github.com/DataDog/agent-payload/v5/process"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	configcomp "github.com/DataDog/datadog-agent/comp/core/config"
@@ -33,6 +35,7 @@ import (
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
+	"github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	orchcfg "github.com/DataDog/datadog-agent/pkg/orchestrator/config"
@@ -40,6 +43,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/clustername"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
+	"github.com/DataDog/datadog-agent/pkg/version"
 )
 
 const (
@@ -87,24 +91,32 @@ type OrchestratorCheck struct {
 	isCLCRunner                 bool
 	apiClient                   *apiserver.APIClient
 	orchestratorInformerFactory *collectors.OrchestratorInformerFactory
+	agentVersion                *model.AgentVersion
 }
 
 func newOrchestratorCheck(base core.CheckBase, instance *OrchestratorInstance, cfg configcomp.Component, wlmStore workloadmeta.Component, tagger tagger.Component) *OrchestratorCheck {
-	extraTags, err := tagger.GlobalTags(types.LowCardinality)
+	agentVersion, err := version.Agent()
 	if err != nil {
-		log.Debugf("Failed to get global tags: %s", err)
+		log.Warnf("Failed to get agent version: %s", err)
 	}
 
 	return &OrchestratorCheck{
-		CheckBase:          base,
-		orchestratorConfig: orchcfg.NewDefaultOrchestratorConfig(extraTags),
-		instance:           instance,
-		wlmStore:           wlmStore,
-		tagger:             tagger,
-		cfg:                cfg,
-		stopCh:             make(chan struct{}),
-		groupID:            atomic.NewInt32(rand.Int31()),
-		isCLCRunner:        pkgconfigsetup.IsCLCRunner(pkgconfigsetup.Datadog()),
+		CheckBase:   base,
+		instance:    instance,
+		wlmStore:    wlmStore,
+		tagger:      tagger,
+		cfg:         cfg,
+		stopCh:      make(chan struct{}),
+		groupID:     atomic.NewInt32(rand.Int31()),
+		isCLCRunner: helper.IsCLCRunner(pkgconfigsetup.Datadog()),
+		agentVersion: &model.AgentVersion{
+			Major:  agentVersion.Major,
+			Minor:  agentVersion.Minor,
+			Patch:  agentVersion.Patch,
+			Pre:    agentVersion.Pre,
+			Meta:   agentVersion.Meta,
+			Commit: agentVersion.Commit,
+		},
 	}
 }
 
@@ -129,13 +141,31 @@ func (o *OrchestratorCheck) Interval() time.Duration {
 }
 
 // Configure configures the orchestrator check
-func (o *OrchestratorCheck) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, config, initConfig integration.Data, source string) error {
+func (o *OrchestratorCheck) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, config, initConfig integration.Data, source string, provider string) error {
 	o.BuildID(integrationConfigDigest, config, initConfig)
 
-	err := o.CommonConfigure(senderManager, initConfig, config, source)
+	err := o.CommonConfigure(senderManager, initConfig, config, source, provider)
 	if err != nil {
 		return err
 	}
+
+	// Retrieves tags on the check config (applicable when scheduled on CLC)
+	checkConfigExtraTags, err := getTags(initConfig, config)
+	if err != nil {
+		return fmt.Errorf("could not parse tags from check config: %w", err)
+	}
+
+	// Retrieves tags from the tagger (applicable when scheduled on DCA)
+	taggerExtraTags, err := o.tagger.GlobalTags(types.LowCardinality)
+	if err != nil {
+		return fmt.Errorf("could not get global tags from tagger: %w", err)
+	}
+
+	extraTags := make([]string, 0, len(checkConfigExtraTags)+len(taggerExtraTags))
+	extraTags = append(extraTags, checkConfigExtraTags...)
+	extraTags = append(extraTags, taggerExtraTags...)
+
+	o.orchestratorConfig = orchcfg.NewDefaultOrchestratorConfig(extraTags)
 
 	err = o.orchestratorConfig.Load()
 	if err != nil {
@@ -183,6 +213,15 @@ func (o *OrchestratorCheck) Configure(senderManager sender.SenderManager, integr
 
 // Run runs the orchestrator check
 func (o *OrchestratorCheck) Run() error {
+	if ok, err := o.IsLeader(); !ok {
+		// Disable terminated resource bundle if not leader so we don't buffer terminated resources by informer DeleteFunc
+		o.collectorBundle.GetTerminatedResourceBundle().Disable()
+		return err
+	}
+
+	// Enable terminated resource bundle to start buffering terminated resources
+	o.collectorBundle.EnableTerminatedResourceBundle()
+
 	// Initialize collectors
 	o.collectorBundle.Initialize()
 
@@ -190,28 +229,6 @@ func (o *OrchestratorCheck) Run() error {
 	sender, err := o.GetSender()
 	if err != nil {
 		return err
-	}
-
-	// If the check is configured as a cluster check, the cluster check worker needs to skip the leader election section.
-	// we also do a safety check for dedicated runners to avoid trying the leader election
-	if !o.isCLCRunner || !o.instance.LeaderSkip {
-		// Only run if Leader Election is enabled.
-		if !pkgconfigsetup.Datadog().GetBool("leader_election") {
-			return log.Errorc("Leader Election not enabled. The cluster-agent will not run the check.", orchestrator.ExtraLogContext...)
-		}
-
-		leader, errLeader := cluster.RunLeaderElection()
-		if errLeader != nil {
-			if errLeader == apiserver.ErrNotLeader {
-				log.Debugf("Not leader (leader is %q). Skipping the Orchestrator check", leader)
-				return nil
-			}
-
-			_ = o.Warn("Leader Election error. Not running the Orchestrator check.")
-			return err
-		}
-
-		log.Tracef("Current leader: %q, running the Orchestrator check", leader)
 	}
 
 	// Run all collectors.
@@ -224,9 +241,9 @@ func (o *OrchestratorCheck) Run() error {
 func (o *OrchestratorCheck) Cancel() {
 	log.Infoc(fmt.Sprintf("Shutting down informers used by the check '%s'", o.ID()), orchestrator.ExtraLogContext...)
 	close(o.stopCh)
-	// send all terminated resources
+	// flush and disable terminated resource bundle
 	if o.collectorBundle != nil {
-		o.collectorBundle.GetTerminatedResourceBundle().Stop()
+		o.collectorBundle.GetTerminatedResourceBundle().Disable()
 	}
 }
 
@@ -238,6 +255,7 @@ func getOrchestratorInformerFactory(apiClient *apiserver.APIClient) *collectors.
 	// Only collect pods that are in a terminated state: Succeeded, Failed, or Pending.
 	terminatedPodsTweakListOptions := func(options *metav1.ListOptions) {
 		options.FieldSelector = fields.AndSelectors(
+			fields.OneTermNotEqualSelector("status.phase", "Pending"),
 			fields.OneTermNotEqualSelector("status.phase", "Running"),
 			fields.OneTermNotEqualSelector("status.phase", "Unknown"),
 		).String()
@@ -253,4 +271,56 @@ func getOrchestratorInformerFactory(apiClient *apiserver.APIClient) *collectors.
 	}
 
 	return of
+}
+
+// getTags extracts tags from the configurations
+func getTags(initConfig, config integration.Data) ([]string, error) {
+	initCommonOptions := integration.CommonInstanceConfig{}
+	err := yaml.Unmarshal(initConfig, &initCommonOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	commonOptions := integration.CommonInstanceConfig{}
+	err = yaml.Unmarshal(config, &commonOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	var tags []string
+	if commonOptions.Tags != nil {
+		tags = append(tags, commonOptions.Tags...)
+	}
+	if initCommonOptions.Tags != nil {
+		tags = append(tags, initCommonOptions.Tags...)
+	}
+
+	return tags, nil
+}
+
+// IsLeader checks if the orchestrator check is running on the leader node
+func (o *OrchestratorCheck) IsLeader() (bool, error) {
+	// If the check is configured as a cluster check, the cluster check worker needs to skip the leader election section.
+	// we also do a safety check for dedicated runners to avoid trying the leader election
+	if o.isCLCRunner && o.instance.LeaderSkip {
+		return true, nil
+	}
+
+	// Only run if Leader Election is enabled.
+	if !pkgconfigsetup.Datadog().GetBool("leader_election") {
+		return false, log.Errorc("Leader Election not enabled. The cluster-agent will not run the check.", orchestrator.ExtraLogContext...)
+	}
+
+	leader, err := cluster.RunLeaderElection()
+	if err != nil {
+		if err == apiserver.ErrNotLeader {
+			log.Debugf("Not leader (leader is %q). Skipping the Orchestrator check", leader)
+			return false, nil
+		}
+		log.Warn("Leader Election error. Not running the Orchestrator check.")
+		return false, err
+	}
+
+	log.Tracef("Current leader: %q, running the Orchestrator check", leader)
+	return true, nil
 }

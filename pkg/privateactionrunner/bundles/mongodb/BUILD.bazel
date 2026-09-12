@@ -1,0 +1,40 @@
+load("@rules_go//go:def.bzl", "go_library")
+load("//bazel/rules/go:dd_agent_go_test.bzl", "dd_agent_go_test")
+
+go_library(
+    name = "mongodb",
+    srcs = [
+        "constants.go",
+        "count_documents.go",
+        "create_index.go",
+        "entrypoint.go",
+        "find.go",
+        "find_and_modify.go",
+        "helpers.go",
+        "insert_many.go",
+        "insert_one.go",
+        "replace_one.go",
+        "test_connection.go",
+        "update_many.go",
+        "update_one.go",
+    ],
+    importpath = "github.com/DataDog/datadog-agent/pkg/privateactionrunner/bundles/mongodb",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/privateactionrunner/adapters/logging",
+        "//pkg/privateactionrunner/libs/privateconnection",
+        "//pkg/privateactionrunner/types",
+        "//pkg/util/hostport",
+        "@org_mongodb_go_mongo_driver_v2//bson",
+        "@org_mongodb_go_mongo_driver_v2//mongo",
+        "@org_mongodb_go_mongo_driver_v2//mongo/options",
+        "@org_mongodb_go_mongo_driver_v2//x/mongo/driver/connstring",
+    ],
+)
+
+dd_agent_go_test(
+    name = "mongodb_test",
+    srcs = ["helpers_test.go"],
+    embed = [":mongodb"],
+    deps = ["@com_github_stretchr_testify//require"],
+)

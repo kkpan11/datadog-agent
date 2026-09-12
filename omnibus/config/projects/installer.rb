@@ -4,8 +4,15 @@
 # Copyright 2016-present Datadog, Inc.
 require "./lib/ostools.rb"
 
-name 'installer'
-package_name 'datadog-installer'
+flavor = ENV['AGENT_FLAVOR']
+
+if flavor.nil? || flavor == 'base'
+  name 'installer'
+  package_name 'datadog-installer'
+else
+  name "installer-#{flavor}"
+  package_name "datadog-#{flavor}-installer"
+end
 license "Apache-2.0"
 license_file "../LICENSE"
 
@@ -13,12 +20,7 @@ third_party_licenses "../LICENSE-3rdparty.csv"
 
 homepage 'http://www.datadoghq.com'
 
-if windows_target?
-  INSTALL_DIR = 'C:/opt/datadog-installer/'
-else
-  INSTALL_DIR = ENV['INSTALL_DIR'] || '/opt/datadog-installer'
-end
-
+INSTALL_DIR = ENV['INSTALL_DIR'] || raise('INSTALL_DIR must be set in tasks/omnibus.py')
 install_dir INSTALL_DIR
 
 if ENV.has_key?("OMNIBUS_WORKERS_OVERRIDE")
@@ -27,9 +29,8 @@ else
   COMPRESSION_THREADS = 1
 end
 
-# We want an higher compression level on deploy pipelines that are not nightly.
-# Nightly pipelines will be used as main reference for static quality gates and need the same compression level as main.
-if ENV.has_key?("DEPLOY_AGENT") && ENV["DEPLOY_AGENT"] == "true" && ENV.has_key?("BUCKET_BRANCH") && ENV['BUCKET_BRANCH'] != "nightly"
+# We want an higher compression level on deploy pipelines.
+if ENV.has_key?("DEPLOY_AGENT") && ENV["DEPLOY_AGENT"] == "true"
   COMPRESSION_LEVEL = 9
 else
   COMPRESSION_LEVEL = 5
@@ -88,7 +89,7 @@ else
 
   dependency 'installer'
 
-  generate_distro_package = false
+  generate_distro_package = ENV.has_key?("OMNIBUS_FORCE_PACKAGES")
 end
 
 

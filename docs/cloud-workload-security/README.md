@@ -16,9 +16,13 @@ docs/cloud-workload-security/
     # event types and fields of the SECL language
 --- secl.json
 
+    # workload protection agent configuration settings
+--- workload_protection_agent_config.schema.json
+
     # final documentation files
 --- agent_expressions.md # SECL part
 --- backend.md # backend event part
+--- workload_protection_agent_config.md
 ```
 
 ### Agent Expressions - SECL
@@ -27,7 +31,7 @@ The Agent expressions documentation is based on the following files:
 
 - `pkg/security/secl/model/model.go` - the source code of the SECL model containing the event types and fields documentation
 - `docs/cloud-workload-security/secl.json` - the JSON representing the SECL model extracted from the source code
-- `docs/cloud-workload-security/scripts/templates/agent_expressions.md` - the template used for the final generation
+- `tasks/libs/cws/templates/agent_expressions.md` - the template used for the final generation
 
 #### Editing files
 
@@ -65,13 +69,54 @@ These lines generate this field for all events containing a File sub-event, for 
 
 The rest of the file is copied verbatim from the template file (modulo the `raw` tags, see [Jinja 2 templates](#jinja2-templates)).
 
+### Workload Protection Agent configuration
+
+Based on:
+
+- `pkg/security/config/config.go` — `RuntimeSecurityConfig` struct and field comments
+- `pkg/security/generators/config_doc/main.go` — extracts `public` and `warning` settings to JSON
+- `docs/cloud-workload-security/workload_protection_agent_config.schema.json` — generated schema
+- `tasks/libs/cws/templates/workload_protection_agent_config.md` — Jinja2 template
+- `tasks/libs/cws/config_doc_gen.py` — renders the final Markdown
+
+Published at `/security/workload_protection/workload_protection_agent_config` (same pull mechanism as `linux_expressions.md`).
+
+#### Editing files
+
+Document settings as comments on `RuntimeSecurityConfig` fields in `config.go`:
+
+| Key | Required | Description |
+| --- | --- | --- |
+| `description` | yes | Human-readable description |
+| `visibility` | yes | `public`, `warning`, or `private` |
+| `default_value` | recommended | Default shown in the docs |
+
+The Go type comes from the field declaration. `public` settings appear in the main table; `warning` settings under **Advanced settings**; `private` settings are omitted. YAML keys are inferred from `NewRuntimeSecurityConfig`; env vars follow the Agent convention (`DD_` + uppercase, `.` → `_`).
+
+Example:
+
+```go
+// description: Defines if the runtime security module should be enabled
+// visibility: public
+// default_value: false
+RuntimeEnabled bool
+```
+
+#### Generating the documentation
+
+```sh
+go generate ./pkg/security/config/config.go
+dda inv -e security-agent.generate-cws-documentation
+# or: bazel run //docs/cloud-workload-security:cws_docs
+```
+
 ### Backend event
 
 The Cloud Workload Security (CWS) part of the Agent sends events to the backend. Those events conform to a JSON schema (this is tested in functional tests of the Agent). This documentation is based on the following files:
 
 - `pkg/security/probe/serializers.go` - the serializers used to output events
 - `docs/cloud-workload-security/backend.schema.json` - the JSON schema of the event
-- `docs/cloud-workload-security/scripts/templates/backend.md` - the template used for the final generation
+- `tasks/libs/cws/templates/templates/backend.md` - the template used for the final generation
 
 ### Editing files
 
@@ -108,7 +153,6 @@ The templates are written in [Jinja2](https://jinja.palletsprojects.com/en/3.0.x
 - Golang (see `go.mod` for the minimal version supported)
 - Python, install dependencies with:
 	- `pip install dda`
-	- `pip install -r docs/cloud-workload-security/scripts/requirements-docs.txt`
 
 
 #### Steps

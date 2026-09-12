@@ -1,16 +1,20 @@
 syntax = "proto3";
 
-option go_package = "pkg/security/proto/api";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+option go_package = "github.com/DataDog/datadog-agent/pkg/security/proto/api";
 
 package api;
-
-message GetEventParams {}
 
 message SecurityEventMessage {
     string RuleID = 1;
     bytes Data = 2;
     repeated string Tags = 3;
     string Service = 4;
+    google.protobuf.Timestamp Timestamp = 5;
+    string OriginalRuleID = 6;
+    string Track = 7;
+    string Hostname = 8;
 }
 
 message DumpProcessCacheParams {
@@ -43,7 +47,6 @@ message SecurityConfigMessage {
 message FilterReport{
     repeated ApproverReport Approvers = 1;
 }
-
 
 message RuleSetReportMessage{
     FilterReport Filters = 1;
@@ -81,6 +84,15 @@ message GetRuleSetReportMessage{
 message ReloadPoliciesParams{}
 
 message ReloadPoliciesResultMessage{}
+
+message GetLoadedPoliciesParams {
+    bool IncludeBundled = 1;
+}
+
+message GetLoadedPoliciesMessage {
+    string Policies = 1;
+    string Error = 2;
+}
 
 message RunSelfTestParams {}
 
@@ -120,12 +132,23 @@ message SECLVariableState {
     string Value = 2;
 }
 
+message SECLVariableStateList {
+    repeated SECLVariableState Variables = 1;
+}
+
+message ScopedVariableStore {
+    map<string, SECLVariableStateList> KeyValues = 1;
+}
+
 message Status {
     EnvironmentStatus Environment = 1;
     SelfTestsStatus SelfTests = 2;
     repeated PolicyStatus PoliciesStatus = 3;
-    repeated SECLVariableState SECLVariables = 4;
-}
+    reserved 4;
+    DirectSenderStatus DirectSenderStatus = 5;
+    repeated SECLVariableState GlobalVariables = 6;
+    map<string, ScopedVariableStore> ScopedVariables = 7;
+ }
 
 message ConstantFetcherStatus {
     repeated string Fetchers = 1;
@@ -139,6 +162,10 @@ message EnvironmentStatus {
     bool UseMmapableMaps = 4;
     bool UseRingBuffer = 5;
     bool UseFentry = 6;
+}
+
+message DirectSenderStatus {
+    repeated string Endpoints = 1;
 }
 
 /*Discarders*/
@@ -183,7 +210,7 @@ message MetadataMessage {
     uint64 Size = 13;
     string Serialization = 14;
     string CGroupID = 15;
-    string CGroupManager = 16;
+    string CGroupManager = 16 [deprecated = true];
 }
 
 message StorageRequestMessage {
@@ -232,8 +259,6 @@ message TranscodingRequestMessage {
     repeated StorageRequestMessage Storage = 2;
 }
 
-message ActivityDumpStreamParams {}
-
 message ActivityDumpStreamMessage {
     WorkloadSelectorMessage Selector = 1;
     bytes Header = 2;
@@ -254,6 +279,7 @@ message LastAnomalyTimestampMessage {
 message InstanceMessage {
     string ContainerID = 1;
     repeated string Tags = 2;
+    string CGroupID = 3;
 }
 
 message ActivityTreeStatsMessage {
@@ -265,6 +291,7 @@ message ActivityTreeStatsMessage {
     int64 IMDSNodesCount = 6;
     int64 SyscallNodesCount = 7;
     int64 FlowNodesCount = 8;
+    int64 CapabilityNodesCount = 9;
 }
 
 message event_type_state {
@@ -314,14 +341,19 @@ message SecurityProfileSaveMessage {
     string File = 2;
 }
 
-service SecurityModule {
-    rpc GetEvents(GetEventParams) returns (stream SecurityEventMessage) {}
+service SecurityModuleEvent {
+    rpc GetEventStream(google.protobuf.Empty) returns (stream SecurityEventMessage) {}
+    rpc GetActivityDumpStream(google.protobuf.Empty) returns (stream ActivityDumpStreamMessage) {}
+}
+
+service SecurityModuleCmd {
     rpc DumpProcessCache(DumpProcessCacheParams) returns (SecurityDumpProcessCacheMessage) {}
     rpc GetConfig(GetConfigParams) returns (SecurityConfigMessage) {}
     rpc GetStatus(GetStatusParams) returns (Status) {}
     rpc RunSelfTest(RunSelfTestParams) returns (SecuritySelfTestResultMessage) {}
     rpc GetRuleSetReport(GetRuleSetReportParams) returns (GetRuleSetReportMessage) {}
     rpc ReloadPolicies(ReloadPoliciesParams) returns (ReloadPoliciesResultMessage) {}
+    rpc GetLoadedPolicies(GetLoadedPoliciesParams) returns (GetLoadedPoliciesMessage) {}
     rpc DumpNetworkNamespace(DumpNetworkNamespaceParams) returns (DumpNetworkNamespaceMessage) {}
     rpc DumpDiscarders(DumpDiscardersParams) returns (DumpDiscardersMessage) {}
 
@@ -330,9 +362,13 @@ service SecurityModule {
     rpc ListActivityDumps(ActivityDumpListParams) returns (ActivityDumpListMessage) {}
     rpc StopActivityDump(ActivityDumpStopParams) returns (ActivityDumpStopMessage) {}
     rpc TranscodingRequest(TranscodingRequestParams) returns (TranscodingRequestMessage) {}
-    rpc GetActivityDumpStream(ActivityDumpStreamParams) returns (stream ActivityDumpStreamMessage) {}
 
     // Security Profiles
     rpc ListSecurityProfiles(SecurityProfileListParams) returns (SecurityProfileListMessage) {}
     rpc SaveSecurityProfile(SecurityProfileSaveParams) returns (SecurityProfileSaveMessage) {}
+}
+
+service SecurityAgentAPI {
+    rpc SendEvent(stream SecurityEventMessage) returns (google.protobuf.Empty) {}
+    rpc SendActivityDumpStream(stream ActivityDumpStreamMessage) returns (google.protobuf.Empty) {}
 }

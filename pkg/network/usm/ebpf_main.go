@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package usm
 
@@ -234,11 +234,6 @@ func (e *ebpfProgram) Start() error {
 	// We check again if there are protocols that could be enabled, and abort if
 	// it is not the case.
 	if len(e.enabledProtocols) == 0 {
-		err = e.Close()
-		if err != nil {
-			log.Errorf("error during USM shutdown: %s", err)
-		}
-
 		return errNoProtocols
 	}
 
@@ -489,7 +484,11 @@ func (e *ebpfProgram) init(buf bytecode.AssetReader, options manager.Options) er
 				log.Debugf("map %s is shared between enabled and disabled protocols", m.Name)
 				continue
 			}
-			options.ExcludedMaps = append(options.ExcludedMaps, m.Name)
+			// Unused maps still need to have a non-zero size
+			options.MapSpecEditors[m.Name] = manager.MapSpecEditor{
+				MaxEntries: uint32(1),
+				EditorFlag: manager.EditMaxEntries,
+			}
 
 			log.Debugf("disabled map: %v", m.Name)
 		}
@@ -527,10 +526,10 @@ func (e *ebpfProgram) init(buf bytecode.AssetReader, options manager.Options) er
 
 func getAssetName(module string, debug bool) string {
 	if debug {
-		return fmt.Sprintf("%s-debug.o", module)
+		return module + "-debug.o"
 	}
 
-	return fmt.Sprintf("%s.o", module)
+	return module + ".o"
 }
 
 func (e *ebpfProgram) dumpMapsHandler(w io.Writer, _ *manager.Manager, mapName string, currentMap *ebpf.Map) {
@@ -646,6 +645,12 @@ func (e *ebpfProgram) initProtocols(c *config.Config) error {
 		if protocol != nil {
 			spec.Instance = protocol
 			e.enabledProtocols = append(e.enabledProtocols, spec)
+
+			// Check if protocol provides additional modifiers (like EventHandlers)
+			if mp, ok := protocol.(protocols.ModifierProvider); ok {
+				modifiers := mp.Modifiers()
+				e.Manager.EnabledModifiers = append(e.Manager.EnabledModifiers, modifiers...)
+			}
 
 			log.Infof("%v monitoring enabled", protocol.Name())
 		} else {

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // Package offsetguess provides offsetguesses for tracer
 package offsetguess
@@ -331,7 +331,7 @@ func newConntrackEventGenerator(ns netns.NsHandle) (*conntrackEventGenerator, er
 
 	// port 0 means we let the kernel choose a free port
 	var err error
-	addr := fmt.Sprintf("%s:0", listenIPv4)
+	addr := listenIPv4 + ":0"
 	err = netnsutil.WithNS(eg.ns, func() error {
 		eg.udpAddr, eg.udpDone, err = newUDPServer(addr)
 		return err

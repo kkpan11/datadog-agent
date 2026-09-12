@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"time"
 
+	metrics "github.com/DataDog/datadog-agent/comp/logs-library/metrics"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/logs/message"
 )
@@ -50,7 +51,8 @@ func addTruncatedTag(msg *message.Message) {
 func (h *SingleLineHandler) process(msg *message.Message) {
 	lastWasTruncated := h.shouldTruncate
 	content := msg.GetContent()
-	h.shouldTruncate = len(content) >= h.lineLimit
+	// Check if content exceeds limit OR if framer already detected truncation
+	h.shouldTruncate = len(content) > h.lineLimit || msg.ParsingExtra.IsTruncated
 
 	content = bytes.TrimSpace(content)
 
@@ -66,12 +68,14 @@ func (h *SingleLineHandler) process(msg *message.Message) {
 		// the line is too long, it needs to be cut off and send,
 		// adding the truncated flag the end of the content
 		content = append(content, message.TruncatedFlag...)
+		metrics.LogsTruncated.Add(1)
+
 	}
 
 	if lastWasTruncated || h.shouldTruncate {
+		msg.ParsingExtra.IsTruncated = true
 		addTruncatedTag(msg)
 	}
-
 	msg.SetContent(content) // refresh the content in the message
 	h.outputFn(msg)
 }

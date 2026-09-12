@@ -14,12 +14,24 @@ type ConnTuple struct {
 	Pid      uint32
 	Metadata uint32
 }
+type TCPEventStats struct {
+	Rto_count      uint32
+	Recovery_count uint32
+	Probe0_count   uint32
+}
 type TCPStats struct {
 	Rtt               uint32
 	Rtt_var           uint32
 	Retransmits       uint32
 	State_transitions uint16
 	Failure_reason    uint16
+	Tcp_event_stats   TCPEventStats
+	Reord_seen        uint32
+	Rcv_ooopack       uint32
+	Delivered_ce      uint32
+	Ecn_negotiated    uint8
+	X_pad             [3]uint8
+	X_pad2            uint32
 }
 type ConnStats struct {
 	Sent_bytes     uint64
@@ -33,6 +45,8 @@ type ConnStats struct {
 	Flags          uint8
 	Direction      uint8
 	Tls_tags       TLSTags
+	Cert_id        uint32
+	Pad_cgo_0      [4]byte
 }
 type Conn struct {
 	Tup        ConnTuple
@@ -47,20 +61,8 @@ type PidTs struct {
 	Tgid      uint64
 	Timestamp uint64
 }
-type Batch struct {
-	C0        Conn
-	C1        Conn
-	C2        Conn
-	C3        Conn
-	Id        uint64
-	Cpu       uint32
-	Len       uint16
-	Pad_cgo_0 [2]byte
-}
 type Telemetry struct {
 	Tcp_sent_miscounts              uint64
-	Unbatched_tcp_close             uint64
-	Unbatched_udp_close             uint64
 	Udp_sends_processed             uint64
 	Udp_sends_missed                uint64
 	Udp_dropped_conns               uint64
@@ -112,6 +114,30 @@ type TLSTagsWrapper struct {
 	Info      TLSTags
 	Pad_cgo_0 [2]byte
 }
+type CertItem struct {
+	Timestamp uint64
+	Serial    CertSerial
+	Domain    CertDomain
+	Validity  CertValidity
+	Pad_cgo_0 [2]byte
+}
+type CertSerial struct {
+	Len  uint8
+	Data [20]uint8
+}
+type CertDomain struct {
+	Len  uint8
+	Data [64]uint8
+}
+type CertValidity struct {
+	Before [12]uint8
+	After  [12]uint8
+}
+type SSLHandshakeState struct {
+	Item      CertItem
+	Id        uint32
+	Pad_cgo_0 [4]byte
+}
 
 type _Ctype_struct_sock uint64
 type _Ctype_struct_msghdr uint64
@@ -132,10 +158,7 @@ const (
 	Assured ConnFlags = 0x4
 )
 
-const BatchSize = 0x4
-const SizeofBatch = 0x1f0
-
-const SizeofConn = 0x78
+const SizeofConn = 0xa0
 
 type ClassificationProgram = uint32
 type ClassificationTLSProgram = uint32

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package postgres
 
@@ -45,7 +45,7 @@ func (s *StatKeeper) Process(tx *EventWrapper) {
 		if len(s.stats) >= s.maxEntries {
 			return
 		}
-		requestStats = new(RequestStat)
+		requestStats = requestStatPool.Get()
 		s.stats[key] = requestStats
 	}
 	requestStats.StaticTags = uint64(tx.Tx.Tags)

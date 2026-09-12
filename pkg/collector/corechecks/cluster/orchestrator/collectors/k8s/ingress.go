@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewIngressCollectorVersions builds the group of collector versions.
-func NewIngressCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewIngressCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewIngressCollector(metadataAsTags),
+		NewIngressCollector(tagger),
 	)
 }
 
@@ -38,11 +39,7 @@ type IngressCollector struct {
 
 // NewIngressCollector creates a new collector for the Kubernetes Ingress
 // resource.
-func NewIngressCollector(metadataAsTags utils.MetadataAsTags) *IngressCollector {
-	resourceType := getResourceType(ingressName, ingressVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewIngressCollector(tagger tagger.Component) *IngressCollector {
 	return &IngressCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -50,15 +47,14 @@ func NewIngressCollector(metadataAsTags utils.MetadataAsTags) *IngressCollector 
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 ingressName,
+			Name:                                 utilTypes.IngressName,
 			Kind:                                 kubernetes.IngressKind,
 			NodeType:                             orchestrator.K8sIngress,
-			Version:                              ingressVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.IngressGroup,
+			Version:                              utilTypes.IngressVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.IngressHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewIngressHandlers(tagger)),
 	}
 }
 

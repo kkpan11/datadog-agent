@@ -29,11 +29,12 @@ type DeviceInfo struct {
 
 // PendingDevice represents a device pending deduplication
 type PendingDevice struct {
-	Config     snmp.Config
-	Info       DeviceInfo
-	AuthIndex  int
-	WriteCache bool
-	IP         string
+	Config         snmp.Config
+	Info           DeviceInfo
+	AuthIndex      int
+	AddedFromCache bool
+	IP             string
+	Failures       int
 }
 
 func (d DeviceInfo) equal(other DeviceInfo) bool {
@@ -47,16 +48,19 @@ func (d DeviceInfo) equal(other DeviceInfo) bool {
 
 // DeviceDeduper is an interface for deduplicating SNMP devices
 type DeviceDeduper interface {
+	DecrementIPCounter(ip string)
 	MarkIPAsProcessed(ip string)
 	AddPendingDevice(device PendingDevice)
 	GetDedupedDevices() []PendingDevice
+	ResetCounters()
 }
 
 type deviceDeduperImpl struct {
 	sync.RWMutex
 	deviceInfos    []DeviceInfo
 	pendingDevices []PendingDevice
-	ipsCounter     map[string]*atomic.Uint32
+	ipsCounter     map[string]*atomic.Int32
+	config         snmp.ListenerConfig
 }
 
 // NewDeviceDeduper creates a new DeviceDeduper instance
@@ -64,16 +68,24 @@ func NewDeviceDeduper(config snmp.ListenerConfig) DeviceDeduper {
 	deduper := &deviceDeduperImpl{
 		deviceInfos:    make([]DeviceInfo, 0),
 		pendingDevices: make([]PendingDevice, 0),
-		ipsCounter:     make(map[string]*atomic.Uint32),
+		ipsCounter:     make(map[string]*atomic.Int32),
+		config:         config,
 	}
 
-	for _, config := range config.Configs {
+	deduper.initializeCounters()
+
+	return deduper
+}
+
+func (d *deviceDeduperImpl) initializeCounters() {
+	for _, config := range d.config.Configs {
 		ipAddr, ipNet, err := net.ParseCIDR(config.Network)
-		startingIP := ipAddr.Mask(ipNet.Mask)
 		if err != nil {
-			log.Error(err)
+			log.Errorf("Couldn't parse SNMP network: %s", err)
 			continue
 		}
+
+		startingIP := ipAddr.Mask(ipNet.Mask)
 
 		for currentIP := startingIP; ipNet.Contains(currentIP); IncrementIP(currentIP) {
 			if ignored := config.IsIPIgnored(currentIP); ignored {
@@ -81,16 +93,14 @@ func NewDeviceDeduper(config snmp.ListenerConfig) DeviceDeduper {
 			}
 
 			ipStr := currentIP.String()
-			counter, exists := deduper.ipsCounter[ipStr]
+			counter, exists := d.ipsCounter[ipStr]
 			if !exists {
-				counter = &atomic.Uint32{}
-				deduper.ipsCounter[ipStr] = counter
+				counter = &atomic.Int32{}
+				d.ipsCounter[ipStr] = counter
 			}
-			counter.Add(uint32(len(config.Authentications)))
+			counter.Add(int32(len(config.Authentications)))
 		}
 	}
-
-	return deduper
 }
 
 func (d *deviceDeduperImpl) checkPreviousIPs(deviceIP string) bool {
@@ -166,15 +176,39 @@ func (d *deviceDeduperImpl) GetDedupedDevices() []PendingDevice {
 	return dedupedDevices
 }
 
-// MarkIPAsProcessed removes an IP from the counter, it is used to make sure we get the minimum IP for a device
+// DecrementIPCounter decrements the counter for an IP by 1, representing one completed auth attempt.
+func (d *deviceDeduperImpl) DecrementIPCounter(ip string) {
+	d.RLock()
+	defer d.RUnlock()
+	counter, exists := d.ipsCounter[ip]
+
+	if exists {
+		counter.Add(-1)
+	}
+}
+
+// MarkIPAsProcessed sets the counter for an IP to 0, signaling that the device was found and no further attempts are needed
 func (d *deviceDeduperImpl) MarkIPAsProcessed(ip string) {
 	d.RLock()
 	defer d.RUnlock()
 	counter, exists := d.ipsCounter[ip]
 
 	if exists {
-		counter.Add(^uint32(0)) // Subtract 1 using bitwise NOT of 0
+		counter.Store(0)
 	}
+}
+
+// ResetCounters resets the IP counters and device infos for a new discovery interval
+func (d *deviceDeduperImpl) ResetCounters() {
+	d.Lock()
+	defer d.Unlock()
+
+	for _, counter := range d.ipsCounter {
+		counter.Store(0)
+	}
+
+	d.initializeCounters()
+	d.deviceInfos = make([]DeviceInfo, 0)
 }
 
 func minimumIP(ipStr1, ipStr2 string) string {

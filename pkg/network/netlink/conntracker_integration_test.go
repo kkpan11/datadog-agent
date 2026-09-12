@@ -3,15 +3,15 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package netlink
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -145,19 +145,14 @@ func testMessageDump(t *testing.T, f *os.File, serverIP, clientIP net.IP) {
 }
 
 func skipUnless(t *testing.T, requiredArg string) {
-	for _, arg := range os.Args[1:] {
-		if arg == requiredArg {
-			return
-		}
+	if slices.Contains(os.Args[1:], requiredArg) {
+		return
 	}
 
-	//nolint:gosimple // TODO(NET) Fix gosimple linter
-	t.Skip(
-		fmt.Sprintf(
-			"skipped %s. you can enable it by using running tests with `-args %s`",
-			t.Name(),
-			requiredArg,
-		),
+	t.Skipf(
+		"skipped %s. you can enable it by using running tests with `-args %s`",
+		t.Name(),
+		requiredArg,
 	)
 }
 

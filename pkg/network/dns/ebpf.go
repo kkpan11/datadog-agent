@@ -3,11 +3,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package dns
 
 import (
+	"fmt"
+
 	manager "github.com/DataDog/ebpf-manager"
 
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
@@ -15,6 +17,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	netebpf "github.com/DataDog/datadog-agent/pkg/network/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/network/ebpf/probes"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const probeUID = "dns"
@@ -52,11 +55,25 @@ func newEBPFProgram(c *config.Config) (*ebpfProgram, error) {
 func (e *ebpfProgram) Init() error {
 	defer e.bytecode.Close()
 
-	var constantEditors []manager.ConstantEditor
+	// The port list has already been sanitized in config.New()
+	ports := e.cfg.DNSMonitoringPortList
+	log.Infof("DNS monitoring ports: %v", ports)
+
+	constantEditors := make([]manager.ConstantEditor, 0, config.DNSPortsMax+1)
 	if e.cfg.CollectDNSStats {
 		constantEditors = append(constantEditors, manager.ConstantEditor{
 			Name:  "dns_stats_enabled",
 			Value: uint64(1),
+		})
+	}
+	for i := 0; i < config.DNSPortsMax; i++ {
+		var val uint64
+		if i < len(ports) {
+			val = uint64(uint16(ports[i]))
+		}
+		constantEditors = append(constantEditors, manager.ConstantEditor{
+			Name:  fmt.Sprintf("dns_port_%d", i),
+			Value: val,
 		})
 	}
 

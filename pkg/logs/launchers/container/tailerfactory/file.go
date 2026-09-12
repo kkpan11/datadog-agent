@@ -5,6 +5,8 @@
 
 //go:build kubelet || docker
 
+// Package tailerfactory implements the logic required to determine which kind
+// of tailer to use for a container-related LogSource, and to create that tailer.
 package tailerfactory
 
 // This file handles creating docker tailers which access the container runtime
@@ -22,18 +24,19 @@ import (
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/util/containersorpods"
+	"github.com/DataDog/datadog-agent/pkg/logs/internal/util/opener"
 	"github.com/DataDog/datadog-agent/pkg/logs/launchers/container/tailerfactory/tailers"
 	"github.com/DataDog/datadog-agent/pkg/logs/sources"
 	status "github.com/DataDog/datadog-agent/pkg/logs/status/utils"
 	containerutilPkg "github.com/DataDog/datadog-agent/pkg/util/containers"
-	"github.com/DataDog/datadog-agent/pkg/util/filesystem"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
-var podLogsBasePath = "/var/log/pods"
-var dockerLogsBasePathNix = "/var/lib/docker"
-var dockerLogsBasePathWin = "c:\\programdata\\docker"
-var podmanRootfullLogsBasePath = "/var/lib/containers"
+var (
+	podLogsBasePath       = "/var/log/pods"
+	dockerLogsBasePathNix = "/var/lib/docker"
+	dockerLogsBasePathWin = "c:\\programdata\\docker"
+)
 
 // makeFileTailer makes a file-based tailer for the given source, or returns
 // an error if it cannot do so (e.g., due to permission errors)
@@ -51,8 +54,13 @@ func (tf *factory) makeFileSource(source *sources.LogSource) (*sources.LogSource
 	// The user configuration consulted is different depending on what we are
 	// logging.  Note that we assume that by the time we have gotten a source
 	// from AD, it is clear what we are logging.  The `Wait` here should return
-	// quickly.
-	logWhat := tf.cop.Wait(context.Background())
+	// quickly. But it doesn't if there is no docker socket, in case of Podman for example.
+	// Make expiring context to run detection on.
+	to := pkgconfigsetup.Datadog().GetDuration("logs_config.container_runtime_waiting_timeout")
+	ctx, cancel := context.WithTimeout(context.Background(), to)
+	defer cancel()
+
+	logWhat := tf.cop.Wait(ctx)
 
 	switch logWhat {
 	case containersorpods.LogContainers:
@@ -92,7 +100,7 @@ func (tf *factory) attachChildSource(source, childSource *sources.LogSource) (Ta
 			childSource.Config.Path))
 
 	// link status for this source and the parent, and hide the parent
-	childSource.Status = source.Status
+	childSource.SetStatus(source.Status())
 	childSource.ParentSource = source
 	source.HideFromStatus()
 
@@ -108,11 +116,14 @@ func (tf *factory) attachChildSource(source, childSource *sources.LogSource) (Ta
 func (tf *factory) makeDockerFileSource(source *sources.LogSource) (*sources.LogSource, error) {
 	containerID := source.Config.Identifier
 
-	path := tf.findDockerLogPath(containerID)
+	path, err := tf.findDockerLogPath(containerID)
+	if err != nil {
+		return nil, err
+	}
 
 	// check access to the file; if it is not readable, then returning an error will
 	// try to fall back to reading from a socket.
-	f, err := filesystem.OpenShared(path)
+	f, err := opener.OpenLogFile(path)
 	if err != nil {
 		// (this error already has the form 'open <path>: ..' so needs no further embellishment)
 		return nil, err
@@ -123,17 +134,27 @@ func (tf *factory) makeDockerFileSource(source *sources.LogSource) (*sources.Log
 
 	// New file source that inherits most of its parent's properties
 	fileSource := sources.NewLogSource(source.Name, &config.LogsConfig{
-		Type:                        config.FileType,
-		TailingMode:                 source.Config.TailingMode,
-		Identifier:                  containerID,
-		Path:                        path,
-		Service:                     serviceName,
-		Source:                      sourceName,
-		Tags:                        source.Config.Tags,
-		ProcessingRules:             source.Config.ProcessingRules,
-		AutoMultiLine:               source.Config.AutoMultiLine,
-		AutoMultiLineSampleSize:     source.Config.AutoMultiLineSampleSize,
-		AutoMultiLineMatchThreshold: source.Config.AutoMultiLineMatchThreshold,
+		Type:                          config.FileType,
+		TailingMode:                   source.Config.TailingMode,
+		Identifier:                    containerID,
+		Path:                          path,
+		Service:                       serviceName,
+		Source:                        sourceName,
+		Encoding:                      source.Config.Encoding,
+		Tags:                          source.Config.Tags,
+		ProcessingRules:               source.Config.ProcessingRules,
+		FingerprintConfig:             source.Config.FingerprintConfig,
+		Format:                        source.Config.Format,
+		AttributeParsing:              source.Config.AttributeParsing,
+		DebugAttrParsing:              source.Config.DebugAttrParsing,
+		MaxMessageSizeBytes:           source.Config.MaxMessageSizeBytes,
+		AutoMultiLine:                 source.Config.AutoMultiLine,
+		AutoMultiLineSampleSize:       source.Config.AutoMultiLineSampleSize,
+		AutoMultiLineMatchThreshold:   source.Config.AutoMultiLineMatchThreshold,
+		AutoMultiLineOptions:          source.Config.AutoMultiLineOptions,
+		AutoMultiLineSamples:          source.Config.AutoMultiLineSamples,
+		ExperimentalAdaptiveSampling:  source.Config.ExperimentalAdaptiveSampling,
+		ExperimentalNoisyLogDetection: source.Config.ExperimentalNoisyLogDetection,
 	})
 
 	// inform the file launcher that it should expect docker-formatted content
@@ -144,37 +165,42 @@ func (tf *factory) makeDockerFileSource(source *sources.LogSource) (*sources.Log
 }
 
 // findDockerLogPath returns a path for the given container.
-func (tf *factory) findDockerLogPath(containerID string) string {
+func (tf *factory) findDockerLogPath(containerID string) (string, error) {
 	// if the user has set a custom docker data root, this will pick it up
 	// and set it in place of the usual docker base path
 	overridePath := pkgconfigsetup.Datadog().GetString("logs_config.docker_path_override")
 	if len(overridePath) > 0 {
-		return filepath.Join(overridePath, "containers", containerID, fmt.Sprintf("%s-json.log", containerID))
+		return filepath.Join(overridePath, "containers", containerID, containerID+"-json.log"), nil
 	}
 
 	switch runtime.GOOS {
 	case "windows":
 		return filepath.Join(
 			dockerLogsBasePathWin, "containers", containerID,
-			fmt.Sprintf("%s-json.log", containerID))
+			containerID+"-json.log"), nil
 	default: // linux, darwin
 		// this config flag provides temporary support for podman while it is
 		// still recognized by AD as a "docker" runtime.
 		if pkgconfigsetup.Datadog().GetBool("logs_config.use_podman_logs") {
-			// Default path for podman rootfull containers
-			podmanLogsBasePath := podmanRootfullLogsBasePath
-			podmanDBPath := pkgconfigsetup.Datadog().GetString("podman_db_path")
-			// User provided a custom podman DB path, they are running rootless containers or modified the root directory.
-			if len(podmanDBPath) > 0 {
-				podmanLogsBasePath = log.ExtractPodmanRootDirFromDBPath(podmanDBPath)
+			// The podman collector adds annotation to containers it pulls with their storage location
+			// This is used to construct the log location (podman k8s-file driver)
+			wmeta, ok := tf.workloadmetaStore.Get()
+			if !ok {
+				return "", fmt.Errorf("cannot determine Podman log root for container %q: workloadmeta store is not initialized", containerID)
 			}
-			return filepath.Join(
-				podmanLogsBasePath, "storage/overlay-containers", containerID,
-				"userdata/ctr.log")
+			ctr, err := wmeta.GetContainer(containerID)
+			if err != nil {
+				return "", fmt.Errorf("cannot determine Podman log root for container %q: cannot find container in workloadmeta: %w", containerID, err)
+			}
+			rootDir := ctr.Annotations[log.ContainerRootDirAnnotationKey]
+			if rootDir == "" {
+				return "", fmt.Errorf("cannot determine Podman log root for container %q: missing annotation %q", containerID, log.ContainerRootDirAnnotationKey)
+			}
+			return filepath.Join(rootDir, "storage/overlay-containers", containerID, "userdata/ctr.log"), nil
 		}
 		return filepath.Join(
 			dockerLogsBasePathNix, "containers", containerID,
-			fmt.Sprintf("%s-json.log", containerID))
+			containerID+"-json.log"), nil
 	}
 }
 
@@ -216,7 +242,6 @@ func (tf *factory) makeK8sFileSource(source *sources.LogSource) (*sources.LogSou
 	}
 
 	// get the path for the discovered pod and container
-	// TODO: need a different base path on windows?
 	path := findK8sLogPath(pod, container.Name)
 
 	// Note that it's not clear from k8s documentation that the container logs,
@@ -230,17 +255,27 @@ func (tf *factory) makeK8sFileSource(source *sources.LogSource) (*sources.LogSou
 	fileSource := sources.NewLogSource(
 		fmt.Sprintf("%s/%s/%s", pod.Namespace, pod.Name, container.Name),
 		&config.LogsConfig{
-			Type:                        config.FileType,
-			TailingMode:                 source.Config.TailingMode,
-			Identifier:                  containerID,
-			Path:                        path,
-			Service:                     serviceName,
-			Source:                      sourceName,
-			Tags:                        source.Config.Tags,
-			ProcessingRules:             source.Config.ProcessingRules,
-			AutoMultiLine:               source.Config.AutoMultiLine,
-			AutoMultiLineSampleSize:     source.Config.AutoMultiLineSampleSize,
-			AutoMultiLineMatchThreshold: source.Config.AutoMultiLineMatchThreshold,
+			Type:                          config.FileType,
+			TailingMode:                   source.Config.TailingMode,
+			Identifier:                    containerID,
+			Path:                          path,
+			Service:                       serviceName,
+			Source:                        sourceName,
+			Encoding:                      source.Config.Encoding,
+			Tags:                          source.Config.Tags,
+			ProcessingRules:               source.Config.ProcessingRules,
+			FingerprintConfig:             source.Config.FingerprintConfig,
+			Format:                        source.Config.Format,
+			AttributeParsing:              source.Config.AttributeParsing,
+			DebugAttrParsing:              source.Config.DebugAttrParsing,
+			MaxMessageSizeBytes:           source.Config.MaxMessageSizeBytes,
+			AutoMultiLine:                 source.Config.AutoMultiLine,
+			AutoMultiLineSampleSize:       source.Config.AutoMultiLineSampleSize,
+			AutoMultiLineMatchThreshold:   source.Config.AutoMultiLineMatchThreshold,
+			AutoMultiLineOptions:          source.Config.AutoMultiLineOptions,
+			AutoMultiLineSamples:          source.Config.AutoMultiLineSamples,
+			ExperimentalAdaptiveSampling:  source.Config.ExperimentalAdaptiveSampling,
+			ExperimentalNoisyLogDetection: source.Config.ExperimentalNoisyLogDetection,
 		})
 
 	switch source.Config.Type {

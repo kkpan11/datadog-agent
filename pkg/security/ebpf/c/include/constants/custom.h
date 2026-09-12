@@ -4,21 +4,21 @@
 #include "macros.h"
 
 #define TTY_NAME_LEN 64
-#define CONTAINER_ID_LEN 64
 #define MAX_XATTR_NAME_LEN 200
 #define CHAR_TO_UINT32_BASE_10_MAX_LEN 11
-#define BASENAME_FILTER_SIZE 256
+#define BASENAME_FILTER_SIZE 32 // has to be in sync with the userspace definition
 #define FSTYPE_LEN 16
 #define MAX_PATH_LEN 256
 #define REVISION_ARRAY_SIZE 4096
 #define INODE_DISCARDER_TYPE 0
 
-#define PATH_ID_MAP_SIZE 512
+#define PATH_ID_HIGH_MAP_SIZE 16384 // mount part of the path id
+#define PATH_ID_LOW_MAP_SIZE 32768 // inode part of the path id
 
 #define MAX_PERF_STR_BUFF_LEN 256
 #define MAX_STR_BUFF_LEN (1 << 15)
 #define MAX_ARRAY_ELEMENT_SIZE 4096
-#define MAX_ARRAY_ELEMENT_PER_TAIL 27
+#define MAX_ARRAY_ELEMENT_PER_TAIL 26
 #define MAX_ARGS_ELEMENTS (MAX_ARRAY_ELEMENT_PER_TAIL * (32 / 2)) // split tailcall limit
 #define MAX_ARGS_READ_PER_TAIL 160
 
@@ -31,13 +31,19 @@
 #define DENTRY_ERROR -3
 #define FAKE_INODE_MSW 0xdeadc001UL
 #define DR_MAX_TAIL_CALL 29
-#define DR_MAX_ITERATION_DEPTH 47
+#define DR_MAX_ITERATION_DEPTH 40
 #define DR_MAX_SEGMENT_LENGTH 255
 #define DR_NO_CALLBACK -1
 
 enum TAIL_CALL_PROG_TYPE {
     KPROBE_OR_FENTRY_TYPE = 0,
     TRACEPOINT_TYPE = 1,
+};
+
+enum SOCKET_APPROVER_KEYS {
+    SOCKET_DOMAIN_APPROVER_KEY,
+    SOCKET_TYPE_APPROVER_KEY,
+    SOCKET_PROTOCOL_APPROVER_KEY,
 };
 
 enum DENTRY_RESOLVER_KEYS {
@@ -57,7 +63,34 @@ enum DENTRY_ERPC_RESOLUTION_CODE {
     DR_ERPC_TAIL_CALL_ERROR,
     DR_ERPC_READ_PAGE_FAULT,
     DR_ERPC_UNKNOWN_ERROR,
+    DR_ERPC_LAST,
 };
+
+// Reader that attempted a per-event span context fill. Matches
+// (span_ctx_stats.go)
+enum span_ctx_event_reader {
+    SPAN_CTX_EVENT_READER_OTEL,       // reader:otel_tls
+    SPAN_CTX_EVENT_READER_GO_LABELS,  // reader:go_labels
+    SPAN_CTX_EVENT_READER_FILL,       // reader:fill  (the tail-call plumbing itself)
+    SPAN_CTX_EVENT_READER_LAST,
+};
+
+// Why a per-event span context fill attempt produced nothing or failed attribute/label lookup
+enum span_ctx_event_status {
+    SPAN_CTX_EVENT_OK,                // filled; also the "no failure" return
+    SPAN_CTX_EVENT_NONE,              // nothing to read (no reader, no record, no labels)
+    SPAN_CTX_EVENT_NO_THREAD_POINTER, // read_thread_pointer() returned 0
+    SPAN_CTX_EVENT_READ_FAULT,        // a bpf_probe_read_user in the chain faulted
+    SPAN_CTX_EVENT_TORN,              // OTel record changed under the copy
+    SPAN_CTX_EVENT_G_NOT_FOUND,       // no goroutine pointer from TLS nor register
+    SPAN_CTX_EVENT_ATTRS_READ_FAULT,  // ids delivered, attributes payload unreadable
+    SPAN_CTX_EVENT_MAP_ERROR,         // scratch / ring / gen-id lookup failed
+    SPAN_CTX_EVENT_MALFORMED,         // fill plumbing: payload offsets out of bounds
+    SPAN_CTX_EVENT_STATUS_LAST,
+};
+
+// Statuses below this are outcomes, not failures, and are never counted.
+#define SPAN_CTX_EVENT_FIRST_ERROR SPAN_CTX_EVENT_NO_THREAD_POINTER
 
 enum TC_TAIL_CALL_KEYS {
     DNS_REQUEST = 1,
@@ -66,9 +99,13 @@ enum TC_TAIL_CALL_KEYS {
     DNS_RESPONSE
 };
 
+// see probes/rawpacket/pcap.go
+#define RAW_PACKET_MAX_TAIL_CALL 5
+
 enum TC_RAWPACKET_KEYS {
     RAW_PACKET_FILTER,
     // reserved keys for raw packet filter tail calls
+    RAW_PACKET_DROP_ACTION = RAW_PACKET_FILTER + RAW_PACKET_MAX_TAIL_CALL + 1, // + 1 for the sender program
 };
 
 #define DNS_MAX_LENGTH 256
@@ -77,8 +114,6 @@ enum TC_RAWPACKET_KEYS {
 
 #define EGRESS 1
 #define INGRESS 2
-#define ACT_OK TC_ACT_UNSPEC
-#define ACT_SHOT TC_ACT_SHOT
 #define PACKET_KEY 0
 #define IMDS_EVENT_KEY 0
 #define IMDS_MAX_LENGTH 2048
@@ -95,6 +130,12 @@ enum TC_RAWPACKET_KEYS {
 #define SYSCALL_MONITOR_TYPE_DUMP 1
 #define SYSCALL_MONITOR_TYPE_DRIFT 2
 
+// reasons for sending a syscall monitor event, mirrored by model.SyscallDriftEventReason
+#define SYSCALL_MONITOR_REASON_NONE 0
+#define SYSCALL_MONITOR_REASON_PERIOD 1
+#define SYSCALL_MONITOR_REASON_EXIT 2
+#define SYSCALL_MONITOR_REASON_EXECVE 3
+
 #define SELINUX_WRITE_BUFFER_LEN 64
 #define SELINUX_ENFORCE_STATUS_DISABLE_KEY 0
 #define SELINUX_ENFORCE_STATUS_ENFORCE_KEY 1
@@ -105,6 +146,12 @@ enum TC_RAWPACKET_KEYS {
 #ifndef USE_RING_BUFFER
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 #define USE_RING_BUFFER 1
+#endif
+#endif
+
+#ifndef USE_SYSCALL_TASK_STORAGE
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#define USE_SYSCALL_TASK_STORAGE 1
 #endif
 #endif
 
@@ -125,6 +172,15 @@ enum TC_RAWPACKET_KEYS {
 #define MAX_SYSCALL_CTX_ENTRIES 8192
 #define MAX_SYSCALL_ARG_MAX_SIZE 128
 #define MAX_SYSCALL_CTX_SIZE MAX_SYSCALL_ARG_MAX_SIZE * 3 + 4 + 1 // id + types octet + 3 args
+
+// Go pprof-label context: raw key/value pairs are dumped into the go_labels_ctx
+// ring by eBPF.
+#define GO_LABELS_CTX_KEY_SIZE 32
+#define GO_LABELS_CTX_VAL_SIZE 64
+#define GO_LABELS_CTX_MAX_PAIRS 10
+#define GO_LABELS_CTX_MAX_ENTRIES 4096
+
+#define OTEL_SPAN_ATTRS_MAX_ENTRIES 4096
 
 __attribute__((always_inline)) u64 is_cgroup_activity_dumps_enabled() {
     u64 cgroup_activity_dumps_enabled;
@@ -191,15 +247,25 @@ static __attribute__((always_inline)) u64 get_imds_ip() {
     return imds_ip;
 };
 
+static __attribute__((always_inline)) u64 get_capabilities_monitoring_period() {
+    u64 capabilities_monitoring_period = 5000000000; // 5 seconds in nanoseconds
+    LOAD_CONSTANT("capabilities_monitoring_period", capabilities_monitoring_period);
+    return capabilities_monitoring_period;
+};
+
+#define CGROUP_MANAGER_UNDEFINED 0
 #define CGROUP_MANAGER_DOCKER 1
 #define CGROUP_MANAGER_CRIO 2
 #define CGROUP_MANAGER_PODMAN 3
 #define CGROUP_MANAGER_CRI 4
 #define CGROUP_MANAGER_SYSTEMD 5
 
-#define CGROUP_MANAGER_MASK 0b111
-#define CGROUP_SYSTEMD_SERVICE (0 << 8)
-#define CGROUP_SYSTEMD_SCOPE   (1 << 8)
+#define CGROUP_MANAGER_MASK 0xff
+
+#define CGROUP_SYSTEMD_SERVICE (1 << 8)
+#define CGROUP_SYSTEMD_SCOPE (1 << 8) + 1
+
+#define SAMPLING_PRESSURE_CRITICAL 90
 
 #define ACTIVE_FLOWS_MAX_SIZE 128
 
@@ -217,6 +283,11 @@ enum FLUSH_NETWORK_STATS_TYPE
     NETWORK_STATS_TICKER,
 };
 
+enum CACHE_SYSCALL_TYPE
+{
+    CACHE_SYSCALL_UPDATE_PROC_CACHE_CGROUP_KEY,
+};
+
 static __attribute__((always_inline)) u64 get_network_monitor_period() {
     u64 network_monitor_period;
     LOAD_CONSTANT("network_monitor_period", network_monitor_period);
@@ -229,10 +300,24 @@ static __attribute__((always_inline)) u64 is_sk_storage_supported() {
     return is_sk_storage_supported;
 }
 
+// is_sk_lookup_pid_enabled returns whether TC pid resolution uses bpf_sk_lookup + sk-local storage
+// instead of the flow_pid map.
+static __attribute__((always_inline)) u64 is_sk_lookup_pid_enabled() {
+    u64 is_sk_lookup_pid_enabled;
+    LOAD_CONSTANT("sk_lookup_pid_enabled", is_sk_lookup_pid_enabled);
+    return is_sk_lookup_pid_enabled;
+}
+
 static __attribute__((always_inline)) u64 is_network_flow_monitor_enabled() {
     u64 is_network_flow_monitor_enabled;
     LOAD_CONSTANT("is_network_flow_monitor_enabled", is_network_flow_monitor_enabled);
     return is_network_flow_monitor_enabled;
+}
+
+static __attribute__((always_inline)) u64 is_span_tracking_enabled() {
+    u64 is_span_tracking_enabled;
+    LOAD_CONSTANT("is_span_tracking_enabled", is_span_tracking_enabled);
+    return is_span_tracking_enabled;
 }
 
 #define SYSCTL_OK 1
@@ -244,6 +329,9 @@ static __attribute__((always_inline)) u64 is_network_flow_monitor_enabled() {
 #define SYSCTL_NAME_TRUNCATED (1 << 0)
 #define SYSCTL_OLD_VALUE_TRUNCATED (1 << 1)
 #define SYSCTL_NEW_VALUE_TRUNCATED (1 << 2)
+#define MAX_BPF_FILTER_SIZE (511 * sizeof(struct sock_filter))
+#define MAX_PRCTL_NAME_LEN 16
+#define TRACER_MEMFD_SUFFIX_LEN 8
 
 static __attribute__((always_inline)) u64 has_tracing_helpers_in_cgroup_sysctl() {
     u64 tracing_helpers_in_cgroup_sysctl;
@@ -258,7 +346,18 @@ enum link_target_dentry_origin {
 };
 
 enum global_rate_limiter_type {
-    RAW_PACKET_LIMITER = 0,
+    RAW_PACKET_FILTER_LIMITER = 0,
+    RAW_PACKET_ACTION_LIMITER,
+    OPEN_SAMPLE_LIMITER,
+    BIND_SAMPLE_LIMITER,
+    DNS_SAMPLE_LIMITER,
+    CONNECT_SAMPLE_LIMITER,
+};
+
+enum PATH_ID_INVALIDATE_TYPE {
+    PATH_ID_INVALIDATE_TYPE_NONE = 0, // no invalidate
+    PATH_ID_INVALIDATE_TYPE_LOCAL = 1, // only the local path id is invalidated, mosly non dir related events
+    PATH_ID_INVALIDATE_TYPE_GLOBAL = 2, // the global path id is invalidated, meaning impacting the volume
 };
 
 #define TAIL_CALL_FNC_NAME(name, ...) tail_call_##name(__VA_ARGS__)
@@ -277,5 +376,7 @@ enum global_rate_limiter_type {
 #define TAIL_CALL_CLASSIFIER_TARGET(name) SEC("classifier/" name)
 #define TAIL_CALL_CLASSIFIER_FNC(name, ...) TAIL_CALL_CLASSIFIER_TARGET("\"" #name "\"") \
     int TAIL_CALL_CLASSIFIER_FNC_NAME(name, __VA_ARGS__)
+
+#define OPEN_TREE_CLONE 1
 
 #endif

@@ -9,12 +9,16 @@ package k8s
 
 import (
 	model "github.com/DataDog/agent-payload/v5/process"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	taggertypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/common"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sTransformers "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/transformers/k8s"
-	"github.com/DataDog/datadog-agent/pkg/orchestrator/redact"
+	"github.com/DataDog/datadog-agent/pkg/redact"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -23,6 +27,30 @@ import (
 // NodeHandlers implements the Handlers interface for Kubernetes Nodes.
 type NodeHandlers struct {
 	common.BaseHandlers
+	tagger tagger.Component
+}
+
+// NewNodeHandlers creates a new NodeHandlers.
+func NewNodeHandlers(tagger tagger.Component) *NodeHandlers {
+	return &NodeHandlers{tagger: tagger}
+}
+
+// EnrichModel is a handler called before cache lookup.
+//
+//nolint:revive
+func (h *NodeHandlers) EnrichModel(ctx processors.ProcessorContext, resource, resourceModel interface{}) (skip bool) {
+	r := resource.(*corev1.Node)
+	m := resourceModel.(*model.Node)
+
+	entityID := taggertypes.NewEntityID(taggertypes.KubernetesNode, r.Name)
+	taggerTags, err := h.tagger.Tag(entityID, taggertypes.HighCardinality)
+	if err != nil {
+		log.Debugf("Could not retrieve tags for node %s: %s", r.Name, err)
+		return
+	}
+
+	m.Tags = append(m.Tags, taggerTags...)
+	return
 }
 
 // AfterMarshalling is a handler called after resource marshalling.
@@ -55,12 +83,13 @@ func (h *NodeHandlers) BuildMessageBody(ctx processors.ProcessorContext, resourc
 	}
 
 	return &model.CollectorNode{
-		ClusterName: pctx.Cfg.KubeClusterName,
-		ClusterId:   pctx.ClusterID,
-		GroupId:     pctx.MsgGroupID,
-		GroupSize:   int32(groupSize),
-		Nodes:       models,
-		Tags:        util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
+		ClusterName:  pctx.Cfg.KubeClusterName,
+		ClusterId:    pctx.ClusterID,
+		GroupId:      pctx.MsgGroupID,
+		GroupSize:    int32(groupSize),
+		Nodes:        models,
+		Tags:         util.ImmutableTagsJoin(pctx.Cfg.ExtraTags, pctx.GetCollectorTags()),
+		AgentVersion: ctx.GetAgentVersion(),
 	}
 }
 
@@ -81,10 +110,24 @@ func (h *NodeHandlers) ResourceList(ctx processors.ProcessorContext, list interf
 	resources = make([]interface{}, 0, len(resourceList))
 
 	for _, resource := range resourceList {
-		resources = append(resources, resource.DeepCopy())
+		resources = append(resources, resource)
 	}
 
 	return resources
+}
+
+// CloneResource returns a deep copy of the resource.
+//
+//nolint:revive
+func (h *NodeHandlers) CloneResource(resource interface{}) interface{} {
+	return resource.(*corev1.Node).DeepCopy()
+}
+
+// ResourceVersionFromRaw returns the resource version from the raw resource.
+//
+//nolint:revive
+func (h *NodeHandlers) ResourceVersionFromRaw(_ processors.ProcessorContext, resource interface{}) string {
+	return resource.(*corev1.Node).ResourceVersion
 }
 
 // ResourceUID is a handler called to retrieve the resource UID.

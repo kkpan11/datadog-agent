@@ -7,7 +7,6 @@ package http
 
 import (
 	"crypto/tls"
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -101,7 +100,7 @@ func TestNoProxyNonexactMatch(t *testing.T) {
 	r6, _ := http.NewRequest("GET", "http://sub.no_proxy2.com/api/v1?arg=21", nil)
 
 	c := configmock.New(t)
-	c.SetWithoutSource("no_proxy_nonexact_match", true)
+	c.SetInTest("no_proxy_nonexact_match", true)
 
 	// Testing some nonexact matching cases as documented here: https://github.com/golang/net/blob/master/http/httpproxy/proxy.go#L38
 	proxies := &pkgconfigmodel.Proxy{
@@ -171,12 +170,12 @@ func TestBadScheme(t *testing.T) {
 func TestCreateHTTPTransport(t *testing.T) {
 	c := configmock.New(t)
 
-	c.SetWithoutSource("skip_ssl_validation", false)
+	c.SetInTest("skip_ssl_validation", false)
 	transport := CreateHTTPTransport(c)
 	assert.False(t, transport.TLSClientConfig.InsecureSkipVerify)
 	assert.Equal(t, transport.TLSClientConfig.MinVersion, uint16(tls.VersionTLS12))
 
-	c.SetWithoutSource("skip_ssl_validation", true)
+	c.SetInTest("skip_ssl_validation", true)
 	transport = CreateHTTPTransport(c)
 	assert.True(t, transport.TLSClientConfig.InsecureSkipVerify)
 	assert.Equal(t, transport.TLSClientConfig.MinVersion, uint16(tls.VersionTLS12))
@@ -188,7 +187,7 @@ func TestCreateHTTPTransport(t *testing.T) {
 	transport = CreateHTTPTransport(c)
 	assert.NotZero(t, transport.TLSHandshakeTimeout)
 
-	c.SetWithoutSource("tls_handshake_timeout", time.Second)
+	c.SetInTest("tls_handshake_timeout", time.Second)
 	transport = CreateHTTPTransport(c)
 	assert.Equal(t, transport.TLSHandshakeTimeout, time.Second)
 }
@@ -208,11 +207,9 @@ func TestCreateHTTP2Transport(t *testing.T) {
 	transport := CreateHTTPTransport(c, WithHTTP2())
 	require.NotNil(t, transport)
 
-	assert.NotNil(t, transport.TLSNextProto)
-	assert.Contains(t, transport.TLSNextProto, "h2", "TLSNextProto should indicate HTTP/2 support")
-
-	assert.Contains(t, transport.TLSClientConfig.NextProtos, "h2", "NextProtos should prefer HTTP/2")
-	assert.Contains(t, transport.TLSClientConfig.NextProtos, "http/1.1", "NextProtos should allow fallback to HTTP/1.1")
+	require.NotNil(t, transport.Protocols)
+	assert.True(t, transport.Protocols.HTTP2(), "Protocols should indicate HTTP/2 support")
+	assert.True(t, transport.Protocols.HTTP1(), "Protocols should allow HTTP/1.1 fallback")
 }
 
 func TestNoProxyWarningMap(t *testing.T) {
@@ -261,11 +258,11 @@ func TestMinTLSVersionFromConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(
-			fmt.Sprintf("min_tls_version=%s", test.minTLSVersion),
+			"min_tls_version="+test.minTLSVersion,
 			func(t *testing.T) {
 				cfg := configmock.New(t)
 				if test.minTLSVersion != "" {
-					cfg.SetWithoutSource("min_tls_version", test.minTLSVersion)
+					cfg.SetInTest("min_tls_version", test.minTLSVersion)
 				}
 				got := minTLSVersionFromConfig(cfg)
 				require.Equal(t, test.expect, got)

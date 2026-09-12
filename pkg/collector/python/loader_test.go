@@ -7,9 +7,7 @@
 
 package python
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestLoadWheelCheck(t *testing.T) {
 	testLoadWheelCheck(t)
@@ -21,4 +19,12 @@ func TestLoadCustomCheck(t *testing.T) {
 
 func TestLoadHACheck(t *testing.T) {
 	testLoadHACheck(t)
+}
+
+func TestLoadError(t *testing.T) {
+	testLoadError(t)
+}
+
+func TestLoadCustomCheckEmitsCheckReadyMetric(t *testing.T) {
+	testLoadCustomCheckEmitsCheckReadyMetric(t)
 }

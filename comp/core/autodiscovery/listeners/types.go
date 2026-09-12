@@ -8,11 +8,12 @@ package listeners
 import (
 	"errors"
 
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
@@ -31,14 +32,18 @@ type Service interface {
 	GetServiceID() string                                        // unique service name
 	GetADIdentifiers() []string                                  // identifiers on which templates will be matched
 	GetHosts() (map[string]string, error)                        // network --> IP address
-	GetPorts() ([]ContainerPort, error)                          // network ports
 	GetTags() ([]string, error)                                  // tags
 	GetTagsWithCardinality(cardinality string) ([]string, error) // tags with given cardinality
 	GetPid() (int, error)                                        // process identifier
 	GetHostname() (string, error)                                // hostname.domainname for the entity
 	IsReady() bool                                               // is the service ready
-	HasFilter(containers.FilterType) bool                        // whether the service is excluded by metrics or logs exclusion config
+	HasFilter(workloadfilter.Scope) bool                         // whether the service is excluded by metrics or logs exclusion config
 	GetExtraConfig(string) (string, error)                       // Extra configuration values
+	GetImageName() string                                        // container image name
+
+	// GetPorts returns the network ports of the service.
+	// Only Name and Port fields are guaranteed to be set.
+	GetPorts() ([]workloadmeta.ContainerPort, error)
 
 	// FilterTemplates filters the templates which will be resolved against
 	// this service, in a map keyed by template digest.
@@ -47,7 +52,7 @@ type Service interface {
 	// with the full set of templates matching this service.  It must not rely
 	// on any non-static information except the given configs, and it must not
 	// modify the configs in the map.
-	FilterTemplates(map[string]integration.Config)
+	FilterTemplates(configs map[string]integration.Config)
 }
 
 // ServiceListener monitors running services and triggers check (un)scheduling
@@ -66,10 +71,13 @@ type Config interface {
 
 // ServiceListernerDeps are the service listerner dependencies
 type ServiceListernerDeps struct {
-	Config    Config
-	Telemetry *telemetry.Store
-	Tagger    tagger.Component
-	Wmeta     option.Option[workloadmeta.Component]
+	Config            Config
+	Telemetry         *telemetry.Store
+	Tagger            tagger.Component
+	Filter            workloadfilter.Component
+	Wmeta             option.Option[workloadmeta.Component]
+	StaticConfigIndex *StaticConfigIndex
+	ServiceTracker    types.ServiceTracker
 }
 
 // ServiceListenerFactory builds a service listener

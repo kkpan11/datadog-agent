@@ -8,10 +8,11 @@ package assertions
 
 import (
 	"fmt"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner/parameters"
-	"github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common"
 	"strings"
+
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common"
 )
 
 // RemoteWindowsBinaryAssertions is a type that extends the RemoteWindowsHostAssertions to add assertions
@@ -24,7 +25,7 @@ type RemoteWindowsBinaryAssertions struct {
 // WithSignature verifies the authenticode signature of the binary. This test does not call `FailNow` in case
 // the signature does not match.
 func (r *RemoteWindowsBinaryAssertions) WithSignature(expectedSignatures map[string]struct{}) *RemoteWindowsBinaryAssertions {
-	r.suite.T().Helper()
+	r.context.T().Helper()
 	verify, _ := runner.GetProfile().ParamStore().GetBoolWithDefault(parameters.VerifyCodeSignature, true)
 
 	if verify {
@@ -42,7 +43,7 @@ func (r *RemoteWindowsBinaryAssertions) WithSignature(expectedSignatures map[str
 // WithVersionEqual verifies the version of a binary matches what's expected by calling "version" on it.
 // Obviously the binary must support the "version" command, which is normally the case for most Agent binaries.
 func (r *RemoteWindowsBinaryAssertions) WithVersionEqual(expected string) *RemoteWindowsBinaryAssertions {
-	r.suite.T().Helper()
+	r.context.T().Helper()
 	return r.WithVersionMatchPredicate(func(actual string) {
 		r.require.Equal(expected, actual, "version should be equal")
 	})
@@ -51,7 +52,7 @@ func (r *RemoteWindowsBinaryAssertions) WithVersionEqual(expected string) *Remot
 // WithVersionNotEqual verifies the version of a binary NOT match the expected by calling "version" on it.
 // Obviously the binary must support the "version" command, which is normally the case for most Agent binaries.
 func (r *RemoteWindowsBinaryAssertions) WithVersionNotEqual(expected string) *RemoteWindowsBinaryAssertions {
-	r.suite.T().Helper()
+	r.context.T().Helper()
 	return r.WithVersionMatchPredicate(func(actual string) {
 		r.require.NotEqual(expected, actual, "version should not be equal")
 	})
@@ -60,7 +61,7 @@ func (r *RemoteWindowsBinaryAssertions) WithVersionNotEqual(expected string) *Re
 // WithVersionMatchPredicate obtains the binary version by calling "version" and uses the predicate to verify
 // if the version match the expectations.
 func (r *RemoteWindowsBinaryAssertions) WithVersionMatchPredicate(predicate func(version string)) *RemoteWindowsBinaryAssertions {
-	r.suite.T().Helper()
+	r.context.T().Helper()
 	actual, err := r.remoteHost.Execute(fmt.Sprintf("& \"%s\" %s", r.binaryPath, "version"))
 	r.require.NoError(err)
 	predicate(strings.TrimSpace(actual))

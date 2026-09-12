@@ -7,9 +7,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	haagent "github.com/DataDog/datadog-agent/comp/haagent/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
@@ -18,7 +21,6 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/runner/tracker"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/hostname"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/utilizationtracker"
@@ -35,7 +37,7 @@ const (
 // for each worker, which is a bit inconvenient to use because the number of
 // workers might be different on every Agent. With telemetry, we can use a
 // single metric and put the worker name in a tag.
-var workerUtilization = telemetry.NewGauge(
+var workerUtilization = telemetryimpl.GetCompatComponent().NewGauge(
 	"collector",
 	"worker_utilization",
 	[]string{"worker_name"},
@@ -55,6 +57,8 @@ type Worker struct {
 	shouldAddCheckStatsFunc func(id checkid.ID) bool
 	utilizationTickInterval time.Duration
 	haAgent                 haagent.Component
+	watchdogWarningTimeout  time.Duration
+	isShadowWorker          bool
 }
 
 // NewWorker returns an instance of a `Worker` after parameter sanity checks are passed
@@ -66,19 +70,8 @@ func NewWorker(
 	pendingChecksChan chan check.Check,
 	checksTracker *tracker.RunningChecksTracker,
 	shouldAddCheckStatsFunc func(id checkid.ID) bool,
+	watchdogWarningTimeout time.Duration,
 ) (*Worker, error) {
-
-	if checksTracker == nil {
-		return nil, fmt.Errorf("worker cannot initialize using a nil checksTracker")
-	}
-
-	if pendingChecksChan == nil {
-		return nil, fmt.Errorf("worker cannot initialize using a nil pendingChecksChan")
-	}
-
-	if shouldAddCheckStatsFunc == nil {
-		return nil, fmt.Errorf("worker cannot initialize using a nil shouldAddCheckStatsFunc")
-	}
 
 	return newWorkerWithOptions(
 		runnerID,
@@ -89,12 +82,37 @@ func NewWorker(
 		senderManager.GetDefaultSender,
 		haAgent,
 		pollingInterval,
+		watchdogWarningTimeout,
+		false,
 	)
 }
 
-// newWorkerWithOptions returns an instance of a `Worker` with an override for the
-// `aggregator.GetDefaultSender()`. The purpose of this pass-through is to help
-// test the aggregator logic.
+// NewShadowWorker returns a Worker that reads from the shadow check lane.
+func NewShadowWorker(
+	senderManager sender.SenderManager,
+	haAgent haagent.Component,
+	runnerID int,
+	ID int,
+	pendingChecksChan chan check.Check,
+	checksTracker *tracker.RunningChecksTracker,
+	shouldAddCheckStatsFunc func(id checkid.ID) bool,
+	watchdogWarningTimeout time.Duration,
+) (*Worker, error) {
+
+	return newWorkerWithOptions(
+		runnerID,
+		ID,
+		pendingChecksChan,
+		checksTracker,
+		shouldAddCheckStatsFunc,
+		senderManager.GetDefaultSender,
+		haAgent,
+		pollingInterval,
+		watchdogWarningTimeout,
+		true,
+	)
+}
+
 func newWorkerWithOptions(
 	runnerID int,
 	ID int,
@@ -104,13 +122,29 @@ func newWorkerWithOptions(
 	getDefaultSenderFunc func() (sender.Sender, error),
 	haAgent haagent.Component,
 	utilizationTickInterval time.Duration,
+	watchdogWarningTimeout time.Duration,
+	isShadowWorker bool,
 ) (*Worker, error) {
+	if checksTracker == nil {
+		return nil, errors.New("worker cannot initialize using a nil checksTracker")
+	}
+
+	if pendingChecksChan == nil {
+		return nil, errors.New("worker cannot initialize using a nil pendingChecksChan")
+	}
+
+	if shouldAddCheckStatsFunc == nil {
+		return nil, errors.New("worker cannot initialize using a nil shouldAddCheckStatsFunc")
+	}
 
 	if getDefaultSenderFunc == nil {
-		return nil, fmt.Errorf("worker cannot initialize using a nil getDefaultSenderFunc")
+		return nil, errors.New("worker cannot initialize using a nil getDefaultSenderFunc")
 	}
 
 	workerName := fmt.Sprintf("worker_%d", ID)
+	if isShadowWorker {
+		workerName += " (shadow)"
+	}
 
 	return &Worker{
 		ID:                      ID,
@@ -122,12 +156,16 @@ func newWorkerWithOptions(
 		getDefaultSenderFunc:    getDefaultSenderFunc,
 		haAgent:                 haAgent,
 		utilizationTickInterval: utilizationTickInterval,
+		watchdogWarningTimeout:  watchdogWarningTimeout,
+		isShadowWorker:          isShadowWorker,
 	}, nil
 }
 
-// Run waits for checks and run them as long as they arrive on the channel
-func (w *Worker) Run() {
-	log.Debugf("Runner %d, worker %d: Ready to process checks...", w.runnerID, w.ID)
+// Run waits for checks and run them as long as they arrive on the channel.
+// The provided ctx is used for cancellable operations such as hostname resolution;
+// it should be cancelled when the agent shuts down.
+func (w *Worker) Run(ctx context.Context) {
+	log.Debugf("Runner %d, worker %d, shadow: %t: Ready to process checks...", w.runnerID, w.ID, w.isShadowWorker)
 
 	alpha := 0.25 // converges to 99.98% of constant input in 30 iterations.
 	utilizationTracker := utilizationtracker.NewUtilizationTracker(w.utilizationTickInterval, alpha)
@@ -152,6 +190,21 @@ func (w *Worker) Run() {
 			continue
 		}
 
+		var watchdogCancel chan struct{}
+		var watchdogWG sync.WaitGroup
+		if w.watchdogWarningTimeout > 0 {
+			watchdogCancel = make(chan struct{})
+			watchdogWG.Add(1)
+			go func() {
+				defer watchdogWG.Done()
+				select {
+				case <-time.After(w.watchdogWarningTimeout):
+					log.Warnf("Check %s is running for longer than the watchdog warning timeout of %s", check.ID(), w.watchdogWarningTimeout)
+				case <-watchdogCancel:
+				}
+			}()
+		}
+
 		checkStartTime := time.Now()
 
 		checkLogger.CheckStarted()
@@ -161,8 +214,18 @@ func (w *Worker) Run() {
 
 		utilizationTracker.Started()
 
-		// Run the check
-		checkErr := check.Run()
+		// Run the check, recovering from any panic so that a single
+		// misbehaving check cannot crash the entire agent process.
+		var checkErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					checkErr = fmt.Errorf("check panicked: %v", r)
+					log.Errorf("Recovered from panic in check %s: %v", check, r)
+				}
+			}()
+			checkErr = check.Run()
+		}()
 
 		utilizationTracker.Finished()
 
@@ -170,15 +233,7 @@ func (w *Worker) Run() {
 
 		checkWarnings := check.GetWarnings()
 
-		// Use the default sender for the service checks
-		sender, err := w.getDefaultSenderFunc()
-		if err != nil {
-			log.Errorf("Error getting default sender: %v. Not sending status check for %s", err, check)
-		}
-		serviceCheckTags := []string{fmt.Sprintf("check:%s", check.String()), "dd_enable_check_intake:true"}
 		serviceCheckStatus := servicecheck.ServiceCheckOK
-
-		hname, _ := hostname.Get(context.TODO())
 
 		if len(checkWarnings) != 0 {
 			expvars.AddWarningsCount(len(checkWarnings))
@@ -191,14 +246,23 @@ func (w *Worker) Run() {
 			serviceCheckStatus = servicecheck.ServiceCheckCritical
 		}
 
-		if sender != nil && !longRunning {
-			if pkgconfigsetup.Datadog().GetBool("integration_check_status_enabled") {
-				sender.ServiceCheck(serviceCheckStatusKey, serviceCheckStatus, hname, serviceCheckTags, "")
+		if !longRunning && !w.isShadowWorker {
+			// Use the default sender for the service checks
+			sender, err := w.getDefaultSenderFunc()
+			if err != nil {
+				log.Errorf("Error getting default sender: %v. Not sending status check for %s", err, check)
 			}
-			// FIXME(remy): this `Commit()` should be part of the `if` above, we keep
-			// it here for now to make sure it's not breaking any historical behavior
-			// with the shared default sender.
-			sender.Commit()
+			if sender != nil {
+				serviceCheckTags := []string{"check:" + check.String(), "dd_enable_check_intake:true"}
+				hname, _ := hostname.Get(ctx)
+				if pkgconfigsetup.Datadog().GetBool("integration_check_status_enabled") {
+					sender.ServiceCheck(serviceCheckStatusKey, serviceCheckStatus, hname, serviceCheckTags, "")
+				}
+				// FIXME(remy): this `Commit()` should be part of the `if` above, we keep
+				// it here for now to make sure it's not breaking any historical behavior
+				// with the shared default sender.
+				sender.Commit()
+			}
 		}
 
 		// Remove the check from the running list
@@ -218,6 +282,11 @@ func (w *Worker) Run() {
 		}
 
 		checkLogger.CheckFinished()
+
+		if watchdogCancel != nil {
+			close(watchdogCancel)
+			watchdogWG.Wait()
+		}
 	}
 
 	log.Debugf("Runner %d, worker %d: Finished processing checks.", w.runnerID, w.ID)

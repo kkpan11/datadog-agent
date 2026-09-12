@@ -1,0 +1,120 @@
+"""
+secret_generic_connector namespaced tasks
+"""
+
+import os
+import platform
+import sys
+
+from invoke import task
+
+from tasks.build_tags import get_default_build_tags
+from tasks.flavor import AgentFlavor
+from tasks.libs.build.bazel import build_binary_with_bazel
+from tasks.libs.common.constants import CONTAINER_PLATFORM_MAPPING, REPO_PATH
+from tasks.libs.common.go import go_build
+from tasks.libs.common.utils import bin_name, get_build_flags
+from tasks.libs.releasing.version import get_version
+from tasks.windows_resources import build_messagetable, build_rc, versioninfo_vars
+
+BINARY_NAME = "secret-generic-connector"
+BIN_DIR = os.path.join(".", "bin", "secret-generic-connector")
+BIN_PATH = os.path.join(BIN_DIR, bin_name(BINARY_NAME))
+
+
+@task
+def build(
+    ctx,
+    rebuild=False,
+    race=False,
+    go_mod="readonly",
+    output_bin=None,
+    strip_binary=True,
+    fips_mode=False,
+    arch_suffix=False,
+    enable_bazel=False,
+):
+    """
+    Build the secret-generic-connector binary.
+    """
+    if enable_bazel:
+        if output_bin:
+            raise NotImplementedError("--enable-bazel does not support --output-bin")
+        if arch_suffix:
+            raise NotImplementedError(
+                "--enable-bazel does not support --arch-suffix yet. Ask agent-build about this need"
+            )
+        if race:
+            raise NotImplementedError("--enable-bazel does not support --race. Use bazel build directly.")
+        bazel_args = ["--//packages/agent:flavor=fips"] if fips_mode else []
+        build_binary_with_bazel(
+            "//cmd/secret-generic-connector:secret-generic-connector", args=bazel_args, bin_path=BIN_PATH
+        )
+        return
+
+    version = get_version(ctx, include_git=True)
+
+    # generate windows resources
+    if sys.platform == 'win32':
+        build_messagetable(ctx)
+        vars = versioninfo_vars(ctx)
+        build_rc(
+            ctx,
+            "cmd/secret-generic-connector/windows_resources/secret-generic-connector.rc",
+            vars=vars,
+            out="cmd/secret-generic-connector/rsrc.syso",
+        )
+
+    ldflags, gcflags, env = get_build_flags(ctx)
+
+    # ldflags: -s -w to reduce binary size, -s not compatible with FIPS
+    # https://github.com/DataDog/datadog-secret-backend/blob/v1/.github/workflows/release.yaml
+    ldflags += f" -X main.appVersion={version}"
+    if strip_binary:
+        if fips_mode:
+            ldflags += " -w"
+        else:
+            ldflags += " -s -w"
+
+    # gcflags: -l disables inlining to reduce binary size.
+    # get_build_flags() only sets gcflags for DELVE/NO_GO_OPT, and both already disable inlining,
+    # so only fall back to our own flag when it left gcflags empty.
+    # https://github.com/DataDog/datadog-secret-backend/blob/v1/.github/workflows/release.yaml
+    if not gcflags:
+        gcflags = "all=-l"
+
+    # FIPS mode requires CGO for BoringCrypto bindings
+    # Non-FIPS builds use CGO_ENABLED=0 for static binary
+    env["CGO_ENABLED"] = "1" if fips_mode else "0"
+
+    build_tags = get_default_build_tags(
+        build="secret-generic-connector", flavor=AgentFlavor.fips if fips_mode else AgentFlavor.base
+    )
+    bin_path = output_bin or BIN_PATH
+
+    if arch_suffix:
+        arch = CONTAINER_PLATFORM_MAPPING.get(platform.machine().lower())
+        bin_path = f'{bin_path}.{arch}'
+
+    go_build(
+        ctx,
+        f"{REPO_PATH}/cmd/secret-generic-connector",
+        mod=go_mod,
+        race=race,
+        rebuild=rebuild,
+        gcflags=gcflags,
+        ldflags=ldflags,
+        build_tags=build_tags,
+        bin_path=bin_path,
+        env=env,
+        check_deadcode=os.getenv("DEPLOY_AGENT") == "true",
+    )
+
+
+@task
+def clean(ctx):
+    """
+    Remove artifacts for secret-generic-connector
+    """
+    print("Removing secret-generic-connector binary artifacts")
+    ctx.run(f"rm -rf {BIN_DIR}")

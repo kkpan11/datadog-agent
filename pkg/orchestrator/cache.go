@@ -12,8 +12,8 @@ import (
 	"github.com/patrickmn/go-cache"
 	"k8s.io/apimachinery/pkg/types"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	pkgorchestratormodel "github.com/DataDog/datadog-agent/pkg/orchestrator/model"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -35,11 +35,11 @@ var (
 	cacheMiss   = map[pkgorchestratormodel.NodeType]*expvar.Int{}
 
 	// KubernetesResourceCache provides an in-memory key:value store similar to memcached for kubernetes resources.
-	KubernetesResourceCache = cache.New(defaultExpire, defaultPurge)
+	KubernetesResourceCache = NewKubernetesResourceCache()
 
 	// Telemetry
-	tlmCacheHits   = telemetry.NewCounter("orchestrator", "cache_hits", []string{"orchestrator", "resource"}, "Number of cache hits")
-	tlmCacheMisses = telemetry.NewCounter("orchestrator", "cache_misses", []string{"orchestrator", "resource"}, "Number of cache misses")
+	tlmCacheHits   = telemetryimpl.GetCompatComponent().NewCounter("orchestrator", "cache_hits", []string{"orchestrator", "resource"}, "Number of cache hits")
+	tlmCacheMisses = telemetryimpl.GetCompatComponent().NewCounter("orchestrator", "cache_misses", []string{"orchestrator", "resource"}, "Number of cache misses")
 )
 
 func init() {
@@ -49,6 +49,12 @@ func init() {
 		cacheExpVars.Set(nodeType.String(), cacheHits[nodeType])
 		sendExpVars.Set(nodeType.String(), cacheMiss[nodeType])
 	}
+}
+
+// NewKubernetesResourceCache creates a new in-memory cache for kubernetes resources.
+// This is used for testing purposes.
+func NewKubernetesResourceCache() *cache.Cache {
+	return cache.New(defaultExpire, defaultPurge)
 }
 
 // SkipKubernetesResource checks with a global kubernetes cache whether the resource was already reported.

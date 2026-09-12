@@ -7,6 +7,7 @@ package api
 
 import (
 	"fmt"
+	"io"
 	stdlog "log"
 	"net/http"
 	"net/http/httputil"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/trace/api/apiutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 	"github.com/google/uuid"
@@ -21,10 +23,10 @@ import (
 
 const (
 	// logsIntakeURLTemplate is the template for building the logs intake URL for each site.
-	logsIntakeURLTemplate = "https://http-intake.logs.%s/api/v2/logs"
+	logsIntakeURLTemplate = config.DebuggerLogsEndpointPrefix + "%s" + config.DebuggerLogsEndpointPath
 
-	// debuggerDiagnosticsURLTemplate is the template for building the debugger intake URL for each site.
-	debuggerDiagnosticsURLTemplate = "https://debugger-intake.%s/api/v2/debugger"
+	// debuggerIntakeURLTemplate specifies the template for obtaining the intake URL along with the site.
+	debuggerIntakeURLTemplate = config.DebuggerIntakeEndpointPrefix + "%s" + config.DebuggerIntakeEndpointPath
 
 	// ddTagsQueryStringMaxLen is the maximum number of characters we send as ddtags in the intake query string.
 	// This limit is not imposed by the event platform intake, it's a safeguard we've added to guarantee an upper
@@ -35,13 +37,40 @@ const (
 // debuggerLogsProxyHandler returns an http.Handler proxying Dynamic Instrumentation dynamic logs
 // to the logs intake.
 func (r *HTTPReceiver) debuggerLogsProxyHandler() http.Handler {
+	if !r.conf.DebuggerLogsEnabled {
+		return debuggerLogsDisabledHandler(r.conf.MaxRequestBytes)
+	}
 	return r.debuggerProxyHandler(logsIntakeURLTemplate, r.conf.DebuggerProxy)
 }
 
 // debuggerDiagnosticsProxyHandler returns an http.Handler proxying Dynamic Instrumentation diagnostic messages
 // to the debugger intake.
 func (r *HTTPReceiver) debuggerDiagnosticsProxyHandler() http.Handler {
-	return r.debuggerProxyHandler(debuggerDiagnosticsURLTemplate, r.conf.DebuggerDiagnosticsProxy)
+	return r.debuggerProxyHandler(debuggerIntakeURLTemplate, r.conf.DebuggerIntakeProxy)
+}
+
+// debuggerV2IntakeProxyHandler returns an http.Handler proxying Dynamic
+// Instrumentation messages to the debugger intake (DEBUGGER track, as opposed
+// to the debuggerLogsProxyHandler above which proxies to the logs track for old
+// tracers).
+func (r *HTTPReceiver) debuggerV2IntakeProxyHandler() http.Handler {
+	if !r.conf.DebuggerLogsEnabled {
+		return debuggerLogsDisabledHandler(r.conf.MaxRequestBytes)
+	}
+	return r.debuggerProxyHandler(debuggerIntakeURLTemplate, r.conf.DebuggerIntakeProxy)
+}
+
+// debuggerLogsDisabledHandler returns an http.Handler that silently drops
+// debugger data when logs are disabled at the agent level (logs_enabled: false).
+// It returns 200 OK so tracers do not retry or log errors.
+func debuggerLogsDisabledHandler(maxBytes int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.Debug("Debugger proxy: dropping request because logs are disabled (logs_enabled: false)")
+		// Drain up to maxBytes so normal uploads get a clean 200 instead of a connection reset,
+		// without waiting on an unbounded body before acknowledging.
+		_, _ = io.Copy(io.Discard, apiutil.NewLimitedReader(req.Body, maxBytes))
+		w.WriteHeader(http.StatusOK)
+	})
 }
 
 // debuggerProxyHandler returns an http.Handler proxying requests to the configured intake. If the intake url cannot be
@@ -67,7 +96,7 @@ func (r *HTTPReceiver) debuggerProxyHandler(urlTemplate string, proxyConfig conf
 		apiKey = strings.TrimSpace(k)
 	}
 	transport := newMeasuringForwardingTransport(
-		r.conf.NewHTTPTransport(), target, apiKey, proxyConfig.AdditionalEndpoints, "datadog.trace_agent.debugger", []string{}, r.statsd)
+		r.conf.NewHTTPTransport(), target, apiKey, proxyConfig.AdditionalEndpoints, r.conf.MaxRequestBytes, "datadog.trace_agent.debugger", []string{}, r.statsd)
 	return newDebuggerProxy(r.conf, transport, hostTags)
 }
 
@@ -81,26 +110,27 @@ func debuggerErrorHandler(err error) http.Handler {
 
 // newDebuggerProxy returns a new httputil.ReverseProxy proxying and augmenting requests with headers containing the tags.
 func newDebuggerProxy(conf *config.AgentConfig, transport http.RoundTripper, hostTags string) *httputil.ReverseProxy {
-	cidProvider := NewIDProvider(conf.ContainerProcRoot, conf.ContainerIDFromOriginInfo)
+	cidProvider := NewContainerIDProviderFromConfig(conf)
 	logger := log.NewThrottled(5, 10*time.Second) // limit to 5 messages every 10 seconds
 	return &httputil.ReverseProxy{
-		Director:  getDirector(hostTags, cidProvider, conf.ContainerTags),
+		Rewrite:   getRewrite(hostTags, cidProvider, conf.ContainerTags),
 		ErrorLog:  stdlog.New(logger, "debugger.Proxy: ", 0),
 		Transport: transport,
 	}
 }
 
-func getDirector(hostTags string, cidProvider IDProvider, containerTags func(string) ([]string, error)) func(*http.Request) {
-	return func(req *http.Request) {
-		req.Header.Set("DD-REQUEST-ID", uuid.New().String())
-		req.Header.Set("DD-EVP-ORIGIN", "agent-debugger")
-		q := req.URL.Query()
-		containerID := cidProvider.GetContainerID(req.Context(), req.Header)
+func getRewrite(hostTags string, cidProvider IDProvider, containerTags func(string) ([]string, error)) func(*httputil.ProxyRequest) {
+	return func(req *httputil.ProxyRequest) {
+		req.SetXForwarded()
+		req.Out.Header.Set("DD-REQUEST-ID", uuid.New().String())
+		req.Out.Header.Set("DD-EVP-ORIGIN", "agent-debugger")
+		q := req.Out.URL.Query()
+		containerID := cidProvider.GetContainerID(req.In.Context(), req.In.Header)
 		tags := hostTags
 		if ctags := getContainerTags(containerTags, containerID); ctags != "" {
 			tags = fmt.Sprintf("%s,%s", tags, ctags)
 		}
-		if htags := req.Header.Get("X-Datadog-Additional-Tags"); htags != "" {
+		if htags := req.In.Header.Get("X-Datadog-Additional-Tags"); htags != "" {
 			tags = fmt.Sprintf("%s,%s", tags, htags)
 		}
 		if qtags := q.Get("ddtags"); qtags != "" {
@@ -108,12 +138,12 @@ func getDirector(hostTags string, cidProvider IDProvider, containerTags func(str
 		}
 		maxLen := len(tags)
 		if maxLen > ddTagsQueryStringMaxLen {
-			log.Warnf("Truncating tags in upload to %s. Got %d, max is %d.", req.URL.Path, maxLen, ddTagsQueryStringMaxLen)
+			log.Warnf("Truncating tags in upload to %s. Got %d, max is %d.", req.Out.URL.Path, maxLen, ddTagsQueryStringMaxLen)
 			maxLen = ddTagsQueryStringMaxLen
 		}
 		tags = tags[0:maxLen]
 		q.Set("ddtags", tags)
 		log.Debugf("Setting query value ddtags=%s for debugger proxy", tags)
-		req.URL.RawQuery = q.Encode()
+		req.Out.URL.RawQuery = q.Encode()
 	}
 }

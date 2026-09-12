@@ -8,6 +8,7 @@ package profilerimpl
 import (
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"testing"
 	"time"
 
@@ -15,16 +16,19 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
 
+	"github.com/DataDog/datadog-agent/comp/core/config"
 	"github.com/DataDog/datadog-agent/comp/core/flare/helpers"
 	"github.com/DataDog/datadog-agent/comp/core/flare/types"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
 	profilerdef "github.com/DataDog/datadog-agent/comp/core/profiler/def"
 	profilermock "github.com/DataDog/datadog-agent/comp/core/profiler/mock"
-	"github.com/DataDog/datadog-agent/comp/core/settings/settingsimpl"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/sysprobeconfigimpl"
+	settingsmock "github.com/DataDog/datadog-agent/comp/core/settings/mock"
+	sysprobeconfigdef "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
+	sysprobeconfigmock "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/mock"
 
-	configcomponent "github.com/DataDog/datadog-agent/comp/core/config"
-
-	"github.com/DataDog/datadog-agent/comp/core"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
@@ -47,16 +51,15 @@ func createGenericConfig(t *testing.T) model.Config {
 	port := u.Port()
 
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("expvar_port", port)
-	mockConfig.SetWithoutSource("apm_config.debug.port", port)
-	mockConfig.SetWithoutSource("process_config.expvar_port", port)
-	mockConfig.SetWithoutSource("security_agent.expvar_port", port)
+	mockConfig.SetInTest("expvar_port", port)
+	mockConfig.SetInTest("apm_config.debug.port", port)
+	mockConfig.SetInTest("process_config.expvar_port", port)
+	mockConfig.SetInTest("security_agent.expvar_port", port)
 
-	mockConfig.SetWithoutSource("process_config.run_in_core_agent.enabled", false)
-	mockConfig.SetWithoutSource("process_config.enabled", false)
-	mockConfig.SetWithoutSource("process_config.container_collection.enabled", false)
-	mockConfig.SetWithoutSource("process_config.process_collection.enabled", false)
-	mockConfig.SetWithoutSource("apm_config.enabled", false)
+	mockConfig.SetInTest("process_config.enabled", "false")
+	mockConfig.SetInTest("process_config.container_collection.enabled", false)
+	mockConfig.SetInTest("process_config.process_collection.enabled", false)
+	mockConfig.SetInTest("apm_config.enabled", false)
 
 	return mockConfig
 }
@@ -67,18 +70,20 @@ type reqs struct {
 	Comp profilerdef.Component
 }
 
-func getProfiler(t testing.TB, overrideConfig map[string]interface{}, overrideSysProbe map[string]interface{}) profiler {
+func getProfiler(t testing.TB, overrideSysProbe map[string]interface{}) profiler {
+	sysprobeConf := sysprobeconfigmock.NewMockWithOverrides(t, overrideSysProbe)
 	deps := fxutil.Test[reqs](
 		t,
-		core.MockBundle(),
-		fx.Replace(configcomponent.MockParams{
-			Overrides: overrideConfig,
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		fx.Provide(func() config.Component {
+			return config.NewMock(t)
 		}),
-		fx.Replace(sysprobeconfigimpl.MockParams{
-			Overrides: overrideSysProbe,
-		}),
-		settingsimpl.MockModule(),
+		fx.Provide(func() sysprobeconfigdef.Component { return sysprobeConf }),
+		fxutil.ProvideOptional[sysprobeconfigdef.Component](),
+		settingsmock.MockModule(),
 		fxutil.ProvideComponentConstructor(NewComponent),
+		fx.Provide(func() ipc.Component { return ipcmock.New(t) }),
+		fx.Provide(func(ipcComp ipc.Component) ipc.HTTPClient { return ipcComp.GetClient() }),
 	)
 
 	return deps.Comp.(profiler)
@@ -119,7 +124,7 @@ func TestProfileSetting(t *testing.T) {
 	for _, s := range scenarios {
 		t.Run(s.name, func(t *testing.T) {
 			fb := helpers.NewFlareBuilderMockWithArgs(t, true, types.FlareArgs{})
-			profiler := getProfiler(t, map[string]interface{}{}, map[string]interface{}{})
+			profiler := getProfiler(t, map[string]interface{}{})
 			profiler.settingsComponent.SetRuntimeSetting("runtime_block_profile_rate", s.oldVal, model.SourceDefault)
 
 			deferFunc := profiler.setProfilerSetting("runtime_block_profile_rate", s.newVal, fb)
@@ -142,7 +147,14 @@ func TestProfileSetting(t *testing.T) {
 }
 
 func TestTimeout(t *testing.T) {
+	const defaultProfileDuration = 10 * time.Second
 	baseTimeout := 10 * time.Minute
+
+	// On Linux, discovery.enabled defaults to true which auto-enables system-probe.
+	var discoveryTimeout time.Duration
+	if runtime.GOOS == "linux" {
+		discoveryTimeout = 2 * defaultProfileDuration
+	}
 
 	scenarios := []struct {
 		name            string
@@ -155,8 +167,8 @@ func TestTimeout(t *testing.T) {
 			name:            "Base Enabled Case",
 			extraCfgs:       map[string]interface{}{},
 			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 4*(10*time.Second),
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 4*defaultProfileDuration + discoveryTimeout,
 		},
 		{
 			name:            "Base Disabled Case",
@@ -171,8 +183,8 @@ func TestTimeout(t *testing.T) {
 				"apm_config.enabled": true,
 			},
 			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 4*(10*time.Second) + 2*(4*time.Second), // APM default runtime has a ceiling of 4
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 4*defaultProfileDuration + discoveryTimeout + 2*(4*time.Second), // APM default runtime has a ceiling of 4
 		},
 		{
 			name: "APM Enabled, Small Runtime",
@@ -181,8 +193,8 @@ func TestTimeout(t *testing.T) {
 				"apm_config.receiver_timeout": 20,
 			},
 			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 6*(10*time.Second), // APM timeout is floored to the profile duration
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 6*defaultProfileDuration + discoveryTimeout, // APM timeout is floored to the profile duration
 		},
 		{
 			name: "APM Enabled, Large Runtime",
@@ -191,66 +203,57 @@ func TestTimeout(t *testing.T) {
 				"apm_config.receiver_timeout": 5,
 			},
 			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 4*(10*time.Second) + 2*(5*time.Second), // APM timeout is the ceiling, limiting profile duration
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 4*defaultProfileDuration + discoveryTimeout + 2*(5*time.Second), // APM timeout is the ceiling, limiting profile duration
 		},
 		{
-			name: "Process Agent Enabled",
-			extraCfgs: map[string]interface{}{
-				"process_config.enabled": true,
-			},
+			name:            "Process Agent Checks in Core Agent",
+			extraCfgs:       map[string]interface{}{},
 			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 6*(10*time.Second),
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 4*defaultProfileDuration + discoveryTimeout,
 		},
 		{
-			name: "Process Agent Enabled, Alternate Setting",
-			extraCfgs: map[string]interface{}{
-				"process_config.process_collection.enabled": true,
-			},
-			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 6*(10*time.Second),
-		},
-		{
-			name: "Process Agent Checks in Core Agent",
-			extraCfgs: map[string]interface{}{
-				"process_config.run_in_core_agent.enabled": true,
-			},
-			extraSysCfgs:    map[string]interface{}{},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 4*(10*time.Second),
-		},
-		{
-			name: "Process Agent Enabled, via NPM",
-			extraCfgs: map[string]interface{}{
-				"process_config.run_in_core_agent.enabled": true,
-			},
+			name:      "SysProbe Explicitly Disabled",
+			extraCfgs: map[string]interface{}{},
 			extraSysCfgs: map[string]interface{}{
-				"network_config.enabled": true,
+				"system_probe_config.enabled": false,
+				"discovery.enabled":           false,
 			},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 8*(10*time.Second),
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 4*defaultProfileDuration,
 		},
 		{
-			name: "Process Agent Enabled, via USM",
-			extraCfgs: map[string]interface{}{
-				"process_config.run_in_core_agent.enabled": true,
+			name:      "Process Agent Enabled, via NPM",
+			extraCfgs: map[string]interface{}{},
+			extraSysCfgs: map[string]interface{}{
+				"network_config.enabled":      true,
+				"network_config.direct_send":  false,
+				"system_probe_config.enabled": true,
 			},
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 8*defaultProfileDuration,
+		},
+		{
+			name:      "Process Agent Enabled, via USM",
+			extraCfgs: map[string]interface{}{},
 			extraSysCfgs: map[string]interface{}{
 				"service_monitoring_config.enabled": true,
+				"system_probe_config.enabled":       true,
+				"network_config.direct_send":        false,
 			},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 8*(10*time.Second),
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 8*defaultProfileDuration,
 		},
 		{
 			name:      "SysProbe Enabled",
 			extraCfgs: map[string]interface{}{},
 			extraSysCfgs: map[string]interface{}{
 				"system_probe_config.enabled": true,
+				"network_config.direct_send":  false,
 			},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 8*(10*time.Second), // config enables NPM, which enables process agent
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 8*defaultProfileDuration, // config enables NPM, which enables process agent
 		},
 		{
 			name: "Everything Enabled",
@@ -261,24 +264,26 @@ func TestTimeout(t *testing.T) {
 			},
 			extraSysCfgs: map[string]interface{}{
 				"system_probe_config.enabled": true,
+				"network_config.direct_send":  false,
 			},
-			profileDuration: 10 * time.Second,
-			expTimeout:      baseTimeout + 10*(10*time.Second),
+			profileDuration: defaultProfileDuration,
+			expTimeout:      baseTimeout + 10*defaultProfileDuration,
 		},
 	}
 
 	for _, s := range scenarios {
 		t.Run(s.name, func(t *testing.T) {
 			cfg := createGenericConfig(t)
-			cfg.SetWithoutSource("flare.profile_overhead_runtime", baseTimeout)
+			cfg.SetInTest("flare.profile_overhead_runtime", baseTimeout)
+
 			fArgs := types.FlareArgs{
 				ProfileDuration: s.profileDuration,
 			}
 			for k, v := range s.extraCfgs {
-				cfg.SetWithoutSource(k, v)
+				cfg.SetInTest(k, v)
 			}
 			fb := helpers.NewFlareBuilderMockWithArgs(t, true, fArgs)
-			profiler := getProfiler(t, cfg.AllSettings(), s.extraSysCfgs)
+			profiler := getProfiler(t, s.extraSysCfgs)
 
 			timeout := profiler.timeout(fb)
 

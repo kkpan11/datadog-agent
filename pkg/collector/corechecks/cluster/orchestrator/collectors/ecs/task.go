@@ -9,7 +9,9 @@
 package ecs
 
 import (
-	"fmt"
+	"errors"
+
+	"github.com/benbjohnson/clock"
 
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
@@ -74,6 +76,8 @@ func (t *TaskCollector) Process(rcfg *collectors.CollectorRunConfig, list interf
 			ManifestProducer: t.metadata.IsManifestProducer,
 			ClusterID:        rcfg.ClusterID,
 			CollectorTags:    nil,
+			AgentVersion:     rcfg.AgentVersion,
+			Clock:            clock.New(),
 		},
 		AWSAccountID: rcfg.AWSAccountID,
 		ClusterName:  rcfg.ClusterName,
@@ -85,7 +89,7 @@ func (t *TaskCollector) Process(rcfg *collectors.CollectorRunConfig, list interf
 	processResult, listed, processed := t.processor.Process(ctx, list)
 
 	if processed == -1 {
-		return nil, fmt.Errorf("unable to process resources: a panic occurred")
+		return nil, errors.New("unable to process resources: a panic occurred")
 	}
 
 	result := &collectors.CollectorRunResult{

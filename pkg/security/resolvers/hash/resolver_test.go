@@ -11,21 +11,52 @@ package hash
 import (
 	"math"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/DataDog/datadog-agent/pkg/fips"
 	"github.com/DataDog/datadog-agent/pkg/security/config"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	"github.com/DataDog/datadog-agent/pkg/security/tests/statsdclient"
 )
 
+// TestNewResolver_FIPSExcludesSHA1 asserts that the hash resolver silently drops sha1 from its
+// configured algorithms when the agent is built for FIPS, since sha1 is not a FIPS-approved algorithm.
+func TestNewResolver_FIPSExcludesSHA1(t *testing.T) {
+	client := statsdclient.NewStatsdClient()
+	cfg := &config.RuntimeSecurityConfig{
+		HashResolverEnabled:        true,
+		HashResolverEventTypes:     []model.EventType{model.ExecEventType},
+		HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA1, model.SHA256},
+		HashResolverMaxHashRate:    1,
+		HashResolverMaxFileSize:    1 << 20,
+	}
+
+	resolver, err := NewResolver(cfg, client, nil)
+	require.NoError(t, err)
+
+	if fips.BuiltForFIPS() {
+		assert.NotContains(t, resolver.opts.HashAlgorithms, model.SHA1, "sha1 should be excluded when built for FIPS")
+	} else {
+		assert.Contains(t, resolver.opts.HashAlgorithms, model.SHA1)
+	}
+}
+
 func generateFileData(size int) []byte {
 	var out []byte
 	for i := 0; i < size; i++ {
 		out = append(out, byte('a'))
+	}
+	return out
+}
+
+func generateFileDataWithPattern(size int, pattern byte) []byte {
+	var out []byte
+	for i := 0; i < size; i++ {
+		out = append(out, byte(pattern+byte(i%256)))
 	}
 	return out
 }
@@ -50,7 +81,7 @@ func TestResolver_ComputeHashes(t *testing.T) {
 			config: &config.RuntimeSecurityConfig{
 				HashResolverEnabled:        true,
 				HashResolverEventTypes:     []model.EventType{model.ExecEventType},
-				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA1, model.SHA256, model.MD5},
+				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA256, model.MD5},
 				HashResolverMaxHashRate:    1,
 				HashResolverMaxFileSize:    1 << 20,
 			},
@@ -75,7 +106,6 @@ func TestResolver_ComputeHashes(t *testing.T) {
 				fileSize: 10,
 			},
 			want: []string{
-				"sha1:3495ff69d34671d1e15b33a63c1379fdedd3a32a",
 				"sha256:bf2cb58a68f684d95a3b78ef8f661c9a4e5b09e82cc8f9cc88cce90528caeb27",
 				"md5:e09c80c42fda55f9d992e59ca6b3307d",
 			},
@@ -86,7 +116,7 @@ func TestResolver_ComputeHashes(t *testing.T) {
 			config: &config.RuntimeSecurityConfig{
 				HashResolverEnabled:        true,
 				HashResolverEventTypes:     []model.EventType{model.FileOpenEventType},
-				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA1, model.SHA256, model.MD5},
+				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA256, model.MD5},
 				HashResolverMaxHashRate:    1,
 				HashResolverMaxFileSize:    1 << 20,
 			},
@@ -118,7 +148,7 @@ func TestResolver_ComputeHashes(t *testing.T) {
 			config: &config.RuntimeSecurityConfig{
 				HashResolverEnabled:        true,
 				HashResolverEventTypes:     []model.EventType{model.ExecEventType},
-				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA1, model.SHA256, model.MD5},
+				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA256, model.MD5},
 				HashResolverMaxHashRate:    1,
 				HashResolverMaxFileSize:    1 << 10,
 			},
@@ -143,7 +173,6 @@ func TestResolver_ComputeHashes(t *testing.T) {
 				fileSize: 1 << 10,
 			},
 			want: []string{
-				"sha1:8eca554631df9ead14510e1a70ae48c70f9b9384",
 				"sha256:2edc986847e209b4016e141a6dc8716d3207350f416969382d431539bf292e4a",
 				"md5:c9a34cfc85d982698c6ac89f76071abd",
 			},
@@ -154,7 +183,7 @@ func TestResolver_ComputeHashes(t *testing.T) {
 			config: &config.RuntimeSecurityConfig{
 				HashResolverEnabled:        true,
 				HashResolverEventTypes:     []model.EventType{model.ExecEventType},
-				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA1, model.SHA256, model.MD5},
+				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA256, model.MD5},
 				HashResolverMaxHashRate:    1,
 				HashResolverMaxFileSize:    1 << 10,
 			},
@@ -186,7 +215,7 @@ func TestResolver_ComputeHashes(t *testing.T) {
 			config: &config.RuntimeSecurityConfig{
 				HashResolverEnabled:        true,
 				HashResolverEventTypes:     []model.EventType{model.ExecEventType},
-				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA1, model.SHA256, model.MD5},
+				HashResolverHashAlgorithms: []model.HashAlgorithm{model.SHA256, model.MD5},
 				HashResolverMaxHashRate:    0,
 				HashResolverMaxFileSize:    1 << 10,
 			},
@@ -231,10 +260,8 @@ func TestResolver_ComputeHashes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("couldn't instantiate a new hash resolver: %v", err)
 			}
-			got := resolver.ComputeHashesFromEvent(tt.args.event, tt.args.file)
-			if !reflect.DeepEqual(strings.Join(got, "-"), strings.Join(tt.want, "-")) {
-				t.Errorf("ComputeHashes() = %v, want %v", got, tt.want)
-			}
+			got := resolver.ComputeHashesFromEvent(tt.args.event, tt.args.file, 0)
+			assert.ElementsMatch(t, tt.want, got, "invalid output hashes")
 			assert.Equal(t, tt.wantHashState, tt.args.file.HashState, "invalid output hash state")
 		})
 	}
@@ -282,6 +309,150 @@ func TestResolver_ComputeHashes(t *testing.T) {
 // BenchmarkHashFunctions/md5/50Mb-16         	      18	  61665791 ns/op	   43324 B/op	      24 allocs/op
 // BenchmarkHashFunctions/md5/100Mb-16        	       9	 119887060 ns/op	   43452 B/op	      24 allocs/op
 // BenchmarkHashFunctions/md5/500Mb-16        	       2	 620456840 ns/op	   44348 B/op	      26 allocs/op
+
+func TestSSDeepCaching(t *testing.T) {
+	client := statsdclient.NewStatsdClient()
+	pid := uint32(os.Getpid())
+
+	// Create a test file
+	tmpFile, err := os.CreateTemp("", "ssdeep_cache_test")
+	if err != nil {
+		t.Fatalf("couldn't create test file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	size := 8192
+
+	// Write some data (SSDEEP requires at least 4KB typically)
+	testData := generateFileDataWithPattern(size, 'a')
+	if _, err := tmpFile.Write(testData); err != nil {
+		t.Fatalf("couldn't write file content: %v", err)
+	}
+	tmpFile.Close()
+
+	// Create resolver with MD5 and SSDEEP
+	config := &config.RuntimeSecurityConfig{
+		HashResolverEnabled:        true,
+		HashResolverEventTypes:     []model.EventType{model.ExecEventType},
+		HashResolverHashAlgorithms: []model.HashAlgorithm{model.MD5, model.SSDEEP},
+		HashResolverMaxHashRate:    math.MaxInt,
+		HashResolverMaxFileSize:    math.MaxInt64,
+		HashResolverCacheSize:      100,
+	}
+
+	resolver, err := NewResolver(config, client, nil)
+	if err != nil {
+		t.Fatalf("couldn't instantiate a new hash resolver: %v", err)
+	}
+
+	// First computation - should compute both MD5 and SSDEEP
+	event := &model.Event{
+		BaseEvent: model.BaseEvent{
+			FieldHandlers: &model.FakeFieldHandlers{},
+			Type:          uint32(model.ExecEventType),
+			ProcessContext: &model.ProcessContext{
+				Process: model.Process{
+					PIDContext: model.PIDContext{
+						Pid: pid,
+					},
+				},
+			},
+		},
+	}
+
+	file := &model.FileEvent{
+		PathnameStr:           tmpFile.Name(),
+		IsPathnameStrResolved: true,
+	}
+
+	hashes1 := resolver.ComputeHashesFromEvent(event, file, 0)
+	assert.Equal(t, model.Done, file.HashState, "first computation should succeed")
+	assert.Equal(t, 2, len(hashes1), "should have 2 hashes")
+
+	// Extract MD5 and SSDEEP from first computation
+	var md5Hash1, ssdeepHash1 string
+	for _, hash := range hashes1 {
+		if strings.HasPrefix(hash, "md5:") {
+			md5Hash1 = hash
+		} else if strings.HasPrefix(hash, "ssdeep:") {
+			ssdeepHash1 = hash
+		}
+	}
+	assert.NotEmpty(t, md5Hash1, "should have MD5 hash")
+	assert.NotEmpty(t, ssdeepHash1, "should have SSDEEP hash")
+
+	// Verify SSDEEP is cached with MD5 as key
+	if resolver.ssdeepCache != nil {
+		ssdeepKey := SSDeepCacheKey{cheapHash: md5Hash1, inode: file.Inode, size: int64(size)}
+		cached, ok := resolver.ssdeepCache.Get(ssdeepKey)
+		assert.True(t, ok, "SSDEEP should be cached with MD5 as key")
+		assert.Equal(t, ssdeepHash1, cached.ssdeepHash, "cached SSDEEP should match")
+	}
+
+	// Second computation on same file - SSDEEP should be retrieved from cache
+	file2 := &model.FileEvent{
+		PathnameStr:           tmpFile.Name(),
+		IsPathnameStrResolved: true,
+	}
+
+	hashes2 := resolver.ComputeHashesFromEvent(event, file2, 0)
+	assert.Equal(t, 2, len(hashes2), "should have 2 hashes")
+
+	var md5Hash2, ssdeepHash2 string
+	for _, hash := range hashes2 {
+		if strings.HasPrefix(hash, "md5:") {
+			md5Hash2 = hash
+		} else if strings.HasPrefix(hash, "ssdeep:") {
+			ssdeepHash2 = hash
+		}
+	}
+
+	assert.Equal(t, md5Hash1, md5Hash2, "MD5 should be the same")
+	assert.Equal(t, ssdeepHash1, ssdeepHash2, "SSDEEP should be the same (from cache)")
+
+	// Modify the file with a significantly different pattern
+	f, err := os.OpenFile(tmpFile.Name(), os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("couldn't open file for modification: %v", err)
+	}
+
+	size = 16384
+
+	newData := generateFileDataWithPattern(size, 'z')
+	if _, err := f.Write(newData); err != nil {
+		t.Fatalf("couldn't write new content: %v", err)
+	}
+	f.Close()
+
+	// Third computation - file changed, both hashes should be recomputed
+	file3 := &model.FileEvent{
+		PathnameStr:           tmpFile.Name(),
+		IsPathnameStrResolved: true,
+	}
+
+	hashes3 := resolver.ComputeHashesFromEvent(event, file3, 0)
+	assert.Equal(t, 2, len(hashes3), "should have 2 hashes")
+
+	var md5Hash3, ssdeepHash3 string
+	for _, hash := range hashes3 {
+		if strings.HasPrefix(hash, "md5:") {
+			md5Hash3 = hash
+		} else if strings.HasPrefix(hash, "ssdeep:") {
+			ssdeepHash3 = hash
+		}
+	}
+
+	assert.NotEqual(t, md5Hash1, md5Hash3, "MD5 should be different after file change")
+	assert.NotEqual(t, ssdeepHash1, ssdeepHash3, "SSDEEP should be different after file change")
+
+	// Verify new SSDEEP is cached with new MD5
+	if resolver.ssdeepCache != nil {
+		ssdeepKey := SSDeepCacheKey{cheapHash: md5Hash3, inode: file.Inode, size: int64(size)}
+		cached, ok := resolver.ssdeepCache.Get(ssdeepKey)
+		assert.True(t, ok, "new SSDEEP should be cached with new MD5 as key")
+		assert.Equal(t, ssdeepHash3, cached.ssdeepHash, "cached SSDEEP should match new hash")
+	}
+}
 
 func BenchmarkHashFunctions(b *testing.B) {
 	client := statsdclient.NewStatsdClient()
@@ -465,22 +636,27 @@ func BenchmarkHashFunctions(b *testing.B) {
 		},
 	}
 
+	tmpDir := b.TempDir()
+
 	for _, bb := range benchmarks {
 		for _, fc := range bb.fileSizes {
 			b.Run(bb.name+"/"+fc.name, func(caseB *testing.B) {
 				caseB.Helper()
 
 				// reset file
-				f, err := os.Create("/tmp/hash_bench")
+				f, err := os.CreateTemp(tmpDir, "hash_bench")
 				if err != nil {
 					caseB.Errorf("couldn't create benchmark file: %v", err)
 					return
 				}
-				if _, err = f.Write(generateFileData(fc.fileSize)); err != nil {
+				if _, err := f.Write(generateFileData(fc.fileSize)); err != nil {
 					caseB.Errorf("couldn't write file content: %v", err)
 					return
 				}
-				_ = f.Close()
+				if err := f.Close(); err != nil {
+					caseB.Errorf("couldn't close benchmark file: %v", err)
+					return
+				}
 
 				resolver, err := NewResolver(bb.config, client, nil)
 				if err != nil {
@@ -503,19 +679,14 @@ func BenchmarkHashFunctions(b *testing.B) {
 							},
 						},
 					}, &model.FileEvent{
-						PathnameStr:           "/tmp/hash_bench",
+						PathnameStr:           f.Name(),
 						IsPathnameStrResolved: true,
-					})
+					}, 0)
 					if len(got) == 0 {
 						caseB.Errorf("hash computation failed (due to rate limiting ?): got %v", got)
 					}
 				}
 			})
 		}
-	}
-
-	// delete test file
-	if err := os.Remove("/tmp/hash_bench"); err != nil {
-		b.Errorf("couldn't delete benchmark file: %v", err)
 	}
 }

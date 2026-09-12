@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mohae/deepcopy"
-
 	haagent "github.com/DataDog/datadog-agent/comp/haagent/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
@@ -21,7 +19,7 @@ import (
 )
 
 const (
-	// Top-level expvar (the convention for them is that they are lowercase)
+	// runnerExpvarKey - the top-level key for the runner expvars
 	runnerExpvarKey = "runner"
 
 	// Nested keys
@@ -100,9 +98,16 @@ func GetCheckStats() map[string]map[checkid.ID]*checkstats.Stats {
 	checkStats.statsLock.RLock()
 	defer checkStats.statsLock.RUnlock()
 
-	// Because the returned maps will be used after the lock is released, and
-	// thus when they might be further modified, we must clone them here.
-	return deepcopy.Copy(checkStats.stats).(map[string]map[checkid.ID]*checkstats.Stats)
+	// Clone to avoid race conditions on the stats later
+	result := make(map[string]map[checkid.ID]*checkstats.Stats, len(checkStats.stats))
+	for name, perCheckID := range checkStats.stats {
+		cloned := make(map[checkid.ID]*checkstats.Stats, len(perCheckID))
+		for id, stats := range perCheckID {
+			cloned[id] = stats.Clone()
+		}
+		result[name] = cloned
+	}
+	return result
 }
 
 // AddCheckStats adds runtime stats to the check's expvars
@@ -256,4 +261,9 @@ func GetErrorsCount() int64 {
 		return 0
 	}
 	return count.(*expvar.Int).Value()
+}
+
+// GetRunner returns the runner expvar Map
+func GetRunner() *expvar.Map {
+	return expvar.Get(runnerExpvarKey).(*expvar.Map)
 }

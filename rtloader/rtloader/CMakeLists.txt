@@ -28,24 +28,24 @@ add_library(datadog-agent-rtloader SHARED
     ../common/rtloader_mem.c
 )
 
-# execinfo is not POSIX-compliant and some libc may have libexecinfo as a library.
-find_library(EXECINFO execinfo)
-if(EXECINFO)
-    target_link_libraries(datadog-agent-rtloader execinfo)
-    add_compile_definitions(HAS_BACKTRACE_LIB)
+# https://cmake.org/cmake/help/latest/module/FindBacktrace.html
+find_package(Backtrace)
+if(Backtrace_FOUND)
+    if(NOT TARGET Backtrace::Backtrace)
+        # for pre-3.30 CMake versions
+        add_library(Backtrace::Backtrace INTERFACE IMPORTED)
+        set_target_properties(Backtrace::Backtrace PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${Backtrace_LIBRARIES}"
+            INTERFACE_INCLUDE_DIRECTORIES "${Backtrace_INCLUDE_DIRS}"
+        )
+    endif()
+    target_link_libraries(datadog-agent-rtloader PRIVATE Backtrace::Backtrace)
+    target_compile_definitions(datadog-agent-rtloader PRIVATE HAS_BACKTRACE_LIB)
 endif()
-endif()
-
-## Backtrace
-if(${CMAKE_SYSTEM_NAME} STREQUAL FreeBSD)
-  find_package(Backtrace REQUIRED)
-  target_link_libraries(datadog-agent-rtloader ${Backtrace_LIBRARIES})
-  add_compile_definitions(HAS_BACKTRACE_LIB)
 endif()
 
 set_target_properties(datadog-agent-rtloader PROPERTIES
     VERSION ${PROJECT_VERSION}
-    SOVERSION 2
     PUBLIC_HEADER "../include/datadog_agent_rtloader.h;../include/rtloader_types.h;../common/rtloader_mem.h"
 )
 
@@ -59,10 +59,6 @@ target_include_directories(datadog-agent-rtloader PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/common
 )
-
-if(NOT WIN32)
-find_library( LIBdl dl )
-endif()
 
 install(TARGETS datadog-agent-rtloader
     RUNTIME DESTINATION bin

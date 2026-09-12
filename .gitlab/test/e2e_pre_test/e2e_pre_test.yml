@@ -1,0 +1,26 @@
+# e2e_pre_test.yml
+# Contains jobs which runs e2e tests to validate the new-e2e framework.
+e2e_pre_test:
+  rules:
+    - !reference [.on_e2e_or_fakeintake_changes_or_manual]
+  stage: e2e_pre_test
+  extends: .new_e2e_template
+  needs:
+    - go_e2e_deps
+    - job: go_e2e_test_binaries
+      artifacts: false
+    - go_tools_deps
+    - agent_deb-x64-a7
+    # PR pipelines run against v<sha> (publish_fakeintake); main uses the pinned
+    # tag (publish_fakeintake_pinned). Both optional: absent otherwise.
+    - job: publish_fakeintake
+      optional: true
+    - job: publish_fakeintake_pinned
+      optional: true
+  variables:
+    TARGETS: ./tests/agent-devx/pre-test
+    TEAM: "agent-devx"
+    KUBERNETES_MEMORY_REQUEST: 24Gi
+    KUBERNETES_MEMORY_LIMIT: 24Gi
+    # override to use latest stable agent
+    E2E_PIPELINE_ID: ""

@@ -12,6 +12,7 @@ import (
 	"runtime"
 
 	"github.com/DataDog/datadog-agent/pkg/config/model"
+	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -28,7 +29,6 @@ func adjustNetwork(cfg model.Config) {
 
 	deprecateInt(cfg, spNS("closed_connection_flush_threshold"), netNS("closed_connection_flush_threshold"))
 	deprecateInt(cfg, spNS("closed_channel_size"), netNS("closed_channel_size"))
-	applyDefault(cfg, netNS("closed_channel_size"), 500)
 
 	limitMaxInt(cfg, spNS("max_conns_per_message"), maxConnsMessageBatchSize)
 
@@ -94,8 +94,18 @@ func adjustNetwork(cfg model.Config) {
 	})
 
 	if cfg.GetBool(evNS("network_process", "enabled")) && !ProcessEventDataStreamSupported() {
-		log.Warn("disabling process event monitoring as it is not supported for this kernel version")
+		if flavor.GetFlavor() == flavor.SystemProbe {
+			// Only log in system-probe, as we cannot reliably know this in the agent
+			log.Warn("disabling process event monitoring as it is not supported for this kernel version")
+		}
 		cfg.Set(evNS("network_process", "enabled"), false, model.SourceAgentRuntime)
+	}
+
+	if cfg.GetBool(netNS("direct_send")) && !DirectSendSupported() {
+		if flavor.GetFlavor() == flavor.SystemProbe {
+			log.Warn("disabling direct send because this feature is not supported for this platform")
+		}
+		cfg.Set(netNS("direct_send"), false, model.SourceAgentRuntime)
 	}
 
 	// if npm connection rollups are enabled, but usm rollups are not,
@@ -105,23 +115,23 @@ func adjustNetwork(cfg model.Config) {
 		cfg.Set(netNS("enable_connection_rollup"), false, model.SourceAgentRuntime)
 	}
 
-	// disable features that are not supported on certain
-	// configs/platforms
-	var disableConfigs []struct {
-		key, reason string
-	}
 	if ebpflessEnabled {
 		const notSupportedEbpfless = "not supported when ebpf-less is enabled"
-		disableConfigs = append(disableConfigs, []struct{ key, reason string }{
-			{netNS("enable_protocol_classification"), notSupportedEbpfless},
-			{evNS("network_process", "enabled"), notSupportedEbpfless}}...,
-		)
+		disableConfig(cfg, netNS("enable_protocol_classification"), notSupportedEbpfless)
+		disableConfig(cfg, evNS("network_process", "enabled"), notSupportedEbpfless)
 	}
-
-	for _, c := range disableConfigs {
-		if cfg.GetBool(c.key) {
-			log.Warnf("disabling %s: %s", c.key, c.reason)
-			cfg.Set(c.key, false, model.SourceAgentRuntime)
-		}
+	if !cfg.GetBool(spNS("enable_co_re")) {
+		const notSupportedCORE = "not supported when CO-RE is disabled in system-probe"
+		disableConfig(cfg, netNS("enable_co_re"), notSupportedCORE)
+		disableConfig(cfg, netNS("enable_sk_tracer"), notSupportedCORE)
+	}
+	if !cfg.GetBool(netNS("enable_ringbuffers")) {
+		disableConfig(cfg, netNS("enable_sk_tracer"), "not supported when ring buffers disabled")
+	}
+	if cfg.GetBool(netNS("enable_sk_tracer")) {
+		const notSupportedSK = "not supported when sk tracer is enabled"
+		disableConfig(cfg, netNS("enable_protocol_classification"), notSupportedSK)
+		disableConfig(cfg, netNS("enable_cert_collection"), notSupportedSK)
+		disableConfig(cfg, smNS("enabled"), notSupportedSK)
 	}
 }

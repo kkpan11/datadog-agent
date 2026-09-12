@@ -13,11 +13,12 @@ import (
 	"fmt"
 	"os"
 
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	"go.uber.org/fx"
 
+	config "github.com/DataDog/datadog-agent/comp/core/config"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	dderrors "github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/sbom/scanner"
 	"github.com/DataDog/datadog-agent/pkg/util/crio"
@@ -29,23 +30,35 @@ const (
 	componentName = "workloadmeta-crio"
 )
 
+type dependencies struct {
+	fx.In
+
+	Config config.Component
+	Filter workloadfilter.Component
+}
+
 type collector struct {
 	id             string
+	cfg            config.Component
 	client         crio.Client
 	store          workloadmeta.Component
 	catalog        workloadmeta.AgentType
 	seenContainers map[workloadmeta.EntityID]struct{}
 	seenImages     map[workloadmeta.EntityID]struct{}
 	sbomScanner    *scanner.Scanner //nolint: unused
+	sbomFilter     workloadfilter.FilterBundle
 }
 
 // NewCollector initializes a new CRI-O collector.
-func NewCollector() (workloadmeta.CollectorProvider, error) {
+func NewCollector(deps dependencies) (workloadmeta.CollectorProvider, error) {
 	return workloadmeta.CollectorProvider{
 		Collector: &collector{
 			id:             collectorID,
+			cfg:            deps.Config,
 			seenContainers: make(map[workloadmeta.EntityID]struct{}),
-			catalog:        workloadmeta.NodeAgent | workloadmeta.ProcessAgent,
+			seenImages:     make(map[workloadmeta.EntityID]struct{}),
+			catalog:        workloadmeta.NodeAgent,
+			sbomFilter:     deps.Filter.GetContainerSBOMFilters(),
 		},
 	}, nil
 }
@@ -72,7 +85,7 @@ func (c *collector) Start(ctx context.Context, store workloadmeta.Component) err
 		return fmt.Errorf("SBOM collection initialization failed: %v", err)
 	}
 
-	if imageMetadataCollectionIsEnabled() {
+	if c.imageMetadataCollectionIsEnabled() {
 		if err := checkOverlayImageDirectoryExists(); err != nil {
 			log.Warnf("Overlay image directory check failed: %v", err)
 		}
@@ -89,43 +102,42 @@ func (c *collector) Pull(ctx context.Context) error {
 	}
 
 	seenContainers := make(map[workloadmeta.EntityID]struct{})
-	seenImages := make(map[workloadmeta.EntityID]struct{})
 	containerEvents := make([]workloadmeta.CollectorEvent, 0, len(containers))
-	imageEvents := make([]workloadmeta.CollectorEvent, 0, len(containers))
+	var imageEvents []workloadmeta.CollectorEvent
 
-	collectImages := imageMetadataCollectionIsEnabled()
+	collectImages := c.imageMetadataCollectionIsEnabled()
 
 	for _, container := range containers {
-		// Generate container event
 		containerEvent := c.convertContainerToEvent(ctx, container)
 		seenContainers[containerEvent.Entity.GetID()] = struct{}{}
 		containerEvents = append(containerEvents, containerEvent)
-
-		// Skip image collection if the condition is not met
-		if !collectImages {
-			continue
-		}
-
-		imageEvent, err := c.generateImageEventFromContainer(ctx, container)
-		if err != nil {
-			log.Warnf("Image event generation failed for container %+v: %v", container, err)
-			continue
-		}
-
-		imageID := imageEvent.Entity.GetID()
-		seenImages[imageID] = struct{}{}
-		imageEvents = append(imageEvents, *imageEvent)
 	}
 
-	// Handle unset events for images if collecting images
 	if collectImages {
-		for seenID := range c.seenImages {
-			if _, ok := seenImages[seenID]; !ok {
-				unsetEvent := generateUnsetImageEvent(seenID)
+		// Get events for new images and IDs of all current images
+		var currentImageIDs []workloadmeta.EntityID
+		imageEvents, currentImageIDs, err = c.generateImageEventsFromImageList(ctx)
+		if err != nil {
+			log.Errorf("Image collection failed: %v", err)
+			return err
+		}
+
+		// Build new seenImages from current run
+		newSeenImages := make(map[workloadmeta.EntityID]struct{})
+		for _, imageID := range currentImageIDs {
+			newSeenImages[imageID] = struct{}{}
+		}
+
+		// Handle cleanup: send unset events for images in old seenImages but not in new
+		for oldImageID := range c.seenImages {
+			if _, stillExists := newSeenImages[oldImageID]; !stillExists {
+				unsetEvent := generateUnsetImageEvent(oldImageID)
 				imageEvents = append(imageEvents, *unsetEvent)
 			}
 		}
-		c.seenImages = seenImages
+
+		// Update seenImages for next run
+		c.seenImages = newSeenImages
 		c.store.Notify(imageEvents)
 	}
 
@@ -136,7 +148,6 @@ func (c *collector) Pull(ctx context.Context) error {
 			containerEvents = append(containerEvents, unsetEvent)
 		}
 	}
-
 	c.seenContainers = seenContainers
 	c.store.Notify(containerEvents)
 
@@ -154,13 +165,13 @@ func (c *collector) GetTargetCatalog() workloadmeta.AgentType {
 }
 
 // imageMetadataCollectionIsEnabled checks if image metadata collection is enabled via configuration.
-func imageMetadataCollectionIsEnabled() bool {
-	return pkgconfigsetup.Datadog().GetBool("container_image.enabled")
+func (c *collector) imageMetadataCollectionIsEnabled() bool {
+	return c.cfg.GetBool("container_image.enabled")
 }
 
 // sbomCollectionIsEnabled returns true if SBOM collection is enabled.
-func sbomCollectionIsEnabled() bool {
-	return imageMetadataCollectionIsEnabled() && pkgconfigsetup.Datadog().GetBool("sbom.container_image.enabled")
+func (c *collector) sbomCollectionIsEnabled() bool {
+	return c.imageMetadataCollectionIsEnabled() && c.cfg.GetBool("sbom.container_image.enabled")
 }
 
 // checkOverlayImageDirectoryExists checks if the overlay-image directory exists.

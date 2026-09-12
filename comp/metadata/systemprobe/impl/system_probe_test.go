@@ -23,8 +23,8 @@ import (
 	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
 	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/sysprobeconfigimpl"
+	sysprobeconfig "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
+	sysprobeconfigmock "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/mock"
 	configFetcher "github.com/DataDog/datadog-agent/pkg/config/fetcher/sysprobe"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	serializermock "github.com/DataDog/datadog-agent/pkg/serializer/mocks"
@@ -39,8 +39,8 @@ func setupFetcher(t *testing.T) {
 		fetchSystemProbeConfigBySource = configFetcher.SystemProbeConfigBySource
 	})
 
-	fetchSystemProbeConfig = func(_ model.Reader) (string, error) { return "full config", nil }
-	fetchSystemProbeConfigBySource = func(_ model.Reader) (string, error) {
+	fetchSystemProbeConfig = func(_ model.Reader, _ ipc.HTTPClient) (string, error) { return "full config", nil }
+	fetchSystemProbeConfigBySource = func(_ model.Reader, _ ipc.HTTPClient) (string, error) {
 		data, err := json.Marshal(map[string]interface{}{
 			string(model.SourceFile):               map[string]bool{"file": true},
 			string(model.SourceEnvVar):             map[string]bool{"env": true},
@@ -69,7 +69,7 @@ func getSystemProbeComp(t *testing.T, enableConfig bool) *systemprobe {
 			fx.Provide(func() log.Component { return l }),
 			fx.Provide(func() config.Component { return cfg }),
 		),
-		SysProbeConfig: fxutil.Test[option.Option[sysprobeconfig.Component]](t, sysprobeconfigimpl.MockModule()),
+		SysProbeConfig: option.New[sysprobeconfig.Component](sysprobeconfigmock.NewMock(t)),
 		Hostname:       hostnameimpl.NewHostnameService(),
 	}
 

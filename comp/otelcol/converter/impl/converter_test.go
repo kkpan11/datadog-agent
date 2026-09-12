@@ -9,11 +9,14 @@ package converterimpl
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/confmap"
@@ -23,7 +26,26 @@ import (
 	"go.opentelemetry.io/collector/confmap/provider/httpsprovider"
 	"go.opentelemetry.io/collector/confmap/provider/yamlprovider"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+type mockHostname struct {
+	hostname string
+	err      error
+}
+
+func (m *mockHostname) Get(_ context.Context) (string, error) {
+	return m.hostname, m.err
+}
+
+func (m *mockHostname) GetWithProvider(_ context.Context) (hostnameinterface.Data, error) {
+	return hostnameinterface.Data{Hostname: m.hostname, Provider: "mock"}, m.err
+}
+
+func (m *mockHostname) GetSafe(_ context.Context) string {
+	return m.hostname
+}
 
 func uriFromFile(filename string) []string {
 	return []string{filepath.Join("testdata", filename)}
@@ -44,8 +66,8 @@ func newResolver(uris []string) (*confmap.Resolver, error) {
 	})
 }
 
-func TestNewConverterForAgent(t *testing.T) {
-	_, err := NewConverterForAgent(Requires{})
+func TestNewComponent(t *testing.T) {
+	_, err := NewComponent(Requires{})
 	assert.NoError(t, err)
 }
 
@@ -57,26 +79,94 @@ func TestConvert(t *testing.T) {
 		provided       string
 		expectedResult string
 		agentConfig    string
+		hostnameErr    bool
 	}{
 		{
-			name:           "extensions/empty-extensions",
-			provided:       "extensions/empty-extensions/config.yaml",
-			expectedResult: "extensions/empty-extensions/config-result.yaml",
+			name:           "extensions/ddflare-and-dd/datadog",
+			provided:       "extensions/ddflare-and-dd/datadog/config.yaml",
+			expectedResult: "extensions/ddflare-and-dd/datadog/config-result.yaml",
+			agentConfig:    "extensions/ddflare-and-dd/datadog/acfg.yaml",
+		},
+
+		{
+			name:           "extensions/empty-extensions/ddflare",
+			provided:       "extensions/empty-extensions/ddflare/config.yaml",
+			expectedResult: "extensions/empty-extensions/ddflare/config-result.yaml",
 		},
 		{
-			name:           "extensions/no-extensions",
-			provided:       "extensions/no-extensions/config.yaml",
-			expectedResult: "extensions/no-extensions/config-result.yaml",
+			name:           "extensions/no-extensions/ddflare",
+			provided:       "extensions/no-extensions/ddflare/config.yaml",
+			expectedResult: "extensions/no-extensions/ddflare/config-result.yaml",
 		},
 		{
-			name:           "extensions/other-extensions",
-			provided:       "extensions/other-extensions/config.yaml",
-			expectedResult: "extensions/other-extensions/config-result.yaml",
+			name:           "extensions/other-extensions/ddflare",
+			provided:       "extensions/other-extensions/ddflare/config.yaml",
+			expectedResult: "extensions/other-extensions/ddflare/config-result.yaml",
 		},
 		{
-			name:           "extensions/no-changes",
-			provided:       "extensions/no-changes/config.yaml",
-			expectedResult: "extensions/no-changes/config.yaml",
+			name:           "extensions/no-changes/ddflare",
+			provided:       "extensions/no-changes/ddflare/config.yaml",
+			expectedResult: "extensions/no-changes/ddflare/config.yaml",
+		},
+		{
+			name:           "extensions/empty-extensions/datadog",
+			provided:       "extensions/empty-extensions/datadog/config.yaml",
+			expectedResult: "extensions/empty-extensions/datadog/config-result.yaml",
+			agentConfig:    "extensions/empty-extensions/datadog/acfg.yaml",
+		},
+		{
+			name:           "extensions/empty-extensions/dd-no-api",
+			provided:       "extensions/empty-extensions/dd-no-api/config.yaml",
+			expectedResult: "extensions/empty-extensions/dd-no-api/config-result.yaml",
+			agentConfig:    "extensions/empty-extensions/dd-no-api/acfg.yaml",
+		},
+		{
+			name:           "extensions/no-extensions/datadog",
+			provided:       "extensions/no-extensions/datadog/config.yaml",
+			expectedResult: "extensions/no-extensions/datadog/config-result.yaml",
+			agentConfig:    "extensions/no-extensions/datadog/acfg.yaml",
+		},
+		{
+			name:           "extensions/no-extensions/datadog-gateway",
+			provided:       "extensions/no-extensions/datadog-gateway/config.yaml",
+			expectedResult: "extensions/no-extensions/datadog-gateway/config-result.yaml",
+			agentConfig:    "extensions/no-extensions/datadog-gateway/acfg.yaml",
+		},
+		{
+			name:           "extensions/other-extensions/datadog",
+			provided:       "extensions/other-extensions/datadog/config.yaml",
+			expectedResult: "extensions/other-extensions/datadog/config-result.yaml",
+			agentConfig:    "extensions/other-extensions/datadog/acfg.yaml",
+		},
+		{
+			name:           "extensions/other-extensions/datadog-site",
+			provided:       "extensions/other-extensions/datadog-site/config.yaml",
+			expectedResult: "extensions/other-extensions/datadog-site/config-result.yaml",
+			agentConfig:    "extensions/other-extensions/datadog-site/acfg.yaml",
+		},
+		{
+			name:           "extensions/other-extensions/dd-wired",
+			provided:       "extensions/other-extensions/dd-wired/config.yaml",
+			expectedResult: "extensions/other-extensions/dd-wired/config-result.yaml",
+			agentConfig:    "extensions/other-extensions/dd-wired/acfg.yaml",
+		},
+		{
+			name:           "extensions/reuse-unwired/all-extensions",
+			provided:       "extensions/reuse-unwired/all-extensions/config.yaml",
+			expectedResult: "extensions/reuse-unwired/all-extensions/config-result.yaml",
+			agentConfig:    "extensions/reuse-unwired/all-extensions/acfg.yaml",
+		},
+		{
+			name:           "extensions/reuse-unwired/duplicates",
+			provided:       "extensions/reuse-unwired/duplicates/config.yaml",
+			expectedResult: "extensions/reuse-unwired/duplicates/config-result.yaml",
+			agentConfig:    "extensions/reuse-unwired/duplicates/acfg.yaml",
+		},
+		{
+			name:           "extensions/no-changes/datadog",
+			provided:       "extensions/no-changes/datadog/config.yaml",
+			expectedResult: "extensions/no-changes/datadog/config.yaml",
+			agentConfig:    "extensions/no-changes/datadog/acfg.yaml",
 		},
 		{
 			name:           "processors/empty-processors",
@@ -101,7 +191,7 @@ func TestConvert(t *testing.T) {
 		{
 			name:           "processors/no-changes",
 			provided:       "processors/no-changes/config.yaml",
-			expectedResult: "processors/no-changes/config.yaml",
+			expectedResult: "processors/no-changes/config-result.yaml",
 		},
 		{
 			name:           "receivers/empty-receivers",
@@ -116,17 +206,17 @@ func TestConvert(t *testing.T) {
 		{
 			name:           "receivers/no-changes",
 			provided:       "receivers/no-changes/config.yaml",
-			expectedResult: "receivers/no-changes/config.yaml",
+			expectedResult: "receivers/no-changes/config-result.yaml",
 		},
 		{
 			name:           "receivers/no-changes-multiple-dd",
 			provided:       "receivers/no-changes-multiple-dd/config.yaml",
-			expectedResult: "receivers/no-changes-multiple-dd/config.yaml",
+			expectedResult: "receivers/no-changes-multiple-dd/config-result.yaml",
 		},
 		{
-			name:           "receivers/no-changes-multiple-dd-same-pipeline",
-			provided:       "receivers/no-changes-multiple-dd-same-pipeline/config.yaml",
-			expectedResult: "receivers/no-changes-multiple-dd-same-pipeline/config.yaml",
+			name:           "receivers/multi-dd-same-pipeline",
+			provided:       "receivers/multi-dd-same-pipeline/config.yaml",
+			expectedResult: "receivers/multi-dd-same-pipeline/config-result.yaml",
 		},
 		{
 			name:           "receivers/no-prometheus-receiver",
@@ -254,7 +344,7 @@ func TestConvert(t *testing.T) {
 		{
 			name:           "dd-core-cfg/all/no-overrides",
 			provided:       "dd-core-cfg/all/no-overrides/config.yaml",
-			expectedResult: "dd-core-cfg/all/no-overrides/config.yaml",
+			expectedResult: "dd-core-cfg/all/no-overrides/config-result.yaml",
 			agentConfig:    "dd-core-cfg/all/no-overrides/acfg.yaml",
 		},
 		{
@@ -305,6 +395,132 @@ func TestConvert(t *testing.T) {
 			expectedResult: "dd-core-cfg/env/empty-profiler-options/config-result.yaml",
 			agentConfig:    "dd-core-cfg/env/empty-profiler-options/acfg.yaml",
 		},
+		{
+			name:           "features/all-features",
+			provided:       "features/all-features/config.yaml",
+			expectedResult: "features/all-features/config-result.yaml",
+			agentConfig:    "features/all-features/acfg.yaml",
+		},
+		{
+			name:           "features/all-extensions-only",
+			provided:       "features/all-extensions-only/config.yaml",
+			expectedResult: "features/all-extensions-only/config-result.yaml",
+			agentConfig:    "features/all-extensions-only/acfg.yaml",
+		},
+		{
+			name:           "features/some-extensions-only",
+			provided:       "features/some-extensions-only/config.yaml",
+			expectedResult: "features/some-extensions-only/config-result.yaml",
+			agentConfig:    "features/some-extensions-only/acfg.yaml",
+		},
+		{
+			name:           "features/infraattributes-only",
+			provided:       "features/infraattributes-only/config.yaml",
+			expectedResult: "features/infraattributes-only/config-result.yaml",
+			agentConfig:    "features/infraattributes-only/acfg.yaml",
+		},
+		{
+			name:           "features/no-features",
+			provided:       "features/no-features/config.yaml",
+			expectedResult: "features/no-features/config.yaml",
+			agentConfig:    "features/no-features/acfg.yaml",
+		},
+		{
+			name:           "features/prometheus-only",
+			provided:       "features/prometheus-only/config.yaml",
+			expectedResult: "features/prometheus-only/config-result.yaml",
+			agentConfig:    "features/prometheus-only/acfg.yaml",
+		},
+		{
+			name:           "features/no-defined-features",
+			provided:       "features/no-defined-features/config.yaml",
+			expectedResult: "features/no-defined-features/config-result.yaml",
+			agentConfig:    "features/no-defined-features/acfg.yaml",
+		},
+		{
+			name:           "extensions/no-extensions/dd-no-hostname",
+			provided:       "extensions/no-extensions/dd-no-hostname/config.yaml",
+			expectedResult: "extensions/no-extensions/dd-no-hostname/config-result.yaml",
+			agentConfig:    "extensions/no-extensions/dd-no-hostname/acfg.yaml",
+			hostnameErr:    true,
+		},
+		{
+			name:           "extensions/standalone/dogtel-injected",
+			provided:       "extensions/standalone/dogtel-injected/config.yaml",
+			expectedResult: "extensions/standalone/dogtel-injected/config-result.yaml",
+			agentConfig:    "extensions/standalone/dogtel-injected/acfg.yaml",
+		},
+		{
+			name:           "extensions/standalone/dogtel-no-inject",
+			provided:       "extensions/standalone/dogtel-no-inject/config.yaml",
+			expectedResult: "extensions/standalone/dogtel-no-inject/config-result.yaml",
+			agentConfig:    "extensions/standalone/dogtel-no-inject/acfg.yaml",
+		},
+		{
+			name:           "extensions/standalone/dogtel-present",
+			provided:       "extensions/standalone/dogtel-present/config.yaml",
+			expectedResult: "extensions/standalone/dogtel-present/config-result.yaml",
+			agentConfig:    "extensions/standalone/dogtel-present/acfg.yaml",
+		},
+		{
+			name:           "extensions/standalone/dogtel-wired",
+			provided:       "extensions/standalone/dogtel-wired/config.yaml",
+			expectedResult: "extensions/standalone/dogtel-wired/config-result.yaml",
+			agentConfig:    "extensions/standalone/dogtel-wired/acfg.yaml",
+		},
+		// cumulativetodelta auto-injection (OTAGENT-1128).
+		{
+			name:           "cumulativetodelta/injected",
+			provided:       "cumulativetodelta/injected/config.yaml",
+			expectedResult: "cumulativetodelta/injected/config-result.yaml",
+			agentConfig:    "cumulativetodelta/injected/acfg.yaml",
+		},
+		{
+			// No-op expected: a user-defined cumulativetodelta is already present, so
+			// the provided config doubles as the expected result (no injection).
+			name:           "cumulativetodelta/dedup",
+			provided:       "cumulativetodelta/dedup/config.yaml",
+			expectedResult: "cumulativetodelta/dedup/config.yaml",
+			agentConfig:    "cumulativetodelta/dedup/acfg.yaml",
+		},
+		{
+			name:           "cumulativetodelta/metrics-only",
+			provided:       "cumulativetodelta/metrics-only/config.yaml",
+			expectedResult: "cumulativetodelta/metrics-only/config-result.yaml",
+			agentConfig:    "cumulativetodelta/metrics-only/acfg.yaml",
+		},
+		{
+			// No-op expected: the metrics pipeline has no datadog exporter, so the
+			// provided config doubles as the expected result (no injection).
+			name:           "cumulativetodelta/no-dd-exporter",
+			provided:       "cumulativetodelta/no-dd-exporter/config.yaml",
+			expectedResult: "cumulativetodelta/no-dd-exporter/config.yaml",
+			agentConfig:    "cumulativetodelta/no-dd-exporter/acfg.yaml",
+		},
+		{
+			name:           "cumulativetodelta/mixed-exporters",
+			provided:       "cumulativetodelta/mixed-exporters/config.yaml",
+			expectedResult: "cumulativetodelta/mixed-exporters/config-result.yaml",
+			agentConfig:    "cumulativetodelta/mixed-exporters/acfg.yaml",
+		},
+		{
+			name:           "cumulativetodelta/multi-metrics",
+			provided:       "cumulativetodelta/multi-metrics/config.yaml",
+			expectedResult: "cumulativetodelta/multi-metrics/config-result.yaml",
+			agentConfig:    "cumulativetodelta/multi-metrics/acfg.yaml",
+		},
+		{
+			name:           "cumulativetodelta/feature-disabled",
+			provided:       "cumulativetodelta/feature-disabled/config.yaml",
+			expectedResult: "cumulativetodelta/feature-disabled/config-result.yaml",
+			agentConfig:    "cumulativetodelta/feature-disabled/acfg.yaml",
+		},
+		{
+			name:           "cumulativetodelta/no-processors-section",
+			provided:       "cumulativetodelta/no-processors-section/config.yaml",
+			expectedResult: "cumulativetodelta/no-processors-section/config-result.yaml",
+			agentConfig:    "cumulativetodelta/no-processors-section/acfg.yaml",
+		},
 	}
 
 	for _, tc := range tests {
@@ -315,21 +531,26 @@ func TestConvert(t *testing.T) {
 				require.NoError(t, err)
 				acfg := config.NewMockFromYAML(t, string(f))
 				r.Conf = acfg
+				if tc.hostnameErr {
+					r.Hostname = &mockHostname{hostname: "", err: errors.New("hostname resolution failed")}
+				} else {
+					r.Hostname = &mockHostname{hostname: "test-host"}
+				}
 			}
-			converter, err := NewConverterForAgent(r)
-			assert.NoError(t, err)
+			converter, err := NewComponent(r)
+			require.NoError(t, err)
 
 			resolver, err := newResolver(uriFromFile(tc.provided))
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			conf, err := resolver.Resolve(context.Background())
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			converter.Convert(context.Background(), conf)
 
 			resolverResult, err := newResolver(uriFromFile(tc.expectedResult))
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			confResult, err := resolverResult.Resolve(context.Background())
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			assert.Equal(t, confResult.ToStringMap(), conf.ToStringMap())
 		})
@@ -345,16 +566,16 @@ func TestConvert(t *testing.T) {
 			converter := newConverter(confmap.ConverterSettings{Logger: nopLogger})
 
 			resolver, err := newResolver(uriFromFile(tc.provided))
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			conf, err := resolver.Resolve(context.Background())
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			converter.Convert(context.Background(), conf)
 
 			resolverResult, err := newResolver(uriFromFile(tc.expectedResult))
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			confResult, err := resolverResult.Resolve(context.Background())
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			assert.Equal(t, confResult.ToStringMap(), conf.ToStringMap())
 		})
@@ -364,7 +585,7 @@ func TestConvert(t *testing.T) {
 func TestConvert_APIKeyFromEnvVar(t *testing.T) {
 	t.Setenv("DD_API_KEY", "123456")
 	t.Setenv("DD_SITE", "")
-	converter, err := NewConverterForAgent(Requires{config.NewMock(t)})
+	converter, err := NewComponent(Requires{Conf: config.NewMock(t), Hostname: &mockHostname{hostname: "test-host"}})
 	assert.NoError(t, err)
 
 	resolver, err := newResolver(uriFromFile("dd-core-cfg/apikey/unset-number/config.yaml"))
@@ -380,4 +601,190 @@ func TestConvert_APIKeyFromEnvVar(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equal(t, confResult.ToStringMap(), conf.ToStringMap())
+}
+
+func TestHostmetricsWarning(t *testing.T) {
+	tests := []struct {
+		name        string
+		provided    string
+		agentConfig string
+		wantWarning bool
+	}{
+		{
+			name:        "hostmetrics in connected mode emits warning",
+			provided:    "receivers/hostmetrics-warning/connected/config.yaml",
+			agentConfig: "receivers/hostmetrics-warning/connected/acfg.yaml",
+			wantWarning: true,
+		},
+		{
+			name:        "hostmetrics in standalone mode no warning",
+			provided:    "receivers/hostmetrics-warning/standalone/config.yaml",
+			agentConfig: "receivers/hostmetrics-warning/standalone/acfg.yaml",
+			wantWarning: false,
+		},
+		{
+			name:        "no hostmetrics in connected mode no warning",
+			provided:    "receivers/hostmetrics-warning/no-hostmetrics/config.yaml",
+			agentConfig: "receivers/hostmetrics-warning/no-hostmetrics/acfg.yaml",
+			wantWarning: false,
+		},
+		{
+			name:        "named hostmetrics instance in connected mode emits warning",
+			provided:    "receivers/hostmetrics-warning/named-instance/config.yaml",
+			agentConfig: "receivers/hostmetrics-warning/named-instance/acfg.yaml",
+			wantWarning: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			observedCore, logs := observer.New(zapcore.WarnLevel)
+
+			f, err := os.ReadFile(uriFromFile(tc.agentConfig)[0])
+			require.NoError(t, err)
+			acfg := config.NewMockFromYAML(t, string(f))
+
+			conv := &ddConverter{
+				coreConfig: acfg,
+				hostname:   &mockHostname{hostname: "test-host"},
+				logger:     zap.New(observedCore),
+			}
+
+			resolver, err := newResolver(uriFromFile(tc.provided))
+			require.NoError(t, err)
+			conf, err := resolver.Resolve(context.Background())
+			require.NoError(t, err)
+
+			conv.Convert(context.Background(), conf)
+
+			hostmetricsWarnings := filterLogsBySubstring(logs, "hostmetrics")
+			if tc.wantWarning {
+				assert.NotEmpty(t, hostmetricsWarnings, "expected a hostmetrics warning log")
+				assert.Contains(t, hostmetricsWarnings[0].Message, "connected mode")
+			} else {
+				assert.Empty(t, hostmetricsWarnings, "expected no hostmetrics warning log")
+			}
+		})
+	}
+}
+
+func TestCumulativeToDeltaMixedExporterWarning(t *testing.T) {
+	tests := []struct {
+		name        string
+		provided    string
+		agentConfig string
+		wantWarning bool
+	}{
+		{
+			name:        "mixed-exporter metrics pipeline warns and skips injection",
+			provided:    "cumulativetodelta/mixed-exporters/config.yaml",
+			agentConfig: "cumulativetodelta/mixed-exporters/acfg.yaml",
+			wantWarning: true,
+		},
+		{
+			name:        "datadog-only metrics pipeline injects without warning",
+			provided:    "cumulativetodelta/injected/config.yaml",
+			agentConfig: "cumulativetodelta/injected/acfg.yaml",
+			wantWarning: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			observedCore, logs := observer.New(zapcore.WarnLevel)
+
+			f, err := os.ReadFile(uriFromFile(tc.agentConfig)[0])
+			require.NoError(t, err)
+			acfg := config.NewMockFromYAML(t, string(f))
+
+			conv := &ddConverter{
+				coreConfig: acfg,
+				hostname:   &mockHostname{hostname: "test-host"},
+				logger:     zap.New(observedCore),
+			}
+
+			resolver, err := newResolver(uriFromFile(tc.provided))
+			require.NoError(t, err)
+			conf, err := resolver.Resolve(context.Background())
+			require.NoError(t, err)
+
+			conv.Convert(context.Background(), conf)
+
+			warnings := filterLogsBySubstring(logs, "non-Datadog exporter")
+			if tc.wantWarning {
+				assert.NotEmpty(t, warnings, "expected a mixed-exporter warning log")
+				assert.Contains(t, warnings[0].Message, "cumulativetodelta")
+			} else {
+				assert.Empty(t, warnings, "expected no mixed-exporter warning log")
+			}
+		})
+	}
+}
+
+func filterLogsBySubstring(logs *observer.ObservedLogs, substr string) []observer.LoggedEntry {
+	var filtered []observer.LoggedEntry
+	for _, entry := range logs.All() {
+		if entry.Level == zapcore.WarnLevel && strings.Contains(entry.Message, substr) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func TestFindExistingExtensionID(t *testing.T) {
+	tests := []struct {
+		name     string
+		exts     map[string]any
+		compName string
+		want     string
+	}{
+		{"canonical wins over suffixed", map[string]any{"ddflare/z": nil, "ddflare/a": nil, "ddflare": nil}, "ddflare", "ddflare"},
+		{"lexicographically-first when no canonical", map[string]any{"pprof/c": nil, "pprof/a": nil, "pprof/b": nil}, "pprof", "pprof/a"},
+		{"single suffixed instance", map[string]any{"zpages/custom": nil}, "zpages", "zpages/custom"},
+		{"no matching base name returns empty", map[string]any{"zpages/x": nil}, "pprof", ""},
+		{"no extensions section returns empty", nil, "pprof", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := map[string]any{}
+			if tt.exts != nil {
+				m["extensions"] = tt.exts
+			}
+			conf := confmap.NewFromStringMap(m)
+			assert.Equal(t, tt.want, findExistingExtensionID(conf, tt.compName))
+		})
+	}
+}
+
+func TestReuseExtension(t *testing.T) {
+	c := &ddConverter{logger: zap.NewNop()}
+
+	t.Run("wires an existing unwired extension into service::extensions", func(t *testing.T) {
+		conf := confmap.NewFromStringMap(map[string]any{
+			"extensions": map[string]any{"pprof/custom": nil},
+			"service":    map[string]any{"extensions": []any{}},
+		})
+		assert.True(t, c.reuseExtension(conf, "pprof"))
+		assert.Equal(t, []any{"pprof/custom"}, conf.Get("service::extensions"))
+	})
+
+	t.Run("returns false without an existing extension", func(t *testing.T) {
+		conf := confmap.NewFromStringMap(map[string]any{
+			"service": map[string]any{"extensions": []any{}},
+		})
+		assert.False(t, c.reuseExtension(conf, "pprof"))
+	})
+
+	t.Run("reports found and logs a warning when the service section is missing", func(t *testing.T) {
+		core, logs := observer.New(zapcore.WarnLevel)
+		c := &ddConverter{logger: zap.New(core)}
+		conf := confmap.NewFromStringMap(map[string]any{
+			"extensions": map[string]any{"pprof/custom": nil},
+		})
+		// Found (so the caller must not add a duplicate), left unwired, but no
+		// longer silent: a warning is emitted.
+		assert.True(t, c.reuseExtension(conf, "pprof"))
+		assert.Nil(t, conf.Get("service::extensions"))
+		assert.NotEmpty(t, filterLogsBySubstring(logs, "Could not wire existing extension"))
+	})
 }

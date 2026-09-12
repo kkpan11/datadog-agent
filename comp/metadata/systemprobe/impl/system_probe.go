@@ -9,21 +9,20 @@ package systemprobeimpl
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	api "github.com/DataDog/datadog-agent/comp/api/api/def"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
-	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig"
+	sysprobeconfig "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
 	"github.com/DataDog/datadog-agent/comp/metadata/internal/util"
-	"github.com/DataDog/datadog-agent/comp/metadata/runner/runnerimpl"
+	runnerdef "github.com/DataDog/datadog-agent/comp/metadata/runner/def"
 	systemprobemetadata "github.com/DataDog/datadog-agent/comp/metadata/systemprobe/def"
 	configFetcher "github.com/DataDog/datadog-agent/pkg/config/fetcher/sysprobe"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
@@ -53,13 +52,6 @@ func (p *Payload) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*PayloadAlias)(p))
 }
 
-// SplitPayload implements marshaler.AbstractMarshaler#SplitPayload.
-//
-// In this case, the payload can't be split any further.
-func (p *Payload) SplitPayload(_ int) ([]marshaler.AbstractMarshaler, error) {
-	return nil, fmt.Errorf("could not split system-probe process payload any more, payload is too big for intake")
-}
-
 type systemprobe struct {
 	util.InventoryPayload
 
@@ -83,7 +75,7 @@ type Requires struct {
 // Provides defines the output of the systemprobe metadatacomponent
 type Provides struct {
 	Comp             systemprobemetadata.Component
-	MetadataProvider runnerimpl.Provider
+	MetadataProvider runnerdef.Provider
 	FlareProvider    flaretypes.Provider
 	Endpoint         api.AgentEndpointProvider
 }
@@ -132,7 +124,7 @@ func (sb *systemprobe) getConfigLayers() map[string]interface{} {
 		return metadata
 	}
 
-	rawLayers, err := fetchSystemProbeConfigBySource(sysprobeConf)
+	rawLayers, err := fetchSystemProbeConfigBySource(sysprobeConf, nil) // It's ok to pass nil here because the IPCClient is not used by SystemProbe API
 	if err != nil {
 		sb.log.Debugf("error fetching system-probe config layers: %s", err)
 		return metadata
@@ -166,7 +158,7 @@ func (sb *systemprobe) getConfigLayers() map[string]interface{} {
 		}
 	}
 
-	if str, err := fetchSystemProbeConfig(sysprobeConf); err == nil {
+	if str, err := fetchSystemProbeConfig(sysprobeConf, nil); err == nil {
 		metadata["full_configuration"] = str
 	} else {
 		sb.log.Debugf("error fetching system-probe config: %s", err)

@@ -21,15 +21,17 @@ import (
 func TestPathValidation(t *testing.T) {
 	mod := &Model{}
 
-	var maxDepthPath string
+	var maxDepthPathBuilder strings.Builder
 	for i := 0; i <= MaxPathDepth; i++ {
-		maxDepthPath += "a/"
+		maxDepthPathBuilder.WriteString("a/")
 	}
+	maxDepthPath := maxDepthPathBuilder.String()
 
-	var maxSegmentPath string
+	var maxSegmentPathBuilder strings.Builder
 	for i := 0; i <= MaxSegmentLength; i++ {
-		maxSegmentPath += "a"
+		maxSegmentPathBuilder.WriteString("a")
 	}
+	maxSegmentPath := maxSegmentPathBuilder.String()
 
 	tests := []struct {
 		val            string
@@ -124,8 +126,16 @@ func TestSetFieldValue(t *testing.T) {
 	for _, field := range event.GetFields() {
 		// use a fresh event to not get polluted by previous SetFieldValue
 		event = NewFakeEvent()
+		eventType, _, _, _, err := event.GetFieldMetadata(field)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		_, kind, _, err := event.GetFieldMetadata(field)
+		if evt, _ := ParseEvalEventType(eventType); evt != UnknownEventType {
+			event.Type = uint32(evt)
+		}
+
+		_, kind, _, _, err := event.GetFieldMetadata(field)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -231,4 +241,53 @@ func TestSetFieldValue(t *testing.T) {
 			t.Errorf("type of field %s unknown: %v", field, kind)
 		}
 	}
+}
+
+func TestProcessAWSSecurityCredentials(t *testing.T) {
+	mod := &Model{}
+
+	evaluateStrings := func(t *testing.T, event *Event, field string) []string {
+		t.Helper()
+
+		evaluator, err := mod.GetEvaluator(field, "", 0)
+		if err != nil {
+			t.Fatalf("failed to get an evaluator for %s: %v", field, err)
+		}
+
+		arrayEvaluator, ok := evaluator.(*eval.StringArrayEvaluator)
+		if !ok {
+			t.Fatalf("%s should evaluate to a string array, got %T", field, evaluator)
+		}
+
+		values, ok := arrayEvaluator.Eval(eval.NewContext(event)).([]string)
+		if !ok {
+			t.Fatalf("%s should evaluate to a string array", field)
+		}
+		return values
+	}
+
+	t.Run("no-credentials", func(t *testing.T) {
+		event := NewFakeEvent()
+
+		if values := evaluateStrings(t, event, "process.aws_security_credentials.access_key_id"); len(values) != 0 {
+			t.Errorf("expected no access key ID, got %v", values)
+		}
+	})
+
+	t.Run("every-resolved-credential", func(t *testing.T) {
+		event := NewFakeEvent()
+		event.ProcessContext.Process.AWSSecurityCredentials = []AWSSecurityCredentials{
+			{Type: "AWS-HMAC", AccessKeyID: "ASIAIOSFODNN7EXAMPLE"},
+			{Type: "AWS-HMAC", AccessKeyID: "ASIAROTATEDKEY000000"},
+		}
+
+		values := evaluateStrings(t, event, "process.aws_security_credentials.access_key_id")
+		if !reflect.DeepEqual(values, []string{"ASIAIOSFODNN7EXAMPLE", "ASIAROTATEDKEY000000"}) {
+			t.Errorf("expected every access key ID the process resolved, got %v", values)
+		}
+
+		if values := evaluateStrings(t, event, "process.aws_security_credentials.type"); !reflect.DeepEqual(values, []string{"AWS-HMAC", "AWS-HMAC"}) {
+			t.Errorf("unexpected credentials types: %v", values)
+		}
+	})
 }

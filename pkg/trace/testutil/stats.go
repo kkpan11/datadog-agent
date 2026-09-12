@@ -19,7 +19,7 @@ const (
 // BucketWithSpans returns a stats bucket populated with spans stats
 func BucketWithSpans(spans []*pb.Span) *pb.ClientStatsBucket {
 	sc := &stats.SpanConcentrator{}
-	srb := stats.NewRawBucket(0, 1e9)
+	srb := stats.NewRawBucket(0, 1e9, stats.BucketCardinalityLimits{})
 	aggKey := stats.PayloadAggregationKey{
 		Env:         defaultEnv,
 		Hostname:    defaultHostname,
@@ -30,7 +30,7 @@ func BucketWithSpans(spans []*pb.Span) *pb.ClientStatsBucket {
 		// override version to ensure all buckets will have the same payload key.
 		s.Meta["version"] = ""
 		s.Metrics["_dd.measured"] = 1 // All stats in a bucket must be eligible for stats, mark all these spans as measured
-		statSpan, _ := sc.NewStatSpanFromPB(s, nil)
+		statSpan, _ := sc.NewStatSpanFromPB(s, nil, nil)
 		srb.HandleSpan(statSpan, 0, "", aggKey)
 	}
 	buckets := srb.Export()

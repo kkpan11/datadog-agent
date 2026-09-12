@@ -13,9 +13,12 @@ import (
 	"time"
 
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
+	"github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace/idx"
 	"github.com/DataDog/datadog-agent/pkg/trace/info"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 	"github.com/DataDog/datadog-agent/pkg/trace/sampler"
+	"github.com/DataDog/datadog-agent/pkg/trace/semantics"
+	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
 	normalizeutil "github.com/DataDog/datadog-agent/pkg/trace/traceutil/normalize"
 )
 
@@ -25,19 +28,191 @@ const (
 	// tagOrigin specifies the origin of the trace.
 	// DEPRECATED: Origin is now specified as a TraceChunk field.
 	tagOrigin = "_dd.origin"
-	// tagSamplingPriority specifies the sampling priority of the trace.
-	// DEPRECATED: Priority is now specified as a TraceChunk field.
-	tagSamplingPriority = "_sampling_priority_v1"
-	// peerServiceKey is the key for the peer.service meta field.
-	peerServiceKey = "peer.service"
-	// baseServiceKey is the key for the _dd.base_service meta field.
-	baseServiceKey = "_dd.base_service"
 )
 
 var (
 	// Year2000NanosecTS is an arbitrary cutoff to spot weird-looking values
 	Year2000NanosecTS = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 )
+
+// normalizeService handles service normalization for both pb.Span and idx.InternalSpan
+func (a *Agent) normalizeService(ts *info.TagStats, service string, lang string) (string, error) {
+	svc, err := normalizeutil.NormalizeService(service, lang)
+	switch err {
+	case normalizeutil.ErrEmpty:
+		ts.SpansMalformed.ServiceEmpty.Inc()
+		log.Debugf("Fixing malformed trace. Service is empty (reason:service_empty), setting span.service=%s: %s", service, service)
+	case normalizeutil.ErrTooLong:
+		ts.SpansMalformed.ServiceTruncate.Inc()
+		log.Debugf("Fixing malformed trace. Service is too long (reason:service_truncate), truncating span.service to length=%d: %s", normalizeutil.MaxServiceLen, service)
+	case normalizeutil.ErrInvalid:
+		ts.SpansMalformed.ServiceInvalid.Inc()
+		log.Debugf("Fixing malformed trace. Service is invalid (reason:service_invalid), replacing invalid span.service=%s with fallback span.service=%s: %s", service, svc, service)
+	}
+	return svc, err
+}
+
+// normalizePeerService handles peer service normalization for both pb.Span and idx.InternalSpan
+func (a *Agent) normalizePeerService(ts *info.TagStats, pSvc string) string {
+	ps, err := normalizeutil.NormalizePeerService(pSvc)
+	switch err {
+	case normalizeutil.ErrTooLong:
+		ts.SpansMalformed.PeerServiceTruncate.Inc()
+		log.Debugf("Fixing malformed trace. peer.service is too long (reason:peer_service_truncate), truncating peer.service to length=%d: %s", normalizeutil.MaxServiceLen, ps)
+	case normalizeutil.ErrInvalid:
+		ts.SpansMalformed.PeerServiceInvalid.Inc()
+		log.Debugf("Fixing malformed trace. peer.service is invalid (reason:peer_service_invalid), replacing invalid peer.service=%s with empty string", pSvc)
+	default:
+		if err != nil {
+			log.Debugf("Unexpected error in peer.service normalization from original value (%s) to new value (%s): %s", pSvc, ps, err)
+		}
+	}
+	return ps
+}
+
+// normalizeBaseService handles base service normalization for both pb.Span and idx.InternalSpan
+func (a *Agent) normalizeBaseService(ts *info.TagStats, bSvc string) string {
+	bs, err := normalizeutil.NormalizePeerService(bSvc)
+	switch err {
+	case normalizeutil.ErrTooLong:
+		ts.SpansMalformed.BaseServiceTruncate.Inc()
+		log.Debugf("Fixing malformed trace. _dd.base_service is too long (reason:base_service_truncate), truncating _dd.base_service to length=%d: %s", normalizeutil.MaxServiceLen, bs)
+	case normalizeutil.ErrInvalid:
+		ts.SpansMalformed.BaseServiceInvalid.Inc()
+		log.Debugf("Fixing malformed trace. _dd.base_service is invalid (reason:base_service_invalid), replacing invalid _dd.base_service=%s with empty string", bSvc)
+	default:
+		if err != nil {
+			log.Debugf("Unexpected error in _dd.base_service normalization from original value (%s) to new value (%s): %s", bSvc, bs, err)
+		}
+	}
+	return bs
+}
+
+// normalizeName handles name normalization for both pb.Span and idx.InternalSpan
+func (a *Agent) normalizeName(ts *info.TagStats, name string) (string, error) {
+	newName, err := normalizeutil.NormalizeName(name)
+	switch err {
+	case normalizeutil.ErrEmpty:
+		ts.SpansMalformed.SpanNameEmpty.Inc()
+		log.Debugf("Fixing malformed trace. Name is empty (reason:span_name_empty), setting span.name=%s: %s", name, name)
+	case normalizeutil.ErrTooLong:
+		ts.SpansMalformed.SpanNameTruncate.Inc()
+		log.Debugf("Fixing malformed trace. Name is too long (reason:span_name_truncate), truncating span.name to length=%d: %s", normalizeutil.MaxServiceLen, name)
+	case normalizeutil.ErrInvalid:
+		ts.SpansMalformed.SpanNameInvalid.Inc()
+		log.Debugf("Fixing malformed trace. Name is invalid (reason:span_name_invalid), setting span.name=%s: %s", name, name)
+	}
+	return newName, err
+}
+
+// validateAndFixDuration handles duration validation for both pb.Span and idx.InternalSpan
+func (a *Agent) validateAndFixDuration(ts *info.TagStats, start int64, duration int64) int64 {
+	if duration < 0 {
+		ts.SpansMalformed.InvalidDuration.Inc()
+		log.Debugf("Fixing malformed trace. Duration is invalid (reason:invalid_duration), setting span.duration=0")
+		return 0
+	}
+	if duration > math.MaxInt64-start {
+		ts.SpansMalformed.InvalidDuration.Inc()
+		log.Debugf("Fixing malformed trace. Duration is too large and causes overflow (reason:invalid_duration), setting span.duration=0")
+		return 0
+	}
+	return duration
+}
+
+// validateAndFixStartTime handles start time validation for both pb.Span and idx.InternalSpan
+func (a *Agent) validateAndFixStartTime(ts *info.TagStats, start int64, duration int64) int64 {
+	if start < Year2000NanosecTS {
+		ts.SpansMalformed.InvalidStartDate.Inc()
+		log.Debugf("Fixing malformed trace. Start date is invalid (reason:invalid_start_date), setting span.start=time.now()")
+		now := time.Now().UnixNano()
+		newStart := now - duration
+		if newStart < 0 {
+			return now
+		}
+		return newStart
+	}
+	return start
+}
+
+// validateAndFixType handles type validation for both pb.Span and idx.InternalSpan
+func (a *Agent) validateAndFixType(ts *info.TagStats, spanType string) string {
+	if len(spanType) > MaxTypeLen {
+		ts.SpansMalformed.TypeTruncate.Inc()
+		log.Debugf("Fixing malformed trace. Type is too long (reason:type_truncate), truncating span.type to length=%d: %s", MaxTypeLen, spanType)
+		return normalizeutil.TruncateUTF8(spanType, MaxTypeLen)
+	}
+	return spanType
+}
+
+// validateAndFixHTTPStatusCode handles HTTP status code validation for both pb.Span and idx.InternalSpan
+func (a *Agent) validateAndFixHTTPStatusCode(ts *info.TagStats, sc string) (string, bool) {
+	if !isValidStatusCode(sc) {
+		ts.SpansMalformed.InvalidHTTPStatusCode.Inc()
+		log.Debugf("Fixing malformed trace. HTTP status code is invalid (reason:invalid_http_status_code), dropping invalid http.status_code=%s", sc)
+		return "", false
+	}
+	return sc, true
+}
+
+// normalizeSpanLinks handles span links normalization for both pb.Span and idx.InternalSpan
+func (a *Agent) normalizeSpanLinks(links []*pb.SpanLink) {
+	for _, link := range links {
+		if link == nil {
+			continue
+		}
+
+		if val, ok := link.Attributes[string(semantics.ConceptLinkName)]; ok {
+			newName, err := normalizeutil.NormalizeName(val)
+			if err != nil {
+				log.Debugf("Fixing malformed trace. 'link.name' attribute in span link is invalid (reason=%q), setting link.Attributes[\"link.name\"]=%s", err, newName)
+			}
+			link.Attributes[string(semantics.ConceptLinkName)] = newName
+		}
+	}
+}
+
+// validateAndFixDurationV1 handles duration validation for idx.InternalSpan
+func (a *Agent) validateAndFixDurationV1(ts *info.TagStats, start uint64, duration uint64) uint64 {
+	if duration > math.MaxInt64-uint64(start) {
+		ts.SpansMalformed.InvalidDuration.Inc()
+		log.Debugf("Fixing malformed trace. Duration is too large and causes overflow (reason:invalid_duration), setting span.duration=0")
+		return 0
+	}
+	return duration
+}
+
+// validateAndFixStartTimeV1 handles start time validation for idx.InternalSpan
+func (a *Agent) validateAndFixStartTimeV1(ts *info.TagStats, start uint64, duration uint64) uint64 {
+	if start < uint64(Year2000NanosecTS) {
+		ts.SpansMalformed.InvalidStartDate.Inc()
+		log.Debugf("Fixing malformed trace. Start date is invalid (reason:invalid_start_date), setting span.start=time.now()")
+		now := uint64(time.Now().UnixNano())
+		newStart := now - duration
+		if newStart > now { // Check for underflow
+			return now
+		}
+		return newStart
+	}
+	return start
+}
+
+// normalizeSpanLinksV1 handles span links normalization for idx.InternalSpan
+func (a *Agent) normalizeSpanLinksV1(links []*idx.InternalSpanLink) {
+	for _, link := range links {
+		if link == nil {
+			continue
+		}
+
+		if val, ok := link.GetAttributeAsString(string(semantics.ConceptLinkName)); ok {
+			newName, err := normalizeutil.NormalizeName(val)
+			if err != nil {
+				log.Debugf("Fixing malformed trace. 'link.name' attribute in span link is invalid (reason=%q), setting link.Attributes[\"link.name\"]=%s", err, newName)
+			}
+			link.SetStringAttribute(string(semantics.ConceptLinkName), newName)
+		}
+	}
+}
 
 // normalize makes sure a Span is properly initialized and encloses the minimum required info, returning error if it
 // is invalid beyond repair
@@ -48,81 +223,28 @@ func (a *Agent) normalize(ts *info.TagStats, s *pb.Span) error {
 	}
 	if s.SpanID == 0 {
 		ts.TracesDropped.SpanIDZero.Inc()
-		return fmt.Errorf("SpanID is zero (reason:span_id_zero): %s", s)
+		return fmt.Errorf("SpanID is zero (reason:span_id_zero): %v", s)
 	}
-	svc, err := normalizeutil.NormalizeService(s.Service, ts.Lang)
-	switch err {
-	case normalizeutil.ErrEmpty:
-		ts.SpansMalformed.ServiceEmpty.Inc()
-		log.Debugf("Fixing malformed trace. Service is empty (reason:service_empty), setting span.service=%s: %s", s.Service, s)
-	case normalizeutil.ErrTooLong:
-		ts.SpansMalformed.ServiceTruncate.Inc()
-		log.Debugf("Fixing malformed trace. Service is too long (reason:service_truncate), truncating span.service to length=%d: %s", normalizeutil.MaxServiceLen, s)
-	case normalizeutil.ErrInvalid:
-		ts.SpansMalformed.ServiceInvalid.Inc()
-		log.Debugf("Fixing malformed trace. Service is invalid (reason:service_invalid), replacing invalid span.service=%s with fallback span.service=%s: %s", s.Service, svc, s)
-	}
+
+	svc, _ := a.normalizeService(ts, s.Service, ts.Lang)
 	s.Service = svc
 
-	pSvc, ok := s.Meta[peerServiceKey]
-	if ok {
-		ps, err := normalizeutil.NormalizePeerService(pSvc)
-		switch err {
-		case normalizeutil.ErrTooLong:
-			ts.SpansMalformed.PeerServiceTruncate.Inc()
-			log.Debugf("Fixing malformed trace. peer.service is too long (reason:peer_service_truncate), truncating peer.service to length=%d: %s", normalizeutil.MaxServiceLen, ps)
-		case normalizeutil.ErrInvalid:
-			ts.SpansMalformed.PeerServiceInvalid.Inc()
-			log.Debugf("Fixing malformed trace. peer.service is invalid (reason:peer_service_invalid), replacing invalid peer.service=%s with empty string", pSvc)
-		default:
-			if err != nil {
-				log.Debugf("Unexpected error in peer.service normalization from original value (%s) to new value (%s): %s", pSvc, ps, err)
-			}
-		}
-		s.Meta[peerServiceKey] = ps
+	reg := semantics.DefaultRegistry()
+	spanAccessor := semantics.NewDDSpanAccessor(s.Meta, s.Metrics)
+	if pSvc := semantics.LookupString(reg, spanAccessor, semantics.ConceptPeerService); pSvc != "" {
+		s.Meta[string(semantics.ConceptPeerService)] = a.normalizePeerService(ts, pSvc)
 	}
-
-	bSvc, ok := s.Meta[baseServiceKey]
-	if ok {
-		bs, err := normalizeutil.NormalizePeerService(bSvc)
-		switch err {
-		case normalizeutil.ErrTooLong:
-			ts.SpansMalformed.BaseServiceTruncate.Inc()
-			log.Debugf("Fixing malformed trace. _dd.base_service is too long (reason:base_service_truncate), truncating _dd.base_service to length=%d: %s", normalizeutil.MaxServiceLen, bs)
-		case normalizeutil.ErrInvalid:
-			ts.SpansMalformed.BaseServiceInvalid.Inc()
-			log.Debugf("Fixing malformed trace. _dd.base_service is invalid (reason:base_service_invalid), replacing invalid _dd.base_service=%s with empty string", bSvc)
-		default:
-			if err != nil {
-				log.Debugf("Unexpected error in _dd.base_service normalization from original value (%s) to new value (%s): %s", bSvc, bs, err)
-			}
-		}
-		s.Meta[baseServiceKey] = bs
+	if bSvc := semantics.LookupString(reg, spanAccessor, semantics.ConceptDDBaseService); bSvc != "" {
+		s.Meta[string(semantics.ConceptDDBaseService)] = a.normalizeBaseService(ts, bSvc)
 	}
 
 	if a.conf.HasFeature("component2name") {
-		// This feature flag determines the component tag to become the span name.
-		//
-		// It works around the incompatibility between Opentracing and Datadog where the
-		// Opentracing operation name is many times invalid as a Datadog operation name (e.g. "/")
-		// and in Datadog terms it's the resource. Here, we aim to make the component the
-		// operation name to provide a better product experience.
-		if v, ok := s.Meta["component"]; ok {
+		if v := semantics.LookupString(reg, spanAccessor, semantics.ConceptComponent); v != "" {
 			s.Name = v
 		}
 	}
-	s.Name, err = normalizeutil.NormalizeName(s.Name)
-	switch err {
-	case normalizeutil.ErrEmpty:
-		ts.SpansMalformed.SpanNameEmpty.Inc()
-		log.Debugf("Fixing malformed trace. Name is empty (reason:span_name_empty), setting span.name=%s: %s", s.Name, s)
-	case normalizeutil.ErrTooLong:
-		ts.SpansMalformed.SpanNameTruncate.Inc()
-		log.Debugf("Fixing malformed trace. Name is too long (reason:span_name_truncate), truncating span.name to length=%d: %s", normalizeutil.MaxServiceLen, s)
-	case normalizeutil.ErrInvalid:
-		ts.SpansMalformed.SpanNameInvalid.Inc()
-		log.Debugf("Fixing malformed trace. Name is invalid (reason:span_name_invalid), setting span.name=%s: %s", s.Name, s)
-	}
+
+	s.Name, _ = a.normalizeName(ts, s.Name)
 
 	if s.Resource == "" {
 		ts.SpansMalformed.ResourceEmpty.Inc()
@@ -130,64 +252,95 @@ func (a *Agent) normalize(ts *info.TagStats, s *pb.Span) error {
 		s.Resource = s.Name
 	}
 
-	// ParentID, TraceID and SpanID set in the client could be the same
-	// Supporting the ParentID == TraceID == SpanID for the root span, is compliant
-	// with the Zipkin implementation. Furthermore, as described in the PR
-	// https://github.com/openzipkin/zipkin/pull/851 the constraint that the
-	// root span's ``trace id = span id`` has been removed
 	if s.ParentID == s.TraceID && s.ParentID == s.SpanID {
 		s.ParentID = 0
 		log.Debugf("span.normalize: `ParentID`, `TraceID` and `SpanID` are the same; `ParentID` set to 0: %d", s.TraceID)
 	}
 
-	// Start & Duration as nanoseconds timestamps
-	// if s.Start is very little, less than year 2000 probably a unit issue so discard
-	// (or it is "le bug de l'an 2000")
-	if s.Duration < 0 {
-		ts.SpansMalformed.InvalidDuration.Inc()
-		log.Debugf("Fixing malformed trace. Duration is invalid (reason:invalid_duration), setting span.duration=0: %s", s)
-		s.Duration = 0
-	}
-	if s.Duration > math.MaxInt64-s.Start {
-		ts.SpansMalformed.InvalidDuration.Inc()
-		log.Debugf("Fixing malformed trace. Duration is too large and causes overflow (reason:invalid_duration), setting span.duration=0: %s", s)
-		s.Duration = 0
-	}
-	if s.Start < Year2000NanosecTS {
-		ts.SpansMalformed.InvalidStartDate.Inc()
-		log.Debugf("Fixing malformed trace. Start date is invalid (reason:invalid_start_date), setting span.start=time.now(): %s", s)
-		now := time.Now().UnixNano()
-		s.Start = now - s.Duration
-		if s.Start < 0 {
-			s.Start = now
-		}
-	}
+	s.Duration = a.validateAndFixDuration(ts, s.Start, s.Duration)
+	s.Start = a.validateAndFixStartTime(ts, s.Start, s.Duration)
 
-	if len(s.Type) > MaxTypeLen {
-		ts.SpansMalformed.TypeTruncate.Inc()
-		log.Debugf("Fixing malformed trace. Type is too long (reason:type_truncate), truncating span.type to length=%d: %s", MaxTypeLen, s)
-		s.Type = normalizeutil.TruncateUTF8(s.Type, MaxTypeLen)
-	}
-	if env, ok := s.Meta["env"]; ok {
+	s.Type = a.validateAndFixType(ts, s.Type)
+
+	if env := semantics.LookupString(reg, spanAccessor, semantics.ConceptDDEnv); env != "" {
 		s.Meta["env"] = normalizeutil.NormalizeTagValue(env)
 	}
+
+	// TODO: We need to extend the semantic registry
+	// to allow validations or updates in place.
 	if sc, ok := s.Meta["http.status_code"]; ok {
-		if !isValidStatusCode(sc) {
-			ts.SpansMalformed.InvalidHTTPStatusCode.Inc()
-			log.Debugf("Fixing malformed trace. HTTP status code is invalid (reason:invalid_http_status_code), dropping invalid http.status_code=%s: %s", sc, s)
+		if _, valid := a.validateAndFixHTTPStatusCode(ts, sc); !valid {
 			delete(s.Meta, "http.status_code")
 		}
 	}
 
 	if len(s.SpanLinks) > 0 {
-		for _, link := range s.SpanLinks {
-			if val, ok := link.Attributes["link.name"]; ok {
-				link.Attributes["link.name"], err = normalizeutil.NormalizeName(val)
-				if err != nil {
-					log.Debugf("Fixing malformed trace. 'link.name' attribute in span link is invalid (reason=%q), setting link.Attributes[\"link.name\"]=%s", err, link.Attributes["link.name"])
-				}
-			}
+		a.normalizeSpanLinks(s.SpanLinks)
+	}
+	return nil
+}
+
+// normalizeV1 makes sure an InternalSpan is properly initialized and encloses the minimum required info, returning error if it
+// is invalid beyond repair
+func (a *Agent) normalizeV1(ts *info.TagStats, s *idx.InternalSpan) error {
+	if s.SpanID() == 0 {
+		ts.TracesDropped.SpanIDZero.Inc()
+		return fmt.Errorf("SpanID is zero (reason:span_id_zero): %v", s)
+	}
+
+	svc, _ := a.normalizeService(ts, s.Service(), ts.Lang)
+	s.SetService(svc)
+
+	reg := semantics.DefaultRegistry()
+	spanAccessorV1 := semantics.NewDDSpanAccessorV1(s)
+	if pSvc := semantics.LookupString(reg, spanAccessorV1, semantics.ConceptPeerService); pSvc != "" {
+		s.SetStringAttribute(string(semantics.ConceptPeerService), a.normalizePeerService(ts, pSvc))
+	}
+	if bSvc := semantics.LookupString(reg, spanAccessorV1, semantics.ConceptDDBaseService); bSvc != "" {
+		s.SetStringAttribute(string(semantics.ConceptDDBaseService), a.normalizeBaseService(ts, bSvc))
+	}
+
+	if a.conf.HasFeature("component2name") {
+		// Use GetAttributeAsString directly instead of the semantic registry:
+		// DDSpanAccessorV1.GetString only reads from the attributes map, but "component"
+		// is stored as a promoted field (ComponentRef) on V1 spans. GetAttributeAsString
+		// handles promoted fields correctly.
+		if v, ok := s.GetAttributeAsString(string(semantics.ConceptComponent)); ok && v != "" {
+			s.SetName(v)
 		}
+	}
+
+	newName, _ := a.normalizeName(ts, s.Name())
+	s.SetName(newName)
+
+	if s.Resource() == "" {
+		ts.SpansMalformed.ResourceEmpty.Inc()
+		log.Debugf("Fixing malformed trace. Resource is empty (reason:resource_empty), setting span.resource=%s: SpanID: %d, Service: %s", s.Name(), s.SpanID(), s.Service())
+		s.SetResource(s.Name())
+	}
+
+	if s.ParentID() == s.SpanID() {
+		s.SetParentID(0)
+		log.Debugf("span.normalize: `ParentID` and `SpanID` are the same; `ParentID` set to 0: %d", s.SpanID())
+	}
+
+	s.SetDuration(a.validateAndFixDurationV1(ts, s.Start(), s.Duration()))
+	s.SetStart(a.validateAndFixStartTimeV1(ts, s.Start(), s.Duration()))
+
+	s.SetType(a.validateAndFixType(ts, s.Type()))
+
+	if env := s.Env(); env != "" {
+		s.SetEnv(normalizeutil.NormalizeTagValue(env))
+	}
+
+	if sc, ok := s.GetAttributeAsString("http.status_code"); ok {
+		if _, valid := a.validateAndFixHTTPStatusCode(ts, sc); !valid {
+			s.DeleteAttribute("http.status_code")
+		}
+	}
+
+	if s.LenLinks() > 0 {
+		a.normalizeSpanLinksV1(s.Links())
 	}
 	return nil
 }
@@ -197,14 +350,15 @@ func (a *Agent) normalize(ts *info.TagStats, s *pb.Span) error {
 // * populates Priority field if it wasn't populated
 // * promotes the decision maker found in any internal span to a chunk tag
 func setChunkAttributes(chunk *pb.TraceChunk, root *pb.Span) {
+	reg := semantics.DefaultRegistry()
 	// check if priority is already populated
 	if chunk.Priority == int32(sampler.PriorityNone) {
 		// Older tracers set sampling priority in the root span.
-		if p, ok := root.Metrics[tagSamplingPriority]; ok {
+		if p, ok := semantics.LookupFloat64(reg, semantics.NewMetricsMapAccessor(root.Metrics), semantics.ConceptSamplingPriority); ok {
 			chunk.Priority = int32(p)
 		} else {
 			for _, s := range chunk.Spans {
-				if p, ok := s.Metrics[tagSamplingPriority]; ok {
+				if p, ok := semantics.LookupFloat64(reg, semantics.NewMetricsMapAccessor(s.Metrics), semantics.ConceptSamplingPriority); ok {
 					chunk.Priority = int32(p)
 					break
 				}
@@ -213,13 +367,18 @@ func setChunkAttributes(chunk *pb.TraceChunk, root *pb.Span) {
 	}
 	if chunk.Origin == "" && root.Meta != nil {
 		// Older tracers set origin in the root span.
-		chunk.Origin = root.Meta[tagOrigin]
+		chunk.Origin = semantics.LookupString(reg, semantics.NewStringMapAccessor(root.Meta), semantics.ConceptDDOrigin)
 	}
 
 	if _, ok := chunk.Tags[tagDecisionMaker]; !ok {
 		for _, span := range chunk.Spans {
 			// First span wins
 			if dm, ok := span.Meta[tagDecisionMaker]; ok {
+				// A v0.7 payload that omits the "tags" key decodes with a nil
+				// map; allocate before writing to avoid panicking on it.
+				if chunk.Tags == nil {
+					chunk.Tags = make(map[string]string, 1)
+				}
 				chunk.Tags[tagDecisionMaker] = dm
 				break
 			}
@@ -253,7 +412,7 @@ func (a *Agent) normalizeTrace(ts *info.TagStats, t pb.Trace) error {
 		if firstSpan == nil {
 			firstSpan = span
 		}
-		if span.TraceID != firstSpan.TraceID {
+		if !traceutil.SameTraceID(span, firstSpan) {
 			ts.TracesDropped.ForeignSpan.Inc()
 			return fmt.Errorf("trace has foreign span (reason:foreign_span): %s", span)
 		}
@@ -270,13 +429,54 @@ func (a *Agent) normalizeTrace(ts *info.TagStats, t pb.Trace) error {
 	return nil
 }
 
+// normalizeTraceChunkV1 takes a trace and
+// * logs a message and increments a metric if two spans have the same span_id
+// * rejects empty traces
+// * rejects traces where at least one span cannot be normalized
+// * return the normalized trace and an error:
+//   - nil if the trace can be accepted
+//   - a reason tag explaining the reason the traces failed normalization
+func (a *Agent) normalizeTraceChunkV1(ts *info.TagStats, t *idx.InternalTraceChunk) error {
+	if len(t.Spans) == 0 {
+		ts.TracesDropped.EmptyTrace.Inc()
+		return errors.New("trace is empty (reason:empty_trace)")
+	}
+
+	// Normalize the TraceID to exactly 16 bytes once here so every downstream slice is
+	// bounds-safe. The TraceID is a big-endian 128-bit value, so a short ID is
+	// right-aligned (missing high-order bytes are zero) and an over-long ID keeps its
+	// low-order 16 bytes.
+	if len(t.TraceID) != 16 {
+		var buf [16]byte
+		if len(t.TraceID) > 16 {
+			copy(buf[:], t.TraceID[len(t.TraceID)-16:])
+		} else {
+			copy(buf[16-len(t.TraceID):], t.TraceID)
+		}
+		t.TraceID = buf[:]
+	}
+
+	spanIDs := make(map[uint64]struct{})
+	for _, span := range t.Spans {
+		if err := a.normalizeV1(ts, span); err != nil {
+			return err
+		}
+		if _, ok := spanIDs[span.SpanID()]; ok {
+			ts.SpansMalformed.DuplicateSpanID.Inc()
+			log.Debugf("Found malformed trace with duplicate span ID (reason:duplicate_span_id): SpanID: %d, Service: %s, Name: %s, Resource: %s", span.SpanID(), span.Service(), span.Name(), span.Resource())
+		}
+		spanIDs[span.SpanID()] = struct{}{}
+	}
+
+	return nil
+}
+
 func (a *Agent) normalizeStatsGroup(b *pb.ClientGroupedStats, lang string) {
 	b.Name, _ = normalizeutil.NormalizeName(b.Name)
 	b.Service, _ = normalizeutil.NormalizeService(b.Service, lang)
 	if b.Resource == "" {
 		b.Resource = b.Name
 	}
-	b.Resource, _ = a.TruncateResource(b.Resource)
 }
 
 func isValidStatusCode(sc string) bool {

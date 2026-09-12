@@ -11,20 +11,21 @@ package cri
 import (
 	"time"
 
-	yaml "gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
+	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/agentperformance"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/generic"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/cri"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
 
@@ -42,20 +43,25 @@ type CRIConfig struct {
 // CRICheck grabs CRI metrics
 type CRICheck struct {
 	core.CheckBase
-	instance  *CRIConfig
-	processor generic.Processor
-	store     workloadmeta.Component
-	tagger    tagger.Component
+	instance         *CRIConfig
+	processor        generic.Processor
+	filterStore      workloadfilter.Component
+	store            workloadmeta.Component
+	tagger           tagger.Component
+	agentPerformance *agentperformance.Recorder
 }
 
 // Factory is exported for integration testing
-func Factory(store workloadmeta.Component, tagger tagger.Component) option.Option[func() check.Check] {
+func Factory(store workloadmeta.Component, filterStore workloadfilter.Component, tagger tagger.Component, telemetry telemetry.Component) option.Option[func() check.Check] {
+	agentPerformance := agentperformance.NewRecorder(telemetry)
 	return option.New(func() check.Check {
 		return &CRICheck{
-			CheckBase: core.NewCheckBase(CheckName),
-			instance:  &CRIConfig{},
-			store:     store,
-			tagger:    tagger,
+			CheckBase:        core.NewCheckBase(CheckName),
+			instance:         &CRIConfig{},
+			filterStore:      filterStore,
+			store:            store,
+			tagger:           tagger,
+			agentPerformance: agentPerformance,
 		}
 	})
 }
@@ -69,9 +75,9 @@ func (c *CRIConfig) Parse(data []byte) error {
 }
 
 // Configure parses the check configuration and init the check
-func (c *CRICheck) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string) error {
+func (c *CRICheck) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string, provider string) error {
 	var err error
-	if err = c.CommonConfigure(senderManager, initConfig, config, source); err != nil {
+	if err = c.CommonConfigure(senderManager, initConfig, config, source, provider); err != nil {
 		return err
 	}
 
@@ -79,12 +85,7 @@ func (c *CRICheck) Configure(senderManager sender.SenderManager, _ uint64, confi
 		return err
 	}
 
-	containerFilter, err := containers.GetSharedMetricFilter()
-	if err != nil {
-		log.Warnf("Can't get container include/exclude filter, no filtering will be applied: %v", err)
-	}
-
-	c.processor = generic.NewProcessor(metrics.GetProvider(option.New(c.store)), generic.NewMetadataContainerAccessor(c.store), metricsAdapter{}, getProcessorFilter(containerFilter, c.store), c.tagger)
+	c.processor = generic.NewProcessor(metrics.GetProvider(option.New(c.store)), generic.NewMetadataContainerAccessor(c.store), metricsAdapter{}, getProcessorFilter(c.filterStore.GetContainerSharedMetricFilters(), c.store), c.tagger, c.agentPerformance, false)
 	if c.instance.CollectDisk {
 		c.processor.RegisterExtension("cri-custom-metrics", &criCustomMetricsExtension{criGetter: func() (cri.CRIClient, error) {
 			return cri.GetUtil()
@@ -109,14 +110,14 @@ func (c *CRICheck) runProcessor(sender sender.Sender) error {
 	return c.processor.Run(sender, cacheValidity)
 }
 
-func getProcessorFilter(legacyFilter *containers.Filter, store workloadmeta.Component) generic.ContainerFilter {
+func getProcessorFilter(filterBundle workloadfilter.FilterBundle, store workloadmeta.Component) generic.ContainerFilter {
 	// Reject all containers that are not run by Docker
 	return generic.ANDContainerFilter{
 		Filters: []generic.ContainerFilter{
 			generic.FuncContainerFilter(func(container *workloadmeta.Container) bool {
 				return container.Labels[kubernetes.CriContainerNamespaceLabel] == ""
 			}),
-			generic.LegacyContainerFilter{OldFilter: legacyFilter, Store: store},
+			generic.LegacyContainerFilter{ContainerFilter: filterBundle, Store: store},
 		},
 	}
 }

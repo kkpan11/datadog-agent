@@ -9,12 +9,14 @@ package autoinstrumentation
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/version"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	mutatecommon "github.com/DataDog/datadog-agent/pkg/clusteragent/admission/mutate/common"
@@ -25,6 +27,13 @@ import (
 // Config is a struct to store the configuration for the autoinstrumentation logic. It can be populated using the
 // datadog config through NewConfig.
 type Config struct {
+	staticConfig
+	runtimeConfig
+}
+
+// staticConfig contains configuration derived exclusively from the Datadog Agent config.
+// It should not require any Kubernetes API calls to construct.
+type staticConfig struct {
 	// Webhook is the configuration for the autoinstrumentation webhook
 	Webhook *WebhookConfig
 
@@ -36,6 +45,18 @@ type Config struct {
 
 	// containerRegistry is the container registry to use for the autoinstrumentation logic
 	containerRegistry string
+
+	// registryAllowList restricts which registries can be used for library injection.
+	// When non-empty, libraries from registries not in this list will not be injected.
+	// An empty list allows all registries (default).
+	registryAllowList []string
+
+	// defaultDDRegistries contains the Datadog-owned registries that the automatic
+	// injection mode can safely use through the CSI driver without extra credentials.
+	defaultDDRegistries []string
+
+	// mutateUnlabelled is used to control if we require workloads to have a label when using Local Lib Injection.
+	mutateUnlabelled bool
 
 	// precomputed containerMutators for the security and profiling products
 	securityClientLibraryMutator  containerMutator
@@ -65,10 +86,21 @@ type Config struct {
 	// for the init containers.
 	defaultResourceRequirements initResourceRequirementConfiguration
 
-	// version is the version of the autoinstrumentation logic to use.
-	// We don't expose this option to the user, and [[instrumentationV1]]
-	// is deprecated and slated for removal.
-	version version
+	// podMetaAsTags is the unified configuration from [[configUtils.MetadataAsTags]]
+	// filtered to pod annotations and pod labels.
+	//
+	// This is used for picking a default service name for a given pod,
+	// see [[serviceNameMutator]].
+	podMetaAsTags podMetaAsTags
+}
+
+// runtimeConfig contains information derived from the runtime environment (e.g. cluster capabilities).
+// It's populated by outer wiring layers (webhook/controller constructors), not from static config.
+type runtimeConfig struct {
+	// kubeServerVersion is the Kubernetes API server version.
+	// It's populated by the webhook constructor (not from static config) and can be used
+	// to gate features that require a minimum Kubernetes version.
+	kubeServerVersion *version.Info
 }
 
 var excludedContainerNames = map[string]bool{
@@ -87,11 +119,6 @@ func NewConfig(datadogConfig config.Component) (*Config, error) {
 		return nil, err
 	}
 
-	version, err := instrumentationVersion(instrumentationConfig.Version)
-	if err != nil {
-		return nil, fmt.Errorf("invalid version for key apm_config.instrumentation.version: %w", err)
-	}
-
 	initResources, err := initDefaultResources(datadogConfig)
 	if err != nil {
 		return nil, err
@@ -108,35 +135,28 @@ func NewConfig(datadogConfig config.Component) (*Config, error) {
 	}
 
 	containerRegistry := mutatecommon.ContainerRegistry(datadogConfig, "admission_controller.auto_instrumentation.container_registry")
+	registryAllowList := datadogConfig.GetStringSlice("admission_controller.auto_instrumentation.container_registry_allow_list")
+	defaultDDRegistries := datadogConfig.GetStringSlice("admission_controller.auto_instrumentation.default_dd_registries")
+	mutateUnlabelled := datadogConfig.GetBool("admission_controller.mutate_unlabelled")
+
 	return &Config{
-		Webhook:                       NewWebhookConfig(datadogConfig),
-		LanguageDetection:             NewLanguageDetectionConfig(datadogConfig),
-		Instrumentation:               instrumentationConfig,
-		containerRegistry:             containerRegistry,
-		initResources:                 initResources,
-		initSecurityContext:           initSecurityContext,
-		defaultResourceRequirements:   defaultResourceRequirements,
-		securityClientLibraryMutator:  securityClientLibraryConfigMutators(datadogConfig),
-		profilingClientLibraryMutator: profilingClientLibraryConfigMutators(datadogConfig),
-		containerFilter:               excludedContainerNamesContainerFilter,
-		version:                       version,
+		staticConfig: staticConfig{
+			Webhook:                       NewWebhookConfig(datadogConfig),
+			LanguageDetection:             NewLanguageDetectionConfig(datadogConfig),
+			Instrumentation:               instrumentationConfig,
+			containerRegistry:             containerRegistry,
+			registryAllowList:             registryAllowList,
+			defaultDDRegistries:           defaultDDRegistries,
+			mutateUnlabelled:              mutateUnlabelled,
+			initResources:                 initResources,
+			initSecurityContext:           initSecurityContext,
+			defaultResourceRequirements:   defaultResourceRequirements,
+			securityClientLibraryMutator:  securityClientLibraryConfigMutators(datadogConfig),
+			profilingClientLibraryMutator: profilingClientLibraryConfigMutators(datadogConfig),
+			containerFilter:               excludedContainerNamesContainerFilter,
+			podMetaAsTags:                 getPodMetaAsTags(datadogConfig),
+		},
 	}, nil
-}
-
-// WebhookConfig use to store options from the config.Component for the autoinstrumentation webhook
-type WebhookConfig struct {
-	// IsEnabled is the flag to enable the autoinstrumentation webhook.
-	IsEnabled bool
-	// Endpoint is the endpoint to use for the autoinstrumentation webhook.
-	Endpoint string
-}
-
-// NewWebhookConfig retrieves the configuration for the autoinstrumentation webhook from the datadog config
-func NewWebhookConfig(datadogConfig config.Component) *WebhookConfig {
-	return &WebhookConfig{
-		IsEnabled: datadogConfig.GetBool("admission_controller.auto_instrumentation.enabled"),
-		Endpoint:  datadogConfig.GetString("admission_controller.auto_instrumentation.endpoint"),
-	}
 }
 
 // LanguageDetectionConfig is a struct to store the configuration for the language detection. It can be populated using
@@ -169,6 +189,10 @@ type InstrumentationConfig struct {
 	// caveat of the annotation based instrumentation. Full config
 	// key: apm_config.instrumentation.enabled
 	Enabled bool `mapstructure:"enabled" json:"enabled"`
+	// OnDemand keeps the SSI admission webhook available for runtime workload
+	// selection without enabling implicit instrumentation. Full config key:
+	// apm_config.instrumentation.on_demand
+	OnDemand bool `mapstructure:"on_demand" json:"on_demand"`
 	// EnabledNamespaces is a list of namespaces where the autoinstrumentation is enabled. If empty, it is enabled in
 	// all namespaces. EnabledNamespace and DisabledNamespaces are mutually exclusive and cannot be set together. Full
 	// config key: apm_config.instrumentation.enabled_namespaces
@@ -181,9 +205,6 @@ type InstrumentationConfig struct {
 	// the version of the library to inject. If empty, the auto instrumentation will inject all libraries. Full config
 	// key: apm_config.instrumentation.lib_versions
 	LibVersions map[string]string `mapstructure:"lib_versions" json:"lib_versions"`
-	// Version is the version of the autoinstrumentation logic to use. We don't expose this option to the user, and V1
-	// is deprecated and slated for removal. Full config key: apm_config.instrumentation.version
-	Version string `mapstructure:"version" json:"version"`
 	// InjectorImageTag is the tag of the image to use for the auto instrumentation injector library. Full config key:
 	// apm_config.instrumentation.injector_image_tag
 	InjectorImageTag string `mapstructure:"injector_image_tag" json:"injector_image_tag"`
@@ -191,6 +212,25 @@ type InstrumentationConfig struct {
 	// used. If no target matches, the auto instrumentation will not be applied. Full config key:
 	// apm_config.instrumentation.targets
 	Targets []Target `mapstructure:"targets" json:"targets"`
+	// InjectionMode determines the default method for injecting libraries into pods.
+	// Possible values: "auto" (default), "init_container" and "csi".
+	// Full config key: apm_config.instrumentation.injection_mode
+	InjectionMode string `mapstructure:"injection_mode" json:"injection_mode"`
+	// CSIDriverDetectionEnabled is a temporary feature flag gating the CSI
+	// auto-detection logic in the library-injection AutoProvider. When true,
+	// AutoProvider may switch to the CSI provider if the Datadog CSI driver
+	// is registered in the cluster. Full config key:
+	// apm_config.instrumentation.csi_driver_detection_enabled.
+	//
+	// The field is unused by this struct's consumers: the flag is read
+	// directly via config.GetBool both in the cluster-agent entry point (to
+	// decide whether to start the CSIDriverWatcher) and in the workloadmeta
+	// kubeapiserver collector (to decide whether to watch
+	// csidrivers.storage.k8s.io). It must still be declared here because
+	// NewInstrumentationConfig unmarshals apm_config.instrumentation with
+	// structure.ErrorUnused: without this field, setting the flag would
+	// crash the cluster-agent at startup.
+	CSIDriverDetectionEnabled bool `mapstructure:"csi_driver_detection_enabled" json:"csi_driver_detection_enabled"`
 }
 
 // NewInstrumentationConfig creates a new InstrumentationConfig from the datadog config. It returns an error if the
@@ -204,23 +244,23 @@ func NewInstrumentationConfig(datadogConfig config.Component) (*InstrumentationC
 
 	// Ensure both enabled and disabled namespaces are not set together.
 	if len(cfg.EnabledNamespaces) > 0 && len(cfg.DisabledNamespaces) > 0 {
-		return nil, fmt.Errorf("apm_config.instrumentation.enabled_namespaces and apm_config.instrumentation.disabled_namespaces are mutually exclusive and cannot be set together")
+		return nil, errors.New("apm_config.instrumentation.enabled_namespaces and apm_config.instrumentation.disabled_namespaces are mutually exclusive and cannot be set together")
 	}
 
 	// Ensure both enabled namespaces and targets are not set together.
 	if len(cfg.EnabledNamespaces) > 0 && len(cfg.Targets) > 0 {
-		return nil, fmt.Errorf("apm_config.instrumentation.enabled_namespaces and apm_config.instrumentation.targets are mutually exclusive and cannot be set together")
+		return nil, errors.New("apm_config.instrumentation.enabled_namespaces and apm_config.instrumentation.targets are mutually exclusive and cannot be set together")
 	}
 
 	// Ensure both library versions and targets are not set together.
 	if len(cfg.LibVersions) > 0 && len(cfg.Targets) > 0 {
-		return nil, fmt.Errorf("apm_config.instrumentation.lib_versions and apm_config.instrumentation.targets are mutually exclusive and cannot be set together")
+		return nil, errors.New("apm_config.instrumentation.lib_versions and apm_config.instrumentation.targets are mutually exclusive and cannot be set together")
 	}
 
 	// Ensure both namespace names and labels are not set together.
 	for _, target := range cfg.Targets {
 		if target.NamespaceSelector != nil && len(target.NamespaceSelector.MatchNames) > 0 && (len(target.NamespaceSelector.MatchLabels) > 0 || len(target.NamespaceSelector.MatchExpressions) > 0) {
-			return nil, fmt.Errorf("apm_config.instrumentation.targets[].namespaceSelector.matchNames and apm_config.instrumentation.targets[].namespaceSelector.matchLabels/matchExpressions are mutually exclusive and cannot be set together")
+			return nil, errors.New("apm_config.instrumentation.targets[].namespaceSelector.matchNames and apm_config.instrumentation.targets[].namespaceSelector.matchLabels/matchExpressions are mutually exclusive and cannot be set together")
 		}
 	}
 
@@ -346,17 +386,12 @@ func (c *TracerConfig) AsEnvVar() corev1.EnvVar {
 	}
 }
 
-var (
-	minimumCPULimit    resource.Quantity = resource.MustParse("0.05")  // 0.05 core, otherwise copying + library initialization is going to take forever
-	minimumMemoryLimit resource.Quantity = resource.MustParse("100Mi") // 100 MB (recommended minimum by Alpine)
-)
-
 type initResourceRequirementConfiguration map[corev1.ResourceName]resource.Quantity
 
-// getOptionalBoolValue returns a pointer to a bool corresponding to the config value if the key is set in the config
+// getOptionalBoolValue returns a pointer to a bool corresponding to the config value if the key is configured
 func getOptionalBoolValue(datadogConfig config.Component, key string) *bool {
 	var value *bool
-	if datadogConfig.IsSet(key) {
+	if datadogConfig.IsConfigured(key) {
 		tmp := datadogConfig.GetBool(key)
 		value = &tmp
 	}
@@ -364,10 +399,10 @@ func getOptionalBoolValue(datadogConfig config.Component, key string) *bool {
 	return value
 }
 
-// getOptionalBoolValue returns a pointer to a bool corresponding to the config value if the key is set in the config
+// getOptionalStringValue returns a pointer to a string corresponding to the config value if the key is configured
 func getOptionalStringValue(datadogConfig config.Component, key string) *string {
 	var value *string
-	if datadogConfig.IsSet(key) {
+	if datadogConfig.IsConfigured(key) {
 		tmp := datadogConfig.GetString(key)
 		value = &tmp
 	}
@@ -387,67 +422,108 @@ type pinnedLibraries struct {
 // given a registry.
 func getPinnedLibraries(libVersions map[string]string, registry string, checkDefaults bool) pinnedLibraries {
 	libs := []libInfo{}
+	defaultLanguages := defaultInjectedLanguagesMap()
 	allDefaults := true
 
 	for lang, version := range libVersions {
 		l := language(lang)
 		if !l.isSupported() {
 			log.Warnf("APM Instrumentation detected configuration for unsupported language: %s. Tracing library for %s will not be injected", lang, lang)
+			allDefaults = false
 			continue
 		}
 
-		info := l.libInfo("", l.libImageName(registry, version))
+		info := l.libInfoWithResolver("", registry, version)
 		log.Infof("Library version %s is specified for language %s, going to use %s", version, lang, info.image)
 		libs = append(libs, info)
 
-		if info.image != l.libImageName(registry, l.defaultLibVersion()) {
+		if !defaultLanguages[l] || info.image != l.libImageName(registry, l.defaultLibVersion()) {
 			allDefaults = false
 		}
+		delete(defaultLanguages, l)
 	}
 
 	return pinnedLibraries{
 		libs:             libs,
-		areSetToDefaults: checkDefaults && allDefaults && len(libs) == len(defaultSupportedLanguagesMap()),
+		areSetToDefaults: checkDefaults && allDefaults && len(defaultLanguages) == 0,
 	}
 }
 
 func initDefaultResources(datadogConfig config.Component) (initResourceRequirementConfiguration, error) {
 	conf := initResourceRequirementConfiguration{}
 
-	if datadogConfig.IsSet("admission_controller.auto_instrumentation.init_resources.cpu") {
+	if datadogConfig.IsConfigured("admission_controller.auto_instrumentation.init_resources.cpu") {
 		quantity, err := resource.ParseQuantity(datadogConfig.GetString("admission_controller.auto_instrumentation.init_resources.cpu"))
 		if err != nil {
 			return conf, err
 		}
 		conf[corev1.ResourceCPU] = quantity
-	} /* else {
-		conf[corev1.ResourceCPU] = *resource.NewMilliQuantity(minimumCPULimit, resource.DecimalSI)
-	}*/
+	}
 
-	if datadogConfig.IsSet("admission_controller.auto_instrumentation.init_resources.memory") {
+	if datadogConfig.IsConfigured("admission_controller.auto_instrumentation.init_resources.memory") {
 		quantity, err := resource.ParseQuantity(datadogConfig.GetString("admission_controller.auto_instrumentation.init_resources.memory"))
 		if err != nil {
 			return conf, err
 		}
 		conf[corev1.ResourceMemory] = quantity
-	} /*else {
-		conf[corev1.ResourceCPU] = *resource.NewMilliQuantity(minimumMemoryLimit, resource.DecimalSI)
-	}*/
+	}
 
 	return conf, nil
 }
 
 func parseInitSecurityContext(datadogConfig config.Component) (*corev1.SecurityContext, error) {
-	securityContext := corev1.SecurityContext{}
 	confKey := "admission_controller.auto_instrumentation.init_security_context"
-
-	if datadogConfig.IsSet(confKey) {
+	if datadogConfig.IsConfigured(confKey) {
 		confValue := datadogConfig.GetString(confKey)
+		var securityContext corev1.SecurityContext
 		err := json.Unmarshal([]byte(confValue), &securityContext)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get init security context from configuration, %s=`%s`: %v", confKey, confValue, err)
 		}
+
+		return &securityContext, nil
 	}
 
-	return &securityContext, nil
+	return nil, nil
+}
+
+// The config for ASM/IAST/SCA has three states: <unset> | true | false.
+// * <unset> - product disactivated but can be activated remotely
+// * true - product activated, not overridable remotely
+// * false - product disactivated, not overridable remotely
+func securityClientLibraryConfigMutators(datadogConfig config.Component) containerMutators {
+	asmEnabled := getOptionalBoolValue(datadogConfig, "admission_controller.auto_instrumentation.asm.enabled")
+	iastEnabled := getOptionalBoolValue(datadogConfig, "admission_controller.auto_instrumentation.iast.enabled")
+	asmScaEnabled := getOptionalBoolValue(datadogConfig, "admission_controller.auto_instrumentation.asm_sca.enabled")
+
+	var mutators []containerMutator
+	if asmEnabled != nil {
+		mutators = append(mutators, newConfigEnvVarFromBoolMutator("DD_APPSEC_ENABLED", asmEnabled))
+	}
+
+	if iastEnabled != nil {
+		mutators = append(mutators, newConfigEnvVarFromBoolMutator("DD_IAST_ENABLED", iastEnabled))
+	}
+
+	if asmScaEnabled != nil {
+		mutators = append(mutators, newConfigEnvVarFromBoolMutator("DD_APPSEC_SCA_ENABLED", asmScaEnabled))
+	}
+
+	return mutators
+}
+
+// The config for profiling has four states: <unset> | "auto" | "true" | "false".
+// * <unset> - profiling not activated, but can be activated remotely
+// * "true" - profiling activated unconditionally, not overridable remotely
+// * "false" - profiling deactivated, not overridable remotely
+// * "auto" - profiling activates per-process heuristically, not overridable remotely
+func profilingClientLibraryConfigMutators(datadogConfig config.Component) containerMutators {
+	profilingEnabled := getOptionalStringValue(datadogConfig, "admission_controller.auto_instrumentation.profiling.enabled")
+
+	var mutators []containerMutator
+	if profilingEnabled != nil {
+		mutators = append(mutators, newConfigEnvVarFromStringMutator("DD_PROFILING_ENABLED", profilingEnabled))
+	}
+
+	return mutators
 }

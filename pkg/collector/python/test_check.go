@@ -8,7 +8,7 @@
 package python
 
 import (
-	"fmt"
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -115,16 +115,18 @@ const char *get_check_init_config = NULL;
 const char *get_check_instance = NULL;
 const char *get_check_check_id = NULL;
 const char *get_check_check_name = NULL;
+const char *get_check_provider = NULL;
 rtloader_pyobject_t *get_check_check = NULL;
 
 int get_check(rtloader_t *rtloader, rtloader_pyobject_t *py_class, const char *init_config, const char *instance,
-const char *check_id, const char *check_name, rtloader_pyobject_t **check) {
+const char *check_id, const char *check_name, const char *provider, rtloader_pyobject_t **check) {
 
 	get_check_py_class = py_class;
 	get_check_init_config = strdup(init_config);
 	get_check_instance = strdup(instance);
 	get_check_check_id = strdup(check_id);
 	get_check_check_name = strdup(check_name);
+	get_check_provider = strdup(provider);
 	*check = get_check_check;
 
 	get_check_calls++;
@@ -141,11 +143,12 @@ const char *get_check_deprecated_instance = NULL;
 const char *get_check_deprecated_check_id = NULL;
 const char *get_check_deprecated_check_name = NULL;
 const char *get_check_deprecated_agent_config = NULL;
+const char *get_check_deprecated_provider = NULL;
 rtloader_pyobject_t *get_check_deprecated_check = NULL;
 
 int get_check_deprecated(rtloader_t *rtloader, rtloader_pyobject_t *py_class, const char *init_config,
 const char *instance, const char *agent_config, const char *check_id, const char *check_name,
-rtloader_pyobject_t **check) {
+const char *provider, rtloader_pyobject_t **check) {
 
 	get_check_deprecated_py_class = py_class;
 	get_check_deprecated_init_config = strdup(init_config);
@@ -153,6 +156,7 @@ rtloader_pyobject_t **check) {
 	get_check_deprecated_check_id = strdup(check_id);
 	get_check_deprecated_check_name = strdup(check_name);
 	get_check_deprecated_agent_config = strdup(agent_config);
+	get_check_deprecated_provider = strdup(provider);
 	*check = get_check_deprecated_check;
 
 	get_check_deprecated_calls++;
@@ -181,6 +185,7 @@ void reset_check_mock() {
 	get_check_instance = NULL;
 	get_check_check_id = NULL;
 	get_check_check_name = NULL;
+	get_check_provider = NULL;
 	get_check_check = NULL;
 	cancel_check_calls = 0;
 	cancel_check_instance = NULL;
@@ -193,6 +198,7 @@ void reset_check_mock() {
 	get_check_deprecated_check_id = NULL;
 	get_check_deprecated_check_name = NULL;
 	get_check_deprecated_agent_config = NULL;
+	get_check_deprecated_provider = NULL;
 	get_check_deprecated_check = NULL;
 
 	get_check_diagnoses_return = NULL;
@@ -230,7 +236,7 @@ func testRunCheck(t *testing.T) {
 	assert.Equal(t, C.int(1), C.get_checks_warnings_calls)
 
 	assert.Equal(t, check.instance, C.run_check_instance)
-	assert.Equal(t, check.lastWarnings, []error{fmt.Errorf("warn1"), fmt.Errorf("warn2")})
+	assert.Equal(t, check.lastWarnings, []error{errors.New("warn1"), errors.New("warn2")})
 }
 
 func testRunCheckWithRuntimeNotInitializedError(t *testing.T) {
@@ -248,11 +254,7 @@ func testRunCheckWithRuntimeNotInitializedError(t *testing.T) {
 	rtloader = nil
 
 	err = check.runCheck(false)
-	assert.EqualError(
-		t,
-		err,
-		"error acquiring the GIL: rtloader is not initialized",
-	)
+	assert.ErrorIs(t, err, ErrNotInitialized)
 }
 
 func testInitiCheckWithRuntimeNotInitialized(t *testing.T) {
@@ -265,11 +267,7 @@ func testInitiCheckWithRuntimeNotInitialized(t *testing.T) {
 		return
 	}
 
-	assert.EqualError(
-		t,
-		err,
-		"error acquiring the GIL: rtloader is not initialized",
-	)
+	assert.ErrorIs(t, err, ErrNotInitialized)
 
 	assert.Equal(t, C.int(0), C.gil_locked_calls)
 	assert.Equal(t, C.int(0), C.gil_unlocked_calls)
@@ -304,6 +302,7 @@ func testCheckCancel(t *testing.T) {
 	assert.Equal(t, check.instance, C.run_check_instance)
 
 	check.Cancel()
+	assert.True(t, check.cancelled)
 
 	// Check that the lock was acquired
 	assert.Equal(t, C.int(2), C.gil_locked_calls)
@@ -442,7 +441,7 @@ func testRunErrorNil(t *testing.T) {
 
 	errStr := check.runCheck(false)
 	assert.NotNil(t, errStr)
-	assert.NotNil(t, fmt.Errorf("some error"), errStr)
+	assert.NotNil(t, errors.New("some error"), errStr)
 
 	assert.Equal(t, C.int(1), C.gil_locked_calls)
 	assert.Equal(t, C.int(1), C.gil_unlocked_calls)
@@ -467,7 +466,7 @@ func testRunErrorReturn(t *testing.T) {
 
 	errStr := check.runCheck(false)
 	assert.NotNil(t, errStr)
-	assert.NotNil(t, fmt.Errorf("not OK"), errStr)
+	assert.NotNil(t, errors.New("not OK"), errStr)
 
 	assert.Equal(t, C.int(1), C.gil_locked_calls)
 	assert.Equal(t, C.int(1), C.gil_unlocked_calls)
@@ -478,7 +477,7 @@ func testRunErrorReturn(t *testing.T) {
 }
 
 func testRun(t *testing.T) {
-	sender := mocksender.NewMockSender(checkid.ID("testID"))
+	sender := mocksender.NewMockSender(t, checkid.ID("testID"))
 	sender.SetupAcceptAll()
 
 	mockRtloader(t)
@@ -510,7 +509,7 @@ func testRun(t *testing.T) {
 }
 
 func testRunSimple(t *testing.T) {
-	sender := mocksender.NewMockSender(checkid.ID("testID"))
+	sender := mocksender.NewMockSender(t, checkid.ID("testID"))
 	sender.SetupAcceptAll()
 
 	mockRtloader(t)
@@ -544,7 +543,7 @@ func testRunSimple(t *testing.T) {
 func testConfigure(t *testing.T) {
 	mockRtloader(t)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
 	c, err := NewPythonFakeCheck(senderManager)
 	if !assert.Nil(t, err) {
 		return
@@ -556,7 +555,7 @@ func testConfigure(t *testing.T) {
 
 	C.get_check_return = 1
 	C.get_check_check = newMockPyObjectPtr()
-	err = c.Configure(senderManager, integration.FakeConfigHash, integration.Data("{\"val\": 21}"), integration.Data("{\"val\": 21}"), "test")
+	err = c.Configure(senderManager, integration.FakeConfigHash, integration.Data("{\"val\": 21}"), integration.Data("{\"val\": 21}"), "test", "provider")
 	assert.Nil(t, err)
 
 	assert.Equal(t, c.class, C.get_check_py_class)
@@ -564,6 +563,7 @@ func testConfigure(t *testing.T) {
 	assert.Equal(t, "{\"val\": 21}", C.GoString(C.get_check_instance))
 	assert.Equal(t, string(c.id), C.GoString(C.get_check_check_id))
 	assert.Equal(t, "fake_check", C.GoString(C.get_check_check_name))
+	assert.Equal(t, "provider", C.GoString(C.get_check_provider))
 	assert.Equal(t, C.get_check_check, c.instance)
 
 	assert.Nil(t, C.get_check_deprecated_py_class)
@@ -572,13 +572,14 @@ func testConfigure(t *testing.T) {
 	assert.Nil(t, C.get_check_deprecated_check_id)
 	assert.Nil(t, C.get_check_deprecated_check_name)
 	assert.Nil(t, C.get_check_deprecated_agent_config)
+	assert.Nil(t, C.get_check_deprecated_provider)
 	assert.Nil(t, C.get_check_deprecated_check)
 }
 
 func testConfigureDeprecated(t *testing.T) {
 	mockRtloader(t)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
 	c, err := NewPythonFakeCheck(senderManager)
 	if !assert.Nil(t, err) {
 		return
@@ -591,7 +592,7 @@ func testConfigureDeprecated(t *testing.T) {
 	C.get_check_return = 0
 	C.get_check_deprecated_check = newMockPyObjectPtr()
 	C.get_check_deprecated_return = 1
-	err = c.Configure(senderManager, integration.FakeConfigHash, integration.Data("{\"val\": 21}"), integration.Data("{\"val\": 21}"), "test")
+	err = c.Configure(senderManager, integration.FakeConfigHash, integration.Data("{\"val\": 21}"), integration.Data("{\"val\": 21}"), "test", "provider")
 	assert.Nil(t, err)
 
 	assert.Equal(t, c.class, C.get_check_py_class)
@@ -599,6 +600,7 @@ func testConfigureDeprecated(t *testing.T) {
 	assert.Equal(t, "{\"val\": 21}", C.GoString(C.get_check_instance))
 	assert.Equal(t, string(c.id), C.GoString(C.get_check_check_id))
 	assert.Equal(t, "fake_check", C.GoString(C.get_check_check_name))
+	assert.Equal(t, "provider", C.GoString(C.get_check_provider))
 	assert.Nil(t, C.get_check_check)
 
 	assert.Equal(t, c.class, C.get_check_deprecated_py_class)
@@ -608,6 +610,7 @@ func testConfigureDeprecated(t *testing.T) {
 	assert.Equal(t, "fake_check", C.GoString(C.get_check_deprecated_check_name))
 	require.NotNil(t, C.get_check_deprecated_agent_config)
 	assert.NotEqual(t, "", C.GoString(C.get_check_deprecated_agent_config))
+	assert.Equal(t, "provider", C.GoString(C.get_check_deprecated_provider))
 	assert.Equal(t, c.instance, C.get_check_deprecated_check)
 }
 
@@ -663,6 +666,34 @@ func testGetDiagnoses(t *testing.T) {
 	assert.Zero(t, len(diagnoses[1].Category))
 	assert.Zero(t, len(diagnoses[1].Description))
 	assert.Zero(t, len(diagnoses[1].Remediation))
+}
+
+func testRunAfterCancel(t *testing.T) {
+	mockRtloader(t)
+
+	check, err := NewPythonFakeCheck(aggregator.NewNoOpSenderManager())
+	require.Nil(t, err)
+
+	check.instance = newMockPyObjectPtr()
+
+	C.reset_check_mock()
+	C.run_check_return = C.CString("")
+
+	err = check.runCheck(false)
+	assert.Nil(t, err)
+
+	check.Cancel()
+	assert.True(t, check.cancelled)
+
+	err = check.runCheck(false)
+	assert.EqualError(t, err, "check fake_check is already cancelled")
+
+	// the lock is acquired to run, cancel, and again to run
+	// but run_check is only called the first time
+	assert.Equal(t, C.int(3), C.gil_locked_calls)
+	assert.Equal(t, C.int(3), C.gil_unlocked_calls)
+	assert.Equal(t, C.int(1), C.run_check_calls)
+
 }
 
 // NewPythonFakeCheck create a fake PythonCheck

@@ -5,8 +5,18 @@ Common utilities for building Cluster Agent variants
 import os
 import shutil
 
-from tasks.build_tags import filter_incompatible_tags, get_build_tags
+from tasks.libs.build.bazel import build_binary_with_bazel
+from tasks.libs.common.go import go_build
 from tasks.libs.common.utils import REPO_PATH, bin_name, get_build_flags, get_version
+from tasks.schema.generate import compress as schema_compress
+from tasks.schema.template import CORE_SCHEMA_FILE, generate_template
+
+# Maps cluster-agent binary suffix to (build_type, output file).
+# Empty suffix -> mainline cluster-agent (dca); -cloudfoundry -> dcacf.
+_CLUSTER_AGENT_RENDER_TARGETS = {
+    "": ("dca", "./Dockerfiles/cluster-agent/datadog-cluster.yaml"),
+    "-cloudfoundry": ("dcacf", "./cloudfoundry.yaml"),
+}
 
 
 def build_common(
@@ -21,42 +31,43 @@ def build_common(
     development,
     skip_assets,
     go_mod="readonly",
-    major_version="7",
+    cover=False,
+    enable_bazel=False,
 ):
     """
     Build Cluster Agent
     """
 
-    build_include = build_tags if build_include is None else filter_incompatible_tags(build_include.split(","))
-    build_exclude = [] if build_exclude is None else build_exclude.split(",")
-    build_tags = get_build_tags(build_include, build_exclude)
+    schema_compress(ctx)
 
-    # We rely on the go libs embedded in the debian stretch image to build dynamically
-    ldflags, gcflags, env = get_build_flags(ctx, static=False, major_version=major_version)
+    agent_bin = os.path.join(bin_path, bin_name(f"datadog-cluster-agent{bin_suffix}"))
 
-    cmd = "go build -mod={go_mod} {race_opt} {build_type} -tags '{build_tags}' -o {bin_name} "
-    cmd += "-gcflags=\"{gcflags}\" -ldflags=\"{ldflags}\" {REPO_PATH}/cmd/cluster-agent{suffix}"
-    args = {
-        "go_mod": go_mod,
-        "race_opt": "-race" if race else "",
-        "build_type": "-a" if rebuild else "",
-        "build_tags": " ".join(build_tags),
-        "bin_name": os.path.join(bin_path, bin_name(f"datadog-cluster-agent{bin_suffix}")),
-        "gcflags": gcflags,
-        "ldflags": ldflags,
-        "REPO_PATH": REPO_PATH,
-        "suffix": bin_suffix,
-    }
+    if enable_bazel:
+        build_binary_with_bazel(f"//cmd/cluster-agent{bin_suffix}", bin_path=agent_bin)
+    else:
+        # We rely on the go libs embedded in the debian stretch image to build dynamically
+        ldflags, gcflags, env = get_build_flags(ctx, static=False)
 
-    ctx.run(cmd.format(**args), env=env)
-    # Render the configuration file template
-    #
-    # We need to remove cross compiling bits if any because go generate must
-    # build and execute in the native platform
-    env.update({"GOOS": "", "GOARCH": ""})
+        go_build(
+            ctx,
+            f"{REPO_PATH}/cmd/cluster-agent{bin_suffix}",
+            mod=go_mod,
+            race=race,
+            rebuild=rebuild,
+            gcflags=gcflags,
+            ldflags=ldflags,
+            build_tags=build_tags,
+            bin_path=agent_bin,
+            env=env,
+            check_deadcode=os.getenv("DEPLOY_AGENT") == "true",
+            coverage=cover,
+        )
 
-    cmd = "go generate -mod={go_mod} -tags '{build_tags}' {repo_path}/cmd/cluster-agent{suffix}"
-    ctx.run(cmd.format(go_mod=go_mod, build_tags=" ".join(build_tags), repo_path=REPO_PATH, suffix=bin_suffix), env=env)
+    # Render the configuration file template. The cluster-agent and the
+    # cloudfoundry variant only ship on linux, so we always target linux
+    # (matches the legacy `go generate` behavior on the native build host).
+    build_type, output = _CLUSTER_AGENT_RENDER_TARGETS[bin_suffix]
+    generate_template(CORE_SCHEMA_FILE, output, build_type, "linux")
 
     if not skip_assets:
         refresh_assets_common(

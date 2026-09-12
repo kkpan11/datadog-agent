@@ -95,6 +95,7 @@ type Check struct {
 	dbVersion                               string
 	driver                                  string
 	metricLastRun                           time.Time
+	customQueryLastRuns                     []time.Time
 	statementsLastRun                       time.Time
 	dbInstanceLastRun                       time.Time
 	tablespaceLastRun                       time.Time
@@ -129,7 +130,8 @@ type vDatabase struct {
 func handleServiceCheck(c *Check, err error) {
 	sender, errSender := c.GetSender()
 	if errSender != nil {
-		log.Errorf("%s failed to get sender for service check %s", c.logPrompt, err)
+		log.Errorf("%s failed to get sender for service check: %s", c.logPrompt, errSender)
+		return
 	}
 
 	message := ""
@@ -141,6 +143,10 @@ func handleServiceCheck(c *Check, err error) {
 		log.Errorf("%s failed to connect: %s", c.logPrompt, err)
 	}
 	sendServiceCheck(c, "oracle.can_connect", status, message)
+	if status == servicecheck.ServiceCheckCritical {
+		// If we can't connect, we can't query
+		sendServiceCheck(c, serviceCheckName, status, message)
+	}
 	sender.Commit()
 }
 
@@ -170,7 +176,7 @@ func (c *Check) Run() error {
 		}
 		if db == nil {
 			c.Teardown()
-			handleServiceCheck(c, fmt.Errorf("empty connection"))
+			handleServiceCheck(c, errors.New("empty connection"))
 			return fmt.Errorf("%s empty connection", c.logPrompt)
 		}
 		c.db = db
@@ -217,7 +223,7 @@ func (c *Check) Run() error {
 			if errConnect != nil {
 				handleServiceCheck(c, errConnect)
 			} else if db == nil {
-				handleServiceCheck(c, fmt.Errorf("empty connection"))
+				handleServiceCheck(c, errors.New("empty connection"))
 			} else {
 				handleServiceCheck(c, nil)
 			}
@@ -227,49 +233,46 @@ func (c *Check) Run() error {
 			handleServiceCheck(c, nil)
 		}
 
-		if c.config.OnlyCustomQueries {
-			if metricIntervalExpired && (len(c.config.InstanceConfig.CustomQueries) > 0 || len(c.config.InitConfig.CustomQueries) > 0) {
-				err = c.CustomQueries()
-				var message string
-				var status servicecheck.ServiceCheckStatus
-				if allErrors == nil {
-					status = servicecheck.ServiceCheckOK
-				} else {
-					status = servicecheck.ServiceCheckCritical
-					message = allErrors.Error()
-				}
-				sendServiceCheck(c, serviceCheckName, status, message)
-				commit(c)
-				return err
-			}
-		}
-
-		if !c.legacyIntegrationCompatibilityMode {
+		if !c.config.OnlyCustomQueries && !c.legacyIntegrationCompatibilityMode {
 			err := c.OS_Stats()
 			if err != nil {
 				allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect os stats %w", c.logPrompt, err))
 			}
 		}
 
-		if c.config.SysMetrics.Enabled {
-			log.Debugf("%s Entered sysmetrics", c.logPrompt)
-			_, err := c.sysMetrics()
-			if err != nil {
-				allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect sysmetrics %w", c.logPrompt, err))
+		if !c.config.OnlyCustomQueries {
+			if c.config.SysMetrics.Enabled {
+				log.Debugf("%s Entered sysmetrics", c.logPrompt)
+				_, err := c.sysMetrics()
+				if err != nil {
+					allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect sysmetrics %w", c.logPrompt, err))
+				}
+			}
+			if c.config.ProcessMemory.Enabled || c.config.InactiveSessions.Enabled {
+				err := c.ProcessMemory()
+				if err != nil {
+					allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect process memory %w", c.logPrompt, err))
+				}
 			}
 		}
-		if c.config.ProcessMemory.Enabled || c.config.InactiveSessions.Enabled {
-			err := c.ProcessMemory()
-			if err != nil {
-				allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect process memory %w", c.logPrompt, err))
-			}
+	}
+
+	if len(c.config.InstanceConfig.CustomQueries) > 0 || len(c.config.InitConfig.CustomQueries) > 0 {
+		if err := c.CustomQueries(); err != nil {
+			allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to execute custom queries %w", c.logPrompt, err))
 		}
-		if metricIntervalExpired && (len(c.config.InstanceConfig.CustomQueries) > 0 || len(c.config.InitConfig.CustomQueries) > 0) {
-			err := c.CustomQueries()
-			if err != nil {
-				allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to execute custom queries %w", c.logPrompt, err))
-			}
+	}
+
+	if c.config.OnlyCustomQueries {
+		var message string
+		status := servicecheck.ServiceCheckOK
+		if allErrors != nil {
+			status = servicecheck.ServiceCheckCritical
+			message = allErrors.Error()
 		}
+		sendServiceCheck(c, serviceCheckName, status, message)
+		commit(c)
+		return allErrors
 	}
 
 	tablespaceIntervalExpired := checkIntervalExpired(&c.tablespaceLastRun, c.config.Tablespaces.CollectionInterval)
@@ -369,17 +372,18 @@ func (c *Check) Teardown() {
 }
 
 // Configure configures the Oracle check.
-func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, rawInstance integration.Data, rawInitConfig integration.Data, source string) error {
+func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigDigest uint64, rawInstance integration.Data, rawInitConfig integration.Data, source string, provider string) error {
 	var err error
 	c.config, err = config.NewCheckConfig(rawInstance, rawInitConfig)
 	if err != nil {
 		return fmt.Errorf("failed to build check config: %w", err)
 	}
+	c.clock = clock.New()
 
 	// Must be called before c.CommonConfigure because this integration supports multiple instances
 	c.BuildID(integrationConfigDigest, rawInstance, rawInitConfig)
 
-	if err := c.CommonConfigure(senderManager, rawInitConfig, rawInstance, source); err != nil {
+	if err := c.CommonConfigure(senderManager, rawInitConfig, rawInstance, source, provider); err != nil {
 		return fmt.Errorf("common configure failed: %s", err)
 	}
 
@@ -397,19 +401,19 @@ func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigD
 	tags := make([]string, len(c.config.Tags))
 	copy(tags, c.config.Tags)
 
-	tags = append(tags, fmt.Sprintf("dbms:%s", common.IntegrationName), fmt.Sprintf("ddagentversion:%s", c.agentVersion))
+	tags = append(tags, "dbms:"+common.IntegrationName, "ddagentversion:"+c.agentVersion)
 	tags = append(tags, fmt.Sprintf("dbm:%t", c.dbmEnabled))
 	if c.config.TnsAlias != "" {
-		tags = append(tags, fmt.Sprintf("tns-alias:%s", c.config.TnsAlias))
+		tags = append(tags, "tns-alias:"+c.config.TnsAlias)
 	}
 	if c.config.Port != 0 {
 		tags = append(tags, fmt.Sprintf("port:%d", c.config.Port))
 	}
 	if c.config.Server != "" {
-		tags = append(tags, fmt.Sprintf("server:%s", c.config.Server))
+		tags = append(tags, "server:"+c.config.Server)
 	}
 	if c.config.ServiceName != "" {
-		tags = append(tags, fmt.Sprintf("service:%s", c.config.ServiceName))
+		tags = append(tags, "service_name:"+c.config.ServiceName)
 	}
 
 	c.logPrompt = config.GetLogPrompt(c.config.InstanceConfig)
@@ -420,7 +424,7 @@ func (c *Check) Configure(senderManager sender.SenderManager, integrationConfigD
 	} else {
 		log.Errorf("%s failed to retrieve agent hostname: %s", c.logPrompt, err)
 	}
-	tags = append(tags, fmt.Sprintf("ddagenthostname:%s", c.agentHostname))
+	tags = append(tags, "ddagenthostname:"+c.agentHostname)
 
 	c.configTags = make([]string, len(tags))
 	copy(c.configTags, tags)

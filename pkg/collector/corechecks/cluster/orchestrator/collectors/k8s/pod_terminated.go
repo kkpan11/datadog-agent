@@ -16,8 +16,8 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -27,14 +27,14 @@ import (
 )
 
 // NewTerminatedPodCollectorVersions builds the group of collector versions.
-func NewTerminatedPodCollectorVersions(cfg config.Component, store workloadmeta.Component, tagger tagger.Component, metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
-	return collectors.NewCollectorVersions(
-		NewTerminatedPodCollector(cfg, store, tagger, metadataAsTags),
-	)
+func NewTerminatedPodCollectorVersions(cfg config.Component, store workloadmeta.Component, tagger tagger.Component) collectors.CollectorVersions {
+	if pkgconfigsetup.Datadog().GetBool("orchestrator_explorer.terminated_pods_improved.enabled") {
+		return collectors.NewCollectorVersions(NewImprovedTerminatedPodCollector(cfg, store, tagger))
+	}
+	return collectors.NewCollectorVersions(NewTerminatedPodCollector(cfg, store, tagger))
 }
 
-// TerminatedPodCollector is a collector for Kubernetes Pods that are not
-// assigned to a node yet.
+// TerminatedPodCollector is a collector for Kubernetes Pods that have been deleted.
 type TerminatedPodCollector struct {
 	informer  corev1Informers.PodInformer
 	lister    corev1Listers.PodLister
@@ -42,13 +42,8 @@ type TerminatedPodCollector struct {
 	processor *processors.Processor
 }
 
-// NewTerminatedPodCollector creates a new collector for the Kubernetes Pod
-// resource that is not assigned to any node.
-func NewTerminatedPodCollector(cfg config.Component, store workloadmeta.Component, tagger tagger.Component, metadataAsTags utils.MetadataAsTags) *TerminatedPodCollector {
-	resourceType := getResourceType(podName, podVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+// NewTerminatedPodCollector creates a new collector for terminated pods.
+func NewTerminatedPodCollector(cfg config.Component, store workloadmeta.Component, tagger tagger.Component) *TerminatedPodCollector {
 	return &TerminatedPodCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -56,12 +51,11 @@ func NewTerminatedPodCollector(cfg config.Component, store workloadmeta.Componen
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 "terminated-pods",
+			Name:                                 utilTypes.TerminatedPodName,
 			Kind:                                 kubernetes.PodKind,
 			NodeType:                             orchestrator.K8sPod,
-			Version:                              "v1",
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.PodGroup,
+			Version:                              utilTypes.PodVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
 		processor: processors.NewProcessor(k8sProcessors.NewPodHandlers(cfg, store, tagger)),
@@ -107,10 +101,4 @@ func (c *TerminatedPodCollector) Process(rcfg *collectors.CollectorRunConfig, li
 	}
 
 	return result, nil
-}
-
-// GetNodeName is used to get the node name from the resource.
-func (c *TerminatedPodCollector) GetNodeName(_ processors.ProcessorContext, resource interface{}) string {
-	r := resource.(*v1.Pod)
-	return r.Spec.NodeName
 }

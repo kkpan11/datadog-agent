@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
 )
 
 // Well Known SIDs
@@ -75,7 +75,12 @@ func MakeDownLevelLogonName(domain string, user string) string {
 
 // GetIdentityForUser returns the Identity for the given user.
 func GetIdentityForUser(host *components.RemoteHost, user string) (Identity, error) {
-	sid, err := GetSIDForUser(host, user)
+	var err error
+	sid, err := GetServiceAliasSID(user)
+	if err == nil {
+		return Identity{Name: user, SID: sid}, nil
+	}
+	sid, err = GetSIDForUser(host, user)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -196,7 +201,7 @@ func GetUserRights(host *components.RemoteHost) (map[string][]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := fmt.Sprintf(`secedit /export /areas USER_RIGHTS /cfg %s`, outFile)
+	cmd := "secedit /export /areas USER_RIGHTS /cfg " + outFile
 	_, err = host.Execute(cmd)
 	if err != nil {
 		return nil, err
@@ -216,7 +221,7 @@ func GetUserRights(host *components.RemoteHost) (map[string][]string, error) {
 
 	// The file is in INI syntax, Go doesn't have a built-in INI parser
 	// but going line by line is sufficient for our needs
-	for _, line := range strings.Split(content, "\r\n") {
+	for line := range strings.SplitSeq(content, "\r\n") {
 		if strings.HasPrefix(line, "Se") {
 			// example: SeDenyNetworkLogonRight = *S-1-5-18,ddagentuser
 			parts := strings.Split(line, "=")
@@ -290,4 +295,33 @@ func RemoveLocalUser(host *components.RemoteHost, user string) error {
 func IsIdentityLocalSystem(i Identity) bool {
 	// We don't need to fetch a full identity with name from the host, we can just compare the SIDs
 	return SecurityIdentifierEqual(i, GetIdentityForSID(LocalSystemSID))
+}
+
+// RemoveUserFromRight strips a user from a single user-rights assignment by
+// exporting the local security policy, removing the entry, and re-importing it.
+// Accepts both the plain username and its SID form in the policy file.
+func RemoveUserFromRight(host *components.RemoteHost, user, right string) error {
+	sid, err := GetSIDForUser(host, user)
+	if err != nil {
+		return fmt.Errorf("resolving SID for %s: %w", user, err)
+	}
+	script := fmt.Sprintf(`
+$ErrorActionPreference = "Stop"
+$cfg = "$env:TEMP\dd-remove-right.cfg"
+$sdb = "$env:TEMP\dd-remove-right.sdb"
+secedit /export /areas USER_RIGHTS /cfg $cfg | Out-Null
+$contents = Get-Content $cfg
+$updated = foreach ($line in $contents) {
+    if ($line -match '^%s\s*=\s*(.*)$') {
+        $kept = ($matches[1] -split ',') | Where-Object {
+            $t = $_.Trim(); $t -ne '%s' -and $t -ne '*%s'
+        }
+        '%s = ' + ($kept -join ',')
+    } else { $line }
+}
+Set-Content -Path $cfg -Value $updated -Encoding Unicode
+secedit /configure /db $sdb /cfg $cfg /areas USER_RIGHTS /quiet
+`, right, user, sid, right)
+	_, err = host.Execute(script)
+	return err
 }

@@ -8,7 +8,6 @@
 package io
 
 import (
-	"fmt"
 	"math"
 	"regexp"
 	"time"
@@ -41,8 +40,8 @@ type IOCheck struct {
 }
 
 // Configure the IOstats check
-func (c *IOCheck) Configure(senderManager sender.SenderManager, _ uint64, data integration.Data, initConfig integration.Data, source string) error {
-	err := c.commonConfigure(senderManager, data, initConfig, source)
+func (c *IOCheck) Configure(senderManager sender.SenderManager, _ uint64, data integration.Data, initConfig integration.Data, source string, provider string) error {
+	err := c.commonConfigure(senderManager, data, initConfig, source, provider)
 	return err
 }
 
@@ -94,11 +93,11 @@ func (c *IOCheck) nixIO() error {
 		}
 
 		tags := []string{}
-		tags = append(tags, fmt.Sprintf("device:%s", device))
-		tags = append(tags, fmt.Sprintf("device_name:%s", device))
+		tags = append(tags, "device:"+device)
+		tags = append(tags, "device_name:"+device)
 
 		if ioStats.Label != "" {
-			tags = append(tags, fmt.Sprintf("device_label:%s", ioStats.Label))
+			tags = append(tags, "device_label:"+ioStats.Label)
 		}
 
 		sender.Rate("system.io.r_s", float64(ioStats.ReadCount), "", tags)

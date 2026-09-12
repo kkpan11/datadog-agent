@@ -16,6 +16,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	le "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/leaderelection/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -54,6 +55,13 @@ func (d *dispatcher) processNodeStatus(nodeName, clientIP string, status types.N
 	node.Lock()
 	defer node.Unlock()
 	node.heartbeat = timestampNow()
+	node.nodetype = status.NodeType
+
+	// Check if we need to disable advanced dispatching when node agents join
+	if d.advancedDispatching.Load() && status.NodeType == types.NodeTypeNodeAgent {
+		d.disableAdvancedDispatching()
+	}
+
 	// When we receive ExtraHeartbeatLastChangeValue, we only update heartbeat
 	if status.LastChange == types.ExtraHeartbeatLastChangeValue {
 		return true
@@ -77,7 +85,7 @@ func (d *dispatcher) processNodeStatus(nodeName, clientIP string, status types.N
 }
 
 // getNodeToScheduleCheck returns the node where a new check should be scheduled
-
+//
 // Advanced dispatching relies on the check stats fetched from the cluster check
 // runners API to distribute the checks. The stats are only updated when the
 // checks are rebalanced, they are not updated every time a check is scheduled.
@@ -89,7 +97,7 @@ func (d *dispatcher) processNodeStatus(nodeName, clientIP string, status types.N
 // On the other hand, when advanced dispatching is not used, we can pick the
 // node with fewer checks. It's because the number of checks is kept up to date.
 func (d *dispatcher) getNodeToScheduleCheck() string {
-	if d.advancedDispatching {
+	if d.advancedDispatching.Load() {
 		return d.getRandomNode()
 	}
 
@@ -203,7 +211,7 @@ func (d *dispatcher) updateRunnersStats() {
 			if err != nil {
 				// This can happen in old versions of the runners that do not expose this information.
 				log.Debugf("Cannot get number of workers for node %s with IP %s. Assuming default. Error: %v", name, node.clientIP, err)
-				node.workers = pkgconfigsetup.DefaultNumWorkers
+				node.workers = constants.DefaultNumWorkers
 			} else {
 				node.workers = workers.Count
 			}

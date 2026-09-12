@@ -6,7 +6,9 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +16,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -22,7 +23,10 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core/tagger/origindetection"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
+	"github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace/idx"
+	"github.com/DataDog/datadog-agent/pkg/trace/api/apiutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/api/internal/header"
+	"github.com/DataDog/datadog-agent/pkg/trace/api/loader"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/info"
 	"github.com/DataDog/datadog-agent/pkg/trace/sampler"
@@ -33,7 +37,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tinylib/msgp/msgp"
-	vmsgp "github.com/vmihailenco/msgpack/v4"
+	vmsgp "github.com/vmihailenco/msgpack/v5"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
 )
@@ -51,71 +56,196 @@ var headerFields = map[string]string{
 
 type noopStatsProcessor struct{}
 
-func (noopStatsProcessor) ProcessStats(_ *pb.ClientStatsPayload, _, _, _, _ string) {}
+func (noopStatsProcessor) ProcessStats(_ context.Context, _ *pb.ClientStatsPayload, _, _, _, _ string) error {
+	return nil
+}
 
 func newTestReceiverFromConfig(conf *config.AgentConfig) *HTTPReceiver {
 	dynConf := sampler.NewDynamicConfig()
 
 	rawTraceChan := make(chan *Payload, 5000)
-	receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
+	rawTraceChanV1 := make(chan *PayloadV1, 5000)
+	receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, rawTraceChanV1, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
 
 	return receiver
 }
 
-func newTestReceiverConfig() *config.AgentConfig {
+// startTestReceiver builds a receiver from conf, binding it to a listener from
+// testutil.TCPListener (overriding conf.ReceiverHost/ReceiverPort) instead of
+// letting Start() bind the address itself, then starts it. Callers should dial
+// the returned receiver via r.Addr(), which is authoritative, rather than
+// reconstructing an address from conf. Build conf with
+// newTestReceiverConfigNoPort, not newTestReceiverConfig: the latter's port
+// selection would just be overwritten here.
+func startTestReceiver(t *testing.T, conf *config.AgentConfig) *HTTPReceiver {
+	ln := testutil.TCPListener(t)
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	conf.ReceiverHost = tcpAddr.IP.String()
+	conf.ReceiverPort = tcpAddr.Port
+	r := newTestReceiverFromConfig(conf)
+	r.SetTCPListener(ln)
+	r.Start()
+	return r
+}
+
+// newTestReceiverConfigNoPort returns a test config with everything
+// newTestReceiverConfig sets except ReceiverHost/ReceiverPort, for callers
+// that bind their own listener (e.g. via startTestReceiver) and would
+// otherwise immediately discard a port newTestReceiverConfig found.
+func newTestReceiverConfigNoPort() *config.AgentConfig {
 	conf := config.New()
 	conf.Endpoints[0].APIKey = "test"
 	conf.DecoderTimeout = 10000
 	conf.ReceiverTimeout = 1
-	conf.ReceiverPort = 8326 // use non-default port to avoid conflict with a running agent
+	// Reset IdleTimeout so the server uses ReadTimeout (1s) instead of the production
+	// default (60s). Without this, tests that call io.ReadAll(resp.Body) on a real server
+	// block for 60 seconds waiting for the connection to close.
+	conf.ReceiverIdleTimeout = 0
 
 	return conf
 }
 
+func newTestReceiverConfig() *config.AgentConfig {
+	conf := newTestReceiverConfigNoPort()
+	// Bind and dial the same concrete address. The production default is the
+	// "localhost" hostname, which on macOS makes the server listen on 127.0.0.1
+	// only while clients resolving "localhost" try ::1 first. Another test
+	// process holding the same port on an IPv6/wildcard address (the kernel
+	// hands out a port already bound on 127.0.0.1 to a wildcard listener) would
+	// then silently receive this receiver's traffic.
+	conf.ReceiverHost = "127.0.0.1"
+	port, err := testutil.FindTCPPort()
+	if err != nil {
+		panic(err)
+	}
+	conf.ReceiverPort = port
+
+	return conf
+}
+
+// newTestReceiverConfigWithFeatures creates a test config with specific features enabled
+func newTestReceiverConfigWithFeatures(features ...string) *config.AgentConfig {
+	conf := newTestReceiverConfig()
+	if conf.Features == nil {
+		conf.Features = make(map[string]struct{})
+	}
+	for _, feat := range features {
+		conf.Features[feat] = struct{}{}
+	}
+	return conf
+}
+
 func TestMain(m *testing.M) {
-	// We're about to os.Exit, no need to revert this value to original
+	// We're about to os.Exit, no need to revert this value to original.
+	// killProcess exits the process in production; panicking mirrors that
+	// (the test binary dies) instead of silently continuing as a bare print
+	// would, which previously let a failed bind masquerade as a protocol error.
 	killProcess = func(format string, args ...interface{}) {
-		fmt.Printf(format, args...)
-		fmt.Println()
+		panic(fmt.Sprintf("trace-agent would have exited: "+format, args...))
 	}
 	os.Exit(m.Run())
+}
+
+func TestServerShutdown(t *testing.T) {
+	// prepare the msgpack payload
+	bts, err := testutil.GetTestTraces(10, 10, true).MarshalMsg(nil)
+	assert.Nil(t, err)
+
+	// prepare the receiver
+	conf := newTestReceiverConfigNoPort()
+	conf.ReceiverSocket = t.TempDir() + "/somesock.sock"
+	ln := testutil.TCPListener(t)
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	conf.ReceiverHost = tcpAddr.IP.String()
+	conf.ReceiverPort = tcpAddr.Port
+	dynConf := sampler.NewDynamicConfig()
+
+	rawTraceChan := make(chan *Payload)
+	rawTraceChanV1 := make(chan *PayloadV1)
+	receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, rawTraceChanV1, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
+	receiver.SetTCPListener(ln)
+
+	receiver.Start()
+
+	go func() {
+		for {
+			// simulate the channel being busy
+			time.Sleep(100 * time.Millisecond)
+			select {
+			case _, ok := <-rawTraceChan:
+				if !ok {
+					return
+				}
+			case _, okV1 := <-rawTraceChanV1:
+				if !okV1 {
+					return
+				}
+			}
+		}
+	}()
+
+	// Create two clients - one for TCP and one for UDS
+	tcpClient := http.Client{Timeout: 10 * time.Second}
+	udsClient := http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", conf.ReceiverSocket)
+			},
+		},
+	}
+
+	wg := &sync.WaitGroup{}
+
+	// Send requests to both TCP and UDS endpoints
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				// Send to TCP endpoint
+				req, _ := http.NewRequest("POST", fmt.Sprintf("http://%s/v0.4/traces", receiver.Addr()), bytes.NewReader(bts))
+				req.Header.Set("Content-Type", "application/msgpack")
+				resp, _ := tcpClient.Do(req)
+				if resp != nil {
+					resp.Body.Close()
+				}
+
+				// Send to UDS endpoint
+				req, _ = http.NewRequest("POST", "http://unix/v0.4/traces", bytes.NewReader(bts))
+				req.Header.Set("Content-Type", "application/msgpack")
+				resp, _ = udsClient.Do(req)
+				if resp != nil {
+					resp.Body.Close()
+				}
+			}
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	receiver.Stop()
+
+	wg.Wait()
 }
 
 func TestReceiverRequestBodyLength(t *testing.T) {
 	assert := assert.New(t)
 
-	conf := newTestReceiverConfig()
+	conf := newTestReceiverConfigNoPort()
 	conf.MaxRequestBytes = 2
+	ln := testutil.TCPListener(t)
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	conf.ReceiverHost = tcpAddr.IP.String()
+	conf.ReceiverPort = tcpAddr.Port
 	receiver := newTestReceiverFromConfig(conf)
-	go receiver.Start()
+	receiver.SetTCPListener(ln)
+	receiver.Start()
 
 	defer receiver.Stop()
 
-	url := fmt.Sprintf("http://%s:%d/v0.4/traces",
-		conf.ReceiverHost, conf.ReceiverPort)
+	url := fmt.Sprintf("http://%s/v0.4/traces", receiver.Addr())
 
-	// Before going further, make sure receiver is started
-	// since it's running in another goroutine
-	serverReady := false
-	for i := 0; i < 100; i++ {
-		var client http.Client
-
-		body := bytes.NewBufferString("[]")
-		req, err := http.NewRequest("POST", url, body)
-		assert.NoError(err)
-
-		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				serverReady = true
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	assert.True(serverReady)
 	testBody := func(expectedStatus int, bodyData string) {
 		var client http.Client
 
@@ -136,7 +266,9 @@ func TestReceiverRequestBodyLength(t *testing.T) {
 func TestListenTCP(t *testing.T) {
 	t.Run("measured", func(t *testing.T) {
 		r := &HTTPReceiver{conf: &config.AgentConfig{ConnectionLimit: 0}}
-		ln, err := r.listenTCP("127.0.0.1:0")
+		ln, err := loader.GetTCPListener("127.0.0.1:0")
+		require.NoError(t, err)
+		ln, err = r.listenTCPListener(ln)
 		require.NoError(t, err)
 		defer ln.Close()
 		_, ok := ln.(*measuredListener)
@@ -145,12 +277,34 @@ func TestListenTCP(t *testing.T) {
 
 	t.Run("limited", func(t *testing.T) {
 		r := &HTTPReceiver{conf: &config.AgentConfig{ConnectionLimit: 10}}
-		ln, err := r.listenTCP("127.0.0.1:0")
+		ln, err := loader.GetTCPListener("127.0.0.1:0")
+		require.NoError(t, err)
+		ln, err = r.listenTCPListener(ln)
 		require.NoError(t, err)
 		defer ln.Close()
 		_, ok := ln.(*rateLimitedListener)
 		assert.True(t, ok)
 	})
+}
+
+func TestStartBindFailurePanics(t *testing.T) {
+	// Squat on a port so Start's own bind attempt fails, then assert that
+	// failure is loud (TestMain's killProcess override panics) rather than
+	// silently leaving the receiver unbound - see api_test.go's TestMain.
+	squatter := testutil.TCPListener(t)
+	tcpAddr := squatter.Addr().(*net.TCPAddr)
+
+	conf := newTestReceiverConfigNoPort()
+	conf.ReceiverHost = tcpAddr.IP.String()
+	conf.ReceiverPort = tcpAddr.Port
+
+	r := newTestReceiverFromConfig(conf)
+	assert.Panics(t, r.Start)
+	// Start launches the telemetry forwarder's workers before attempting the
+	// TCP bind that panics, and the panic recovery above skips the rest of
+	// Start, so nothing else stops them. r.Stop is not an option: it waits on
+	// r.exit, which is only drained by the serve loop that never started.
+	r.telemetryForwarder.Stop()
 }
 
 func TestNoDuplicatePatterns(t *testing.T) {
@@ -164,12 +318,22 @@ func TestNoDuplicatePatterns(t *testing.T) {
 }
 
 func TestTracesDecodeMakingHugeAllocation(t *testing.T) {
-	r := newTestReceiverFromConfig(newTestReceiverConfig())
-	r.Start()
+	r := startTestReceiver(t, newTestReceiverConfigNoPort())
 	defer r.Stop()
 	data := []byte{0x96, 0x97, 0xa4, 0x30, 0x30, 0x30, 0x30, 0xa6, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa6, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa6, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa6, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa6, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa6, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x96, 0x94, 0x9c, 0x00, 0x00, 0x00, 0x30, 0x30, 0xd1, 0x30, 0x30, 0x30, 0x30, 0x30, 0xdf, 0x30, 0x30, 0x30, 0x30}
 
-	path := fmt.Sprintf("http://%s:%d/v0.5/traces", r.conf.ReceiverHost, r.conf.ReceiverPort)
+	path := fmt.Sprintf("http://%s/v0.5/traces", r.Addr())
+	resp, err := http.Post(path, "application/msgpack", bytes.NewReader(data))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestTracesDecodeSlowDecodeInvalid(t *testing.T) {
+	r := startTestReceiver(t, newTestReceiverConfigNoPort())
+	defer r.Stop()
+	data := []byte("\x96\x90\xdd\x01\x7D\x78\x3F")
+	path := fmt.Sprintf("http://%s/v0.5/traces", r.Addr())
 	resp, err := http.Post(path, "application/msgpack", bytes.NewReader(data))
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -178,13 +342,11 @@ func TestTracesDecodeMakingHugeAllocation(t *testing.T) {
 
 func TestStateHeaders(t *testing.T) {
 	assert := assert.New(t)
-	cfg := newTestReceiverConfig()
+	cfg := newTestReceiverConfigNoPort()
 	cfg.AgentVersion = "testVersion"
-	url := fmt.Sprintf("http://%s:%d",
-		cfg.ReceiverHost, cfg.ReceiverPort)
-	r := newTestReceiverFromConfig(cfg)
-	r.Start()
+	r := startTestReceiver(t, cfg)
 	defer r.Stop()
+	url := fmt.Sprintf("http://%s", r.Addr())
 	data := msgpTraces(t, pb.Traces{
 		testutil.RandomTrace(10, 20),
 		testutil.RandomTrace(10, 20),
@@ -252,19 +414,21 @@ func TestLegacyReceiver(t *testing.T) {
 
 			// now we should be able to read the trace data
 			select {
-			case p := <-tc.r.out:
-				assert.Len(p.Chunks(), 1)
-				rt := p.Chunk(0).Spans
+			case p := <-tc.r.outV1:
+				assert.Len(p.TracerPayload.Chunks, 1)
+				rt := p.TracerPayload.Chunks[0].Spans
 				assert.Len(rt, 1)
 				span := rt[0]
-				assert.Equal(uint64(42), span.TraceID)
-				assert.Equal(uint64(52), span.SpanID)
-				assert.Equal("fennel_IS amazing!", span.Service)
-				assert.Equal("something &&<@# that should be a metric!", span.Name)
-				assert.Equal("NOT touched because it is going to be hashed", span.Resource)
-				assert.Equal("192.168.0.1", span.Meta["http.host"])
-				assert.Equal(41.99, span.Metrics["http.monitor"])
-			case <-time.After(time.Second):
+				assert.Equal([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a}, p.TracerPayload.Chunks[0].TraceID)
+				assert.Equal(uint64(52), span.SpanID())
+				assert.Equal("fennel_IS amazing!", span.Service())
+				assert.Equal("something &&<@# that should be a metric!", span.Name())
+				assert.Equal("NOT touched because it is going to be hashed", span.Resource())
+				httpHost, _ := span.GetAttributeAsString("http.host")
+				assert.Equal("192.168.0.1", httpHost)
+				httpMonitor, _ := span.GetAttributeAsFloat64("http.monitor")
+				assert.Equal(41.99, httpMonitor)
+			case <-time.After(5 * time.Second):
 				t.Fatalf("no data received")
 			}
 
@@ -272,6 +436,172 @@ func TestLegacyReceiver(t *testing.T) {
 			server.Close()
 		})
 	}
+}
+
+// TestHandleTracesNilSpanDoesNotPanic verifies that a v0.4 JSON body carrying a
+// nil span (`[[null]]`) is sanitized before it leaves the decoder. Covers both
+// the legacy (pb) and converted (idx) handler paths.
+func TestHandleTracesNilSpanDoesNotPanic(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) {
+		// Conversion is on by default; opt out to exercise the legacy pb path.
+		conf := newTestReceiverConfigWithFeatures("disable-convert-traces")
+		r := newTestReceiverFromConfig(conf)
+		server := httptest.NewServer(r.handleWithVersion(v04, r.handleTraces))
+		defer server.Close()
+
+		req, err := http.NewRequest("POST", server.URL, bytes.NewBufferString("[[null]]"))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := (&http.Client{}).Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		select {
+		case p := <-r.out:
+			assert.Empty(t, p.TracerPayload.Chunks)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no data received on r.out")
+		}
+	})
+
+	t.Run("converted", func(t *testing.T) {
+		conf := newTestReceiverConfig() // conversion enabled by default
+		r := newTestReceiverFromConfig(conf)
+		server := httptest.NewServer(r.handleWithVersion(v04, r.handleTraces))
+		defer server.Close()
+
+		req, err := http.NewRequest("POST", server.URL, bytes.NewBufferString("[[null]]"))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := (&http.Client{}).Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		// The converted path must respond without the handler panicking; the
+		// all-nil chunk is dropped during conversion so no payload is enqueued.
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+}
+
+func TestHandleTracesAttributesServiceAfterNilSpan(t *testing.T) {
+	// Conversion is on by default; opt out to exercise the legacy pb path.
+	conf := newTestReceiverConfigWithFeatures("disable-convert-traces")
+	r := newTestReceiverFromConfig(conf)
+	server := httptest.NewServer(r.handleWithVersion(v04, r.handleTraces))
+	defer server.Close()
+
+	body, err := json.Marshal(pb.Traces{{nil, {Service: "svc"}}})
+	require.NoError(t, err)
+	req, err := http.NewRequest("POST", server.URL, bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	r.Stats.RLock()
+	defer r.Stats.RUnlock()
+	found := false
+	for tags := range r.Stats.Stats {
+		if tags.EndpointVersion == string(v04) && tags.Service == "svc" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "receiver stats should be attributed to the first non-nil span's service")
+}
+
+func TestLegacyDecoderSanitizesV07Payload(t *testing.T) {
+	conf := newTestReceiverConfigWithFeatures("disable-convert-traces")
+	r := newTestReceiverFromConfig(conf)
+	server := httptest.NewServer(r.handleWithVersion(V07, r.handleTraces))
+	defer server.Close()
+
+	wire, err := (&pb.TracerPayload{Chunks: []*pb.TraceChunk{
+		nil,
+		{Spans: []*pb.Span{nil, {Service: "svc", TraceID: 1, SpanID: 2}}},
+		nil,
+	}}).MarshalMsg(nil)
+	require.NoError(t, err)
+	req, err := http.NewRequest("POST", server.URL, bytes.NewReader(wire))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/msgpack")
+
+	resp, err := (&http.Client{}).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	select {
+	case p := <-r.out:
+		require.Len(t, p.TracerPayload.Chunks, 1)
+		require.Len(t, p.TracerPayload.Chunks[0].Spans, 1)
+		assert.Equal(t, "svc", p.TracerPayload.Chunks[0].Spans[0].Service)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no data received on r.out")
+	}
+}
+
+func TestSanitizeTracerPayload(t *testing.T) {
+	arrayValue := &pb.AttributeAnyValue{
+		Type: pb.AttributeAnyValue_ARRAY_VALUE,
+		ArrayValue: &pb.AttributeArray{Values: []*pb.AttributeArrayValue{
+			nil,
+			{Type: pb.AttributeArrayValue_STRING_VALUE, StringValue: "keep"},
+			nil,
+		}},
+	}
+	span := &pb.Span{
+		SpanLinks: []*pb.SpanLink{nil, {TraceID: 1}, nil},
+		SpanEvents: []*pb.SpanEvent{
+			nil,
+			{
+				Name: "event",
+				Attributes: map[string]*pb.AttributeAnyValue{
+					"drop":  nil,
+					"array": arrayValue,
+				},
+			},
+			nil,
+		},
+	}
+	payload := &pb.TracerPayload{Chunks: []*pb.TraceChunk{
+		nil,
+		{Spans: []*pb.Span{nil, span, nil}},
+		{Spans: []*pb.Span{nil}},
+	}}
+
+	normalizeDecodedPayload(payload)
+
+	require.Len(t, payload.Chunks, 1)
+	require.Len(t, payload.Chunks[0].Spans, 1)
+	assert.Same(t, span, payload.Chunks[0].Spans[0])
+	assert.NotNil(t, payload.Chunks[0].Tags, "retained chunks must have a non-nil Tags map")
+	require.Len(t, span.SpanLinks, 1)
+	require.Len(t, span.SpanEvents, 1)
+	assert.NotContains(t, span.SpanEvents[0].Attributes, "drop")
+	require.Len(t, arrayValue.ArrayValue.Values, 1)
+	assert.Equal(t, "keep", arrayValue.ArrayValue.Values[0].StringValue)
+}
+
+func TestNormalizeDecodedPayloadChunkTags(t *testing.T) {
+	span := &pb.Span{Service: "svc"}
+	payload := &pb.TracerPayload{Chunks: []*pb.TraceChunk{
+		{Spans: []*pb.Span{span}}, // v0.7 chunk that omitted "tags"
+		{Spans: []*pb.Span{span}, Tags: map[string]string{"_dd.p.dm": "-4"}}, // tags already present
+	}}
+
+	normalizeDecodedPayload(payload)
+
+	require.Len(t, payload.Chunks, 2)
+	assert.NotNil(t, payload.Chunks[0].Tags)
+	assert.Empty(t, payload.Chunks[0].Tags)
+	// An existing map must be left untouched.
+	assert.Equal(t, map[string]string{"_dd.p.dm": "-4"}, payload.Chunks[1].Tags)
 }
 
 func TestReceiverJSONDecoder(t *testing.T) {
@@ -317,17 +647,19 @@ func TestReceiverJSONDecoder(t *testing.T) {
 
 			// now we should be able to read the trace data
 			select {
-			case p := <-tc.r.out:
-				rt := p.Chunk(0).Spans
+			case p := <-tc.r.outV1:
+				rt := p.TracerPayload.Chunks[0].Spans
 				assert.Len(rt, 1)
 				span := rt[0]
-				assert.Equal(uint64(42), span.TraceID)
-				assert.Equal(uint64(52), span.SpanID)
-				assert.Equal("fennel_IS amazing!", span.Service)
-				assert.Equal("something &&<@# that should be a metric!", span.Name)
-				assert.Equal("NOT touched because it is going to be hashed", span.Resource)
-				assert.Equal("192.168.0.1", span.Meta["http.host"])
-				assert.Equal(41.99, span.Metrics["http.monitor"])
+				assert.Equal([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a}, p.TracerPayload.Chunks[0].TraceID)
+				assert.Equal(uint64(52), span.SpanID())
+				assert.Equal("fennel_IS amazing!", span.Service())
+				assert.Equal("something &&<@# that should be a metric!", span.Name())
+				assert.Equal("NOT touched because it is going to be hashed", span.Resource())
+				httpHost, _ := span.GetAttributeAsString("http.host")
+				assert.Equal("192.168.0.1", httpHost)
+				httpMonitor, _ := span.GetAttributeAsFloat64("http.monitor")
+				assert.Equal(41.99, httpMonitor)
 			case <-time.After(time.Second):
 				t.Fatalf("no data received")
 			}
@@ -384,17 +716,19 @@ func TestReceiverMsgpackDecoder(t *testing.T) {
 
 				// now we should be able to read the trace data
 				select {
-				case p := <-tc.r.out:
-					rt := p.Chunk(0).Spans
+				case p := <-tc.r.outV1:
+					rt := p.TracerPayload.Chunks[0].Spans
 					assert.Len(rt, 1)
 					span := rt[0]
-					assert.Equal(uint64(42), span.TraceID)
-					assert.Equal(uint64(52), span.SpanID)
-					assert.Equal("fennel_IS amazing!", span.Service)
-					assert.Equal("something &&<@# that should be a metric!", span.Name)
-					assert.Equal("NOT touched because it is going to be hashed", span.Resource)
-					assert.Equal("192.168.0.1", span.Meta["http.host"])
-					assert.Equal(41.99, span.Metrics["http.monitor"])
+					assert.Equal([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a}, p.TracerPayload.Chunks[0].TraceID)
+					assert.Equal(uint64(52), span.SpanID())
+					assert.Equal("fennel_IS amazing!", span.Service())
+					assert.Equal("something &&<@# that should be a metric!", span.Name())
+					assert.Equal("NOT touched because it is going to be hashed", span.Resource())
+					httpHost, _ := span.GetAttributeAsString("http.host")
+					assert.Equal("192.168.0.1", httpHost)
+					httpMonitor, _ := span.GetAttributeAsFloat64("http.monitor")
+					assert.Equal(41.99, httpMonitor)
 				case <-time.After(time.Second):
 					t.Fatalf("no data received")
 				}
@@ -407,25 +741,29 @@ func TestReceiverMsgpackDecoder(t *testing.T) {
 
 				// now we should be able to read the trace data
 				select {
-				case p := <-tc.r.out:
-					rt := p.Chunk(0).Spans
+				case p := <-tc.r.outV1:
+					rt := p.TracerPayload.Chunks[0].Spans
 					assert.Len(rt, 1)
 					span := rt[0]
-					assert.Equal(uint64(42), span.TraceID)
-					assert.Equal(uint64(52), span.SpanID)
-					assert.Equal("fennel_IS amazing!", span.Service)
-					assert.Equal("something &&<@# that should be a metric!", span.Name)
-					assert.Equal("NOT touched because it is going to be hashed", span.Resource)
-					assert.Equal("192.168.0.1", span.Meta["http.host"])
-					assert.Equal(41.99, span.Metrics["http.monitor"])
-					assert.Equal(1, len(span.SpanLinks))
-					assert.Equal(uint64(42), span.SpanLinks[0].TraceID)
-					assert.Equal(uint64(32), span.SpanLinks[0].TraceIDHigh)
-					assert.Equal(uint64(52), span.SpanLinks[0].SpanID)
-					assert.Equal("v1", span.SpanLinks[0].Attributes["a1"])
-					assert.Equal("v2", span.SpanLinks[0].Attributes["a2"])
-					assert.Equal("dd=s:2;o:rum,congo=baz123", span.SpanLinks[0].Tracestate)
-					assert.Equal(uint32(2147483649), span.SpanLinks[0].Flags)
+					assert.Equal([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a}, p.TracerPayload.Chunks[0].TraceID)
+					assert.Equal(uint64(52), span.SpanID())
+					assert.Equal("fennel_IS amazing!", span.Service())
+					assert.Equal("something &&<@# that should be a metric!", span.Name())
+					assert.Equal("NOT touched because it is going to be hashed", span.Resource())
+					httpHost, _ := span.GetAttributeAsString("http.host")
+					assert.Equal("192.168.0.1", httpHost)
+					httpMonitor, _ := span.GetAttributeAsFloat64("http.monitor")
+					assert.Equal(41.99, httpMonitor)
+					links := span.Links()
+					assert.Equal(1, len(links))
+					assert.Equal([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a}, links[0].TraceID())
+					assert.Equal(uint64(52), links[0].SpanID())
+					a1, _ := links[0].GetAttributeAsString("a1")
+					assert.Equal("v1", a1)
+					a2, _ := links[0].GetAttributeAsString("a2")
+					assert.Equal("v2", a2)
+					assert.Equal("dd=s:2;o:rum,congo=baz123", links[0].Tracestate())
+					assert.Equal(uint32(2147483649), links[0].Flags())
 				case <-time.After(time.Second):
 					t.Fatalf("no data received")
 				}
@@ -441,6 +779,151 @@ func TestReceiverMsgpackDecoder(t *testing.T) {
 			server.Close()
 		})
 	}
+}
+
+func TestUnmarshalTestSpanV1(t *testing.T) {
+	traces := testutil.GetTestTracesV1(1, 1, false)
+	bts, err := traces.MarshalMsg(nil)
+	require.Nil(t, err)
+	tp := &idx.InternalTracerPayload{}
+	_, err = tp.UnmarshalMsg(bts)
+	require.Nil(t, err)
+}
+
+func TestReceiverV1MsgpackDecoder(t *testing.T) {
+	// testing traces without content-type in agent endpoints, it should use Msgpack decoding
+	// or it should raise a 415 Unsupported media type
+	assert := assert.New(t)
+	conf := newTestReceiverConfig()
+
+	traces := testutil.GetTestTracesV1(1, 1, false)
+
+	r := newTestReceiverFromConfig(conf)
+	// start testing server
+	server := httptest.NewServer(
+		r.handleWithVersion(V10, r.handleTraces),
+	)
+
+	// send traces to that endpoint using the msgpack content-type
+	bts, err := traces.MarshalMsg(nil)
+	assert.Nil(err)
+	req, err := http.NewRequest("POST", server.URL, bytes.NewReader(bts))
+	assert.Nil(err)
+	req.Header.Set("Content-Type", "application/msgpack")
+
+	var client http.Client
+	resp, err := client.Do(req)
+	require.Nil(t, err)
+	assert.Equal(200, resp.StatusCode)
+
+	// now we should be able to read the trace data
+	select {
+	case p := <-r.outV1:
+		assert.Equal([]byte{0x53, 0x8c, 0x7f, 0x96, 0xb1, 0x64, 0xbf, 0x1b, 0x97, 0xbb, 0x9f, 0x4b, 0xb4, 0x72, 0xe8, 0x9f}, p.TracerPayload.Chunks[0].TraceID)
+		rt := p.TracerPayload.Chunks[0].Spans
+		assert.Len(rt, 1)
+		span := rt[0]
+		assert.Equal(uint64(52), span.SpanID())
+		assert.Equal("fennel_IS amazing!", span.Service())
+		assert.Equal("something &&<@# that should be a metric!", span.Name())
+		assert.Equal("NOT touched because it is going to be hashed", span.Resource())
+		httpHost, _ := span.GetAttributeAsString("http.host")
+		assert.Equal("192.168.0.1", httpHost)
+		httpMonitor, _ := span.GetAttributeAsString("http.monitor")
+		assert.Equal("41.99", httpMonitor)
+		links := span.Links()
+		assert.Equal(1, len(links))
+		assert.Equal([]byte{0x2a}, links[0].TraceID())
+		assert.Equal(uint64(52), links[0].SpanID())
+		a1, _ := links[0].GetAttributeAsString("a1")
+		assert.Equal("v1", a1)
+		a2, _ := links[0].GetAttributeAsString("a2")
+		assert.Equal("v2", a2)
+		assert.Equal("dd=s:2;o:rum,congo=baz123", links[0].Tracestate())
+		assert.Equal(uint32(2147483649), links[0].Flags())
+	case <-time.After(time.Second):
+		t.Fatalf("no data received")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	assert.Nil(err)
+	var tr traceResponse
+	err = json.Unmarshal(body, &tr)
+	assert.Nil(err, "the answer should be a valid JSON")
+
+	resp.Body.Close()
+	server.Close()
+}
+
+// Test the response message when decoding with a mismatched type somewhere
+func TestReceiverV1MsgpackDecoderError(t *testing.T) {
+	assert := assert.New(t)
+	conf := newTestReceiverConfig()
+
+	r := newTestReceiverFromConfig(conf)
+	server := httptest.NewServer(
+		r.handleWithVersion(V10, r.handleTraces),
+	)
+
+	// tip: decode this using https://ref45638.github.io/msgpack-converter/
+	bts := []byte{0x81, 0xa2, 0x31, 0x31, 0x91, 0x82, 0xa1, 0x34, 0x91, 0x89, 0xa1, 0x31, 0x7b, 0xa1, 0x32, 0xd9, 0x28, 0x73, 0x6f, 0x6d, 0x65, 0x74, 0x68, 0x69, 0x6e, 0x67, 0x20, 0x26, 0x26, 0x3c, 0x40, 0x23, 0x20, 0x74, 0x68, 0x61, 0x74, 0x20, 0x73, 0x68, 0x6f, 0x75, 0x6c, 0x64, 0x20, 0x62, 0x65, 0x20, 0x61, 0x20, 0x6d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x21, 0xa1, 0x33, 0xd9, 0x2c, 0x4e, 0x4f, 0x54, 0x20, 0x74, 0x6f, 0x75, 0x63, 0x68, 0x65, 0x64, 0x20, 0x62, 0x65, 0x63, 0x61, 0x75, 0x73, 0x65, 0x20, 0x69, 0x74, 0x20, 0x69, 0x73, 0x20, 0x67, 0x6f, 0x69, 0x6e, 0x67, 0x20, 0x74, 0x6f, 0x20, 0x62, 0x65, 0x20, 0x68, 0x61, 0x73, 0x68, 0x65, 0x64, 0xa1, 0x34, 0x34, 0xa1, 0x35, 0x2a, 0xa1, 0x36, 0xcb, 0x43, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa1, 0x37, 0xcb, 0x43, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa1, 0x39, 0x96, 0xa9, 0x68, 0x74, 0x74, 0x70, 0x2e, 0x68, 0x6f, 0x73, 0x74, 0x01, 0xab, 0x31, 0x39, 0x32, 0x2e, 0x31, 0x36, 0x38, 0x2e, 0x30, 0x2e, 0x31, 0xac, 0x68, 0x74, 0x74, 0x70, 0x2e, 0x6d, 0x6f, 0x6e, 0x69, 0x74, 0x6f, 0x72, 0x03, 0xcb, 0x40, 0x44, 0xfe, 0xb8, 0x51, 0xeb, 0x85, 0x1f, 0xa2, 0x31, 0x31, 0x91, 0x85, 0xa1, 0x31, 0x81, 0xa1, 0x30, 0x2a, 0xa1, 0x32, 0x34, 0xa1, 0x33, 0x96, 0xa2, 0x61, 0x31, 0x01, 0xa2, 0x76, 0x31, 0xa2, 0x61, 0x32, 0x01, 0xa2, 0x76, 0x32, 0xa1, 0x34, 0xb9, 0x64, 0x64, 0x3d, 0x73, 0x3a, 0x32, 0x3b, 0x6f, 0x3a, 0x72, 0x75, 0x6d, 0x2c, 0x63, 0x6f, 0x6e, 0x67, 0x6f, 0x3d, 0x62, 0x61, 0x7a, 0x31, 0x32, 0x33, 0xa1, 0x35, 0xce, 0x80, 0x00, 0x00, 0x01, 0xa1, 0x36, 0xde, 0x00, 0x10, 0xa1, 0x30, 0x53, 0xa1, 0x31, 0xcc, 0x8c, 0xa1, 0x32, 0x7f, 0xa1, 0x33, 0xcc, 0x96, 0xa1, 0x34, 0xcc, 0xb1, 0xa1, 0x35, 0x64, 0xa1, 0x36, 0xcc, 0xbf, 0xa1, 0x37, 0x1b, 0xa1, 0x38, 0xcc, 0x97, 0xa1, 0x39, 0xcc, 0xbb, 0xa2, 0x31, 0x30, 0xcc, 0x9f, 0xa2, 0x31, 0x31, 0x4b, 0xa2, 0x31, 0x32, 0xcc, 0xb4, 0xa2, 0x31, 0x33, 0x72, 0xa2, 0x31, 0x34, 0xcc, 0xe8, 0xa2, 0x31, 0x35, 0xcc, 0x9f}
+	req, err := http.NewRequest("POST", server.URL, bytes.NewReader(bts))
+	assert.Nil(err)
+	req.Header.Set("Content-Type", "application/msgpack")
+
+	var client http.Client
+	resp, err := client.Do(req)
+	require.Nil(t, err)
+	assert.Equal(400, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	assert.Nil(err)
+	assert.Contains(string(body), "msgp: attempted to decode type \"str\" with method for \"uint\"")
+
+	resp.Body.Close()
+	server.Close()
+}
+
+func TestReceiverV1DecodingError(t *testing.T) {
+	assert := assert.New(t)
+	conf := newTestReceiverConfig()
+	r := newTestReceiverFromConfig(conf)
+	server := httptest.NewServer(r.handleWithVersion(V10, r.handleTraces))
+	data := []byte("invalid msgpack")
+	var client http.Client
+	req, err := http.NewRequest("POST", server.URL, bytes.NewBuffer(data))
+	assert.NoError(err)
+	traceCount := 10
+	req.Header.Set(header.TraceCount, strconv.Itoa(traceCount))
+	req.Header.Set("Content-Type", "application/msgpack")
+
+	resp, err := client.Do(req)
+	assert.NoError(err)
+	resp.Body.Close()
+	assert.Equal(400, resp.StatusCode)
+	assert.EqualValues(traceCount, r.Stats.GetTagStats(info.Tags{EndpointVersion: "v1.0"}).TracesDropped.DecodingError.Load())
+}
+
+func FuzzHandleTracesV1NoPanic(f *testing.F) {
+	traces := testutil.GetTestTracesV1(1, 1, false)
+	bts, err := traces.MarshalMsg(nil)
+	require.Nil(f, err)
+	f.Add(bts)
+	conf := newTestReceiverConfig()
+	r := newTestReceiverFromConfig(conf)
+	server := httptest.NewServer(r.handleWithVersion(V10, r.handleTraces))
+	defer server.Close()
+	// We just want to make sure our server never panics, regardless of the input
+	f.Fuzz(func(t *testing.T, data []byte) {
+		req, err := http.NewRequest("POST", server.URL, bytes.NewBuffer(data))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/msgpack")
+		client := &http.Client{}
+		resp, _ := client.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+	})
 }
 
 func TestReceiverDecodingError(t *testing.T) {
@@ -521,9 +1004,38 @@ func TestReceiverUnexpectedEOF(t *testing.T) {
 	resp, err := client.Do(req)
 	assert.NoError(err)
 
+	respBodyBytes, err := io.ReadAll(resp.Body)
+	assert.NoError(err)
+	respBody := string(respBodyBytes)
+
 	resp.Body.Close()
 	assert.Equal(400, resp.StatusCode)
 	assert.EqualValues(traceCount, r.Stats.GetTagStats(info.Tags{EndpointVersion: "v0.5"}).TracesDropped.MSGPShortBytes.Load())
+	assert.Contains(respBody, "too few bytes left to read")
+}
+
+func TestHandleTracesV05RejectsInvalidDictionaryIndex(t *testing.T) {
+	assert := assert.New(t)
+	conf := newTestReceiverConfig()
+	r := newTestReceiverFromConfig(conf)
+	server := httptest.NewServer(r.handleWithVersion(v05, r.handleTraces))
+	defer server.Close()
+
+	data := []byte("\x91\x90\x91\x91\x9c\x0000000000\x80\x800")
+	var decoded pb.Traces
+	decodeErr := decoded.UnmarshalMsgDictionary(data)
+	assert.ErrorContains(decodeErr, "dictionary index 0 out of range")
+
+	var client http.Client
+	req, err := http.NewRequest("POST", server.URL, bytes.NewBuffer(data))
+	assert.NoError(err)
+	req.Header.Set("Content-Type", "application/msgpack")
+	req.Header.Set(header.TraceCount, "1")
+
+	resp, err := client.Do(req)
+	assert.NoError(err)
+	resp.Body.Close()
+	assert.Equal(http.StatusBadRequest, resp.StatusCode)
 }
 
 func TestTraceCount(t *testing.T) {
@@ -589,66 +1101,121 @@ func TestDecodeV05(t *testing.T) {
 	req, err := http.NewRequest("POST", "/v0.5/traces", bytes.NewReader(b))
 	assert.NoError(err)
 	req.Header.Set(header.ContainerID, "abcdef123789456")
-	tp, err := decodeTracerPayload(v05, req, NewIDProvider("", func(_ origindetection.OriginInfo) (string, error) {
+	emptyRecv := HTTPReceiver{}
+	tp, err := emptyRecv.decodeTracerPayload(v05, req, NewIDProvider("", func(_ origindetection.OriginInfo) (string, error) {
 		return "abcdef123789456", nil
 	}), "python", "3.8.1", "1.2.3")
 	assert.NoError(err)
-	assert.EqualValues(tp, &pb.TracerPayload{
-		ContainerID:     "abcdef123789456",
-		LanguageName:    "python",
-		LanguageVersion: "3.8.1",
-		TracerVersion:   "1.2.3",
-		Chunks: []*pb.TraceChunk{
+
+	// Check payload-level fields
+	assert.Equal("abcdef123789456", tp.ContainerID)
+	assert.Equal("python", tp.LanguageName)
+	assert.Equal("3.8.1", tp.LanguageVersion)
+	assert.Equal("1.2.3", tp.TracerVersion)
+
+	// Check we have one chunk
+	assert.Len(tp.Chunks, 1)
+	chunk := tp.Chunks[0]
+
+	// Check chunk-level fields
+	assert.Equal(int32(sampler.PriorityNone), chunk.Priority)
+
+	// Check we have 3 spans
+	assert.Len(chunk.Spans, 3)
+
+	// Check first span (TraceID 1)
+	span0 := chunk.Spans[0]
+	assert.Equal("Service", span0.Service)
+	assert.Equal("Name", span0.Name)
+	assert.Equal("Resource", span0.Resource)
+	assert.Equal(uint64(2), span0.SpanID)
+	assert.Equal(uint64(3), span0.ParentID)
+	assert.Equal(int64(123), span0.Start)
+	assert.Equal(int64(456), span0.Duration)
+	assert.Equal(int32(1), span0.Error)
+	metaA, ok := span0.Meta["A"]
+	assert.True(ok)
+	assert.Equal("B", metaA)
+	metricX, ok := span0.Metrics["X"]
+	assert.True(ok)
+	assert.Equal(1.2, metricX)
+	assert.Equal("sql", span0.Type)
+
+	// Check second span (TraceID 2)
+	span1 := chunk.Spans[1]
+	assert.Equal("Service2", span1.Service)
+	assert.Equal("Name2", span1.Name)
+	assert.Equal("Resource2", span1.Resource)
+	assert.Equal(uint64(3), span1.SpanID)
+	assert.Equal(uint64(3), span1.ParentID)
+	assert.Equal(int64(789), span1.Start)
+	assert.Equal(int64(456), span1.Duration)
+	assert.Equal(int32(0), span1.Error)
+	metaC, ok := span1.Meta["c"]
+	assert.True(ok)
+	assert.Equal("d", metaC)
+	metricY, ok := span1.Metrics["y"]
+	assert.True(ok)
+	assert.Equal(1.4, metricY)
+	assert.Equal("sql", span1.Type)
+
+	// Check third span (TraceID 2, same as second but no metrics)
+	span2 := chunk.Spans[2]
+	assert.Equal("Service2", span2.Service)
+	assert.Equal("Name2", span2.Name)
+	assert.Equal("Resource2", span2.Resource)
+	assert.Equal(uint64(3), span2.SpanID)
+	assert.Equal(uint64(3), span2.ParentID)
+	assert.Equal(int64(789), span2.Start)
+	assert.Equal(int64(456), span2.Duration)
+	assert.Equal(int32(0), span2.Error)
+	metaC2, ok := span2.Meta["c"]
+	assert.True(ok)
+	assert.Equal("d", metaC2)
+	assert.Equal("sql", span2.Type)
+}
+
+func TestDecodeTracerPayloadContentLengthTooLarge(t *testing.T) {
+	// Test that decodeTracerPayload rejects requests when the Content-Length header
+	// exceeds MaxRequestBytes. This prevents allocating large buffers for oversized requests.
+	assert := assert.New(t)
+	require := require.New(t)
+
+	// Create a simple msgpack payload (v0.5 format)
+	data := [2]interface{}{
+		0: []string{
+			0: "Service",
+			1: "Name",
+			2: "Resource",
+			3: "sql",
+		},
+		1: [][][12]interface{}{
 			{
-				Tags:     make(map[string]string),
-				Priority: int32(sampler.PriorityNone),
-				Spans: []*pb.Span{
-					{
-						Service:  "Service",
-						Name:     "Name",
-						Resource: "Resource",
-						TraceID:  1,
-						SpanID:   2,
-						ParentID: 3,
-						Start:    123,
-						Duration: 456,
-						Error:    1,
-						Meta:     map[string]string{"A": "B"},
-						Metrics:  map[string]float64{"X": 1.2},
-						Type:     "sql",
-					},
-					{
-						Service:  "Service2",
-						Name:     "Name2",
-						Resource: "Resource2",
-						TraceID:  2,
-						SpanID:   3,
-						ParentID: 3,
-						Start:    789,
-						Duration: 456,
-						Error:    0,
-						Meta:     map[string]string{"c": "d"},
-						Metrics:  map[string]float64{"y": 1.4},
-						Type:     "sql",
-					},
-					{
-						Service:  "Service2",
-						Name:     "Name2",
-						Resource: "Resource2",
-						TraceID:  2,
-						SpanID:   3,
-						ParentID: 3,
-						Start:    789,
-						Duration: 456,
-						Error:    0,
-						Meta:     map[string]string{"c": "d"},
-						Metrics:  nil,
-						Type:     "sql",
-					},
-				},
+				{uint32(3), uint32(1), uint32(2), uint64(1), uint64(2), uint64(3), int64(123), int64(456), 0, map[uint32]uint32{}, map[uint32]float64{}, uint32(3)},
 			},
 		},
-	})
+	}
+	b, err := vmsgp.Marshal(&data)
+	require.NoError(err)
+
+	// Create an HTTPReceiver with a small MaxRequestBytes
+	conf := newTestReceiverConfig()
+	conf.MaxRequestBytes = 100 // Set a small limit
+	recv := newTestReceiverFromConfig(conf)
+
+	// Create request with Content-Length header that exceeds MaxRequestBytes
+	req, err := http.NewRequest("POST", "/v0.5/traces", bytes.NewReader(b))
+	require.NoError(err)
+	req.Header.Set("Content-Length", "1000") // Set Content-Length larger than MaxRequestBytes
+
+	// Call decodeTracerPayload and expect it to fail with ErrLimitedReaderLimitReached
+	_, err = recv.decodeTracerPayload(v05, req, NewIDProvider("", func(_ origindetection.OriginInfo) (string, error) {
+		return "", nil
+	}), "python", "3.8.1", "1.2.3")
+
+	// Assert that we get the expected error
+	assert.Error(err)
+	assert.ErrorIs(err, apiutil.ErrLimitedReaderLimitReached)
 }
 
 type mockStatsProcessor struct {
@@ -658,9 +1225,13 @@ type mockStatsProcessor struct {
 	lastTracerVersion string
 	containerID       string
 	obfVersion        string
+
+	// processingLantency is used to mock a busy processor.
+	// use this variable to control how long the processor should 'wait' for the work to be done.
+	processingLantency time.Duration
 }
 
-func (m *mockStatsProcessor) ProcessStats(p *pb.ClientStatsPayload, lang, tracerVersion, containerID, obfVersion string) {
+func (m *mockStatsProcessor) ProcessStats(ctx context.Context, p *pb.ClientStatsPayload, lang, tracerVersion, containerID, obfVersion string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastP = p
@@ -668,6 +1239,13 @@ func (m *mockStatsProcessor) ProcessStats(p *pb.ClientStatsPayload, lang, tracer
 	m.lastTracerVersion = tracerVersion
 	m.containerID = containerID
 	m.obfVersion = obfVersion
+
+	select {
+	case <-time.After(m.processingLantency):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *mockStatsProcessor) Got() (p *pb.ClientStatsPayload, lang, tracerVersion, containerID string) {
@@ -706,13 +1284,112 @@ func TestHandleStats(t *testing.T) {
 
 		resp.Body.Close()
 		gotp, gotlang, gotTracerVersion, containerID := mockProcessor.Got()
-		assert.True(t, reflect.DeepEqual(gotp, p), "payload did not match")
+		assert.True(t, proto.Equal(gotp, p), "payload did not match")
 		assert.Equal(t, "lang1", gotlang, "lang did not match")
 		assert.Equal(t, "0.1.0", gotTracerVersion, "tracerVersion did not match")
 		assert.Equal(t, "abcdef123789456", containerID, "containerID did not match")
 
 		_, ok := rcv.Stats.Stats[info.Tags{Lang: "lang1", EndpointVersion: "v0.6", Service: "service", TracerVersion: "0.1.0"}]
 		assert.True(t, ok)
+	})
+	t.Run("timeout", func(t *testing.T) {
+		cfg := newTestReceiverConfig()
+		cfg.ReceiverTimeoutDuration = 50 * time.Millisecond
+		rcv := newTestReceiverFromConfig(cfg)
+		mockProcessor := &mockStatsProcessor{processingLantency: 500 * time.Millisecond}
+		rcv.statsProcessor = mockProcessor
+		mux := rcv.buildMux()
+		server := httptest.NewServer(mux)
+
+		var buf bytes.Buffer
+		if err := msgp.Encode(&buf, p); err != nil {
+			t.Fatal(err)
+		}
+		req, _ := http.NewRequest("POST", server.URL+"/v0.6/stats", &buf)
+		req.Header.Set("Content-Type", "application/msgpack")
+		req.Header.Set(header.Lang, "lang1")
+		req.Header.Set(header.TracerVersion, "0.1.0")
+		req.Header.Set(header.ContainerID, "abcdef123789456")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
+	})
+}
+
+func TestStatsKeepaliveIdleTimeout(t *testing.T) {
+	// When IdleTimeout is unset, Go falls back to ReadTimeout for keepalive connections.
+	// Tracers reuse connections across their ~10s stats flush interval, so IdleTimeout
+	// must be set independently to avoid "connection reset by peer" errors.
+	runTest := func(t *testing.T, idleTimeout time.Duration) (firstErr, secondErr error) {
+		cfg := newTestReceiverConfigNoPort()
+		cfg.ReceiverTimeoutDuration = 50 * time.Millisecond
+		cfg.ReceiverIdleTimeout = idleTimeout
+		readTimeout := cfg.ReceiverTimeoutDuration
+
+		rcv := startTestReceiver(t, cfg)
+		defer rcv.Stop()
+
+		addr := rcv.Addr().String()
+		require.Eventually(t, func() bool {
+			c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+			if err != nil {
+				return false
+			}
+			c.Close()
+			return true
+		}, 2*time.Second, 10*time.Millisecond)
+
+		p := testutil.StatsPayloadSample()
+		var buf bytes.Buffer
+		require.NoError(t, msgp.Encode(&buf, p))
+		payload := buf.Bytes()
+
+		// doRequest bypasses http.Client's reconnect logic.
+		doRequest := func(conn net.Conn) error {
+			req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v0.6/stats", bytes.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/msgpack")
+			if err := req.Write(conn); err != nil {
+				return err
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+			if err != nil {
+				return err
+			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			return nil
+		}
+
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		firstErr = doRequest(conn)
+		time.Sleep(2 * readTimeout) // sleep past ReadTimeout
+		secondErr = doRequest(conn)
+		return firstErr, secondErr
+	}
+
+	t.Run("without idle timeout", func(t *testing.T) {
+		// With no IdleTimeout, Go falls back to ReadTimeout (50ms). The second request on the
+		// same connection after 2×ReadTimeout must fail with a connection reset.
+		firstErr, secondErr := runTest(t, 0)
+		require.NoError(t, firstErr)
+		require.Error(t, secondErr, "expected connection reset when IdleTimeout falls back to ReadTimeout")
+	})
+
+	t.Run("with idle timeout", func(t *testing.T) {
+		// With IdleTimeout > ReadTimeout, the connection stays alive and both requests succeed.
+		firstErr, secondErr := runTest(t, 500*time.Millisecond)
+		require.NoError(t, firstErr)
+		require.NoError(t, secondErr, "keepalive connection must survive past ReadTimeout")
 	})
 }
 
@@ -754,7 +1431,7 @@ func TestClientComputedStatsHeader(t *testing.T) {
 			timeout := time.After(time.Second)
 			for {
 				select {
-				case p := <-rcv.out:
+				case p := <-rcv.outV1:
 					assert.Equal(t, p.ClientComputedStats, on)
 					wg.Wait()
 					return
@@ -767,6 +1444,39 @@ func TestClientComputedStatsHeader(t *testing.T) {
 
 	t.Run("on", run(true))
 	t.Run("off", run(false))
+}
+
+func TestHandleTracesV1(t *testing.T) {
+	// prepare the receiver
+	conf := newTestReceiverConfig()
+	receiver := newTestReceiverFromConfig(conf)
+
+	// response recorder
+	handler := receiver.handleWithVersion(V10, receiver.handleTraces)
+
+	strings := idx.NewStringTable()
+	tp := idx.InternalTracerPayload{
+		Strings: strings,
+	}
+	tp.SetLanguageName("python")
+	bts, err := tp.MarshalMsg(nil)
+	assert.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1.0/traces", bytes.NewReader(bts))
+	req.Header.Set("Content-Type", "application/msgpack")
+
+	handler.ServeHTTP(rr, req)
+
+	result := rr.Result()
+	defer result.Body.Close()
+	assert.Equal(t, http.StatusOK, result.StatusCode)
+	select {
+	case p := <-receiver.outV1:
+		assert.Equal(t, "python", p.TracerPayload.LanguageName())
+	default:
+		t.Fatal("no trace sent for processing")
+	}
 }
 
 func TestHandleTraces(t *testing.T) {
@@ -784,7 +1494,7 @@ func TestHandleTraces(t *testing.T) {
 	for n := 0; n < 10; n++ {
 		// consume the traces channel without doing anything
 		select {
-		case <-receiver.out:
+		case <-receiver.outV1:
 		default:
 		}
 
@@ -824,8 +1534,9 @@ func TestHandleTraces(t *testing.T) {
 		dynConf := sampler.NewDynamicConfig()
 
 		rawTraceChan := make(chan *Payload)
-		receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
-		receiver.recvsem = make(chan struct{}) //overwrite recvsem to ALWAYS block and ensure we look overwhelmed
+		rawTraceChanV1 := make(chan *PayloadV1)
+		receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, rawTraceChanV1, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
+		receiver.recvsem = make(chan struct{}) // overwrite recvsem to ALWAYS block and ensure we look overwhelmed
 		// response recorder
 		handler := receiver.handleWithVersion(v04, receiver.handleTraces)
 		rr := httptest.NewRecorder()
@@ -838,6 +1549,139 @@ func TestHandleTraces(t *testing.T) {
 		assert.Equal(t, http.StatusTooManyRequests, result.StatusCode)
 		assert.Equal(t, "application/json", result.Header.Get("Content-Type"))
 	})
+
+	t.Run("context_timeout", func(t *testing.T) {
+		// prepare the msgpack payload
+		bts, err := testutil.GetTestTraces(10, 10, true).MarshalMsg(nil)
+		assert.Nil(t, err)
+
+		// prepare the receiver
+		conf := newTestReceiverConfig()
+		conf.Decoders = 1
+		dynConf := sampler.NewDynamicConfig()
+
+		rawTraceChan := make(chan *Payload)
+		receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, nil, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
+
+		// Block the recvsem to ensure the handler waits for the semaphore
+		receiver.recvsem = make(chan struct{})
+
+		// response recorder
+		handler := receiver.handleWithVersion(v04, receiver.handleTraces)
+		rr := httptest.NewRecorder()
+
+		// Create a request with a context that times out immediately
+		req, _ := http.NewRequest("POST", "/v0.4/traces", bytes.NewReader(bts))
+		req.Header.Set("Content-Type", "application/msgpack")
+		req.Header.Set("Datadog-Send-Real-Http-Status", "true")
+		req.Header.Set(header.Lang, "go")
+
+		// Create a context with a very short timeout to trigger the context cancellation
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		// Wait a bit to ensure the context is cancelled before the handler processes it
+		time.Sleep(10 * time.Millisecond)
+
+		// Get initial PayloadTimeout count
+		ts := receiver.tagStats(v04, req, "")
+		initialTimeout := ts.PayloadTimeout.Load()
+
+		handler.ServeHTTP(rr, req)
+		result := rr.Result()
+		defer result.Body.Close()
+
+		// Verify that we got a 429 status code
+		assert.Equal(t, http.StatusTooManyRequests, result.StatusCode)
+
+		// Verify that PayloadTimeout was incremented
+		finalTimeout := ts.PayloadTimeout.Load()
+		assert.Equal(t, initialTimeout+1, finalTimeout, "PayloadTimeout should be incremented when request context is cancelled")
+	})
+
+	t.Run("context_timeout_v10", func(t *testing.T) {
+		// Test the same scenario for V10 endpoint
+		strings := idx.NewStringTable()
+		tp := idx.InternalTracerPayload{
+			Strings: strings,
+		}
+		tp.SetLanguageName("python")
+		bts, err := tp.MarshalMsg(nil)
+		assert.Nil(t, err)
+
+		conf := newTestReceiverConfig()
+		conf.Decoders = 1
+		dynConf := sampler.NewDynamicConfig()
+
+		rawTraceChan := make(chan *Payload)
+		rawTraceChanV1 := make(chan *PayloadV1)
+		receiver := NewHTTPReceiver(conf, dynConf, rawTraceChan, rawTraceChanV1, noopStatsProcessor{}, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
+
+		// Block the recvsem
+		receiver.recvsem = make(chan struct{})
+
+		handler := receiver.handleWithVersion(V10, receiver.handleTraces)
+		rr := httptest.NewRecorder()
+
+		req, _ := http.NewRequest("POST", "/v1.0/traces", bytes.NewReader(bts))
+		req.Header.Set("Content-Type", "application/msgpack")
+		req.Header.Set(header.TraceCount, "1")
+		req.Header.Set(header.Lang, "python")
+
+		// Create a context with a very short timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		time.Sleep(10 * time.Millisecond)
+
+		ts := receiver.tagStats(V10, req, "")
+		initialTimeout := ts.PayloadTimeout.Load()
+
+		handler.ServeHTTP(rr, req)
+		result := rr.Result()
+		defer result.Body.Close()
+
+		assert.Equal(t, http.StatusTooManyRequests, result.StatusCode)
+
+		finalTimeout := ts.PayloadTimeout.Load()
+		assert.Equal(t, initialTimeout+1, finalTimeout, "PayloadTimeout should be incremented for V10 endpoint")
+	})
+}
+
+func TestHandleTracesWithoutConvertFeature(t *testing.T) {
+	// Test that the old code path (with disable-convert-traces feature) still works
+	// prepare the msgpack payload
+	bts, err := testutil.GetTestTraces(10, 10, true).MarshalMsg(nil)
+	assert.Nil(t, err)
+
+	// prepare the receiver WITH the disable-convert-traces feature
+	conf := newTestReceiverConfigWithFeatures("disable-convert-traces")
+	receiver := newTestReceiverFromConfig(conf)
+
+	// response recorder
+	handler := receiver.handleWithVersion(v04, receiver.handleTraces)
+
+	// forge the request
+	rr := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v0.4/traces", bytes.NewReader(bts))
+	req.Header.Set("Content-Type", "application/msgpack")
+	req.Header.Set("Datadog-Meta-Lang", "python")
+
+	handler.ServeHTTP(rr, req)
+
+	// Should receive from the old 'out' channel, not 'outV1'
+	select {
+	case p := <-receiver.out:
+		assert.NotNil(t, p)
+		assert.NotNil(t, p.TracerPayload)
+		assert.Equal(t, 10, len(p.TracerPayload.Chunks))
+	case <-receiver.outV1:
+		t.Fatal("received from outV1 but expected out channel")
+	case <-time.After(time.Second):
+		t.Fatal("no data received")
+	}
 }
 
 func TestClientComputedTopLevel(t *testing.T) {
@@ -876,7 +1720,7 @@ func TestClientComputedTopLevel(t *testing.T) {
 			timeout := time.After(time.Second)
 			for {
 				select {
-				case p := <-rcv.out:
+				case p := <-rcv.outV1:
 					assert.Equal(t, p.ClientComputedTopLevel, on)
 					wg.Wait()
 					return
@@ -913,7 +1757,7 @@ func TestClientDropP0s(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatal(resp.StatusCode)
 	}
-	p := <-rcv.out
+	p := <-rcv.outV1
 	assert.Equal(t, p.ClientDroppedP0s, int64(153))
 }
 
@@ -938,7 +1782,7 @@ func BenchmarkHandleTracesFromOneApp(b *testing.B) {
 		b.StopTimer()
 		// consume the traces channel without doing anything
 		select {
-		case <-receiver.out:
+		case <-receiver.outV1:
 		default:
 		}
 
@@ -979,7 +1823,7 @@ func BenchmarkHandleTracesFromMultipleApps(b *testing.B) {
 		b.StopTimer()
 		// consume the traces channel without doing anything
 		select {
-		case <-receiver.out:
+		case <-receiver.outV1:
 		default:
 		}
 
@@ -1046,11 +1890,181 @@ func BenchmarkDecoderMsgpack(b *testing.B) {
 	}
 }
 
+// buildV05Payload builds a msgpack-encoded v0.5 ("dictionary") trace payload with
+// nTraces chunks of nSpansPerChunk spans each, referencing a shared string dictionary.
+// The wire layout mirrors what tracers POST to /v0.5/traces and is decoded identically
+// by both the legacy (pb.Traces) and converted (idx.InternalTracerPayload) paths, so the
+// same bytes can feed both BenchmarkDecodeV05Legacy and BenchmarkDecodeV05Converted.
+func buildV05Payload(b *testing.B, nTraces, nSpansPerChunk int) []byte {
+	b.Helper()
+	// Shared string dictionary. Spans reference entries by index.
+	dict := []string{
+		0:  "", // index 0 is conventionally the empty string
+		1:  "my-service",
+		2:  "my-operation",
+		3:  "my-resource",
+		4:  "web",
+		5:  "http.method",
+		6:  "GET",
+		7:  "http.status_code",
+		8:  "env",
+		9:  "prod",
+		10: "version",
+		11: "1.2.3",
+		12: "component",
+		13: "net/http",
+		14: "_sampling_priority_v1",
+	}
+	traces := make([][][12]interface{}, nTraces)
+	for t := 0; t < nTraces; t++ {
+		rootID := uint64(t*nSpansPerChunk + 1)
+		spans := make([][12]interface{}, nSpansPerChunk)
+		for s := 0; s < nSpansPerChunk; s++ {
+			spanID := uint64(t*nSpansPerChunk + s + 1)
+			parentID := rootID
+			if s == 0 {
+				parentID = 0 // first span in the chunk is the local root
+			}
+			spans[s] = [12]interface{}{
+				1,                 // service (dict ref)
+				2,                 // name (dict ref)
+				3,                 // resource (dict ref)
+				uint64(t + 1),     // traceID
+				spanID,            // spanID
+				parentID,          // parentID
+				int64(1234567890), // start
+				int64(1000),       // duration
+				0,                 // error
+				map[interface{}]interface{}{ // meta (dict ref -> dict ref)
+					5:  6,
+					8:  9,
+					10: 11,
+					12: 13,
+				},
+				map[interface{}]float64{ // metrics (dict ref -> float64)
+					7:  200,
+					14: 1,
+				},
+				4, // type (dict ref)
+			}
+		}
+		traces[t] = spans
+	}
+	payload := [2]interface{}{0: dict, 1: traces}
+	bts, err := vmsgp.Marshal(&payload)
+	require.NoError(b, err)
+	return bts
+}
+
+// benchIDProvider is a no-op container-ID provider for the decode benchmarks.
+var benchIDProvider = NewIDProvider("", func(_ origindetection.OriginInfo) (string, error) {
+	return "", nil
+})
+
+// buildV04Payload builds a msgpack-encoded v0.4 trace payload (a pb.Traces blob) with
+// nTraces chunks of nSpansPerChunk spans each. The per-span attribute shape (4 meta,
+// 2 metrics) mirrors buildV05Payload so the converted v0.4 and v0.5 decode paths can be
+// compared on equivalent input.
+func buildV04Payload(b *testing.B, nTraces, nSpansPerChunk int) []byte {
+	b.Helper()
+	traces := make(pb.Traces, nTraces)
+	for t := 0; t < nTraces; t++ {
+		rootID := uint64(t*nSpansPerChunk + 1)
+		trace := make(pb.Trace, nSpansPerChunk)
+		for s := 0; s < nSpansPerChunk; s++ {
+			spanID := uint64(t*nSpansPerChunk + s + 1)
+			parentID := rootID
+			if s == 0 {
+				parentID = 0 // first span in the chunk is the local root
+			}
+			trace[s] = &pb.Span{
+				Service:  "my-service",
+				Name:     "my-operation",
+				Resource: "my-resource",
+				Type:     "web",
+				TraceID:  uint64(t + 1),
+				SpanID:   spanID,
+				ParentID: parentID,
+				Start:    1234567890,
+				Duration: 1000,
+				Meta: map[string]string{
+					"http.method": "GET",
+					"env":         "prod",
+					"version":     "1.2.3",
+					"component":   "net/http",
+				},
+				Metrics: map[string]float64{
+					"http.status_code":      200,
+					"_sampling_priority_v1": 1,
+				},
+			}
+		}
+		traces[t] = trace
+	}
+	bts, err := traces.MarshalMsg(nil)
+	require.NoError(b, err)
+	return bts
+}
+
+// BenchmarkDecodeV04Converted measures the convert-traces (default) v0.4 decode path:
+// decode the msgpack pb.Traces payload directly into the internal idx.InternalTracerPayload
+// format via UnmarshalMsgConverted.
+func BenchmarkDecodeV04Converted(b *testing.B) {
+	bts := buildV04Payload(b, 10, 10)
+	recv := HTTPReceiver{}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(bts)))
+	for n := 0; n < b.N; n++ {
+		req, _ := http.NewRequest("POST", "/v0.4/traces", bytes.NewReader(bts))
+		req.Header.Set("Content-Type", "application/msgpack")
+		if _, err := recv.decodeConvertedTracerPayload(v04, req, benchIDProvider, "python", "3.8.1", "1.2.3"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDecodeV05Legacy measures the legacy (convert-traces disabled) v0.5 decode
+// path: decode the dictionary payload into pb.Traces and build a pb.TracerPayload.
+func BenchmarkDecodeV05Legacy(b *testing.B) {
+	bts := buildV05Payload(b, 10, 10)
+	recv := HTTPReceiver{}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(bts)))
+	for n := 0; n < b.N; n++ {
+		req, _ := http.NewRequest("POST", "/v0.5/traces", bytes.NewReader(bts))
+		if _, err := recv.decodeTracerPayload(v05, req, benchIDProvider, "python", "3.8.1", "1.2.3"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDecodeV05Converted measures the convert-traces (default) v0.5 decode path:
+// decode the dictionary payload directly into the internal idx.InternalTracerPayload
+// format. Compare against BenchmarkDecodeV05Legacy to gauge the feature's impact.
+func BenchmarkDecodeV05Converted(b *testing.B) {
+	bts := buildV05Payload(b, 10, 10)
+	recv := HTTPReceiver{}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(bts)))
+	for n := 0; n < b.N; n++ {
+		req, _ := http.NewRequest("POST", "/v0.5/traces", bytes.NewReader(bts))
+		if _, err := recv.decodeConvertedTracerPayload(v05, req, benchIDProvider, "python", "3.8.1", "1.2.3"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkWatchdog(b *testing.B) {
 	now := time.Now()
 	conf := newTestReceiverConfig()
 	conf.Endpoints[0].APIKey = "apikey_2"
-	r := NewHTTPReceiver(conf, nil, nil, nil, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
+	r := NewHTTPReceiver(conf, nil, nil, nil, nil, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{})
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -1060,13 +2074,12 @@ func BenchmarkWatchdog(b *testing.B) {
 }
 
 func TestReplyOKV5(t *testing.T) {
-	r := newTestReceiverFromConfig(newTestReceiverConfig())
-	r.Start()
+	r := startTestReceiver(t, newTestReceiverConfigNoPort())
 	defer r.Stop()
 
 	data, err := vmsgp.Marshal([2][]interface{}{{}, {}})
 	assert.NoError(t, err)
-	path := fmt.Sprintf("http://%s:%d/v0.5/traces", r.conf.ReceiverHost, r.conf.ReceiverPort)
+	path := fmt.Sprintf("http://%s/v0.5/traces", r.Addr())
 	resp, err := http.Post(path, "application/msgpack", bytes.NewReader(data))
 	assert.NoError(t, err)
 	slurp, err := io.ReadAll(resp.Body)
@@ -1262,9 +2275,7 @@ func TestGetProcessTags(t *testing.T) {
 			header: http.Header{header.ProcessTags: []string{"header-value"}},
 			payload: &pb.TracerPayload{
 				Chunks: []*pb.TraceChunk{
-					nil,
 					{},
-					{Spans: []*pb.Span{nil}},
 				},
 			},
 			expected: "header-value",
@@ -1298,15 +2309,12 @@ func TestUpdateAPIKey(t *testing.T) {
 	}
 	AttachEndpoint(testEndpoint)
 
-	conf := newTestReceiverConfig()
-	receiver := newTestReceiverFromConfig(conf)
-	receiver.Start()
+	receiver := startTestReceiver(t, newTestReceiverConfigNoPort())
 	defer receiver.Stop()
 
 	assert.Equal(1, counter)
 
-	url := fmt.Sprintf("http://%s:%d/test",
-		conf.ReceiverHost, conf.ReceiverPort)
+	url := fmt.Sprintf("http://%s/test", receiver.Addr())
 
 	for i := 1; i <= 10; i++ {
 		receiver.UpdateAPIKey() // force handler rebuild

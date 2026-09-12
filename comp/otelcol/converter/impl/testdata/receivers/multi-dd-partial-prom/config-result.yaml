@@ -6,6 +6,7 @@ receivers:
           - job_name: 'datadog-agent'
             scrape_interval: 60s
             metric_name_validation_scheme: legacy
+            metric_name_escaping_scheme: underscores
             scrape_protocols:
               - "PrometheusText0.0.4"
             static_configs:
@@ -17,6 +18,7 @@ receivers:
             job_name: 'datadog-agent'
             scrape_interval: 60s
             metric_name_validation_scheme: legacy
+            metric_name_escaping_scheme: underscores
             scrape_protocols:
               - "PrometheusText0.0.4"
             static_configs:
@@ -39,9 +41,19 @@ extensions:
   zpages/user-defined:
     endpoint: "localhost:55679"
   ddflare/user-defined:
-    
+  datadog/user-defined:
+
 processors:
+  cumulativetodelta/dd-autoconfigured:
   infraattributes/user-defined:
+  filter/drop-prometheus-internal-metrics/dd-autoconfigured:
+    metrics:
+      exclude:
+        match_type: regexp
+        metric_names:
+          - ^scrape_.*$
+          - ^up$
+          - ^promhttp_metric_handler_errors_total$
 
 service:
   telemetry:
@@ -55,7 +67,7 @@ service:
                 without_scope_info: true
                 without_type_suffix: true
                 without_units: true
-  extensions: [pprof/user-defined, zpages/user-defined, health_check/user-defined, ddflare/user-defined]
+  extensions: [pprof/user-defined, zpages/user-defined, health_check/user-defined, ddflare/user-defined, datadog/user-defined]
   pipelines:
       traces:
           receivers: [nop]
@@ -63,7 +75,7 @@ service:
           exporters: [datadog/1]
       metrics:
           receivers: [nop, prometheus/user-defined]
-          processors: [infraattributes/user-defined]
+          processors: [infraattributes/user-defined, cumulativetodelta/dd-autoconfigured]
           exporters: [datadog/2]
       logs:
           receivers: [nop]
@@ -71,7 +83,9 @@ service:
           exporters: [datadog/3]
       metrics/dd-autoconfigured/datadog/1:
           receivers: [prometheus/dd-autoconfigured]
+          processors: [filter/drop-prometheus-internal-metrics/dd-autoconfigured]
           exporters: [datadog/1]
       metrics/dd-autoconfigured/datadog/3:
           receivers: [prometheus/dd-autoconfigured]
+          processors: [filter/drop-prometheus-internal-metrics/dd-autoconfigured]
           exporters: [datadog/3]

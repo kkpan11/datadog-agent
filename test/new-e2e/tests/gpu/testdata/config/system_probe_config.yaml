@@ -1,0 +1,9 @@
+system_probe_config:
+  log_level: debug
+  enabled: true
+gpu_monitoring:
+  enabled: true
+  # The eBPF probes are deprecated and disabled by default. This suite asserts on
+  # gpu.process.core.usage, which only they can produce, so ask for them explicitly
+  # instead of relying on the default.
+  enable_ebpf_probes: true

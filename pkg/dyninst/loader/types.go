@@ -1,0 +1,173 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2024-present Datadog, Inc.
+
+//go:build ignore
+
+// Package loader supports setting up the eBPF program.
+package loader
+
+// #define CGO
+// #define bool _Bool
+// #define int32_t int
+// #define int64_t long long
+// #define uint8_t unsigned char
+// #define uint16_t unsigned short
+// #define uint32_t unsigned int
+// #define uint64_t unsigned long long
+// #include "../ebpf/types.h"
+import "C"
+import (
+	"fmt"
+
+	"github.com/DataDog/datadog-agent/pkg/dyninst/compiler"
+)
+
+type typeInfo C.type_info_t
+type probeParams C.probe_params_t
+type throttlerParams C.throttler_params_t
+type stats C.stats_t
+
+func opcodeByte(opcode compiler.Opcode) uint8 {
+	switch opcode {
+	case compiler.OpcodeInvalid:
+		return C.SM_OP_INVALID
+	case compiler.OpcodeCall:
+		return C.SM_OP_CALL
+	case compiler.OpcodeReturn:
+		return C.SM_OP_RETURN
+	case compiler.OpcodeIllegal:
+		return C.SM_OP_ILLEGAL
+	case compiler.OpcodeIncrementOutputOffset:
+		return C.SM_OP_INCREMENT_OUTPUT_OFFSET
+	case compiler.OpcodeExprPrepare:
+		return C.SM_OP_EXPR_PREPARE
+	case compiler.OpcodeExprSave:
+		return C.SM_OP_EXPR_SAVE
+	case compiler.OpcodeExprDereferenceCfa:
+		return C.SM_OP_EXPR_DEREFERENCE_CFA
+	case compiler.OpcodeExprReadRegister:
+		return C.SM_OP_EXPR_READ_REGISTER
+	case compiler.OpcodeExprDereferencePtr:
+		return C.SM_OP_EXPR_DEREFERENCE_PTR
+	case compiler.OpcodeProcessPointer:
+		return C.SM_OP_PROCESS_POINTER
+	case compiler.OpcodeProcessSlice:
+		return C.SM_OP_PROCESS_SLICE
+	case compiler.OpcodeProcessArrayDataPrep:
+		return C.SM_OP_PROCESS_ARRAY_DATA_PREP
+	case compiler.OpcodeProcessSliceDataPrep:
+		return C.SM_OP_PROCESS_SLICE_DATA_PREP
+	case compiler.OpcodeProcessSliceDataRepeat:
+		return C.SM_OP_PROCESS_SLICE_DATA_REPEAT
+	case compiler.OpcodeProcessString:
+		return C.SM_OP_PROCESS_STRING
+	case compiler.OpcodeProcessGoEmptyInterface:
+		return C.SM_OP_PROCESS_GO_EMPTY_INTERFACE
+	case compiler.OpcodeProcessGoInterface:
+		return C.SM_OP_PROCESS_GO_INTERFACE
+	case compiler.OpcodeProcessGoDictType:
+		return C.SM_OP_PROCESS_GO_DICT_TYPE
+	case compiler.OpcodeProcessGoHmap:
+		return C.SM_OP_PROCESS_GO_HMAP
+	case compiler.OpcodeProcessGoSwissMap:
+		return C.SM_OP_PROCESS_GO_SWISS_MAP
+	case compiler.OpcodeProcessGoSwissMapGroups:
+		return C.SM_OP_PROCESS_GO_SWISS_MAP_GROUPS
+	case compiler.OpcodeChasePointers:
+		return C.SM_OP_CHASE_POINTERS
+	case compiler.OpcodePrepareEventRoot:
+		return C.SM_OP_PREPARE_EVENT_ROOT
+	case compiler.OpcodeExprPushOffset:
+		return C.SM_OP_EXPR_PUSH_OFFSET
+	case compiler.OpcodeExprLoadLiteral:
+		return C.SM_OP_EXPR_LOAD_LITERAL
+	case compiler.OpcodeExprReadString:
+		return C.SM_OP_EXPR_READ_STRING
+	case compiler.OpcodeExprCmpBase:
+		return C.SM_OP_EXPR_CMP_BASE
+	case compiler.OpcodeExprCmpString:
+		return C.SM_OP_EXPR_CMP_STRING
+	case compiler.OpcodeConditionCheck:
+		return C.SM_OP_CONDITION_CHECK
+	case compiler.OpcodeConditionBegin:
+		return C.SM_OP_CONDITION_BEGIN
+	case compiler.OpcodeCallDictResolved:
+		return C.SM_OP_CALL_DICT_RESOLVED
+	case compiler.OpcodeExprSliceBoundsCheck:
+		return C.SM_OP_EXPR_SLICE_BOUNDS_CHECK
+	case compiler.OpcodeSwissMapSetup:
+		return C.SM_OP_SWISS_MAP_SETUP
+	case compiler.OpcodeSwissMapAesenc:
+		return C.SM_OP_SWISS_MAP_AESENC
+	case compiler.OpcodeSwissMapHashFinish:
+		return C.SM_OP_SWISS_MAP_HASH_FINISH
+	case compiler.OpcodeSwissMapProbe:
+		return C.SM_OP_SWISS_MAP_PROBE
+	case compiler.OpcodeSwissMapCheckSlot:
+		return C.SM_OP_SWISS_MAP_CHECK_SLOT
+	case compiler.OpcodeCondNot:
+		return C.SM_OP_COND_NOT
+	case compiler.OpcodeCondJumpIfFalse:
+		return C.SM_OP_COND_JUMP_IF_FALSE
+	case compiler.OpcodeCondJumpIfTrue:
+		return C.SM_OP_COND_JUMP_IF_TRUE
+	case compiler.OpcodeExprLoadDuration:
+		return C.SM_OP_EXPR_LOAD_DURATION
+	case compiler.OpcodeConditionStateInit:
+		return C.SM_OP_CONDITION_STATE_INIT
+	case compiler.OpcodeConditionLeafRecord:
+		return C.SM_OP_CONDITION_LEAF_RECORD
+	case compiler.OpcodeConditionLeafLoad:
+		return C.SM_OP_CONDITION_LEAF_LOAD
+	case compiler.OpcodeConditionCheckPreserveError:
+		return C.SM_OP_CONDITION_CHECK_PRESERVE_ERROR
+	case compiler.OpcodeConditionLeafComplete:
+		return C.SM_OP_CONDITION_LEAF_COMPLETE
+	case compiler.OpcodeGoContextChainInit:
+		return C.SM_OP_GO_CONTEXT_CHAIN_INIT
+	case compiler.OpcodeGoContextChainHop:
+		return C.SM_OP_GO_CONTEXT_CHAIN_HOP
+	case compiler.OpcodeProcessGoTime:
+		return C.SM_OP_PROCESS_GO_TIME
+	case compiler.OpcodeExprLoadAddress:
+		return C.SM_OP_EXPR_LOAD_ADDRESS
+	case compiler.OpcodeArrayLoopBegin:
+		return C.SM_OP_ARRAY_LOOP_BEGIN
+	case compiler.OpcodeArrayLoopEnd:
+		return C.SM_OP_ARRAY_LOOP_END
+	case compiler.OpcodeSliceLoopBegin:
+		return C.SM_OP_SLICE_LOOP_BEGIN
+	case compiler.OpcodeSliceLoopEnd:
+		return C.SM_OP_SLICE_LOOP_END
+	case compiler.OpcodeSwissMapLoopBegin:
+		return C.SM_OP_SWISS_MAP_LOOP_BEGIN
+	case compiler.OpcodeSwissMapLoopEnd:
+		return C.SM_OP_SWISS_MAP_LOOP_END
+	case compiler.OpcodeExprAdvanceOffset:
+		return C.SM_OP_EXPR_ADVANCE_OFFSET
+	case compiler.OpcodePanicUnwindPrepare:
+		return C.SM_OP_PANIC_UNWIND_PREPARE
+	case compiler.OpcodePanicUnwindEvictSlots:
+		return C.SM_OP_PANIC_UNWIND_EVICT_SLOTS
+	case compiler.OpcodeEmitFilterSliceMarker:
+		return C.SM_OP_EMIT_FILTER_SLICE_MARKER
+	case compiler.OpcodeEmitFilterMapMarker:
+		return C.SM_OP_EMIT_FILTER_MAP_MARKER
+	case compiler.OpcodeInitFilterSliceLoop:
+		return C.SM_OP_INIT_FILTER_SLICE_LOOP
+	case compiler.OpcodeEmitFilterSliceElement:
+		return C.SM_OP_EMIT_FILTER_SLICE_ELEMENT
+	case compiler.OpcodeFilterSliceAdvance:
+		return C.SM_OP_FILTER_SLICE_ADVANCE
+	case compiler.OpcodeInitFilterMapLoop:
+		return C.SM_OP_INIT_FILTER_MAP_LOOP
+	case compiler.OpcodeEmitFilterMapElement:
+		return C.SM_OP_EMIT_FILTER_MAP_ELEMENT
+	case compiler.OpcodeFilterMapAdvance:
+		return C.SM_OP_FILTER_MAP_ADVANCE
+	default:
+		panic(fmt.Sprintf("unknown opcode: %s", opcode))
+	}
+}

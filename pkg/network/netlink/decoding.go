@@ -9,6 +9,7 @@ package netlink
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -24,7 +25,7 @@ const (
 const (
 	ctaTupleIP    = 1
 	ctaTupleProto = 2
-	ctaTupleZone  = 3 //nolint:deadcode
+	ctaTupleZone  = 3 //nolint:unused
 )
 
 const (
@@ -199,14 +200,14 @@ func (d *Decoder) unmarshalProto(t *ConTuple) error {
 
 func ipv4(b []byte) (netip.Addr, error) {
 	if len(b) != 4 {
-		return netip.Addr{}, fmt.Errorf("invalid IPv4 size")
+		return netip.Addr{}, errors.New("invalid IPv4 size")
 	}
 	return netip.AddrFrom4([4]byte(b)), nil
 }
 
 func ipv6(b []byte) (netip.Addr, error) {
 	if len(b) != 16 {
-		return netip.Addr{}, fmt.Errorf("invalid IPv6 size")
+		return netip.Addr{}, errors.New("invalid IPv6 size")
 	}
 	return netip.AddrFrom16([16]byte(b)), nil
 }

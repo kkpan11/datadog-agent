@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf || (windows && npm)
+//go:build (linux && bpf) || (windows && npm)
 
 package tracer
 
@@ -15,13 +15,16 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/pkg/network/events"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
-	maxProcessQueueLen = 100
+	// the queue is oversized to account for the procfs snapshot when system-probe starts.
+	// these are pointers, so the memory cost is not severe
+	maxProcessQueueLen = 2048
 	// maxProcessListSize is the max size of a processList
 	maxProcessListSize     = 3
 	processCacheModuleName = "network_tracer__process_cache"
@@ -34,10 +37,10 @@ var processCacheTelemetry = struct {
 	eventsDropped telemetry.Counter
 	eventsSkipped telemetry.Counter
 }{
-	telemetry.NewCounter(processCacheModuleName, "cache_evicts", []string{}, "Counter measuring the number of evictions in the process cache"),
+	telemetryimpl.GetCompatComponent().NewCounter(processCacheModuleName, "cache_evicts", []string{}, "Counter measuring the number of evictions in the process cache"),
 	prometheus.NewDesc(processCacheModuleName+"__cache_length", "Gauge measuring the current size of the process cache", nil, nil),
-	telemetry.NewCounter(processCacheModuleName, "events_dropped", []string{}, "Counter measuring the number of dropped process events"),
-	telemetry.NewCounter(processCacheModuleName, "events_skipped", []string{}, "Counter measuring the number of skipped process events"),
+	telemetryimpl.GetCompatComponent().NewCounter(processCacheModuleName, "events_dropped", []string{}, "Counter measuring the number of dropped process events"),
+	telemetryimpl.GetCompatComponent().NewCounter(processCacheModuleName, "events_skipped", []string{}, "Counter measuring the number of skipped process events"),
 }
 
 type processList []*events.Process
@@ -73,8 +76,7 @@ func newProcessCache(maxProcs int) (*processCache, error) {
 	var err error
 	pc.cache, err = lru.NewWithEvict(maxProcs, func(_ processCacheKey, p *events.Process) {
 		log.TraceFunc(func() string { return fmt.Sprintf("evicting process %+v", p) })
-		//nolint:gosimple // TODO(NET) Fix gosimple linter
-		pl, _ := pc.cacheByPid[p.Pid]
+		pl := pc.cacheByPid[p.Pid]
 		if pl = pl.remove(p); len(pl) == 0 {
 			delete(pc.cacheByPid, p.Pid)
 			return
@@ -125,7 +127,11 @@ func (pc *processCache) HandleProcessEvent(entry *events.Process) {
 
 func (pc *processCache) processEvent(entry *events.Process) *events.Process {
 	if len(entry.Tags) == 0 && entry.ContainerID == nil {
-		return nil
+		// CWS event had no container ID — cgroup migration may not have
+		// completed yet. Try reading /proc/<pid>/cgroup directly as a
+		// fallback; by this point the migration is more likely to have
+		// finished.
+		return rescueEventWithProcfs(entry)
 	}
 
 	return entry
@@ -206,6 +212,48 @@ func (pc *processCache) Get(pid uint32, ts int64) (*events.Process, bool) {
 
 	log.TraceFunc(func() string { return fmt.Sprintf("entry not found for process %d", pid) })
 	return nil, false
+}
+
+// GetAllPIDTags returns a map of PID -> []string tags for all processes in the cache.
+// For each PID, the most recent (latest StartTime) process entry is used.
+func (pc *processCache) GetAllPIDTags() map[uint32][]string {
+	if pc == nil {
+		return nil
+	}
+
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	now := time.Now().Unix()
+	result := make(map[uint32][]string, len(pc.cacheByPid))
+	for pid, pl := range pc.cacheByPid {
+		// pick the most recent entry for this PID
+		var latest *events.Process
+		for _, p := range pl {
+			if now > p.Expiry {
+				continue
+			}
+			if latest == nil || p.StartTime > latest.StartTime {
+				latest = p
+			}
+		}
+		if latest == nil || len(latest.Tags) == 0 {
+			continue
+		}
+		tags := make([]string, 0, len(latest.Tags))
+		for _, t := range latest.Tags {
+			if t == nil {
+				continue
+			}
+			if s, ok := t.Get().(string); ok {
+				tags = append(tags, s)
+			}
+		}
+		if len(tags) > 0 {
+			result[pid] = tags
+		}
+	}
+	return result
 }
 
 func (pc *processCache) Dump() (interface{}, error) {

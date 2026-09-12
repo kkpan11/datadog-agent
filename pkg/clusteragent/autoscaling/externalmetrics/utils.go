@@ -31,17 +31,18 @@ const (
 )
 
 var (
-	datadogMetricFormat = *regexp.MustCompile("^" + datadogMetricRefPrefix + kubernetesNameFormat + datadogMetricRefSep + kubernetesNameFormat + "$")
+	// The namespace part of the reference is optional and ignored, DatadogMetric objects are always resolved in the namespace of the referencing object.
+	datadogMetricFormat = *regexp.MustCompile("^" + datadogMetricRefPrefix + "(?:" + kubernetesNameFormat + datadogMetricRefSep + ")?" + kubernetesNameFormat + "$")
 	// These values are set by the provider when starting, here are default values for unit tests
 	queryConfigAggregator = "avg"
 	queryConfigRollup     = 30
 )
 
-// datadogMetric.ID is namespace/name
-func metricNameToDatadogMetricID(metricName string) (id string, parsed bool, hasPrefix bool) {
+// datadogMetric.ID is namespace/name, the namespace being the one of the object referencing the DatadogMetric.
+func metricNameToDatadogMetricID(metricName, namespace string) (id string, parsed bool, hasPrefix bool) {
 	metricName = strings.ToLower(metricName)
 	if matches := datadogMetricFormat.FindStringSubmatch(metricName); matches != nil {
-		return matches[1] + kubernetesNamespaceSep + matches[2], true, true
+		return namespace + kubernetesNamespaceSep + matches[2], true, true
 	}
 
 	return "", false, strings.HasPrefix(metricName, datadogMetricRefPrefix)
@@ -78,15 +79,15 @@ func buildDatadogQueryForExternalMetric(metricName string, labels map[string]str
 	var result string
 
 	if len(labels) == 0 {
-		result = fmt.Sprintf("%s{*}", metricName)
+		result = metricName + "{*}"
 	} else {
-		datadogTags := []string{}
+		datadogTags := make([]string, 0, len(labels))
 		for key, val := range labels {
-			datadogTags = append(datadogTags, fmt.Sprintf("%s:%s", key, val))
+			datadogTags = append(datadogTags, key+":"+val)
 		}
 		sort.Strings(datadogTags)
 		tags := strings.Join(datadogTags, ",")
-		result = fmt.Sprintf("%s{%s}", metricName, tags)
+		result = metricName + "{" + tags + "}"
 	}
 
 	return fmt.Sprintf("%s:%s.rollup(%d)", queryConfigAggregator, result, queryConfigRollup)

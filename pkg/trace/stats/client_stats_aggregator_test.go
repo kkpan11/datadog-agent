@@ -6,6 +6,7 @@
 package stats
 
 import (
+	"math"
 	"math/rand"
 	"sync"
 	"testing"
@@ -18,6 +19,8 @@ import (
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/sketches-go/ddsketch"
+	"github.com/DataDog/sketches-go/ddsketch/mapping"
+	"github.com/DataDog/sketches-go/ddsketch/pb/sketchpb"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
 	"google.golang.org/protobuf/proto"
@@ -59,13 +62,14 @@ func (w *mockStatsWriter) Reset() []*pb.StatsPayload {
 	return ret
 }
 
-func payloadWithCounts(ts time.Time, k BucketsAggregationKey, containerID, version, imageTag, gitCommitSha string, hits, errors, duration uint64) *pb.ClientStatsPayload {
+func payloadWithCounts(ts time.Time, k BucketsAggregationKey, containerID, version, imageTag, gitCommitSha, lang string, hits, errors, duration uint64) *pb.ClientStatsPayload {
 	return &pb.ClientStatsPayload{
 		Env:          "test-env",
 		Version:      version,
 		ImageTag:     imageTag,
 		GitCommitSha: gitCommitSha,
 		ContainerID:  containerID,
+		Lang:         lang,
 		Stats: []*pb.ClientStatsBucket{
 			{
 				Start: uint64(ts.UnixNano()),
@@ -82,6 +86,9 @@ func payloadWithCounts(ts time.Time, k BucketsAggregationKey, containerID, versi
 						Errors:         errors,
 						Duration:       duration,
 						GRPCStatusCode: k.GRPCStatusCode,
+						HTTPMethod:     k.HTTPMethod,
+						HTTPEndpoint:   k.HTTPEndpoint,
+						ServiceSource:  k.ServiceSource,
 					},
 				},
 			},
@@ -106,6 +113,8 @@ func getTestStatsWithStart(t *testing.T, start time.Time, incPeerTags bool) *pb.
 			s.PeerTags = nil
 		}
 		s.DBType = ""
+		s.SpanDerivedPrimaryTags = nil
+		s.AdditionalMetricTags = nil
 		s.OkSummary = encodeTestSketch(t, generateTestSketch(t))
 		s.ErrorSummary = encodeTestSketch(t, generateTestSketch(t))
 		stats = append(stats, s)
@@ -115,7 +124,6 @@ func getTestStatsWithStart(t *testing.T, start time.Time, incPeerTags bool) *pb.
 	p := &pb.ClientStatsPayload{}
 	fuzzer.Fuzz(p)
 	p.Tags = nil
-	p.Lang = ""
 	p.TracerVersion = ""
 	p.RuntimeID = ""
 	p.ContainerID = ""
@@ -132,7 +140,9 @@ func generateTestSketch(t *testing.T) *ddsketch.DDSketch {
 		v := rand.NormFloat64()
 		sketch.Add(v)
 	}
-	return normalizeSketch(sketch)
+	normalized, err := normalizeSketch(sketch)
+	assert.NoError(t, err)
+	return normalized
 }
 
 func encodeTestSketch(t *testing.T, s *ddsketch.DDSketch) []byte {
@@ -144,7 +154,6 @@ func encodeTestSketch(t *testing.T, s *ddsketch.DDSketch) []byte {
 
 func assertAggCountsPayload(t *testing.T, aggCounts *pb.StatsPayload) {
 	for _, p := range aggCounts.Stats {
-		assert.Empty(t, p.Lang)
 		assert.Empty(t, p.TracerVersion)
 		assert.Empty(t, p.RuntimeID)
 		assert.Equal(t, uint64(0), p.Sequence)
@@ -159,7 +168,6 @@ func assertAggCountsPayload(t *testing.T, aggCounts *pb.StatsPayload) {
 
 func assertAggStatsPayload(t *testing.T, aggStats *pb.StatsPayload) {
 	for _, p := range aggStats.Stats {
-		assert.Empty(t, p.Lang)
 		assert.Empty(t, p.TracerVersion)
 		assert.Empty(t, p.RuntimeID)
 		assert.Equal(t, uint64(0), p.Sequence)
@@ -192,7 +200,7 @@ func duplicateStats(insertionTime time.Time, p *pb.ClientStatsPayload, times uin
 				copy(okSumBytes, stat.OkSummary)
 
 				okSummary, _ := decodeSketch(stat.OkSummary)
-				okSummary = normalizeSketch(okSummary)
+				okSummary, _ = normalizeSketch(okSummary)
 
 				mergeSketch(okSummary, okSumBytes)
 				stat.OkSummary, _ = proto.Marshal(okSummary.ToProto())
@@ -202,7 +210,7 @@ func duplicateStats(insertionTime time.Time, p *pb.ClientStatsPayload, times uin
 				copy(errSumBytes, stat.ErrorSummary)
 
 				errSummary, _ := decodeSketch(stat.ErrorSummary)
-				errSummary = normalizeSketch(errSummary)
+				errSummary, _ = normalizeSketch(errSummary)
 
 				mergeSketch(errSummary, errSumBytes)
 
@@ -398,6 +406,16 @@ func TestCountAggregation(t *testing.T) {
 			&pb.ClientGroupedStats{GRPCStatusCode: "2"},
 			"status",
 		},
+		{
+			BucketsAggregationKey{HTTPMethod: "GET"},
+			&pb.ClientGroupedStats{HTTPMethod: "GET"},
+			"name",
+		},
+		{
+			BucketsAggregationKey{HTTPEndpoint: "/"},
+			&pb.ClientGroupedStats{HTTPEndpoint: "/"},
+			"name",
+		},
 	}
 	for _, tc := range tts {
 		t.Run(tc.name, func(t *testing.T) {
@@ -406,11 +424,11 @@ func TestCountAggregation(t *testing.T) {
 			a.writer = msw
 			testTime := time.Unix(time.Now().Unix(), 0)
 
-			c1 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", 11, 7, 100)
-			c2 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", 27, 2, 300)
-			c3 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", 5, 10, 3)
+			c1 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", "", 11, 7, 100)
+			c2 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", "", 27, 2, 300)
+			c3 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", "", 5, 10, 3)
 			keyDefault := BucketsAggregationKey{}
-			cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "", "", 0, 2, 4)
+			cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "", "", "", 0, 2, 4)
 
 			assert.Len(msw.payloads, 0)
 			a.add(testTime, deepCopy(c1))
@@ -474,14 +492,14 @@ func TestCountAggregationPeerTags(t *testing.T) {
 			a.writer = msw
 			testTime := time.Unix(time.Now().Unix(), 0)
 
-			c1 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", 11, 7, 100)
-			c2 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", 27, 2, 300)
-			c3 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", 5, 10, 3)
+			c1 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", "", 11, 7, 100)
+			c2 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", "", 27, 2, 300)
+			c3 := payloadWithCounts(testTime, tc.k, "", "test-version", "", "", "", 5, 10, 3)
 			c1.Stats[0].Stats[0].PeerTags = tc.peerTags
 			c2.Stats[0].Stats[0].PeerTags = tc.peerTags
 			c3.Stats[0].Stats[0].PeerTags = tc.peerTags
 			keyDefault := BucketsAggregationKey{}
-			cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "", "", 0, 2, 4)
+			cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "", "", "", 0, 2, 4)
 
 			assert.Len(msw.payloads, 0)
 			a.add(testTime, deepCopy(c1))
@@ -523,11 +541,11 @@ func TestAggregationVersionData(t *testing.T) {
 		testTime := time.Unix(time.Now().Unix(), 0)
 
 		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
-		c1 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 11, 7, 100)
-		c2 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 27, 2, 300)
-		c3 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 5, 10, 3)
+		c1 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 11, 7, 100)
+		c2 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 27, 2, 300)
+		c3 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 5, 10, 3)
 		keyDefault := BucketsAggregationKey{}
-		cDefault := payloadWithCounts(testTime, keyDefault, "1", "test-version", "abc", "abc123", 0, 2, 4)
+		cDefault := payloadWithCounts(testTime, keyDefault, "1", "test-version", "abc", "abc123", "", 0, 2, 4)
 
 		assert.Len(msw.payloads, 0)
 		a.add(testTime, deepCopy(c1))
@@ -577,11 +595,11 @@ func TestAggregationVersionData(t *testing.T) {
 		testTime := time.Unix(time.Now().Unix(), 0)
 
 		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
-		c1 := payloadWithCounts(testTime, bak, "1", "", "", "", 11, 7, 100)
-		c2 := payloadWithCounts(testTime, bak, "1", "", "", "", 27, 2, 300)
-		c3 := payloadWithCounts(testTime, bak, "1", "", "", "", 5, 10, 3)
+		c1 := payloadWithCounts(testTime, bak, "1", "", "", "", "", 11, 7, 100)
+		c2 := payloadWithCounts(testTime, bak, "1", "", "", "", "", 27, 2, 300)
+		c3 := payloadWithCounts(testTime, bak, "1", "", "", "", "", 5, 10, 3)
 		keyDefault := BucketsAggregationKey{}
-		cDefault := payloadWithCounts(testTime, keyDefault, "1", "", "", "", 0, 2, 4)
+		cDefault := payloadWithCounts(testTime, keyDefault, "1", "", "", "", "", 0, 2, 4)
 
 		assert.Len(msw.payloads, 0)
 		a.add(testTime, deepCopy(c1))
@@ -591,16 +609,6 @@ func TestAggregationVersionData(t *testing.T) {
 		assert.Len(msw.payloads, 0)
 		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
 		require.Len(t, msw.payloads, 1)
-
-		// Add the expected gitCommitSha and imageTag on c1, c2, c3, and cDefault for these assertions.
-		c1.GitCommitSha = "sha-from-container-tags"
-		c1.ImageTag = "image-tag-from-container-tags"
-		c2.GitCommitSha = "sha-from-container-tags"
-		c2.ImageTag = "image-tag-from-container-tags"
-		c3.GitCommitSha = "sha-from-container-tags"
-		c3.ImageTag = "image-tag-from-container-tags"
-		cDefault.GitCommitSha = "sha-from-container-tags"
-		cDefault.ImageTag = "image-tag-from-container-tags"
 
 		aggCounts := msw.payloads[0]
 		assertAggCountsPayload(t, aggCounts)
@@ -628,6 +636,54 @@ func TestAggregationVersionData(t *testing.T) {
 		assert.Len(a.buckets, 0)
 	})
 
+	t.Run("version comes from container tags when not set in payload", func(t *testing.T) {
+		assert := assert.New(t)
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		cfg := config.New()
+		cfg.ContainerTags = func(_ string) ([]string, error) {
+			return []string{"git.commit.sha:sha-from-container-tags", "image_tag:image-tag-from-container-tags", "version:version-from-container-tags"}, nil
+		}
+		a.conf = cfg
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
+		c1 := payloadWithCounts(testTime, bak, "1", "", "", "", "", 11, 7, 100)
+
+		a.add(testTime, deepCopy(c1))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+		require.Len(t, msw.payloads, 1)
+
+		aggCounts := msw.payloads[0]
+		assert.Equal("version-from-container-tags", aggCounts.Stats[0].Version)
+		assert.Equal("image-tag-from-container-tags", aggCounts.Stats[0].ImageTag)
+		assert.Equal("sha-from-container-tags", aggCounts.Stats[0].GitCommitSha)
+	})
+
+	t.Run("payload version overrides container tags", func(t *testing.T) {
+		assert := assert.New(t)
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		cfg := config.New()
+		cfg.ContainerTags = func(_ string) ([]string, error) {
+			return []string{"version:version-from-container-tags"}, nil
+		}
+		a.conf = cfg
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
+		c1 := payloadWithCounts(testTime, bak, "1", "payload-version", "", "", "", 11, 7, 100)
+
+		a.add(testTime, deepCopy(c1))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+		require.Len(t, msw.payloads, 1)
+
+		aggCounts := msw.payloads[0]
+		assert.Equal("payload-version", aggCounts.Stats[0].Version)
+	})
+
 	t.Run("payload git commit sha and image tag override container tags", func(t *testing.T) {
 		assert := assert.New(t)
 		a := newTestAggregator()
@@ -641,11 +697,11 @@ func TestAggregationVersionData(t *testing.T) {
 		testTime := time.Unix(time.Now().Unix(), 0)
 
 		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
-		c1 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 11, 7, 100)
-		c2 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 27, 2, 300)
-		c3 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 5, 10, 3)
+		c1 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 11, 7, 100)
+		c2 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 27, 2, 300)
+		c3 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 5, 10, 3)
 		keyDefault := BucketsAggregationKey{}
-		cDefault := payloadWithCounts(testTime, keyDefault, "1", "test-version", "abc", "abc123", 0, 2, 4)
+		cDefault := payloadWithCounts(testTime, keyDefault, "1", "test-version", "abc", "abc123", "", 0, 2, 4)
 
 		assert.Len(msw.payloads, 0)
 		a.add(testTime, deepCopy(c1))
@@ -691,9 +747,9 @@ func TestAggregationProcessTags(t *testing.T) {
 	testTime := time.Unix(time.Now().Unix(), 0)
 
 	bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
-	c1 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", 11, 7, 100)
+	c1 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", "", 11, 7, 100)
 	c1.ProcessTags = "a:1,b:2,c:3"
-	c2 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", 11, 7, 100)
+	c2 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", "", 11, 7, 100)
 	c2.ProcessTags = "b:33"
 
 	assert.Len(msw.payloads, 0)
@@ -723,11 +779,11 @@ func TestAggregationContainerID(t *testing.T) {
 		testTime := time.Unix(time.Now().Unix(), 0)
 
 		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
-		c1 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", 11, 7, 100)
-		c2 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", 27, 2, 300)
-		c3 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", 5, 10, 3)
+		c1 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", "", 11, 7, 100)
+		c2 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", "", 27, 2, 300)
+		c3 := payloadWithCounts(testTime, bak, "", "test-version", "abc", "abc123", "", 5, 10, 3)
 		keyDefault := BucketsAggregationKey{}
-		cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "abc", "abc123", 0, 2, 4)
+		cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "abc", "abc123", "", 0, 2, 4)
 
 		assert.Len(msw.payloads, 0)
 		a.add(testTime, deepCopy(c1))
@@ -753,11 +809,11 @@ func TestAggregationContainerID(t *testing.T) {
 		testTime := time.Unix(time.Now().Unix(), 0)
 
 		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
-		c1 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 11, 7, 100)
-		c2 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 27, 2, 300)
-		c3 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", 5, 10, 3)
+		c1 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 11, 7, 100)
+		c2 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 27, 2, 300)
+		c3 := payloadWithCounts(testTime, bak, "1", "test-version", "abc", "abc123", "", 5, 10, 3)
 		keyDefault := BucketsAggregationKey{}
-		cDefault := payloadWithCounts(testTime, keyDefault, "1", "test-version", "abc", "abc123", 0, 2, 4)
+		cDefault := payloadWithCounts(testTime, keyDefault, "1", "test-version", "abc", "abc123", "", 0, 2, 4)
 
 		assert.Len(msw.payloads, 0)
 		a.add(testTime, deepCopy(c1))
@@ -774,7 +830,116 @@ func TestAggregationContainerID(t *testing.T) {
 		assert.Equal(aggCounts.Stats[0].ContainerID, "1")
 		assert.Len(a.buckets, 0)
 	})
+}
 
+func TestLangAggregation(t *testing.T) {
+	t.Run("different_lang_separate_buckets", func(t *testing.T) {
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "test-service"}
+		c1 := payloadWithCounts(testTime, bak, "", "1.0.0", "", "", "go", 10, 1, 100)
+		c2 := payloadWithCounts(testTime, bak, "", "1.0.0", "", "", "python", 5, 2, 200)
+
+		a.add(testTime, deepCopy(c1))
+		a.add(testTime, deepCopy(c2))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+
+		require.Len(t, msw.payloads, 1)
+		assert.Len(t, msw.payloads[0].Stats, 2) // Separate buckets for different languages
+	})
+
+	t.Run("same_lang_same_bucket", func(t *testing.T) {
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "test-service"}
+		c1 := payloadWithCounts(testTime, bak, "", "1.0.0", "", "", "go", 10, 1, 100)
+		c2 := payloadWithCounts(testTime, bak, "", "1.0.0", "", "", "go", 5, 2, 200)
+
+		a.add(testTime, deepCopy(c1))
+		a.add(testTime, deepCopy(c2))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+
+		require.Len(t, msw.payloads, 1)
+		require.Len(t, msw.payloads[0].Stats, 1) // Same bucket for same lang
+
+		payload := msw.payloads[0].Stats[0]
+		assert.Equal(t, "go", payload.Lang)
+		assert.Equal(t, uint64(15), payload.Stats[0].Stats[0].Hits) // 10 + 5
+	})
+}
+
+func TestBaseServiceAggregation(t *testing.T) {
+	t.Run("service_preserved_through_aggregation", func(t *testing.T) {
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
+		c1 := payloadWithCounts(testTime, bak, "", "test-version", "", "", "", 11, 7, 100)
+		c1.Service = "my-base-service"
+		c2 := payloadWithCounts(testTime, bak, "", "test-version", "", "", "", 27, 2, 300)
+		c2.Service = "my-base-service"
+
+		a.add(testTime, deepCopy(c1))
+		a.add(testTime, deepCopy(c2))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+
+		require.Len(t, msw.payloads, 1)
+		require.Len(t, msw.payloads[0].Stats, 1)
+		assert.Equal(t, "my-base-service", msw.payloads[0].Stats[0].Service)
+	})
+
+	t.Run("different_service_separate_payloads", func(t *testing.T) {
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
+		c1 := payloadWithCounts(testTime, bak, "", "test-version", "", "", "", 11, 7, 100)
+		c1.Service = "service-a"
+		c2 := payloadWithCounts(testTime, bak, "", "test-version", "", "", "", 27, 2, 300)
+		c2.Service = "service-b"
+
+		a.add(testTime, deepCopy(c1))
+		a.add(testTime, deepCopy(c2))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+
+		require.Len(t, msw.payloads, 1)
+		require.Len(t, msw.payloads[0].Stats, 2)
+
+		services := make(map[string]bool)
+		for _, stat := range msw.payloads[0].Stats {
+			services[stat.Service] = true
+		}
+		assert.True(t, services["service-a"])
+		assert.True(t, services["service-b"])
+	})
+
+	t.Run("empty_service_preserved", func(t *testing.T) {
+		a := newTestAggregator()
+		msw := &mockStatsWriter{}
+		a.writer = msw
+		testTime := time.Unix(time.Now().Unix(), 0)
+
+		bak := BucketsAggregationKey{Service: "s", Name: "test.op"}
+		c1 := payloadWithCounts(testTime, bak, "", "test-version", "", "", "", 11, 7, 100)
+		c1.Service = ""
+
+		a.add(testTime, deepCopy(c1))
+		a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+
+		require.Len(t, msw.payloads, 1)
+		require.Len(t, msw.payloads[0].Stats, 1)
+		assert.Equal(t, "", msw.payloads[0].Stats[0].Service)
+	})
 }
 
 func TestNewBucketAggregationKeyPeerTags(t *testing.T) {
@@ -790,6 +955,85 @@ func TestNewBucketAggregationKeyPeerTags(t *testing.T) {
 		r := newBucketAggregationKey(&pb.ClientGroupedStats{Service: "a", PeerTags: []string{"peer.service:remote-service"}})
 		assert.Equal(BucketsAggregationKey{Service: "a", PeerTagsHash: peerTagsHash}, r)
 	})
+}
+
+func TestNewBucketAggregationKeyAdditionalMetricTags(t *testing.T) {
+	tagsHash := tagsFnvHash([]string{"env:prod", "region:us-east-1"})
+	t.Run("empty", func(t *testing.T) {
+		assert := assert.New(t)
+		r := newBucketAggregationKey(&pb.ClientGroupedStats{Service: "a"})
+		assert.Equal(BucketsAggregationKey{Service: "a"}, r)
+	})
+	t.Run("populated", func(t *testing.T) {
+		assert := assert.New(t)
+		r := newBucketAggregationKey(&pb.ClientGroupedStats{Service: "a", AdditionalMetricTags: []string{"env:prod", "region:us-east-1"}})
+		assert.Equal(BucketsAggregationKey{Service: "a", AdditionalMetricTagsHash: tagsHash}, r)
+	})
+}
+
+func TestCountAggregationAdditionalMetricTags(t *testing.T) {
+	assert := assert.New(t)
+	a := newTestAggregator()
+	msw := &mockStatsWriter{}
+	a.writer = msw
+	testTime := time.Unix(time.Now().Unix(), 0)
+
+	tags := []string{"env:prod", "region:us-east-1"}
+	tagsHash := tagsFnvHash(tags)
+	k := BucketsAggregationKey{Service: "s", AdditionalMetricTagsHash: tagsHash}
+
+	c1 := payloadWithCounts(testTime, k, "", "test-version", "", "", "", 11, 7, 100)
+	c2 := payloadWithCounts(testTime, k, "", "test-version", "", "", "", 27, 2, 300)
+	c1.Stats[0].Stats[0].AdditionalMetricTags = tags
+	c2.Stats[0].Stats[0].AdditionalMetricTags = tags
+
+	keyDefault := BucketsAggregationKey{}
+	cDefault := payloadWithCounts(testTime, keyDefault, "", "test-version", "", "", "", 0, 2, 4)
+
+	a.add(testTime, deepCopy(c1))
+	a.add(testTime, deepCopy(c2))
+	a.add(testTime, deepCopy(cDefault))
+	a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+	require.Len(t, msw.payloads, 1)
+
+	payload := msw.payloads[0]
+	assertAggCountsPayload(t, payload)
+
+	assert.ElementsMatch(payload.Stats[0].Stats[0].Stats, []*pb.ClientGroupedStats{
+		{
+			Service:              "s",
+			Hits:                 38,
+			Errors:               9,
+			Duration:             400,
+			AdditionalMetricTags: tags,
+		},
+		{
+			Hits:     0,
+			Errors:   2,
+			Duration: 4,
+		},
+	})
+	assert.Len(a.buckets, 0)
+}
+
+func TestGoroutineShutdown(t *testing.T) {
+	a := NewClientStatsAggregator(&config.AgentConfig{}, &mockStatsWriter{}, &statsd.NoOpClient{})
+
+	a.Start()
+
+	// Test graceful shutdown
+	done := make(chan bool)
+	go func() {
+		a.Stop() // Should signal both goroutines to exit and wait for them
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Success - both goroutines stopped properly
+	case <-time.After(time.Second):
+		t.Fatal("Goroutines did not stop within timeout")
+	}
 }
 
 func deepCopy(p *pb.ClientStatsPayload) *pb.ClientStatsPayload {
@@ -842,21 +1086,25 @@ func deepCopyGroupedStats(s []*pb.ClientGroupedStats) []*pb.ClientGroupedStats {
 		}
 
 		stats[i] = &pb.ClientGroupedStats{
-			Service:        b.GetService(),
-			Name:           b.GetName(),
-			Resource:       b.GetResource(),
-			HTTPStatusCode: b.GetHTTPStatusCode(),
-			Type:           b.GetType(),
-			DBType:         b.GetDBType(),
-			Hits:           b.GetHits(),
-			Errors:         b.GetErrors(),
-			Duration:       b.GetDuration(),
-			Synthetics:     b.GetSynthetics(),
-			TopLevelHits:   b.GetTopLevelHits(),
-			SpanKind:       b.GetSpanKind(),
-			PeerTags:       b.GetPeerTags(),
-			IsTraceRoot:    b.GetIsTraceRoot(),
-			GRPCStatusCode: b.GetGRPCStatusCode(),
+			Service:              b.GetService(),
+			Name:                 b.GetName(),
+			Resource:             b.GetResource(),
+			HTTPStatusCode:       b.GetHTTPStatusCode(),
+			Type:                 b.GetType(),
+			DBType:               b.GetDBType(),
+			Hits:                 b.GetHits(),
+			Errors:               b.GetErrors(),
+			Duration:             b.GetDuration(),
+			Synthetics:           b.GetSynthetics(),
+			TopLevelHits:         b.GetTopLevelHits(),
+			SpanKind:             b.GetSpanKind(),
+			PeerTags:             b.GetPeerTags(),
+			ServiceSource:        b.GetServiceSource(),
+			IsTraceRoot:          b.GetIsTraceRoot(),
+			GRPCStatusCode:       b.GetGRPCStatusCode(),
+			HTTPMethod:           b.GetHTTPMethod(),
+			HTTPEndpoint:         b.GetHTTPEndpoint(),
+			AdditionalMetricTags: b.GetAdditionalMetricTags(),
 		}
 		if b.OkSummary != nil {
 			stats[i].OkSummary = make([]byte, len(b.OkSummary))
@@ -868,4 +1116,163 @@ func deepCopyGroupedStats(s []*pb.ClientGroupedStats) []*pb.ClientGroupedStats {
 		}
 	}
 	return stats
+}
+
+// degenerateSketchBytes returns an encoded sketch whose index mapping has a
+// gamma large enough that its bucket lower bounds overflow to +Inf. sketches-go
+// only rejects gamma <= 1, so this decodes successfully; re-mapping it onto the
+// agent's mapping used to index out of the bounds of a collapsing store and
+// panic. Two bin counts are required: a single-bin sketch is re-mapped through a
+// path that does not compute a lower bound.
+func degenerateSketchBytes(t *testing.T) []byte {
+	t.Helper()
+	msg := &sketchpb.DDSketch{
+		Mapping: &sketchpb.IndexMapping{
+			Gamma:         math.MaxFloat64,
+			Interpolation: sketchpb.IndexMapping_NONE,
+		},
+		PositiveValues: &sketchpb.Store{BinCounts: map[int32]float64{1: 1, 2: 1}},
+		NegativeValues: &sketchpb.Store{},
+	}
+	data, err := proto.Marshal(msg)
+	require.NoError(t, err)
+	return data
+}
+
+func TestValidMapping(t *testing.T) {
+	canonical, err := mapping.NewLogarithmicMapping(relativeAccuracy)
+	require.NoError(t, err)
+	finer, err := mapping.NewLogarithmicMapping(0.005)
+	require.NoError(t, err)
+	// Passes the gamma > 1 check in sketches-go but is degenerate: both
+	// indexable bounds come out finite (4 and 0) yet inverted, and the relative
+	// accuracy is 1.
+	overflowing, err := mapping.NewLogarithmicMappingWithGamma(math.MaxFloat64, 0)
+	require.NoError(t, err)
+	coarse, err := mapping.NewLogarithmicMapping(0.9)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name  string
+		m     mapping.IndexMapping
+		valid bool
+	}{
+		{"nil", nil, false},
+		{"canonical", canonical, true},
+		{"finer", finer, true},
+		{"overflowing gamma", overflowing, false},
+		{"too coarse", coarse, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.valid, validMapping(tc.m))
+		})
+	}
+}
+
+func TestNormalizeSketch(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		s, err := normalizeSketch(nil)
+		assert.NoError(t, err)
+		assert.Nil(t, s)
+	})
+
+	t.Run("canonical mapping is returned as is", func(t *testing.T) {
+		in, err := ddsketch.LogCollapsingLowestDenseDDSketch(relativeAccuracy, maxNumBins)
+		require.NoError(t, err)
+		require.NoError(t, in.Add(1))
+		out, err := normalizeSketch(in)
+		assert.NoError(t, err)
+		assert.Same(t, in, out)
+	})
+
+	t.Run("finer mapping is normalized", func(t *testing.T) {
+		in, err := ddsketch.LogCollapsingLowestDenseDDSketch(0.005, maxNumBins)
+		require.NoError(t, err)
+		require.NoError(t, in.Add(1))
+		require.NoError(t, in.Add(1000))
+		out, err := normalizeSketch(in)
+		require.NoError(t, err)
+		require.NotNil(t, out)
+		assert.True(t, out.IndexMapping.Equals(ddsketchMapping))
+		assert.Equal(t, 2.0, out.GetCount())
+	})
+
+	t.Run("degenerate mapping is rejected", func(t *testing.T) {
+		in, err := decodeSketch(degenerateSketchBytes(t))
+		require.NoError(t, err)
+		require.NotNil(t, in)
+		out, err := normalizeSketch(in)
+		assert.Error(t, err)
+		assert.Nil(t, out)
+	})
+}
+
+func TestMergeSketchDegenerate(t *testing.T) {
+	raw := degenerateSketchBytes(t)
+
+	t.Run("no existing sketch", func(t *testing.T) {
+		out, err := mergeSketch(nil, raw)
+		assert.Error(t, err)
+		assert.Nil(t, out)
+	})
+
+	t.Run("existing sketch is preserved", func(t *testing.T) {
+		s1 := generateTestSketch(t)
+		count := s1.GetCount()
+		out, err := mergeSketch(s1, raw)
+		assert.Error(t, err)
+		assert.Same(t, s1, out)
+		assert.Equal(t, count, out.GetCount())
+	})
+}
+
+// TestAggregatorDegenerateSketch covers the full aggregation path: a client
+// sends the same degenerate sketch twice, so the second payload forces the
+// aggregator to decode and re-map the first one. The counts must survive and
+// only the distributions are dropped.
+func TestAggregatorDegenerateSketch(t *testing.T) {
+	a := newTestAggregator()
+	msw := &mockStatsWriter{}
+	a.writer = msw
+	testTime := time.Unix(time.Now().Unix(), 0)
+	raw := degenerateSketchBytes(t)
+	k := BucketsAggregationKey{Service: "s", Name: "n", Resource: "r"}
+
+	for i := 0; i < 2; i++ {
+		p := payloadWithCounts(testTime, k, "", "test-version", "", "", "", 11, 7, 100)
+		p.Stats[0].Stats[0].OkSummary = raw
+		p.Stats[0].Stats[0].ErrorSummary = raw
+		a.add(testTime, p)
+	}
+
+	a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+	require.Len(t, msw.payloads, 1)
+	stats := msw.payloads[0].Stats[0].Stats[0].Stats
+	require.Len(t, stats, 1)
+	assert.Equal(t, uint64(22), stats[0].Hits)
+	assert.Equal(t, uint64(14), stats[0].Errors)
+	assert.Equal(t, uint64(200), stats[0].Duration)
+	assert.Nil(t, stats[0].OkSummary)
+	assert.Nil(t, stats[0].ErrorSummary)
+	assert.Len(t, a.buckets, 0)
+}
+
+// TestAggregatorAddRecovers checks that a panic while aggregating one payload
+// drops that payload instead of taking down the trace-agent, and that the
+// aggregator's lock is released so later payloads still go through.
+func TestAggregatorAddRecovers(t *testing.T) {
+	a := newTestAggregator()
+	msw := &mockStatsWriter{}
+	a.writer = msw
+	testTime := time.Unix(time.Now().Unix(), 0)
+
+	assert.NotPanics(t, func() { a.add(testTime, nil) })
+
+	k := BucketsAggregationKey{Service: "s"}
+	a.add(testTime, payloadWithCounts(testTime, k, "", "test-version", "", "", "", 11, 7, 100))
+	a.flushOnTime(testTime.Add(oldestBucketStart + time.Nanosecond))
+	require.Len(t, msw.payloads, 1)
+	stats := msw.payloads[0].Stats[0].Stats[0].Stats
+	require.Len(t, stats, 1)
+	assert.Equal(t, uint64(11), stats[0].Hits)
 }

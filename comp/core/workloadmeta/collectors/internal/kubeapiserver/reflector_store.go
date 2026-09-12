@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 
 	kubernetesresourceparsers "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/util/kubernetes_resource_parsers"
@@ -65,7 +66,7 @@ func (r *reflectorStore) Add(obj interface{}) error {
 	r.wlmetaStore.Notify([]workloadmeta.CollectorEvent{
 		{
 			Type:   workloadmeta.EventTypeSet,
-			Source: collectorID,
+			Source: workloadmeta.SourceKubeAPIServer,
 			Entity: entity,
 		},
 	})
@@ -106,7 +107,7 @@ func (r *reflectorStore) Replace(list []interface{}, _ string) error {
 
 		events = append(events, workloadmeta.CollectorEvent{
 			Type:   workloadmeta.EventTypeSet,
-			Source: collectorID,
+			Source: workloadmeta.SourceKubeAPIServer,
 			Entity: entity,
 		})
 
@@ -123,7 +124,7 @@ func (r *reflectorStore) Replace(list []interface{}, _ string) error {
 
 		events = append(events, workloadmeta.CollectorEvent{
 			Type:   workloadmeta.EventTypeUnset,
-			Source: collectorID,
+			Source: workloadmeta.SourceKubeAPIServer,
 			Entity: entity,
 		})
 	}
@@ -148,10 +149,16 @@ func (r *reflectorStore) Delete(obj interface{}) error {
 	// to be deleted.
 	case *corev1.Pod:
 		uid = v.UID
+	case *MinimalPod:
+		uid = v.UID
 	case *appsv1.Deployment:
+		uid = v.UID
+	case *corev1.Node:
 		uid = v.UID
 	case *metav1.PartialObjectMetadata:
 		uid = v.UID
+	case *unstructured.Unstructured:
+		uid = v.GetUID()
 	default:
 		return fmt.Errorf("failed to identify Kind of object: %#v", obj)
 	}
@@ -168,7 +175,7 @@ func (r *reflectorStore) Delete(obj interface{}) error {
 	r.wlmetaStore.Notify([]workloadmeta.CollectorEvent{
 		{
 			Type:   workloadmeta.EventTypeUnset,
-			Source: collectorID,
+			Source: workloadmeta.SourceKubeAPIServer,
 			Entity: entity,
 		},
 	})
@@ -216,6 +223,11 @@ func entityFromEntityID(entityID workloadmeta.EntityID) (workloadmeta.Entity, er
 			EntityID: entityID,
 		}, nil
 
+	case workloadmeta.KindKubernetesNode:
+		return &workloadmeta.KubernetesNode{
+			EntityID: entityID,
+		}, nil
+
 	case workloadmeta.KindKubernetesPod:
 		return &workloadmeta.KubernetesPod{
 			EntityID: entityID,
@@ -223,6 +235,21 @@ func entityFromEntityID(entityID workloadmeta.EntityID) (workloadmeta.Entity, er
 
 	case workloadmeta.KindKubernetesMetadata:
 		return &workloadmeta.KubernetesMetadata{
+			EntityID: entityID,
+		}, nil
+
+	case workloadmeta.KindKubernetesKueueQueue:
+		return &workloadmeta.KubernetesKueueQueue{
+			EntityID: entityID,
+		}, nil
+
+	case workloadmeta.KindKubernetesKueueResourceFlavor:
+		return &workloadmeta.KubernetesKueueResourceFlavor{
+			EntityID: entityID,
+		}, nil
+
+	case workloadmeta.KindKubernetesKueueWorkload:
+		return &workloadmeta.KubernetesKueueWorkload{
 			EntityID: entityID,
 		}, nil
 	}

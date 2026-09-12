@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf || (windows && npm)
+//go:build (linux && bpf) || (windows && npm)
 
 // Package usm contains tests for USM
 package tests
@@ -55,6 +55,9 @@ func setupTracer(t testing.TB, cfg *config.Config) *tracer.Tracer {
 		cfg.ProtocolClassificationEnabled = false
 	}
 	if ebpftest.GetBuildMode() == ebpftest.Fentry {
+		cfg.ProtocolClassificationEnabled = false
+	}
+	if ebpftest.GetBuildMode() == ebpftest.SK {
 		cfg.ProtocolClassificationEnabled = false
 	}
 

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package tests
 
@@ -27,7 +27,6 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
-	gorilla "github.com/gorilla/mux"
 	redis2 "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +36,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/sys/unix"
 
@@ -70,6 +68,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/network/usm/utils"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
+	"github.com/DataDog/datadog-agent/pkg/util/testutil/flake"
 )
 
 var kv = kernel.MustHostVersion()
@@ -121,7 +120,7 @@ func skipIfUsingNAT(t *testing.T, ctx testContext) {
 
 // skipIfGoTLSNotSupported skips the test if GoTLS is not supported.
 func skipIfGoTLSNotSupported(t *testing.T, _ testContext) {
-	if !gotlstestutil.GoTLSSupported(t, utils.NewUSMEmptyConfig()) {
+	if !gotlstestutil.GoTLSSupported(t, usm.NewUSMEmptyConfig()) {
 		t.Skip("GoTLS is not supported")
 	}
 }
@@ -163,8 +162,9 @@ func (s *USMSuite) TestDisableUSM() {
 	cfg.ServiceMonitoringEnabled = false
 	// Enabling all features, to ensure nothing is forcing USM enablement.
 	cfg.EnableHTTPMonitoring = true
-	cfg.EnableHTTP2Monitoring = true
+	cfg.EnableHTTP2Monitoring = kv >= usmhttp2.MinimumKernelVersion
 	cfg.EnableKafkaMonitoring = true
+	cfg.EnableRedisMonitoring = kv >= redis.MinimumKernelVersion
 	cfg.EnablePostgresMonitoring = true
 	cfg.EnableGoTLSSupport = true
 	cfg.EnableNodeJSMonitoring = true
@@ -243,7 +243,7 @@ func testProtocolConnectionProtocolMapCleanup(t *testing.T, tr *tracer.Tracer, c
 		require.NoError(t, tr.RegisterClient(clientID))
 		require.NoError(t, tr.Resume())
 
-		mux := gorilla.NewRouter()
+		mux := nethttp.NewServeMux()
 		mux.Handle("/test", nethttp.DefaultServeMux)
 		grpcHandler := grpc.NewServerWithoutBind()
 
@@ -695,12 +695,12 @@ func TestFullMonitorWithTracer(t *testing.T) {
 		t.Skip("USM is not supported")
 	}
 
-	cfg := utils.NewUSMEmptyConfig()
+	cfg := usm.NewUSMEmptyConfig()
 	cfg.EnableHTTPMonitoring = true
 	cfg.EnableHTTP2Monitoring = kv >= usmhttp2.MinimumKernelVersion
 	cfg.EnableKafkaMonitoring = true
 	cfg.EnablePostgresMonitoring = true
-	cfg.EnableRedisMonitoring = true
+	cfg.EnableRedisMonitoring = kv >= redis.MinimumKernelVersion
 	cfg.EnableNativeTLSMonitoring = true
 	cfg.EnableIstioMonitoring = true
 	cfg.EnableGoTLSSupport = true
@@ -1945,11 +1945,14 @@ func testHTTP2ProtocolClassification(t *testing.T, tr *tracer.Tracer, clientHost
 	http2TargetAddress := net.JoinHostPort(targetHost, http2Port)
 	http2Server := &nethttp.Server{
 		Addr: ":" + http2Port,
-		Handler: h2c.NewHandler(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, _ *nethttp.Request) {
+		Handler: nethttp.HandlerFunc(func(w nethttp.ResponseWriter, _ *nethttp.Request) {
 			w.WriteHeader(200)
 			w.Write([]byte("test"))
-		}), &http2.Server{}),
+		}),
+		Protocols: new(nethttp.Protocols),
 	}
+	http2Server.Protocols.SetHTTP1(true)
+	http2Server.Protocols.SetUnencryptedHTTP2(true)
 
 	go func() {
 		if err := http2Server.ListenAndServe(); err != nethttp.ErrServerClosed {
@@ -2077,6 +2080,7 @@ func testHTTP2ProtocolClassification(t *testing.T, tr *tracer.Tracer, clientHost
 				extras:        map[string]interface{}{},
 			},
 			preTracerSetup: func(t *testing.T, ctx testContext) {
+				flake.Mark(t)
 				server := tracertestutil.NewTCPServerOnAddress(ctx.serverAddress, func(c net.Conn) {
 					io.Copy(c, c)
 					c.Close()
@@ -2301,7 +2305,9 @@ func testHTTPLikeSketches(t *testing.T, tr *tracer.Tracer, client *nethttp.Clien
 	var getRequestStats, postRequestsStats *http.RequestStats
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		conns, cleanup := getConnections(ct, tr)
-		defer cleanup()
+		// Calling cleanup will restore the requestStats to a pool, and can modify/empty it.
+		// hence, we call the cleanup only during the end of the test
+		t.Cleanup(cleanup)
 
 		requests := conns.USMData.HTTP
 		if isHTTP2 {
@@ -2441,7 +2447,9 @@ func testKafkaSketches(t *testing.T, tr *tracer.Tracer) {
 	var fetchRequestStats, produceTopic1RequestsStats, produceTopic2RequestsStats *kafka.RequestStats
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		conns, cleanup := getConnections(ct, tr)
-		defer cleanup()
+		// Calling cleanup will restore the requestStats to a pool, and can modify/empty it.
+		// hence, we call the cleanup only during the end of the test
+		t.Cleanup(cleanup)
 
 		requests := conns.USMData.Kafka
 		if fetchRequestStats == nil || produceTopic1RequestsStats == nil || produceTopic2RequestsStats == nil {
@@ -2525,7 +2533,9 @@ func testPostgresSketches(t *testing.T, tr *tracer.Tracer) {
 	var insertRequestStats, selectRequestsStats *pgutils.RequestStat
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		conns, cleanup := getConnections(ct, tr)
-		defer cleanup()
+		// Calling cleanup will restore the requestStats to a pool, and can modify/empty it.
+		// hence, we call the cleanup only during the end of the test
+		t.Cleanup(cleanup)
 
 		requests := conns.USMData.Postgres
 		if insertRequestStats == nil || selectRequestsStats == nil {
@@ -2561,6 +2571,7 @@ func testPostgresSketches(t *testing.T, tr *tracer.Tracer) {
 }
 
 func testRedisSketches(t *testing.T, tr *tracer.Tracer) {
+	skipIfKernelIsNotSupported(t, redis.MinimumKernelVersion)
 	serverAddress := net.JoinHostPort(localhost, redisPort)
 	require.NoError(t, redis.RunServer(t, localhost, redisPort, false))
 
@@ -2590,7 +2601,9 @@ func testRedisSketches(t *testing.T, tr *tracer.Tracer) {
 	var getRequestStats, setRequestStats *redis.RequestStats
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		conns, cleanup := getConnections(ct, tr)
-		defer cleanup()
+		// Calling cleanup will restore the requestStats to a pool, and can modify/empty it.
+		// hence, we call the cleanup only during the end of the test
+		t.Cleanup(cleanup)
 
 		requests := conns.USMData.Redis
 		if len(requests) == 0 {
@@ -2634,12 +2647,13 @@ func (s *USMSuite) TestVerifySketches() {
 	t := s.T()
 	skipIfKernelIsNotSupported(t, usmconfig.MinimumKernelVersion)
 
-	cfg := utils.NewUSMEmptyConfig()
+	cfg := usm.NewUSMEmptyConfig()
 	cfg.EnableHTTPMonitoring = true
 	cfg.EnableHTTP2Monitoring = kv >= usmhttp2.MinimumKernelVersion
 	cfg.EnableKafkaMonitoring = true
 	cfg.EnablePostgresMonitoring = true
-	cfg.EnableRedisMonitoring = true
+	cfg.EnableRedisMonitoring = kv >= redis.MinimumKernelVersion
+	cfg.RedisTrackResources = true
 
 	tr, err := tracer.NewTracer(cfg, nil, nil)
 	require.NoError(t, err)

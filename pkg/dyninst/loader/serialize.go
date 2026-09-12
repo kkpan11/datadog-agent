@@ -1,0 +1,275 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+//go:build linux && bpf
+
+// Package loader supports setting up the eBPF program.
+package loader
+
+import (
+	"bytes"
+	"cmp"
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
+
+	"github.com/DataDog/datadog-agent/pkg/dyninst/compiler"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
+)
+
+type serializedProgram struct {
+	programID               uint32
+	code                    []byte
+	maxOpLen                uint32
+	chasePointersEntrypoint uint32
+
+	typeIDs   []uint64
+	typeInfos []typeInfo
+
+	throttlerParams []throttlerParams
+
+	probeParams     []probeParams
+	bpfAttachPoints []BPFAttachPoint
+
+	// numProbes is the raw IR probe count and may be 0. It defines the
+	// size of the per-probe stats_buf map; the loader clamps stats_buf's
+	// MaxEntries to at least 1 to satisfy BPF_MAP_TYPE_ARRAY's
+	// nonzero-max-entries requirement.
+	numProbes uint32
+
+	goRuntimeTypeIDs goRuntimeTypeIDs
+	goModuledataInfo ir.GoModuledataInfo
+	goMapHashInfo    ir.GoMapHashInfo
+	commonTypes      ir.CommonTypes
+	isARM64          bool
+
+	// traceContextTypeID is the IR type id of the synthetic
+	// ir.TraceContextType. Set as the BPF volatile-const
+	// trace_context_type_id; SM_OP_GO_CONTEXT_CHAIN_INIT writes it into the
+	// rewritten data item header at chase time.
+	traceContextTypeID ir.TypeID
+}
+
+type goRuntimeTypeIDs struct {
+	goRuntimeTypes []uint64
+	typeIDs        []uint64 // interface-adjusted: pointer types map to their pointee
+	directTypeIDs  []uint64 // unadjusted: always the actual type ID (for dict resolution)
+}
+
+var _ sort.Interface = (*goRuntimeTypeIDs)(nil)
+
+func (g *goRuntimeTypeIDs) Len() int { return len(g.goRuntimeTypes) }
+func (g *goRuntimeTypeIDs) Less(i int, j int) bool {
+	return g.goRuntimeTypes[i] < g.goRuntimeTypes[j]
+}
+func (g *goRuntimeTypeIDs) Swap(i int, j int) {
+	grts, tids, dtids := g.goRuntimeTypes, g.typeIDs, g.directTypeIDs
+	grts[i], grts[j] = grts[j], grts[i]
+	tids[i], tids[j] = tids[j], tids[i]
+	dtids[i], dtids[j] = dtids[j], dtids[i]
+}
+
+// BPFAttachPoint specifies how the eBPF program should be attached to the user process.
+type BPFAttachPoint struct {
+	// User process PC to attach at.
+	PC uint64
+	// Cookie to provide to the entrypoint function.
+	Cookie uint64
+}
+
+// ByteSerializer serializes the code into a byte array.
+type ByteSerializer struct {
+	buf *bytes.Buffer
+}
+
+// CommentBlock implements CodeSerializer.
+func (s *ByteSerializer) CommentBlock(_ string) error {
+	return nil
+}
+
+// CommentFunction implements CodeSerializer.
+func (s *ByteSerializer) CommentFunction(_ compiler.FunctionID, _ uint32) error {
+	return nil
+}
+
+// SerializeInstruction implements CodeSerializer.
+func (s *ByteSerializer) SerializeInstruction(opcode compiler.Opcode, paramBytes []byte, _ string) error {
+	s.buf.WriteByte(opcodeByte(opcode))
+	s.buf.Write(paramBytes)
+	return nil
+}
+
+func serializeProgram(
+	program compiler.Program,
+	additionalSerializer compiler.CodeSerializer,
+) (*serializedProgram, error) {
+	buf := &bytes.Buffer{}
+	serializer := compiler.CodeSerializer(&ByteSerializer{
+		buf: buf,
+	})
+
+	if additionalSerializer != nil {
+		serializer = compiler.NewDispatchingSerializer(serializer, additionalSerializer)
+	}
+
+	metadata, err := compiler.GenerateCode(program, serializer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize code: %w", err)
+	}
+	serialized := &serializedProgram{
+		programID: program.ID,
+		code:      buf.Bytes(),
+		maxOpLen:  metadata.MaxOpLen,
+		numProbes: program.NumProbes,
+	}
+	var ok bool
+	serialized.chasePointersEntrypoint, ok = metadata.FunctionLoc[compiler.ChasePointers{}]
+	if !ok {
+		return nil, errors.New("serialized program is missing ChasePointers function")
+	}
+
+	slices.SortFunc(program.Types, func(a, b ir.Type) int {
+		return cmp.Compare(a.GetID(), b.GetID())
+	})
+	serialized.typeIDs = make([]uint64, len(program.Types))
+	serialized.typeInfos = make([]typeInfo, len(program.Types))
+	serialized.goRuntimeTypeIDs = goRuntimeTypeIDs{
+		goRuntimeTypes: make([]uint64, 0, len(program.Types)),
+		typeIDs:        make([]uint64, 0, len(program.Types)),
+		directTypeIDs:  make([]uint64, 0, len(program.Types)),
+	}
+	grts := &serialized.goRuntimeTypeIDs
+	for i, t := range program.Types {
+		typeID := uint64(t.GetID())
+		serialized.typeIDs[i] = typeID
+		if _, ok := t.(*ir.TraceContextType); ok {
+			serialized.traceContextTypeID = t.GetID()
+		}
+		info := typeInfo{
+			Dynamic_size_class: uint32(t.GetDynamicSizeClass()),
+			Byte_len:           t.GetByteSize(),
+			Enqueue_pc:         metadata.FunctionLoc[compiler.ProcessType{Type: t}],
+		}
+		fillSpecialTypeInfo(&info, t)
+		serialized.typeInfos[i] = info
+		if goRuntimeType, ok := t.GetGoRuntimeType(); ok {
+			grts.goRuntimeTypes = append(grts.goRuntimeTypes, uint64(goRuntimeType))
+			// directTypeIDs stores the actual type ID without any dereferencing.
+			// Used by dict resolution where we need the type as-is.
+			grts.directTypeIDs = append(grts.directTypeIDs, typeID)
+			// If the t is a reference type, the value is not indirected when
+			// put into an interface box. Put differently, the data being
+			// pointed to is the pointee of the reference type. For all other
+			// kinds of types, the box will contain a pointer to that type.
+			switch t := t.(type) {
+			case *ir.PointerType:
+				grts.typeIDs = append(grts.typeIDs, uint64(t.Pointee.GetID()))
+			case *ir.GoMapType:
+				grts.typeIDs = append(grts.typeIDs, uint64(t.HeaderType.GetID()))
+			case *ir.GoChannelType, *ir.GoSubroutineType:
+				// TODO: Handle these kinds of types. Right now this is going to
+				// be incorrect when we stumble upon them, but we don't have
+				// anything more correct to say is underneath the pointer.
+				grts.typeIDs = append(grts.typeIDs, typeID)
+			default:
+				grts.typeIDs = append(grts.typeIDs, typeID)
+			}
+		}
+	}
+	sort.Sort(grts)
+	serialized.goModuledataInfo = program.GoModuledataInfo
+	serialized.goMapHashInfo = program.GoMapHashInfo
+	serialized.commonTypes = program.CommonTypes
+	serialized.isARM64 = program.IsARM64
+
+	serialized.throttlerParams = make([]throttlerParams, len(program.Throttlers))
+	for i, t := range program.Throttlers {
+		serialized.throttlerParams[i] = throttlerParams{
+			Ns:     t.PeriodNs,
+			Budget: t.Budget,
+		}
+	}
+
+	for _, p := range program.Functions {
+		if f, ok := p.ID.(compiler.ProcessEvent); ok {
+			serialized.probeParams = append(serialized.probeParams, probeParams{
+				Throttler_idx:         uint32(f.ThrottlerIdx),
+				Stack_machine_pc:      metadata.FunctionLoc[f],
+				Pointer_chasing_limit: f.PointerChasingLimit,
+				Collection_size_limit: f.CollectionSizeLimit,
+				String_size_limit:     f.StringSizeLimit,
+				Frameless:             f.Frameless,
+				Has_associated_return: f.HasAssociatedReturn,
+				No_return_reason:      int8(f.NoReturnReason),
+				Throttle_mode:         int8(f.ThrottleMode),
+				Kind:                  int8(f.EventKind),
+				Probe_id:              f.ProbeID,
+				Top_pc_offset:         int8(f.TopPCOffset),
+				X__padding:            [2]int8{},
+			})
+			serialized.bpfAttachPoints = append(serialized.bpfAttachPoints, BPFAttachPoint{
+				PC:     f.InjectionPC,
+				Cookie: uint64(len(serialized.bpfAttachPoints)),
+			})
+		}
+	}
+
+	return serialized, nil
+}
+
+func fillSpecialTypeInfo(info *typeInfo, t ir.Type) {
+	info.Go_context_context_offset = -1
+	info.Go_context_key_offset = -1
+	info.Go_context_value_offset = -1
+	info.Ddtrace_trace_id_offset = -1
+	info.Ddtrace_span_id_offset = -1
+	info.Ddtrace_parent_id_offset = -1
+	info.Ddtrace_span_context_offset = -1
+	info.Ddtrace_span_context_trace_id_offset = -1
+
+	switch t := t.(type) {
+	case *ir.GoContextImplementationType:
+		// An impl that is not a chain link carries no chain-walk layout; it is
+		// captured as an ordinary struct, so leave the context fields at their
+		// -1 defaults and don't floor byte_len (there is no INIT rewrite to
+		// reserve for).
+		if !t.HasChainData() {
+			break
+		}
+		info.Go_context_is_context = 1
+		info.Go_context_context_offset = t.ContextOffset
+		info.Go_context_key_offset = t.KeyOffset
+		info.Go_context_value_offset = t.ValueOffset
+		// Floor byte_len to ir.TraceContextByteSize so that the chase
+		// preamble reserves at least 40 bytes of payload. The
+		// SM_OP_GO_CONTEXT_CHAIN_INIT opcode rewrites the just-serialized
+		// data item to type=TraceContextType and zeros 40 bytes of payload;
+		// without this floor, a chain-walked impl smaller than 40 bytes would
+		// have a payload reservation too small for the zero, overrunning into
+		// the next data item's header.
+		if info.Byte_len < ir.TraceContextByteSize {
+			info.Byte_len = ir.TraceContextByteSize
+		}
+	case *ir.DDTraceSpanType:
+		info.Ddtrace_span_kind = uint8(t.SpanKind)
+		info.Ddtrace_trace_id_offset = t.TraceIDOffset
+		info.Ddtrace_span_id_offset = t.SpanIDOffset
+		info.Ddtrace_parent_id_offset = t.ParentIDOffset
+		info.Ddtrace_span_context_offset = t.SpanContextOffset
+		info.Ddtrace_span_context_trace_id_offset = t.SpanContextTraceIDOffset
+	case *ir.PointerType:
+		// A pointer to a chain-walked context impl also uses the chain-walk
+		// enqueue routine (compiler emits [INIT, HOP, RETURN] for
+		// *context.cancelCtx, etc.) — floor byte_len to 40 bytes for the same
+		// reason as struct impls. A pointer to a non-chain-link impl is a plain
+		// pointer and needs no floor.
+		if impl, ok := t.Pointee.(*ir.GoContextImplementationType); ok && impl.HasChainData() {
+			if info.Byte_len < ir.TraceContextByteSize {
+				info.Byte_len = ir.TraceContextByteSize
+			}
+		}
+	}
+}

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // Package verifier is responsible for exposing information the verifier provides
 // for any loaded eBPF program
@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	noopsimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl/noops"
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/bytecode"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/names"
@@ -53,6 +54,10 @@ func BuildVerifierStats(opts *StatsOptions) (*StatsResult, map[string]struct{}, 
 	}
 	if kversion < kernel.VersionCode(4, 15, 0) {
 		return nil, nil, fmt.Errorf("Kernel %s does not expose verifier statistics", kversion)
+	}
+	err = ddebpf.Setup(ddebpf.NewConfig(), nil, noopsimpl.NewComponent())
+	if err != nil {
+		return nil, nil, fmt.Errorf("ebpf setup: %s", err)
 	}
 
 	failedToLoad := make(map[string]struct{})
@@ -191,9 +196,9 @@ func generateLoadFunction(file string, opts *StatsOptions, results *StatsResult,
 			prog := reflect.New(
 				reflect.StructOf([]reflect.StructField{
 					{
-						Name: fmt.Sprintf("Func_%s", progSpec.Name),
+						Name: "Func_" + progSpec.Name,
 						Type: reflect.TypeOf(&ebpf.Program{}),
-						Tag:  reflect.StructTag(fmt.Sprintf(`ebpf:"%s"`, progSpec.Name)),
+						Tag:  reflect.StructTag(`ebpf:"` + progSpec.Name + `"`),
 					},
 				}),
 			)
@@ -204,7 +209,7 @@ func generateLoadFunction(file string, opts *StatsOptions, results *StatsResult,
 				continue
 			}
 
-			if prog.Type().Kind() != reflect.Ptr {
+			if prog.Type().Kind() != reflect.Pointer {
 				return fmt.Errorf("%T is not a pointer to struct", prog)
 			}
 

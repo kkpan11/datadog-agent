@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 from tasks.libs.common.color import color_message
 
@@ -8,10 +9,27 @@ def directory_has_packages_without_owner(owners, folder="pkg"):
     """Check every package in `pkg` has an owner"""
 
     error = False
+    folder_path = "/" + folder
 
-    for x in os.listdir(folder):
-        path = os.path.join("/" + folder, x)
-        if all(owner[1].rstrip('/') != path for owner in owners.paths):
+    for entry in os.scandir(folder):
+        if not entry.is_dir():
+            # Single files directly under `folder` (e.g. /pkg/BUILD.bazel) aren't
+            # standalone packages, so they don't need a dedicated CODEOWNERS entry.
+            continue
+        subdir_name = entry.name
+        # CODEOWNERS files always use forward slashes regardless of platform, so we use
+        # PurePosixPath-style formatting (as_posix()) to ensure consistent path separators
+        # for comparison, even on Windows where Path would otherwise use backslashes.
+        path = "/" + (Path(folder) / subdir_name).as_posix()
+        # codeowners represents directories with a trailing slash without
+        # it, a directory-only rule like `/pkg/api/` won't match.
+        stripped = path.lstrip('/') + '/'
+        rule_owners, _, rule_path, _ = owners.matching_line(stripped)
+        # A match against the folder's own blanket rule (e.g. `/pkg/`) doesn't count as a
+        # dedicated owner for this specific package — it covers everything under `folder`
+        # indiscriminately. A match with no owners (e.g. a "do not notify anyone" rule) doesn't
+        # count either.
+        if not rule_owners or (rule_path is not None and rule_path.rstrip('/') == folder_path):
             if not error:
                 print(
                     color_message("The following packages don't have owner in CODEOWNER file", "red"), file=sys.stderr
@@ -56,6 +74,74 @@ def codeowner_has_orphans(owners):
     return err_invalid_rule_path or err_orphans_path
 
 
+_CATCH_ALL_PATTERNS = frozenset(["/.*", "/*.md"])
+
+
+_AI_ARTEFACT_NAMES = frozenset(["AGENTS.md", "CLAUDE.md", "GEMINI.md"])
+
+
+def ai_artefacts_have_owner(ctx, owners):
+    """Check that every AI artefact file has an explicit owner in CODEOWNERS — i.e. is not
+    solely covered by a broad catch-all rule like /.*  or /*.md, and has a non-empty owner list.
+
+    AI artefacts are AGENTS.md, CLAUDE.md, and GEMINI.md at any depth, plus everything under .agents/ or .claude/.
+    """
+
+    # Collect all AI artefact paths from tracked files only (respects .gitignore).
+    # Symlinks point to external targets and are excluded — only regular files are checked.
+    tracked = ctx.run("git ls-files", hide=True).stdout.splitlines()
+    ai_files = [
+        p
+        for p in tracked
+        if (os.path.basename(p) in _AI_ARTEFACT_NAMES or p.startswith((".claude/", ".agents/")))
+        and not os.path.islink(p)
+    ]
+
+    unowned = []
+    for path in ai_files:
+        matched_rule = next((rule for rule in owners.paths if rule[0].match(path)), None)
+        if matched_rule is None or matched_rule[1] in _CATCH_ALL_PATTERNS or not matched_rule[2]:
+            unowned.append(path)
+
+    if unowned:
+        print(
+            color_message(
+                "The following AI artefacts don't have an explicit owner in the CODEOWNERS file"
+                " (catch-all rules like /.*  or /*.md don't count, and rules with no owners don't count)",
+                "red",
+            ),
+            file=sys.stderr,
+        )
+        for path in unowned:
+            print(color_message(f"\t- /{path}", "orange"), file=sys.stderr)
+
+    return bool(unowned)
+
+
+def skills_use_agents_directory(ctx, _owners=None):
+    """Fail if any file is tracked under the repo-root `.claude/skills/`, which must remain a symlink
+    into the canonical `.agents/skills/`. This prevents regressing the layout when a skill is created
+    under `.claude/skills/` directly. Nested `.claude/skills/` elsewhere in the tree is out of scope.
+    """
+    tracked = ctx.run("git ls-files", hide=True).stdout.splitlines()
+    # Only a real (non-symlink) `.claude/skills/` directory yields tracked child paths.
+    offenders = [p for p in tracked if p.startswith(".claude/skills/")]
+    if offenders:
+        print(
+            color_message(
+                "Skills must live under `.agents/skills/` with `.claude/skills` as a symlink into it"
+                " (`.claude/skills` -> ../.agents/skills). The following files are tracked under"
+                " `.claude/skills/` and must be moved to `.agents/skills/`:",
+                "red",
+            ),
+            file=sys.stderr,
+        )
+        for path in offenders:
+            print(color_message(f"	- {path}", "orange"), file=sys.stderr)
+
+    return bool(offenders)
+
+
 def _get_static_root(pattern):
     """_get_static_root returns the longest prefix path from the pattern without any wildcards."""
     result = "."
@@ -69,7 +155,9 @@ def _get_static_root(pattern):
     for elem in pattern.split("/"):
         if '*' in elem:
             return result
-        result = os.path.join(result, elem)
+        # Don't use cross-platfom path.join since CODEOWNERS expect forward slashes
+        # regardless of platforms
+        result = result + "/" + elem
     return result
 
 
@@ -87,14 +175,18 @@ def _is_pattern_in_fs(path, pattern):
         return True
     elif os.path.isdir(path):
         for root, _, files in os.walk(path):
-            # Check if root is matching the the pattern, without "./" at the begining
-            if pattern.match(root[2:]):
+            # Check if root is matching the pattern, without "./" at the begining
+            # On Windows, os.walk() and os.path.join() return paths with backslashes, but the regex pattern
+            # from the codeowners library expects forward slashes (like '/internal/tools/**/go.sum')
+            normalized_root = root[2:].replace('\\', '/')
+            if pattern.match(normalized_root):
                 return True
             for name in files:
                 # file_path is the relative path from the root of the repo, without "./" at the begining
                 file_path = os.path.join(root, name)[2:]
+                normalized_file_path = file_path.replace('\\', '/')
 
                 # Check if the file path matches any of the regex patterns
-                if pattern.match(file_path):
+                if pattern.match(normalized_file_path):
                     return True
     return False

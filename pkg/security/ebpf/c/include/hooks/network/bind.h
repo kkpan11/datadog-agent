@@ -4,9 +4,10 @@
 #include "constants/offsets/netns.h"
 #include "constants/syscall_macro.h"
 #include "helpers/discarders.h"
+#include "helpers/span_fill.h"
 #include "helpers/syscalls.h"
 
-int __attribute__((always_inline)) sys_bind(u64 pid_tgid) {
+int __attribute__((always_inline)) sys_bind(void *ctx, u64 pid_tgid) {
     struct syscall_cache_t syscall = {
         .type = EVENT_BIND,
         .async = pid_tgid ? 1: 0,
@@ -14,7 +15,7 @@ int __attribute__((always_inline)) sys_bind(u64 pid_tgid) {
             .pid_tgid = pid_tgid,
         }
     };
-    cache_syscall(&syscall);
+    cache_syscall_update_cgroup(ctx, &syscall);
     return 0;
 }
 
@@ -23,10 +24,10 @@ HOOK_SYSCALL_ENTRY3(bind, int, socket, struct sockaddr *, addr, unsigned int, ad
         return 0;
     }
 
-    return sys_bind(0);
+    return sys_bind(ctx, 0);
 }
 
-int __attribute__((always_inline)) sys_bind_ret(void *ctx, int retval) {
+int __attribute__((always_inline)) sys_bind_ret_impl(void *ctx, int retval, enum TAIL_CALL_PROG_TYPE prog_type) {
     struct syscall_cache_t *syscall = pop_syscall(EVENT_BIND);
     if (!syscall) {
         return 0;
@@ -37,34 +38,61 @@ int __attribute__((always_inline)) sys_bind_ret(void *ctx, int retval) {
     }
 
     /* pre-fill the event */
-    struct bind_event_t event = {
-        .syscall.retval = retval,
-        .addr[0] = syscall->bind.addr[0],
-        .addr[1] = syscall->bind.addr[1],
-        .family = syscall->bind.family,
-        .port = syscall->bind.port,
-        .protocol = syscall->connect.protocol,
-    };
+    struct bind_event_t *event = SPAN_FILL_EVENT(struct bind_event_t, EVENT_BIND);
+    if (!event) {
+        return 0;
+    }
+    event->syscall.retval = retval;
+    event->addr[0] = syscall->bind.addr[0];
+    event->addr[1] = syscall->bind.addr[1];
+    event->family = syscall->bind.family;
+    event->port = syscall->bind.port;
+    event->protocol = syscall->bind.protocol;
 
     struct proc_cache_t *entry;
     if (syscall->bind.pid_tgid != 0) {
-        entry = fill_process_context_with_pid_tgid(&event.process, syscall->bind.pid_tgid);
+        entry = fill_process_context_with_pid_tgid(&event->process, syscall->bind.pid_tgid);
     } else {
-        entry = fill_process_context(&event.process);
+        entry = fill_process_context(&event->process);
     }
-    fill_container_context(entry, &event.container);
-    fill_span_context(&event.span);
+    fill_cgroup_context(entry, &event->cgroup);
 
     // should we sample this event for activity dumps ?
-    struct activity_dump_config *config = lookup_or_delete_traced_pid(event.process.pid, bpf_ktime_get_ns(), NULL);
+    struct activity_dump_config *config = lookup_or_delete_traced_pid(event->process.pid, bpf_ktime_get_ns(), NULL);
     if (config) {
         if (mask_has_event(config->event_mask, EVENT_BIND)) {
-            event.event.flags |= EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE;
+            event->event.flags |= EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE;
         }
     }
 
-    send_event(ctx, EVENT_BIND, event);
+    if (!(event->event.flags & EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE)) {
+        struct bind_connect_sample_key_t bind_key;
+        __builtin_memset(&bind_key, 0, sizeof(bind_key));
+        bind_key.pid = event->process.pid;
+        bind_key.family = event->family;
+        bind_key.port = event->port;
+        bind_key.protocol = event->protocol;
+        bind_key.addr[0] = event->addr[0];
+        bind_key.addr[1] = event->addr[1];
+
+        u32 bind_cookie = 0;
+        u32 bind_refresh_needed = 0;
+        if (approve_bind_sample(&bind_key, &bind_cookie, &bind_refresh_needed) == SAMPLED) {
+            event->event.flags |= EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE | EVENT_FLAGS_SAVED_BY_AD;
+            event->sample_cookie = bind_cookie;
+        } else if (bind_refresh_needed) {
+            struct sample_refresh_event_t ev = {};
+            ev.cookie = bind_cookie;
+            send_event(ctx, EVENT_SAMPLE_REFRESH, ev);
+        }
+    }
+
+    span_fill_tail_call(ctx, prog_type);
     return 0;
+}
+
+int __attribute__((always_inline)) sys_bind_ret(void *ctx, int retval) {
+    return sys_bind_ret_impl(ctx, retval, KPROBE_OR_FENTRY_TYPE);
 }
 
 HOOK_SYSCALL_EXIT(bind) {
@@ -76,7 +104,7 @@ HOOK_ENTRY("io_bind")
 int hook_io_bind(ctx_t *ctx) {
     void *raw_req = (void *)CTX_PARM1(ctx);
     u64 pid_tgid = get_pid_tgid_from_iouring(raw_req);
-    return sys_bind(pid_tgid);
+    return sys_bind(ctx, pid_tgid);
 }
 
 HOOK_EXIT("io_bind")
@@ -86,9 +114,8 @@ int rethook_io_bind(ctx_t *ctx) {
 
 HOOK_ENTRY("security_socket_bind")
 int hook_security_socket_bind(ctx_t *ctx) {
-    struct socket *sk = (struct socket *)CTX_PARM1(ctx);
+    struct socket *sock = (struct socket *)CTX_PARM1(ctx);
     struct sockaddr *address = (struct sockaddr *)CTX_PARM2(ctx);
-    short socket_type = 0;
 
     // fill syscall_cache if necessary
     struct syscall_cache_t *syscall = peek_syscall(EVENT_BIND);
@@ -107,20 +134,13 @@ int hook_security_socket_bind(ctx_t *ctx) {
         bpf_probe_read(&syscall->bind.port, sizeof(addr_in6->sin6_port), &addr_in6->sin6_port);
         bpf_probe_read(&syscall->bind.addr, sizeof(u64) * 2, (char *)addr_in6 + offsetof(struct sockaddr_in6, sin6_addr));
     }
-
-    // We only handle TCP and UDP sockets for now
-    bpf_probe_read(&socket_type, sizeof(socket_type), &sk->type);
-    if (socket_type == SOCK_STREAM) {
-        syscall->connect.protocol = IPPROTO_TCP;
-    } else if (socket_type == SOCK_DGRAM) {
-        syscall->connect.protocol = IPPROTO_UDP;
-    }
-
+    struct sock *sk = get_sock_from_socket(sock);
+    syscall->bind.protocol = get_protocol_from_sock(sk);
     return 0;
 }
 
 TAIL_CALL_TRACEPOINT_FNC(handle_sys_bind_exit, struct tracepoint_raw_syscalls_sys_exit_t *args) {
-    return sys_bind_ret(args, args->ret);
+    return sys_bind_ret_impl(args, args->ret, TRACEPOINT_TYPE);
 }
 
 #endif /* _BIND_H_ */

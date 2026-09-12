@@ -8,34 +8,31 @@
 package nvidia
 
 import (
+	"errors"
 	"fmt"
-	"math"
 	"slices"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
-	"github.com/hashicorp/go-multierror"
 
 	ddnvml "github.com/DataDog/datadog-agent/pkg/gpu/safenvml"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 type fieldsCollector struct {
-	device       ddnvml.SafeDevice
+	device       ddnvml.Device
 	fieldMetrics []fieldValueMetric
 }
 
-func newFieldsCollector(device ddnvml.SafeDevice) (Collector, error) {
+func newFieldsCollector(device ddnvml.Device, _ *CollectorDependencies) (Collector, error) {
 	c := &fieldsCollector{
 		device: device,
 	}
-	c.fieldMetrics = append(c.fieldMetrics, metricNameToFieldID...) // copy all metrics to avoid modifying the original slice
+	c.fieldMetrics = append(c.fieldMetrics, allFieldMetrics...) // copy all metrics to avoid modifying the original slice
 
 	// Remove any unsupported fields, we also want to check if we have any fields left
 	// to avoid doing unnecessary work
-	err := c.removeUnsupportedFields()
-	if err != nil {
-		return nil, err
-	}
+	c.removeUnsupportedMetrics()
 	if len(c.fieldMetrics) == 0 {
 		return nil, errUnsupportedDevice
 	}
@@ -43,26 +40,54 @@ func newFieldsCollector(device ddnvml.SafeDevice) (Collector, error) {
 	return c, nil
 }
 
-func (c *fieldsCollector) DeviceUUID() string {
-	uuid, _ := c.device.GetUUID()
-	return uuid
+// Device returns the device this collector monitors.
+func (c *fieldsCollector) Device() ddnvml.Device {
+	return c.device
 }
 
-func (c *fieldsCollector) removeUnsupportedFields() error {
+func (c *fieldsCollector) removeUnsupportedMetrics() {
 	fieldValues, err := c.getFieldValues()
 	if err != nil {
-		return err
+		// If the entire field values API is unsupported, remove all metrics
+		if ddnvml.IsAPIUnsupportedOnDevice(err, c.device) {
+			log.Debugf("GPU fields collector removing all field metrics for device %s because GetFieldValues is unsupported", c.Device().GetDeviceInfo().UUID)
+			c.fieldMetrics = nil
+		}
+		// Otherwise, do nothing and keep all metrics
+		return
 	}
 
+	// Remove individual unsupported fields
 	for _, val := range fieldValues {
-		if val.NvmlReturn == uint32(nvml.ERROR_NOT_SUPPORTED) {
-			c.fieldMetrics = slices.DeleteFunc(c.fieldMetrics, func(fm fieldValueMetric) bool {
+		if val.NvmlReturn == uint32(nvml.ERROR_NOT_SUPPORTED) || (val.NvmlReturn == uint32(nvml.ERROR_INVALID_ARGUMENT)) {
+			fieldValueIdx := slices.IndexFunc(c.fieldMetrics, func(fm fieldValueMetric) bool {
 				return fm.fieldValueID == val.FieldId
 			})
+			if fieldValueIdx == -1 {
+				log.Warnf("Unexpected field ID %d returned for device %s (scope_id=%d): return value is %s",
+					val.FieldId,
+					c.Device().GetDeviceInfo().UUID,
+					val.ScopeId,
+					nvml.ErrorString(nvml.Return(val.NvmlReturn)),
+				)
+				continue
+			}
+
+			fieldMetric := c.fieldMetrics[fieldValueIdx]
+			if val.NvmlReturn == uint32(nvml.ERROR_INVALID_ARGUMENT) && !fieldMetric.markUnsupportedOnInvalidArgument {
+				continue
+			}
+
+			log.Debugf("GPU fields collector removing unsupported metric %s for device %s (field_id=%d scope_id=%d)",
+				fieldMetric.name,
+				c.Device().GetDeviceInfo().UUID,
+				fieldMetric.fieldValueID,
+				fieldMetric.scopeID,
+			)
+
+			c.fieldMetrics = slices.Delete(c.fieldMetrics, fieldValueIdx, fieldValueIdx+1)
 		}
 	}
-
-	return nil
 }
 
 func (c *fieldsCollector) getFieldValues() ([]nvml.FieldValue, error) {
@@ -80,34 +105,37 @@ func (c *fieldsCollector) getFieldValues() ([]nvml.FieldValue, error) {
 	return fields, nil
 }
 
-// Collect collects all the metrics from the given NVML device.
-func (c *fieldsCollector) Collect() ([]Metric, error) {
+// Collect collects all samples from the given NVML device.
+func (c *fieldsCollector) Collect() ([]Sample, error) {
 	fields, err := c.getFieldValues()
 	if err != nil {
 		return nil, err
 	}
 
-	metrics := make([]Metric, 0, len(c.fieldMetrics))
+	samples := make([]Sample, 0, len(c.fieldMetrics))
+	var errs []error
 	for i, val := range fields {
-		name := metricNameToFieldID[i].name
+		name := c.fieldMetrics[i].name
 		if val.NvmlReturn != uint32(nvml.SUCCESS) {
-			err = multierror.Append(err, fmt.Errorf("failed to get field value %s: %s", name, nvml.ErrorString(nvml.Return(val.NvmlReturn))))
+			errs = append(errs, fmt.Errorf("failed to get field value %s: %s", name, nvml.ErrorString(nvml.Return(val.NvmlReturn))))
 			continue
 		}
 
 		value, convErr := fieldValueToNumber[float64](nvml.ValueType(val.ValueType), val.Value)
 		if convErr != nil {
-			err = multierror.Append(err, fmt.Errorf("failed to convert field value %s: %w", name, convErr))
+			errs = append(errs, fmt.Errorf("failed to convert field value %s: %w", name, convErr))
 		}
 
-		metrics = append(metrics, Metric{
-			Name:  name,
-			Value: value,
-			Type:  metricNameToFieldID[i].metricType},
-		)
+		samples = append(samples, &Metric{
+			baseSample:          baseSample{priority: c.fieldMetrics[i].priority},
+			Name:                name,
+			Value:               value,
+			Type:                c.fieldMetrics[i].metricType,
+			RateCalculationMode: c.fieldMetrics[i].rateCalculationMode,
+		})
 	}
 
-	return metrics, err
+	return samples, errors.Join(errs...)
 }
 
 // Name returns the name of the collector.
@@ -116,32 +144,43 @@ func (c *fieldsCollector) Name() CollectorName {
 }
 
 // fieldValueMetric represents a metric that can be retrieved using the NVML
-// FieldValues API, and associates a name for that metric
+// FieldValues API, and associates a name for that metric.
+// When multiple field IDs can emit the same metric name, priority determines
+// which one is preferred: higher priority wins. Duplicate resolution is handled
+// by RemoveDuplicateSamples at collection time.
 type fieldValueMetric struct {
 	name         string
 	fieldValueID uint32 // No specific type, but these are constants prefixed with FI_DEV in the nvml package
 	// some fields require scopeID to be filled for the GetFieldValues to work properly
 	// (e.g: https://github.com/NVIDIA/nvidia-settings/blob/main/src/nvml.h#L2175-L2177)
-	scopeID    uint32
-	metricType metrics.MetricType
+	scopeID uint32
+	// Some fields on older architectures return INVALID_ARGUMENT immediately
+	// instead of cleanly reporting ERROR_NOT_SUPPORTED. Mark those fields here
+	// so collector initialization can treat INVALID_ARGUMENT as unsupported.
+	markUnsupportedOnInvalidArgument bool
+	metricType                       metrics.MetricType
+	rateCalculationMode              RateCalculationMode
+	priority                         MetricPriority
 }
 
-var metricNameToFieldID = []fieldValueMetric{
-	{"memory.temperature", nvml.FI_DEV_MEMORY_TEMP, 0, metrics.GaugeType},
-	// we don't want to use bandwidth fields as they are deprecated:
-	// https://github.com/NVIDIA/nvidia-settings/blob/main/src/nvml.h#L2049-L2057
-	// uint_max to collect the aggregated value summed up across all links (ref: https://github.com/NVIDIA/nvidia-settings/blob/main/src/nvml.h#L2175-L2177)
-	{"nvlink.throughput.data.rx", nvml.FI_DEV_NVLINK_THROUGHPUT_DATA_RX, math.MaxUint32, metrics.GaugeType},
-	{"nvlink.throughput.data.tx", nvml.FI_DEV_NVLINK_THROUGHPUT_DATA_TX, math.MaxUint32, metrics.GaugeType},
-	{"nvlink.throughput.raw.rx", nvml.FI_DEV_NVLINK_THROUGHPUT_RAW_RX, math.MaxUint32, metrics.GaugeType},
-	{"nvlink.throughput.raw.tx", nvml.FI_DEV_NVLINK_THROUGHPUT_RAW_TX, math.MaxUint32, metrics.GaugeType},
-	{"nvlink.speed", nvml.FI_DEV_NVLINK_SPEED_MBPS_COMMON, 0, metrics.GaugeType},
-	{"nvlink.nvswitch_connected", nvml.FI_DEV_NVSWITCH_CONNECTED_LINK_COUNT, 0, metrics.GaugeType},
-	{"nvlink.errors.crc.data", nvml.FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL, 0, metrics.CountType},
-	{"nvlink.errors.crc.flit", nvml.FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL, 0, metrics.CountType},
-	{"nvlink.errors.ecc", nvml.FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL, 0, metrics.CountType},
-	{"nvlink.errors.recovery", nvml.FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL, 0, metrics.CountType},
-	{"nvlink.errors.replay", nvml.FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL, 0, metrics.CountType},
-	{"pci.replay_counter", nvml.FI_DEV_PCIE_REPLAY_COUNTER, 0, metrics.CountType},
-	{"slowdown_temperature", nvml.FI_DEV_PERF_POLICY_THERMAL, 0, metrics.GaugeType},
+// allFieldMetrics lists all candidate field-value metrics. When multiple entries
+// share the same metric name, they are alternatives for the same logical metric;
+// the highest-priority one is selected by RemoveDuplicateSamples at collection time.
+//
+// Low (default) = legacy fields (pre-NVLink5), MediumLow = newer per-link fields
+// introduced with NVLink5/Blackwell (field IDs 164+). The newer fields use
+// scopeId to specify the link index and support >12 links.
+var allFieldMetrics = []fieldValueMetric{
+	// -- Non-NVLink metrics (no alternatives) --
+	{name: "memory.temperature", fieldValueID: nvml.FI_DEV_MEMORY_TEMP, metricType: metrics.GaugeType},
+	{name: "pci.replay_counter", fieldValueID: nvml.FI_DEV_PCIE_REPLAY_COUNTER, metricType: metrics.GaugeType},
+	{name: "slowdown_temperature", fieldValueID: nvml.FI_DEV_PERF_POLICY_THERMAL, metricType: metrics.GaugeType},
+
+	// -- C2C link error counters --
+	{name: "c2c.errors.interrupt", fieldValueID: nvml.FI_DEV_C2C_LINK_ERROR_INTR, markUnsupportedOnInvalidArgument: true, metricType: metrics.GaugeType},
+	{name: "c2c.errors.replay", fieldValueID: nvml.FI_DEV_C2C_LINK_ERROR_REPLAY, markUnsupportedOnInvalidArgument: true, metricType: metrics.GaugeType},
+	{name: "c2c.errors.replay.b2b", fieldValueID: nvml.FI_DEV_C2C_LINK_ERROR_REPLAY_B2B, markUnsupportedOnInvalidArgument: true, metricType: metrics.GaugeType},
+
+	// -- NVSwitch connection --
+	{name: "nvlink.nvswitch_connected", fieldValueID: nvml.FI_DEV_NVSWITCH_CONNECTED_LINK_COUNT, metricType: metrics.GaugeType},
 }

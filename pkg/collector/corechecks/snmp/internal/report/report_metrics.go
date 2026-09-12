@@ -6,6 +6,7 @@
 package report
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
@@ -127,6 +128,9 @@ func (ms *MetricSender) reportScalarMetrics(metric profiledefinition.MetricsConf
 
 func (ms *MetricSender) reportColumnMetrics(metricConfig profiledefinition.MetricsConfig, values *valuestore.ResultValueStore, tags []string, deviceID string) map[string]map[string]MetricSample {
 	rowTagsCache := make(map[string][]string)
+	skippedInterfaceIndexes := make(map[string]bool)
+	var missingOIDs []*valuestore.OIDNotFoundError
+
 	samples := map[string]map[string]MetricSample{}
 
 	for _, symbol := range metricConfig.Symbols {
@@ -138,11 +142,21 @@ func (ms *MetricSender) reportColumnMetrics(metricConfig profiledefinition.Metri
 			var err error
 			metricValues, err = getColumnValueFromSymbol(values, symbol)
 			if err != nil {
-				log.Debugf("report column: error getting column value: %v", err)
+				var oidErr *valuestore.OIDNotFoundError
+				if errors.As(err, &oidErr) {
+					missingOIDs = append(missingOIDs, oidErr)
+				} else {
+					log.Debugf("report column: error getting column value: %v", err)
+				}
 				continue
 			}
 		}
 		for fullIndex, value := range metricValues {
+			_, skip := skippedInterfaceIndexes[fullIndex]
+			if skip && isInterfaceTableMetric(symbol.OID) {
+				continue
+			}
+
 			// cache row tags by fullIndex to avoid rebuilding it for every column rows
 			if _, ok := rowTagsCache[fullIndex]; !ok {
 				tmpTags := utils.CopyStrings(tags)
@@ -153,9 +167,13 @@ func (ms *MetricSender) reportColumnMetrics(metricConfig profiledefinition.Metri
 					if err != nil {
 						log.Tracef("unable to tag snmp.%s metric with interface_config data: %s", symbol.Name, err.Error())
 					}
+					if interfaceCfg.Disabled {
+						skippedInterfaceIndexes[fullIndex] = true
+						continue
+					}
 					tmpTags = append(tmpTags, interfaceCfg.Tags...)
 
-					tmpTags = addInternalResourceTag(tmpTags, fmt.Sprintf("ndm_interface_user_tags:%s:%s", deviceID, fullIndex))
+					tmpTags = addInternalResourceTag(tmpTags, fmt.Sprintf("ndm_interface:%s:%s", deviceID, fullIndex))
 				}
 				rowTagsCache[fullIndex] = tmpTags
 			}
@@ -174,6 +192,9 @@ func (ms *MetricSender) reportColumnMetrics(metricConfig profiledefinition.Metri
 			samples[sample.symbol.Name][fullIndex] = sample
 			ms.sendInterfaceVolumeMetrics(symbol, fullIndex, values, rowTags)
 		}
+	}
+	if len(missingOIDs) > 0 {
+		log.Debugf("report column: missing OIDs: %v", valuestore.ListOIDs(missingOIDs))
 	}
 	return samples
 }

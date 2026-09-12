@@ -23,10 +23,7 @@ const (
 )
 
 // GetRdsInstancesFromTags queries an AWS account for RDS instances with the specified tags
-func (c *Client) GetRdsInstancesFromTags(ctx context.Context, tags []string, dbmTag string) ([]Instance, error) {
-	if len(tags) == 0 {
-		return nil, fmt.Errorf("at least one tag filter is required")
-	}
+func (c *Client) GetRdsInstancesFromTags(ctx context.Context, config Config) ([]Instance, error) {
 	instances := make([]Instance, 0)
 	var marker *string
 	var err error
@@ -48,8 +45,8 @@ func (c *Client) GetRdsInstancesFromTags(ctx context.Context, tags []string, dbm
 			return nil, fmt.Errorf("error running GetRdsInstancesFromTags: %v", err)
 		}
 		for _, db := range dbInstances.DBInstances {
-			if containsTags(db.TagList, tags) {
-				instance, err := makeInstance(db, dbmTag)
+			if containsTags(db.TagList, config.Tags) {
+				instance, err := makeInstance(db, nil, config)
 				if err != nil {
 					log.Errorf("error creating instance from DBInstance: %v", err)
 					continue

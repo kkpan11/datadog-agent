@@ -9,11 +9,18 @@ from invoke import Collection, Task
 
 from tasks import (
     agent,
+    agent_ci_api,
+    ai_sandbox,
     ami,
+    anomalydetection,
+    auth,
+    bazel,
     bench,
     buildimages,
+    claude,
     cluster_agent,
     cluster_agent_cloudfoundry,
+    code_review,
     collector,
     components,
     coverage,
@@ -24,21 +31,28 @@ from tasks import (
     diff,
     docker_tasks,
     dogstatsd,
+    dyntest,
     ebpf,
     emacs,
     epforwarder,
     fakeintake,
+    files_inventory,
     fips,
     git,
     github_tasks,
     gitlab_helpers,
     go,
     go_deps,
+    gpu,
+    host_profiler,
     installer,
     invoke_unit_tests,
     issue,
+    k8s_versions,
+    kind_node_image,
     kmt,
     linter,
+    loader,
     macos,
     modules,
     msi,
@@ -51,15 +65,18 @@ from tasks import (
     owners,
     package,
     pipeline,
-    pkg_template,
     pre_commit,
+    privateactionrunner,
     process_agent,
     protobuf,
+    python_version,
     quality_gates,
     release,
+    renovate,
     rtloader,
     sbomgen,
-    sds,
+    schema,
+    secret_generic_connector,
     security_agent,
     selinux,
     setup,
@@ -69,15 +86,27 @@ from tasks import (
     testwasher,
     trace_agent,
     vim,
+    virustotal,
     vscode,
     winbuild,
     windows_dev_env,
     worktree,
 )
-from tasks.build_tags import audit_tag_impact, print_default_build_tags
+from tasks.build_tags import codegen_to_json, print_default_build_tags
 from tasks.components import lint_components, lint_fxutil_oneshot_test
 from tasks.custom_task.custom_task import custom__call__
+
+# e2e-framework tasks
+from tasks.e2e_framework import aws as e2e_aws
+from tasks.e2e_framework import azure as e2e_azure
+from tasks.e2e_framework import gcp as e2e_gcp
+from tasks.e2e_framework import localpodman as e2e_localpodman
+from tasks.e2e_framework import test as e2e_test
+from tasks.e2e_framework.deploy import check_s3_image_exists
+from tasks.e2e_framework.setup import setup as e2e_setup
+from tasks.e2e_framework.vm import get_vm_password as e2e_get_vm_password
 from tasks.fuzz import fuzz
+from tasks.fuzz_infra import build_and_upload_fuzz
 from tasks.go import (
     check_go_mod_replaces,
     check_go_version,
@@ -104,16 +133,20 @@ from tasks.gotest import (
     lint_go,
     send_unit_tests_stats,
     test,
+    test_new,
 )
 from tasks.install_tasks import (
     download_tools,
     install_devcontainer_cli,
-    install_protoc,
+    install_rust_license_tool,
     install_shellcheck,
     install_tools,
 )
 from tasks.junit_tasks import junit_upload
-from tasks.show_linters_issues.show_linters_issues import show_linters_issues
+from tasks.licenses import (
+    generate_rust_licenses,
+    lint_rust_licenses,
+)
 from tasks.update_go import go_version, update_go
 from tasks.windows_resources import build_messagetable
 
@@ -124,22 +157,24 @@ ns = Collection()
 
 # add single tasks to the root
 ns.add_task(test)
+ns.add_task(test_new)
 ns.add_task(integration_tests)
 ns.add_task(deps)
 ns.add_task(deps_vendored)
 ns.add_task(lint_licenses)
 ns.add_task(generate_licenses)
+ns.add_task(lint_rust_licenses)
+ns.add_task(generate_rust_licenses)
 ns.add_task(lint_components)
 ns.add_task(lint_fxutil_oneshot_test)
 ns.add_task(reset)
-ns.add_task(show_linters_issues)
 ns.add_task(go_version)
 ns.add_task(update_go)
-ns.add_task(audit_tag_impact)
+ns.add_task(codegen_to_json)
 ns.add_task(print_default_build_tags)
 ns.add_task(e2e_tests)
 ns.add_task(install_shellcheck)
-ns.add_task(install_protoc)
+ns.add_task(install_rust_license_tool)
 ns.add_task(install_devcontainer_cli)
 ns.add_task(download_tools)
 ns.add_task(install_tools)
@@ -160,13 +195,20 @@ ns.add_task(get_impacted_packages)
 ns.add_task(get_modified_packages)
 ns.add_task(send_unit_tests_stats)
 ns.add_task(mod_diffs)
+ns.add_task(build_and_upload_fuzz)
 # To deprecate
 ns.add_task(lint_go)
-
 # add namespaced tasks to the root
+ns.add_collection(anomalydetection)
+ns.add_collection(auth)
+ns.add_collection(bazel)
 ns.add_collection(agent)
 ns.add_collection(ami)
+ns.add_collection(agent_ci_api)
+ns.add_collection(ai_sandbox)
 ns.add_collection(buildimages)
+ns.add_collection(claude)
+ns.add_collection(code_review)
 ns.add_collection(cluster_agent)
 ns.add_collection(cluster_agent_cloudfoundry)
 ns.add_collection(components)
@@ -180,6 +222,7 @@ ns.add_collection(ebpf)
 ns.add_collection(emacs)
 ns.add_collection(vim)
 ns.add_collection(macos)
+ns.add_collection(dyntest)
 ns.add_collection(epforwarder)
 ns.add_collection(fips)
 ns.add_collection(go)
@@ -190,29 +233,37 @@ ns.add_collection(git)
 ns.add_collection(github_tasks, "github")
 ns.add_collection(gitlab_helpers, "gitlab")
 ns.add_collection(issue)
+ns.add_collection(loader)
+ns.add_collection(gpu)
 ns.add_collection(package)
 ns.add_collection(pipeline)
 ns.add_collection(quality_gates)
 ns.add_collection(protobuf)
+ns.add_collection(python_version, "python-version")
 ns.add_collection(notes)
 ns.add_collection(notify)
 ns.add_collection(oracle)
 ns.add_collection(otel_agent)
-ns.add_collection(sds)
+ns.add_collection(host_profiler)
 ns.add_collection(selinux)
 ns.add_collection(setup)
 ns.add_collection(systray)
 ns.add_collection(release)
+ns.add_collection(renovate)
 ns.add_collection(rtloader)
 ns.add_collection(system_probe)
 ns.add_collection(process_agent)
+ns.add_collection(privateactionrunner)
 ns.add_collection(testwasher)
+ns.add_collection(secret_generic_connector)
 ns.add_collection(security_agent)
 ns.add_collection(cws_instrumentation)
 ns.add_collection(vscode)
 ns.add_collection(new_e2e_tests)
 ns.add_collection(fakeintake)
 ns.add_collection(kmt)
+ns.add_collection(k8s_versions)
+ns.add_collection(kind_node_image)
 ns.add_collection(diff)
 ns.add_collection(installer)
 ns.add_collection(owners)
@@ -227,8 +278,25 @@ ns.add_collection(debug)
 ns.add_collection(winbuild)
 ns.add_collection(windows_dev_env)
 ns.add_collection(worktree)
+ns.add_collection(schema)
 ns.add_collection(sbomgen)
-ns.add_collection(pkg_template)
+ns.add_collection(virustotal)
+ns.add_collection(files_inventory)
+
+# e2e-framework collections (from test/e2e-framework)
+ns.add_collection(e2e_aws.collection, "aws")
+ns.add_collection(e2e_azure.collection, "az")
+ns.add_collection(e2e_gcp.collection, "gcp")
+ns.add_collection(e2e_localpodman.collection, "localpodman")
+
+# e2e namespace with setup, ci, and test
+e2e_ns = Collection("e2e")
+e2e_ns.add_collection(e2e_setup)
+e2e_ns.add_collection(e2e_test)
+e2e_ns.add_task(check_s3_image_exists)
+e2e_ns.add_task(e2e_get_vm_password, name="get-vm-password")
+
+ns.add_collection(e2e_ns)
 ns.configure(
     {
         "run": {

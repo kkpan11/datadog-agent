@@ -28,7 +28,9 @@ LICENSE_HEADER = """// Unless explicitly stated otherwise all files in this repo
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 """
-OCB_VERSION = "0.127.0"
+OCB_VERSION = "0.159.0"
+# The version the core collector and collector-contrib may or may not match
+OTEL_CONTRIB_VERSION = "0.159.0"
 
 MANDATORY_COMPONENTS = {
     "extensions": [
@@ -204,7 +206,7 @@ def generate(ctx):
             print(f"Downloaded to {binary_path}")
         except Exception as e:
             raise Exit(
-                color_message("Error: Failed to download the binary", Color.RED),
+                color_message(f"Error: Failed to download the binary from {binary_url}: {e}", Color.RED),
                 code=1,
             ) from e
 
@@ -338,9 +340,20 @@ def update_go_mod_file(go_mod_path, module_versions):
 
 
 def update_all_go_mod(collector_version_modules):
+    # Files to ignore during go.mod updates
+    ignored_paths = ["./pkg/dyninst/testprogs/progs/go.mod", "pkg/dyninst/testprogs/progs/go.mod"]
+
     for root, _, files in os.walk("."):
         if "go.mod" in files:
             go_mod_path = os.path.join(root, "go.mod")
+            # Normalize the path for comparison
+            normalized_path = os.path.normpath(go_mod_path)
+
+            # Skip ignored paths
+            if any(os.path.normpath(ignored) == normalized_path for ignored in ignored_paths):
+                print(f"Skipping ignored go.mod file: {go_mod_path}")
+                continue
+
             update_go_mod_file(go_mod_path, collector_version_modules)
     print("All go.mod files updated.")
 
@@ -356,8 +369,27 @@ def read_old_version(filepath):
     return None
 
 
+def update_variables_in_file(filepath, variables_new_values: dict[str, str]):
+    """Updates all assignations of provided variables in file."""
+    with open(filepath) as f:
+        content = []
+        for line in f:
+            if '=' in line:
+                left, _ = map(str.strip, line.split('=', 1))
+                if left in variables_new_values:
+                    content.append(f'{left} = "{variables_new_values[left]}"\n')
+                    continue
+            content.append(line)
+    with open(filepath, 'w') as f:
+        for line in content:
+            f.write(line)
+    print(f"Updated all assignations of : {', '.join(variables_new_values)}")
+
+
 def update_file(filepath, old_version, new_version):
     """Updates all instances of the old version to the new version in the file."""
+    if old_version == new_version:
+        return
     print(f"Updating all instances of {old_version} to {new_version} in {filepath}")
     with open(filepath) as file:
         content = file.read()
@@ -468,7 +500,7 @@ class CollectorRepo:
 
         for _, details in data.get("module-sets", {}).items():
             version = details.get("version", "unknown")
-            for module in details.get("modules", []):
+            for module in details.get("modules") or []:
                 version_modules[version] = version_modules.get(version, []) + [module]
 
         return version_modules
@@ -487,10 +519,6 @@ class CollectorVersionUpdater:
 
     def update_ocb_yaml(self):
         update_versions_in_ocb_yaml(
-            "./test/otel/testdata/builder-config.yaml",
-            self.modules_version,
-        )
-        update_versions_in_ocb_yaml(
             MANIFEST_FILE,
             self.modules_version,
         )
@@ -499,17 +527,23 @@ class CollectorVersionUpdater:
         files = [
             MANIFEST_FILE,
             "./comp/otelcol/collector/impl/collector.go",
-            "./tasks/collector.py",
-            "./.gitlab/integration_test/otel.yml",
-            "./test/otel/testdata/ocb_build_script.sh",
+            "./.gitlab/test/integration_test/otel.yml",
         ]
+        collector_version = self.core_collector.get_version()[1:]
+        contrib_version = self.contrib_collector.get_version()[1:]
+        variables = {
+            "OCB_VERSION": collector_version,
+            "OTEL_CONTRIB_VERSION": contrib_version,
+        }
+
         for root, _, testfiles in os.walk("./tasks/unit_tests/testdata/collector"):
             for file in testfiles:
                 files.append(os.path.join(root, file))
-        collector_version = self.core_collector.get_version()[1:]
-        os.environ["OCB_VERSION"] = collector_version
+        os.environ |= variables
         for file in files:
             update_file(file, self.core_collector.get_old_version(), collector_version)
+        update_variables_in_file("./tasks/collector.py", variables)
+        update_variables_in_file("./tasks/host_profiler.py", {"PPROFILE_MAX_VERSION": f"v{contrib_version}"})
 
     def update(self):
         self.update_all_go_mod()

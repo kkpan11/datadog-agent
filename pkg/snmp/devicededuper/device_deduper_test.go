@@ -6,10 +6,9 @@
 package devicededuper
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"sync/atomic"
 
 	"github.com/DataDog/datadog-agent/pkg/snmp"
 	"github.com/stretchr/testify/assert"
@@ -150,7 +149,7 @@ func TestDeviceDeduper_Contains(t *testing.T) {
 	deduper := &deviceDeduperImpl{
 		deviceInfos:    make([]DeviceInfo, 0),
 		pendingDevices: make([]PendingDevice, 0),
-		ipsCounter:     make(map[string]*atomic.Uint32),
+		ipsCounter:     make(map[string]*atomic.Int32),
 	}
 
 	now := time.Now().UnixMilli()
@@ -176,32 +175,53 @@ func TestDeviceDeduper_Contains(t *testing.T) {
 	assert.False(t, deduper.contains(differentDevice))
 }
 
+func TestDeviceDeduper_DecrementIPCounter(t *testing.T) {
+	deduper := &deviceDeduperImpl{
+		deviceInfos:    make([]DeviceInfo, 0),
+		pendingDevices: make([]PendingDevice, 0),
+		ipsCounter:     make(map[string]*atomic.Int32),
+	}
+
+	counter1 := &atomic.Int32{}
+	counter1.Store(2)
+	deduper.ipsCounter["192.168.1.1"] = counter1
+
+	counter2 := &atomic.Int32{}
+	counter2.Store(1)
+	deduper.ipsCounter["192.168.1.2"] = counter2
+
+	deduper.DecrementIPCounter("192.168.1.1")
+	count := deduper.ipsCounter["192.168.1.1"].Load()
+	assert.Equal(t, int32(1), count)
+
+	deduper.DecrementIPCounter("192.168.1.1")
+	count = deduper.ipsCounter["192.168.1.1"].Load()
+	assert.Equal(t, int32(0), count)
+
+	deduper.DecrementIPCounter("192.168.1.2")
+	count = deduper.ipsCounter["192.168.1.2"].Load()
+	assert.Equal(t, int32(0), count)
+
+	// Decrementing past 0 goes to -1, which checkPreviousIPs still treats as processed (count > 0 is false)
+	deduper.DecrementIPCounter("192.168.1.2")
+	count = deduper.ipsCounter["192.168.1.2"].Load()
+	assert.Equal(t, int32(-1), count)
+}
+
 func TestDeviceDeduper_MarkIPAsProcessed(t *testing.T) {
 	deduper := &deviceDeduperImpl{
 		deviceInfos:    make([]DeviceInfo, 0),
 		pendingDevices: make([]PendingDevice, 0),
-		ipsCounter:     make(map[string]*atomic.Uint32),
+		ipsCounter:     make(map[string]*atomic.Int32),
 	}
 
-	counter1 := &atomic.Uint32{}
-	counter1.Store(2)
+	counter1 := &atomic.Int32{}
+	counter1.Store(5)
 	deduper.ipsCounter["192.168.1.1"] = counter1
-
-	counter2 := &atomic.Uint32{}
-	counter2.Store(1)
-	deduper.ipsCounter["192.168.1.2"] = counter2
 
 	deduper.MarkIPAsProcessed("192.168.1.1")
 	count := deduper.ipsCounter["192.168.1.1"].Load()
-	assert.Equal(t, uint32(1), count)
-
-	deduper.MarkIPAsProcessed("192.168.1.1")
-	count = deduper.ipsCounter["192.168.1.1"].Load()
-	assert.Equal(t, uint32(0), count)
-
-	deduper.MarkIPAsProcessed("192.168.1.2")
-	count = deduper.ipsCounter["192.168.1.2"].Load()
-	assert.Equal(t, uint32(0), count)
+	assert.Equal(t, int32(0), count)
 }
 
 func TestDeviceDeduper_InitIPCounter(t *testing.T) {
@@ -227,9 +247,9 @@ func TestDeviceDeduper_InitIPCounter(t *testing.T) {
 	assert.True(t, ok)
 
 	count := deduperImpl.ipsCounter["192.168.1.1"].Load()
-	assert.Equal(t, uint32(2), count)
+	assert.Equal(t, int32(2), count)
 	count = deduperImpl.ipsCounter["192.168.1.2"].Load()
-	assert.Equal(t, uint32(2), count)
+	assert.Equal(t, int32(2), count)
 
 	_, ok = deduperImpl.ipsCounter["192.168.1.0"]
 	assert.False(t, ok)
@@ -241,22 +261,22 @@ func TestDeviceDeduper_CheckPreviousIPs(t *testing.T) {
 	deduper := &deviceDeduperImpl{
 		deviceInfos:    make([]DeviceInfo, 0),
 		pendingDevices: make([]PendingDevice, 0),
-		ipsCounter:     make(map[string]*atomic.Uint32),
+		ipsCounter:     make(map[string]*atomic.Int32),
 	}
 
-	counter1 := &atomic.Uint32{}
+	counter1 := &atomic.Int32{}
 	counter1.Store(0)
 	deduper.ipsCounter["192.168.1.1"] = counter1 // Already processed
 
-	counter2 := &atomic.Uint32{}
+	counter2 := &atomic.Int32{}
 	counter2.Store(1)
 	deduper.ipsCounter["192.168.1.2"] = counter2 // Not processed yet
 
-	counter3 := &atomic.Uint32{}
+	counter3 := &atomic.Int32{}
 	counter3.Store(0)
 	deduper.ipsCounter["192.168.1.3"] = counter3 // Already processed
 
-	counter4 := &atomic.Uint32{}
+	counter4 := &atomic.Int32{}
 	counter4.Store(0)
 	deduper.ipsCounter["192.168.1.4"] = counter4 // Already processed
 
@@ -278,7 +298,7 @@ func TestDeviceDeduper_AddPendingDevice(t *testing.T) {
 	deduper := &deviceDeduperImpl{
 		deviceInfos:    make([]DeviceInfo, 0),
 		pendingDevices: make([]PendingDevice, 0),
-		ipsCounter:     make(map[string]*atomic.Uint32),
+		ipsCounter:     make(map[string]*atomic.Int32),
 	}
 
 	now := time.Now().UnixMilli()
@@ -295,9 +315,9 @@ func TestDeviceDeduper_AddPendingDevice(t *testing.T) {
 			BootTimeMs:  now,
 			SysObjectID: "1.3.6.1.4.1.9.1.1",
 		},
-		AuthIndex:  0,
-		WriteCache: true,
-		IP:         "192.168.1.2",
+		AuthIndex:      0,
+		AddedFromCache: false,
+		IP:             "192.168.1.2",
 	}
 
 	pendingDevice2 := PendingDevice{
@@ -313,9 +333,9 @@ func TestDeviceDeduper_AddPendingDevice(t *testing.T) {
 			BootTimeMs:  now,
 			SysObjectID: "1.3.6.1.4.1.9.1.2",
 		},
-		AuthIndex:  0,
-		WriteCache: true,
-		IP:         "192.168.1.3",
+		AuthIndex:      0,
+		AddedFromCache: false,
+		IP:             "192.168.1.3",
 	}
 
 	deduper.AddPendingDevice(pendingDevice1)
@@ -338,9 +358,9 @@ func TestDeviceDeduper_AddPendingDevice(t *testing.T) {
 			BootTimeMs:  now,
 			SysObjectID: "1.3.6.1.4.1.9.1.1",
 		},
-		AuthIndex:  0,
-		WriteCache: true,
-		IP:         "192.168.1.1",
+		AuthIndex:      0,
+		AddedFromCache: false,
+		IP:             "192.168.1.1",
 	}
 
 	deduper.AddPendingDevice(pendingDevice3)
@@ -364,9 +384,9 @@ func TestDeviceDeduper_AddPendingDevice(t *testing.T) {
 			BootTimeMs:  now,
 			SysObjectID: "1.3.6.1.4.1.9.1.2",
 		},
-		AuthIndex:  0,
-		WriteCache: true,
-		IP:         "192.168.1.4",
+		AuthIndex:      0,
+		AddedFromCache: false,
+		IP:             "192.168.1.4",
 	}
 
 	deduper.AddPendingDevice(pendingDevice4)
@@ -380,7 +400,7 @@ func TestDeviceDeduper_GetDedupedDevices(t *testing.T) {
 	deduper := &deviceDeduperImpl{
 		deviceInfos:    make([]DeviceInfo, 0),
 		pendingDevices: make([]PendingDevice, 0),
-		ipsCounter:     make(map[string]*atomic.Uint32),
+		ipsCounter:     make(map[string]*atomic.Int32),
 	}
 
 	now := time.Now().UnixMilli()
@@ -406,10 +426,10 @@ func TestDeviceDeduper_GetDedupedDevices(t *testing.T) {
 				{Community: "public"},
 			},
 		},
-		Info:       device1,
-		AuthIndex:  0,
-		WriteCache: true,
-		IP:         "192.168.1.1",
+		Info:           device1,
+		AuthIndex:      0,
+		AddedFromCache: false,
+		IP:             "192.168.1.1",
 	}
 
 	pendingDevice2 := PendingDevice{
@@ -419,10 +439,10 @@ func TestDeviceDeduper_GetDedupedDevices(t *testing.T) {
 				{Community: "public"},
 			},
 		},
-		Info:       device2,
-		AuthIndex:  0,
-		WriteCache: true,
-		IP:         "192.168.1.3",
+		Info:           device2,
+		AuthIndex:      0,
+		AddedFromCache: false,
+		IP:             "192.168.1.3",
 	}
 
 	deduper.AddPendingDevice(pendingDevice1)
@@ -430,19 +450,19 @@ func TestDeviceDeduper_GetDedupedDevices(t *testing.T) {
 
 	// Set IP counter such that 192.168.1.1 has all previous IPs discovered
 	// but 192.168.1.3 does not
-	counter0 := &atomic.Uint32{}
+	counter0 := &atomic.Int32{}
 	counter0.Store(0)
 	deduper.ipsCounter["192.168.1.0"] = counter0 // Already scanned
 
-	counter1 := &atomic.Uint32{}
+	counter1 := &atomic.Int32{}
 	counter1.Store(0)
 	deduper.ipsCounter["192.168.1.1"] = counter1 // Current IP
 
-	counter2 := &atomic.Uint32{}
+	counter2 := &atomic.Int32{}
 	counter2.Store(1)
 	deduper.ipsCounter["192.168.1.2"] = counter2 // Pending IP
 
-	counter3 := &atomic.Uint32{}
+	counter3 := &atomic.Int32{}
 	counter3.Store(0)
 	deduper.ipsCounter["192.168.1.3"] = counter3 // Current IP
 
@@ -548,4 +568,63 @@ func TestNewDeviceDeduper(t *testing.T) {
 		count++
 	}
 	assert.Equal(t, 4, count)
+}
+
+func TestDeviceDeduper_ResetCounters(t *testing.T) {
+	config := snmp.ListenerConfig{
+		Configs: []snmp.Config{
+			{
+				Network: "192.168.1.0/30",
+				Authentications: []snmp.Authentication{
+					{Community: "public"},
+					{Community: "private"},
+				},
+				IgnoredIPAddresses: map[string]bool{
+					"192.168.1.0": true,
+				},
+			},
+		},
+	}
+
+	deduper := NewDeviceDeduper(config)
+	deduperImpl, ok := deduper.(*deviceDeduperImpl)
+	assert.True(t, ok)
+
+	// Initially, all counters should be set to 2 (number of authentications)
+	count := deduperImpl.ipsCounter["192.168.1.1"].Load()
+	assert.Equal(t, int32(2), count)
+	count = deduperImpl.ipsCounter["192.168.1.2"].Load()
+	assert.Equal(t, int32(2), count)
+
+	// Process some IPs
+	deduper.DecrementIPCounter("192.168.1.1")
+	deduper.DecrementIPCounter("192.168.1.2")
+
+	count = deduperImpl.ipsCounter["192.168.1.1"].Load()
+	assert.Equal(t, int32(1), count)
+	count = deduperImpl.ipsCounter["192.168.1.2"].Load()
+	assert.Equal(t, int32(1), count)
+
+	// Add a discovered device
+	now := time.Now().UnixMilli()
+	deviceInfo := DeviceInfo{
+		Name:        "device1",
+		Description: "test device",
+		BootTimeMs:  now,
+		SysObjectID: "1.3.6.1.4.1.9.1.1",
+	}
+	deduperImpl.deviceInfos = append(deduperImpl.deviceInfos, deviceInfo)
+	assert.Len(t, deduperImpl.deviceInfos, 1)
+
+	// Reset counters
+	deduper.ResetCounters()
+
+	// Verify counters are reset to initial value
+	count = deduperImpl.ipsCounter["192.168.1.1"].Load()
+	assert.Equal(t, int32(2), count)
+	count = deduperImpl.ipsCounter["192.168.1.2"].Load()
+	assert.Equal(t, int32(2), count)
+
+	// Verify device infos are cleared
+	assert.Len(t, deduperImpl.deviceInfos, 0)
 }

@@ -10,18 +10,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awsdocker "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/docker"
+	scendocker "github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2docker"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awsdocker "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/docker"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/dockeragentparams"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/apps"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/dockeragentparams"
 )
 
 type DockerFakeintakeSuite struct {
 	e2e.BaseSuite[environments.DockerHost]
 	transport transport
+}
+
+// SetupSuite is called once before all tests in the suite.
+// This function is called by [testify Suite].
+func (s *DockerFakeintakeSuite) SetupSuite() {
+	s.BaseSuite.SetupSuite()
+	defer s.CleanupOnSetupFailure() // cleanup if setup fails
+
+	// Pre-pull Docker image once for all tests to avoid network timeout issues during test execution
+	s.Env().RemoteHost.MustExecute("docker pull ghcr.io/datadog/apps-tracegen:" + apps.Version)
 }
 
 func dockerSuiteOpts(tr transport, opts ...awsdocker.ProvisionerOption) []e2e.SuiteOption {
@@ -60,16 +73,16 @@ func dockerAgentOptions(tr transport) []func(*dockeragentparams.Params) error {
 
 // TestDockerFakeintakeSuiteUDS runs basic Trace Agent tests over the UDS transport
 func TestDockerFakeintakeSuiteUDS(t *testing.T) {
-	options := dockerSuiteOpts(uds, awsdocker.WithAgentOptions(
-		dockerAgentOptions(uds)...,
+	options := dockerSuiteOpts(uds, awsdocker.WithRunOptions(
+		scendocker.WithAgentOptions(dockerAgentOptions(uds)...),
 	))
 	e2e.Run(t, &DockerFakeintakeSuite{transport: uds}, options...)
 }
 
 // TestDockerFakeintakeSuiteTCP runs basic Trace Agent tests over the TCP transport
 func TestDockerFakeintakeSuiteTCP(t *testing.T) {
-	options := dockerSuiteOpts(tcp, awsdocker.WithAgentOptions(
-		dockerAgentOptions(tcp)...,
+	options := dockerSuiteOpts(tcp, awsdocker.WithRunOptions(
+		scendocker.WithAgentOptions(dockerAgentOptions(tcp)...),
 	))
 	e2e.Run(t, &DockerFakeintakeSuite{transport: tcp}, options...)
 }
@@ -78,7 +91,7 @@ func (s *DockerFakeintakeSuite) TestTraceAgentMetrics() {
 	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
 	s.Require().NoError(err)
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		testTraceAgentMetrics(s.T(), c, s.Env().FakeIntake)
+		testTraceAgentMetrics(s.T(), c, s.Env().FakeIntake, !s.Env().Agent.FIPSEnabled)
 	}, 2*time.Minute, 10*time.Second, "Failed finding datadog.trace_agent.* metrics")
 }
 
@@ -113,7 +126,7 @@ func (s *DockerFakeintakeSuite) TestAutoVersionTraces() {
 	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
 	defer runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})()
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		testAutoVersionTraces(s.T(), c, s.Env().FakeIntake)
+		testAutoVersionTraces(s.T(), c, service, s.Env().FakeIntake)
 	}, 2*time.Minute, 10*time.Second, "Failed finding version tags")
 }
 
@@ -125,7 +138,7 @@ func (s *DockerFakeintakeSuite) TestAutoVersionStats() {
 	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
 	defer runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})()
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		testAutoVersionStats(s.T(), c, s.Env().FakeIntake)
+		testAutoVersionStats(s.T(), c, service, s.Env().FakeIntake)
 	}, 2*time.Minute, 10*time.Second, "Failed finding version tags")
 }
 
@@ -137,7 +150,7 @@ func (s *DockerFakeintakeSuite) TestIsTraceRootTag() {
 	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
 	defer runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})()
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		testIsTraceRootTag(s.T(), c, s.Env().FakeIntake)
+		testIsTraceRootTag(s.T(), c, service, s.Env().FakeIntake)
 	}, 2*time.Minute, 10*time.Second, "Failed finding is_trace_root tag")
 }
 
@@ -191,12 +204,13 @@ func (s *DockerFakeintakeSuite) TestBasicTrace() {
 func (s *DockerFakeintakeSuite) TestTPS() {
 	agentTPS := 2.
 
-	s.UpdateEnv(awsdocker.Provisioner(awsdocker.WithAgentOptions(
-		append(dockerAgentOptions(s.transport),
+	s.UpdateEnv(awsdocker.Provisioner(awsdocker.WithRunOptions(
+		scendocker.WithAgentOptions(append(dockerAgentOptions(s.transport),
 			dockeragentparams.WithAgentServiceEnvVariable(
 				"DD_APM_TARGET_TPS",
 				pulumi.Float64(agentTPS)),
-		)...)))
+		)...),
+	)))
 
 	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
 	s.Require().NoError(err)
@@ -211,13 +225,13 @@ func (s *DockerFakeintakeSuite) TestTPS() {
 
 	s.T().Log("Waiting for traces.")
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		testTPS(c, s.Env().FakeIntake, agentTPS)
+		testTPS(c, s.Env().FakeIntake, service, agentTPS)
 	}, 2*time.Minute, 10*time.Second, "Failed to test TargetTPS")
 }
 
 func (s *DockerFakeintakeSuite) TestProbabilitySampler() {
-	s.UpdateEnv(awsdocker.Provisioner(awsdocker.WithAgentOptions(
-		append(dockerAgentOptions(s.transport),
+	s.UpdateEnv(awsdocker.Provisioner(awsdocker.WithRunOptions(
+		scendocker.WithAgentOptions(append(dockerAgentOptions(s.transport),
 			dockeragentparams.WithAgentServiceEnvVariable(
 				"DD_APM_PROBABILISTIC_SAMPLER_ENABLED",
 				pulumi.Bool(true)),
@@ -227,7 +241,8 @@ func (s *DockerFakeintakeSuite) TestProbabilitySampler() {
 			dockeragentparams.WithAgentServiceEnvVariable(
 				"DD_APM_PROBABILISTIC_SAMPLER_SAMPLING_PERCENTAGE",
 				pulumi.Int(22)),
-		)...)))
+		)...),
+	)))
 
 	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
 	s.Require().NoError(err)
@@ -242,6 +257,50 @@ func (s *DockerFakeintakeSuite) TestProbabilitySampler() {
 
 	s.T().Log("Waiting for traces.")
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		tracesSampledByProbabilitySampler(s.T(), c, s.Env().FakeIntake)
+		tracesSampledByProbabilitySampler(s.T(), c, service, s.Env().FakeIntake)
 	}, 2*time.Minute, 10*time.Second, "Failed to find traces sampled by the probability sampler")
+}
+
+func (s *DockerFakeintakeSuite) TestAPMModeDefault() {
+	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
+	s.Require().NoError(err)
+
+	service := fmt.Sprintf("tracegen-apm-mode-default-%s", s.transport)
+
+	// Run Trace Generator
+	s.T().Log("Starting Trace Generator.")
+	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
+	shutdown := runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})
+	defer shutdown()
+
+	s.T().Log("Waiting for traces.")
+	s.EventuallyWithTf(func(c *assert.CollectT) {
+		testAPMMode(c, s.Env().FakeIntake, service, "")
+	}, 2*time.Minute, 10*time.Second, "Failed to find traces with _dd.apm_mode=default")
+}
+
+func (s *DockerFakeintakeSuite) TestAPMModeEdge() {
+	s.UpdateEnv(awsdocker.Provisioner(awsdocker.WithRunOptions(
+		scendocker.WithAgentOptions(append(dockerAgentOptions(s.transport),
+			dockeragentparams.WithAgentServiceEnvVariable(
+				"DD_APM_MODE",
+				pulumi.String("edge")),
+		)...),
+	)))
+
+	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
+	s.Require().NoError(err)
+
+	service := fmt.Sprintf("tracegen-apm-mode-edge-%s", s.transport)
+
+	// Run Trace Generator
+	s.T().Log("Starting Trace Generator.")
+	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
+	shutdown := runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})
+	defer shutdown()
+
+	s.T().Log("Waiting for traces.")
+	s.EventuallyWithTf(func(c *assert.CollectT) {
+		testAPMMode(c, s.Env().FakeIntake, service, "edge")
+	}, 2*time.Minute, 10*time.Second, "Failed to find traces with _dd.apm_mode=edge")
 }

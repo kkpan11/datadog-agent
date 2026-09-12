@@ -62,7 +62,7 @@ func (p *ProcessCheck) runRealtime(groupID int32) (RunResult, error) {
 		return CombinedRunResult{}, nil
 	}
 
-	chunkedStats := fmtProcessStats(p.maxBatchSize, procs, p.realtimeLastProcs, pidToCid, cpuTimes[0], p.realtimeLastCPUTime, p.realtimeLastRun)
+	chunkedStats := fmtProcessStats(p.maxBatchSize, procs, p.realtimeLastProcs, pidToCid, cpuTimes[0], p.realtimeLastCPUTime, p.realtimeLastRun, time.Now())
 	groupSize := len(chunkedStats)
 	chunkedCtrStats := convertAndChunkContainers(containers, groupSize)
 
@@ -96,9 +96,14 @@ func fmtProcessStats(
 	pidToCid map[int]string,
 	syst2, syst1 cpu.TimesStat,
 	lastRun time.Time,
+	now time.Time,
 ) [][]*model.ProcessStat {
 	chunked := make([][]*model.ProcessStat, 0)
-	chunk := make([]*model.ProcessStat, 0, maxBatchSize)
+	chunkSize := len(procs)
+	if maxBatchSize > 0 && maxBatchSize < chunkSize {
+		chunkSize = maxBatchSize
+	}
+	chunk := make([]*model.ProcessStat, 0, chunkSize)
 
 	for pid, fp := range procs {
 		// Skipping any processes that didn't exist in the previous run.
@@ -116,9 +121,14 @@ func fmtProcessStats(
 				WriteBytesRate: float32(fp.IORateStat.WriteBytesRate),
 			}
 		} else {
-			ioStat = formatIO(fp, lastProcs[pid].IOStat, lastRun)
+			ioStat = formatIO(fp, lastProcs[pid].IOStat, now, lastRun)
 		}
 
+		var voluntaryCtxSwitches, involuntaryCtxSwitches uint64
+		if fp.CtxSwitches != nil {
+			voluntaryCtxSwitches = uint64(fp.CtxSwitches.Voluntary)
+			involuntaryCtxSwitches = uint64(fp.CtxSwitches.Involuntary)
+		}
 		stat := &model.ProcessStat{
 			Pid:                    pid,
 			CreateTime:             fp.CreateTime,
@@ -129,8 +139,8 @@ func fmtProcessStats(
 			OpenFdCount:            fp.OpenFdCount,
 			ProcessState:           model.ProcessState(model.ProcessState_value[fp.Status]),
 			IoStat:                 ioStat,
-			VoluntaryCtxSwitches:   uint64(fp.CtxSwitches.Voluntary),
-			InvoluntaryCtxSwitches: uint64(fp.CtxSwitches.Involuntary),
+			VoluntaryCtxSwitches:   voluntaryCtxSwitches,
+			InvoluntaryCtxSwitches: involuntaryCtxSwitches,
 			ContainerId:            pidToCid[int(pid)],
 		}
 

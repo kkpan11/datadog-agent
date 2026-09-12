@@ -6,6 +6,7 @@ receivers:
           - job_name: 'datadog-agent'
             scrape_interval: 60s
             metric_name_validation_scheme: legacy
+            metric_name_escaping_scheme: underscores
             scrape_protocols:
               - "PrometheusText0.0.4"
             static_configs:
@@ -28,6 +29,7 @@ extensions:
   zpages/user-defined:
     endpoint: "localhost:55679"
   ddflare/user-defined:
+  datadog/user-defined:
 
 processors:
   infraattributes/user-defined:
@@ -44,7 +46,7 @@ service:
                 without_scope_info: true
                 without_type_suffix: true
                 without_units: true
-  extensions: [pprof/user-defined, zpages/user-defined, health_check/user-defined, ddflare/user-defined]
+  extensions: [pprof/user-defined, zpages/user-defined, health_check/user-defined, ddflare/user-defined, datadog/user-defined]
   pipelines:
       traces:
           receivers: [nop]

@@ -30,13 +30,15 @@ func TestNewInstrumentationConfig(t *testing.T) {
 			shouldErr:  false,
 			expected: &InstrumentationConfig{
 				Enabled:            true,
-				EnabledNamespaces:  []string{"default"},
+				OnDemand:           true,
+				EnabledNamespaces:  []string{"application"},
 				DisabledNamespaces: []string{},
 				LibVersions: map[string]string{
-					"python": "default",
+					"python": "v3",
 				},
-				Version:          "v2",
 				InjectorImageTag: "foo",
+				Targets:          []Target{},
+				InjectionMode:    "auto",
 			},
 		},
 		{
@@ -51,13 +53,15 @@ func TestNewInstrumentationConfig(t *testing.T) {
 			shouldErr:  false,
 			expected: &InstrumentationConfig{
 				Enabled:            true,
+				OnDemand:           true,
 				EnabledNamespaces:  []string{},
 				DisabledNamespaces: []string{"default"},
 				LibVersions: map[string]string{
 					"python": "default",
 				},
-				Version:          "v2",
 				InjectorImageTag: "foo",
+				Targets:          []Target{},
+				InjectionMode:    "auto",
 			},
 		},
 		{
@@ -66,10 +70,10 @@ func TestNewInstrumentationConfig(t *testing.T) {
 			shouldErr:  false,
 			expected: &InstrumentationConfig{
 				Enabled:           true,
+				OnDemand:          true,
 				EnabledNamespaces: []string{},
 				InjectorImageTag:  "0",
 				LibVersions:       map[string]string{},
-				Version:           "v2",
 				DisabledNamespaces: []string{
 					"hacks",
 				},
@@ -106,6 +110,7 @@ func TestNewInstrumentationConfig(t *testing.T) {
 						},
 					},
 				},
+				InjectionMode: "auto",
 			},
 		},
 		{
@@ -114,10 +119,10 @@ func TestNewInstrumentationConfig(t *testing.T) {
 			shouldErr:  false,
 			expected: &InstrumentationConfig{
 				Enabled:           true,
+				OnDemand:          true,
 				EnabledNamespaces: []string{},
 				InjectorImageTag:  "0",
 				LibVersions:       map[string]string{},
-				Version:           "v2",
 				DisabledNamespaces: []string{
 					"hacks",
 				},
@@ -163,6 +168,7 @@ func TestNewInstrumentationConfig(t *testing.T) {
 						},
 					},
 				},
+				InjectionMode: "auto",
 			},
 		},
 		{
@@ -170,10 +176,10 @@ func TestNewInstrumentationConfig(t *testing.T) {
 			configPath: "testdata/filter_service_env_var_from.yaml",
 			expected: &InstrumentationConfig{
 				Enabled:            true,
+				OnDemand:           true,
 				EnabledNamespaces:  []string{},
 				DisabledNamespaces: []string{},
 				InjectorImageTag:   "0",
-				Version:            "v2",
 				LibVersions:        map[string]string{},
 				Targets: []Target{
 					{
@@ -190,6 +196,7 @@ func TestNewInstrumentationConfig(t *testing.T) {
 						},
 					},
 				},
+				InjectionMode: "auto",
 			},
 		},
 		{
@@ -404,6 +411,7 @@ func TestTargetEnvVar(t *testing.T) {
 }
 
 func TestGetPinnedLibraries(t *testing.T) {
+
 	tests := []struct {
 		name          string
 		libVersions   map[string]string
@@ -450,6 +458,54 @@ func TestGetPinnedLibraries(t *testing.T) {
 			},
 		},
 		{
+			name: "default libs with explicit c lib",
+			libVersions: map[string]string{
+				"java":   "v1",
+				"python": "v4",
+				"js":     "v6",
+				"dotnet": "v3",
+				"ruby":   "v2",
+				"php":    "v1",
+				"c":      "v0",
+			},
+			checkDefaults: true,
+			expected: pinnedLibraries{
+				libs: []libInfo{
+					defaultLibInfo(java),
+					defaultLibInfo(python),
+					defaultLibInfo(js),
+					defaultLibInfo(dotnet),
+					defaultLibInfo(ruby),
+					defaultLibInfo(php),
+					defaultLibInfoWithVersion(c, "v0"),
+				},
+				areSetToDefaults: false,
+			},
+		},
+		{
+			name: "explicit c lib cannot substitute for missing default lib",
+			libVersions: map[string]string{
+				"java":   "v1",
+				"python": "v4",
+				"js":     "v6",
+				"dotnet": "v3",
+				"ruby":   "v2",
+				"c":      "v0",
+			},
+			checkDefaults: true,
+			expected: pinnedLibraries{
+				libs: []libInfo{
+					defaultLibInfo(java),
+					defaultLibInfo(python),
+					defaultLibInfo(js),
+					defaultLibInfo(dotnet),
+					defaultLibInfo(ruby),
+					defaultLibInfoWithVersion(c, "v0"),
+				},
+				areSetToDefaults: false,
+			},
+		},
+		{
 			name:          "default libs, one missing",
 			libVersions:   defaultLibrariesFor("java", "python", "js", "dotnet"),
 			checkDefaults: true,
@@ -489,8 +545,8 @@ func TestGetPinnedLibraries(t *testing.T) {
 			name: "default libs (major versions)",
 			libVersions: map[string]string{
 				"java":   "v1",
-				"python": "v3",
-				"js":     "v5",
+				"python": "v4",
+				"js":     "v6",
 				"dotnet": "v3",
 				"ruby":   "v2",
 				"php":    "v1",
@@ -512,7 +568,7 @@ func TestGetPinnedLibraries(t *testing.T) {
 			name: "default libs (major versions mismatch)",
 			libVersions: map[string]string{
 				"java":   "v1",
-				"python": "v3",
+				"python": "v4",
 				"js":     "v3",
 				"dotnet": "v3",
 				"ruby":   "v2",
@@ -522,7 +578,7 @@ func TestGetPinnedLibraries(t *testing.T) {
 				libs: []libInfo{
 					defaultLibInfo(java),
 					defaultLibInfo(python),
-					js.libInfo("", "registry/dd-lib-js-init:v3"),
+					defaultLibInfoWithVersion(js, "v3"),
 					defaultLibInfo(dotnet),
 					defaultLibInfo(ruby),
 				},

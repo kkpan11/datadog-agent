@@ -11,6 +11,7 @@ package crio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -63,6 +64,10 @@ type Client interface {
 	// GetCRIOImageLayers returns paths to `diff` directories for each layer of the specified image,
 	// using imgMeta to identify the image and resolve its layers.
 	GetCRIOImageLayers(imgMeta *workloadmeta.ContainerImageMetadata) ([]string, error)
+
+	// ListImages retrieves all images available in the CRI-O runtime.
+	// Accepts a context for request management and returns a slice of image metadata.
+	ListImages(ctx context.Context) ([]*v1.Image, error)
 }
 
 // clientImpl is a client to interact with the CRI-API.
@@ -143,19 +148,19 @@ func (c *clientImpl) GetPodStatus(ctx context.Context, podSandboxID string) (*v1
 func (c *clientImpl) GetCRIOImageLayers(imgMeta *workloadmeta.ContainerImageMetadata) ([]string, error) {
 	var lowerDirs []string
 
-	digestToIDMap, err := c.buildDigestToIDMap(imgMeta)
+	diffIDToIDMap, err := c.buildDiffIDToIDMap(imgMeta)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build digest to ID map: %w", err)
+		return nil, fmt.Errorf("failed to build diff_id to ID map: %w", err)
 	}
 
 	// Construct the list of lowerDirs by mapping each layer to its corresponding `diff` directory path
 	for _, layer := range imgMeta.Layers {
-		if layer.Digest == "" { // Skip empty layers
+		if layer.DiffID == "" { // Skip empty layers
 			continue
 		}
-		layerID, found := digestToIDMap[layer.Digest]
+		layerID, found := diffIDToIDMap[layer.DiffID]
 		if !found {
-			return nil, fmt.Errorf("layer ID not found for digest %s", layer.Digest)
+			return nil, fmt.Errorf("layer ID not found for diff_id %s", layer.DiffID)
 		}
 
 		layerPath := filepath.Join(GetOverlayPath(), layerID, "diff")
@@ -221,14 +226,14 @@ func (c *clientImpl) connect() error {
 
 	// Ensure connection is ready
 	if conn.GetState() != connectivity.Ready {
-		return fmt.Errorf("connection not in READY state")
+		return errors.New("connection not in READY state")
 	}
 
 	return nil
 }
 
-// buildDigestToIDMap creates a map of layer digests to IDs for the layers in imgMeta.
-func (c *clientImpl) buildDigestToIDMap(imgMeta *workloadmeta.ContainerImageMetadata) (map[string]string, error) {
+// buildDiffIDToIDMap creates a map of layer diff_ids to CRI-O layer IDs for the layers in imgMeta.
+func (c *clientImpl) buildDiffIDToIDMap(imgMeta *workloadmeta.ContainerImageMetadata) (map[string]string, error) {
 	file, err := os.Open(GetOverlayLayersPath())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open layers.json: %w", err)
@@ -245,21 +250,30 @@ func (c *clientImpl) buildDigestToIDMap(imgMeta *workloadmeta.ContainerImageMeta
 		return nil, fmt.Errorf("failed to parse layers.json: %w", err)
 	}
 
-	neededDigests := make(map[string]struct{})
+	neededDiffIDs := make(map[string]struct{})
 	for _, layer := range imgMeta.Layers {
-		if layer.Digest != "" { // Skip empty layers
-			neededDigests[layer.Digest] = struct{}{}
+		if layer.DiffID != "" { // Skip empty layers
+			neededDiffIDs[layer.DiffID] = struct{}{}
 		}
 	}
 
-	digestToIDMap := make(map[string]string)
+	diffIDToIDMap := make(map[string]string)
 	for _, layer := range layers {
-		if _, found := neededDigests[layer.DiffDigest]; found {
-			digestToIDMap[layer.DiffDigest] = layer.ID
+		if _, found := neededDiffIDs[layer.DiffDigest]; found {
+			diffIDToIDMap[layer.DiffDigest] = layer.ID
 		}
 	}
 
-	return digestToIDMap, nil
+	return diffIDToIDMap, nil
+}
+
+// ListImages retrieves all images available in the CRI-O runtime.
+func (c *clientImpl) ListImages(ctx context.Context) ([]*v1.Image, error) {
+	imageListResponse, err := c.imageClient.ListImages(ctx, &v1.ListImagesRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list images: %w", err)
+	}
+	return imageListResponse.GetImages(), nil
 }
 
 // layerInfo represents each entry in layers.json

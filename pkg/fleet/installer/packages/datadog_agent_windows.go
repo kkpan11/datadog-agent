@@ -12,12 +12,19 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/util/winutil"
+	"github.com/DataDog/datadog-agent/pkg/version"
 
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/env"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/exec"
+	extensionsPkg "github.com/DataDog/datadog-agent/pkg/fleet/installer/packages/extensions"
+	"github.com/DataDog/datadog-agent/pkg/fleet/installer/packages/processmanager"
+	windowssvc "github.com/DataDog/datadog-agent/pkg/fleet/installer/packages/service/windows"
+	windowsuser "github.com/DataDog/datadog-agent/pkg/fleet/installer/packages/user/windows"
+	"github.com/DataDog/datadog-agent/pkg/fleet/installer/repository"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
@@ -30,44 +37,123 @@ import (
 )
 
 // datadogAgentPackage is the package for the Datadog Agent
+//
+// Any hooks that cause the daemon to stop, e.g. uninstall/reinstall the Agent
+// or stop/start the Agent services, must run in the background to allow the
+// daemon to stop correctly. The Agent package manager for Linux relies on the
+// async behavior of systemd to be able to run the hooks synchronously and return
+// when they are done. However on Windows we need to perform this work ourselves.
+// If this is not followed, then the daemon will fail to report the remote config
+// task as DONE, and upon shutdown will hang until the fx timeout is hit.
+// Use a custom packag-command to perform this background work.
 var datadogAgentPackage = hooks{
-	postInstall:           postInstallDatadogAgent,
-	preRemove:             preRemoveDatadogAgent,
+	postInstall: postInstallDatadogAgent,
+	preRemove:   preRemoveDatadogAgent,
+
+	preStartExperiment:    preStartExperimentDatadogAgent,
 	postStartExperiment:   postStartExperimentDatadogAgent,
 	postStopExperiment:    postStopExperimentDatadogAgent,
 	postPromoteExperiment: postPromoteExperimentDatadogAgent,
+
+	postStartConfigExperiment:   postStartConfigExperimentDatadogAgent,
+	preStopConfigExperiment:     preStopConfigExperimentDatadogAgent,
+	postPromoteConfigExperiment: postPromoteConfigExperimentDatadogAgent,
+
+	preInstallExtension:  preInstallExtensionDatadogAgent,
+	postInstallExtension: postInstallExtensionDatadogAgent,
+	preRemoveExtension:   preRemoveExtensionDatadogAgent,
 }
 
 const (
-	datadogAgent          = "datadog-agent"
 	watchdogStopEventName = "Global\\DatadogInstallerStop"
 	oldInstallerDir       = "C:\\ProgramData\\Datadog Installer"
 )
 
+// getExtensionStoragePath returns the path where extension lists should be stored.
+// On Windows, this is always the protected directory to ensure persistence across MSI upgrades.
+func getExtensionStoragePath(_ string) string {
+	return paths.ProtectedDir
+}
+
+// getAgentPackageState returns the current repository state for the agent package.
+func getAgentPackageState() (repository.State, error) {
+	repos := repository.NewRepositories(paths.PackagesPath, AsyncPreRemoveHooks)
+	return repos.Get(agentPackage).GetState()
+}
+
 // postInstallDatadogAgent runs post install scripts for a given package.
 func postInstallDatadogAgent(ctx HookContext) error {
-	// must get env before uninstalling the Agent since it may read from the registry
-	env := getenv()
+	if ctx.PackageType != PackageTypeMSI {
+		// OCI path: Remove old agent, install via MSI
+		env := getenv()
 
-	// remove the installer if it is installed
-	// if nothing is installed this will return without an error
-	err := removeInstallerIfInstalled(ctx)
-	if err != nil {
-		// failed to remove the installer
-		return fmt.Errorf("failed to remove installer: %w", err)
+		// remove the installer if it is installed
+		// if nothing is installed this will return without an error
+		err := removeInstallerIfInstalled(ctx)
+		if err != nil {
+			// failed to remove the installer
+			return fmt.Errorf("failed to remove installer: %w", err)
+		}
+
+		// remove the Agent if it is installed
+		// if nothing is installed this will return without an error
+		err = removeAgentIfInstalledAndRestartOnFailure(ctx)
+		if err != nil {
+			// failed to remove the Agent
+			return fmt.Errorf("failed to remove Agent: %w", err)
+		}
+
+		// Install the new stable Agent without starting services.
+		// Services are started after extensions are installed so that
+		// the core agent discovers and starts extension services (e.g. DDOT).
+		installOnlyArgs := append(ctx.WindowsArgs, "DD_INSTALL_ONLY=1")
+		err = installAgentPackage(ctx, env, "stable", installOnlyArgs, "setup_agent.log")
+		if err != nil {
+			return err
+		}
 	}
 
-	// remove the Agent if it is installed
-	// if nothing is installed this will return without an error
-	err = removeAgentIfInstalled(ctx)
+	// Common for both OCI and MSI: Restore extensions.
+	// For OCI fleet installs the MSI custom action fires RunPostInstallHook (PackageTypeMSI)
+	// AND the OCI hook chain also calls restoreAgentExtensions. The Install() call inside
+	// Restore is idempotent (extensions already marked in the DB are skipped), so the
+	// double-restore is harmless.
+	// Call SetPackage separately (not inside restoreAgentExtensions)
+	agentVersion := getCurrentAgentVersion()
+	// Detect whether this install is an experiment so hooks use the correct package path.
+	// When the experiment MSI runs postInstall, isExperiment=true ensures PostInstallExtension
+	// uses ExperimentPath() (resolved to the versioned dir) rather than StablePath().
+	state, err := getAgentPackageState()
 	if err != nil {
-		// failed to remove the Agent
-		return fmt.Errorf("failed to remove Agent: %w", err)
+		log.Warnf("failed to get agent package state: %s", err)
+	}
+	isExperiment := state.Experiment == agentVersion
+	if err := extensionsPkg.SetPackage(ctx, agentPackage, agentVersion, isExperiment); err != nil {
+		return fmt.Errorf("failed to set package version in extensions db: %w", err)
+	}
+	if err := restoreAgentExtensions(ctx, agentVersion, isExperiment); err != nil {
+		log.Warnf("failed to restore extensions: %s", err)
 	}
 
-	// install the new stable Agent
-	err = installAgentPackage(env, "stable", ctx.WindowsArgs, "setup_agent.log")
-	return err
+	// install new extensions provided via environment variables
+	// not during experiments, we don't expect new extensions to be installed, only restored
+	if !isExperiment {
+		if err := installAgentExtensions(ctx, agentVersion, isExperiment); err != nil {
+			log.Warnf("failed to install extensions: %s", err)
+		}
+	}
+
+	for _, cfg := range procmgrConfigs {
+		if err := ensureProcmgrConfig(cfg); err != nil {
+			return fmt.Errorf("failed to write %s process manager config: %w", cfg.label, err)
+		}
+	}
+
+	// No need to explicitly start the Agent here
+	// - MSI: done at the end in StartDDServices custom action
+	// - OCI: done at the end of setup script (setup.go)
+
+	return nil
 }
 
 // preRemoveDatadogAgent runs pre remove scripts for a given package.
@@ -75,13 +161,103 @@ func preRemoveDatadogAgent(ctx HookContext) (err error) {
 	// Don't return an error if the Agent is already not installed.
 	// returning an error here will prevent the package from being removed
 	// from the local repository.
+
+	// Save and remove extensions (all package types)
+	if ctx.Upgrade {
+		if err := saveAgentExtensions(ctx, false); err != nil {
+			log.Warnf("failed to save extensions: %s", err)
+		}
+	}
+	if err := removeAgentExtensions(ctx, false); err != nil {
+		log.Warnf("failed to remove extensions: %s", err)
+	}
+
+	if ctx.PackageType == PackageTypeMSI {
+		// MSI custom action calling hook - done.
+		// Note: the save file written above lives in ProtectedDir which intentionally persists
+		// across MSI upgrades. It is not cleaned up on full uninstall so that a subsequent
+		// reinstall can potentially re-use it, which is an acceptable trade-off.
+		return nil
+	}
+
+	// OCI path: Run MSI to uninstall
 	if !ctx.Upgrade {
-		return removeAgentIfInstalled(ctx)
+		return removeAgentIfInstalledAndRestartOnFailure(ctx)
 	}
 	return nil
 }
 
-// postStartExperimentDatadogAgent runs post start scripts for a given package.
+func resolveDatadogProgramFilesInstallRoot() (string, error) {
+	installRoot := paths.ResolveDatadogProgramFilesDir()
+	if installRoot == "" {
+		return "", errors.New("cannot resolve Datadog Agent install path for processes.d")
+	}
+	if resolved, err := filepath.EvalSymlinks(installRoot); err == nil {
+		installRoot = resolved
+	}
+	paths.DatadogProgramFilesDir = installRoot
+	return installRoot, nil
+}
+
+// procmgrConfig is a processes.d definition managed at install time.
+type procmgrConfig struct {
+	label  string
+	write  func(installRoot string) error
+	remove func(installRoot string) error
+}
+
+var procmgrConfigs = []procmgrConfig{
+	{"ADP", processmanager.WriteADPProcmgrConfig, processmanager.RemoveADPProcmgrConfig},
+	{"PAR", processmanager.WritePARProcmgrConfig, processmanager.RemovePARProcmgrConfig},
+	{"PAR executor", processmanager.WritePARExecutorProcmgrConfig, processmanager.RemovePARExecutorProcmgrConfig},
+	{"PAR control plane", processmanager.WritePARControlProcmgrConfig, processmanager.RemovePARControlProcmgrConfig},
+}
+
+func ensureProcmgrConfig(cfg procmgrConfig) error {
+	installRoot, err := resolveDatadogProgramFilesInstallRoot()
+	if err != nil {
+		return err
+	}
+
+	if env.FromEnv().ProcessManagerEnabled {
+		return cfg.write(installRoot)
+	}
+	if err := cfg.remove(installRoot); err != nil {
+		log.Warnf("%s: could not remove stale process manager config: %v", cfg.label, err)
+	}
+	return nil
+}
+
+// preStartExperimentDatadogAgent checks prerequisites before starting the experiment
+//
+// These checks are intended to prevent entering a state where we are unable to reinstall stable
+// and the host is left without the Agent installed.
+//
+// Performing the checks in the "pre" hook allows us to return an error before the
+// experiment state is created, which allows us to skip stop_experiment which would
+// otherwise unecessarily try to uninstall and then reinstall the stable Agent.
+func preStartExperimentDatadogAgent(_ HookContext) error {
+	env := getenv()
+	err := windowsuser.ValidateAgentUserRemoteUpdatePrerequisites(env.MsiParams.AgentUserName)
+	if err != nil {
+		return fmt.Errorf("cannot start remote update: %w", err)
+	}
+
+	return nil
+}
+
+// postStartExperimentDatadogAgent stops the watchdog and launches a new process to start the experiment in the background.
+func postStartExperimentDatadogAgent(ctx HookContext) error {
+	// open event that signal the end of the experiment
+	// this will terminate other running instances of the watchdog
+	// this allows for running multiple experiments in sequence
+	_ = setWatchdogStopEvent()
+
+	return launchPackageCommandInBackground(ctx.Context, getenv(), "postStartExperimentBackground")
+}
+
+// postStartExperimentDatadogAgentBackground uninstalls the Agent, installs the experiment,
+// and then stays running to ensure the experiment is running.
 //
 // Function requirements:
 //   - be its own process, not run within the daemon
@@ -101,24 +277,38 @@ func preRemoveDatadogAgent(ctx HookContext) (err error) {
 //   - If the new daemon fails to start, then after a timeout the watchdog will
 //     restore the previous version, which should start and then receive
 //     "stop experiment" from the backend.
-func postStartExperimentDatadogAgent(ctx HookContext) error {
+func postStartExperimentDatadogAgentBackground(ctx context.Context) error {
 	// must get env before uninstalling the Agent since it may read from the registry
 	env := getenv()
+	hookCtx := HookContext{Context: ctx, PackagePath: paths.DatadogProgramFilesDir}
 
-	// open event that signal the end of the experiment
-	// this will terminate other running instances of the watchdog
-	// this allows for running multiple experiments in sequence
-	_ = setWatchdogStopEvent()
+	// Save and remove stable extensions before uninstalling the stable agent.
+	// PreRemoveExtension cleans up after the stable version (stops DDOT service, etc.).
+	if err := saveAgentExtensions(hookCtx, false); err != nil {
+		log.Warnf("failed to save extensions: %s", err)
+	}
+	if err := removeAgentExtensions(hookCtx, false); err != nil {
+		log.Warnf("failed to remove extensions: %s", err)
+	}
 
-	timeout := getWatchdogTimeout()
-
-	err := removeAgentIfInstalled(ctx)
+	// remove the Agent if it is installed
+	// if nothing is installed this will return without an error
+	removeCtx, cancelRemoveCtx := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancelRemoveCtx()
+	err := removeAgentIfInstalledAndRestartOnFailure(removeCtx)
 	if err != nil {
 		return err
 	}
 
 	args := getStartExperimentMSIArgs()
-	err = installAgentPackage(env, "experiment", args, "start_agent_experiment.log")
+	// Note: Do not change this timeout without considering the timeout in the fleet backend.
+	//       If our retry exceeds the fleet backend timeout then the experiment will fail anyway.
+	//       At time of writing, the fleet backend timeouts are:
+	//       - 10 minutes for the update task to be marked as DONE
+	//       - 15 minutes for the installer to poll remote config
+	installCtx, cancelInstallCtx := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancelInstallCtx()
+	err = installAgentPackage(installCtx, env, "experiment", args, "start_agent_experiment.log")
 	if err != nil {
 		// we failed to install the Agent, we need to restore the stable Agent
 		// to leave the system in a consistent state.
@@ -133,7 +323,7 @@ func postStartExperimentDatadogAgent(ctx HookContext) error {
 
 	// now we start our watchdog to make sure the Agent is running
 	// and we can restore the stable Agent if it stops.
-	err = startWatchdog(ctx, time.Now().Add(timeout))
+	err = startWatchdog(ctx, time.Now().Add(getWatchdogTimeout()))
 	if err != nil {
 		log.Errorf("Watchdog failed: %s", err)
 		// we failed to start the watchdog, the Agent stopped, or we received a timeout
@@ -149,23 +339,33 @@ func postStartExperimentDatadogAgent(ctx HookContext) error {
 	return nil
 }
 
-// postStopExperimentDatadogAgent runs post stop scripts for a given package.
-//
-// Function requirements:
-//   - be its own process, not run within the daemon
-//   - be run from a copy of the installer, not from the install path,
-//     to avoid locking the executable
+// postStopExperimentDatadogAgent stops the watchdog and launches a new process to stop the experiment.
 func postStopExperimentDatadogAgent(ctx HookContext) (err error) {
 	// set watchdog stop to make sure the watchdog stops
 	// don't care if it fails cause we will proceed with the stop anyway
 	// this will just stop a watchdog that is running
 	_ = setWatchdogStopEvent()
 
+	return launchPackageCommandInBackground(ctx.Context, getenv(), "postStopExperimentBackground")
+}
+
+// postStopExperimentDatadogAgentBackground uninstalls the Agent and then reinstalls the stable Agent,
+//
+// Function requirements:
+//   - be its own process, not run within the daemon
+//   - be run from a copy of the installer, not from the install path,
+//     to avoid locking the executable
+func postStopExperimentDatadogAgentBackground(ctx context.Context) (err error) {
 	// must get env before uninstalling the Agent since it may read from the registry
 	env := getenv()
+	hookCtx := HookContext{Context: ctx, PackagePath: paths.DatadogProgramFilesDir}
+
+	if err := removeAgentExtensions(hookCtx, true); err != nil {
+		log.Warnf("failed to remove experiment extensions: %s", err)
+	}
 
 	// remove the Agent
-	err = removeAgentIfInstalled(ctx)
+	err = removeAgentIfInstalledAndRestartOnFailure(ctx)
 	if err != nil {
 		// we failed to remove the Agent
 		// we can't do much here
@@ -173,7 +373,9 @@ func postStopExperimentDatadogAgent(ctx HookContext) (err error) {
 	}
 
 	// reinstall the stable Agent
-	err = installAgentPackage(env, "stable", nil, "restore_stable_agent.log")
+	// The fleet backend does no more work after sending stop_experiment,
+	// so we do not need to limit the timeout here as we do when starting the experiment.
+	err = installAgentPackage(ctx, env, "stable", nil, "restore_stable_agent.log")
 	if err != nil {
 		// we failed to reinstall the stable Agent
 		// we can't do much here
@@ -184,14 +386,19 @@ func postStopExperimentDatadogAgent(ctx HookContext) (err error) {
 }
 
 // postPromoteExperimentDatadogAgent runs post promote scripts for a given package.
-func postPromoteExperimentDatadogAgent(_ HookContext) error {
+func postPromoteExperimentDatadogAgent(ctx HookContext) error {
 	err := setWatchdogStopEvent()
 	if err != nil {
 		// if we can't set the event it means the watchdog has failed
 		// In this case, we were already premoting the experiment
 		// so we can return without an error as all we were about to do
 		// is stop the watchdog
-		log.Errorf("failed to set premote event: %s", err)
+		log.Errorf("failed to set promote event: %s", err)
+	}
+
+	// Promote extensions from experiment to stable
+	if err := extensionsPkg.Promote(ctx.Context, agentPackage); err != nil {
+		log.Warnf("failed to promote extensions: %s", err)
 	}
 
 	return nil
@@ -249,7 +456,7 @@ func startWatchdog(_ context.Context, timeout time.Time) error {
 			// the service has died
 			// we need to restore the stable Agent
 			// return an error to signal the caller to restore the stable Agent
-			return fmt.Errorf("Datadog Installer is not running")
+			return errors.New("Datadog Installer is not running")
 		}
 
 		// check the Agent service
@@ -261,7 +468,7 @@ func startWatchdog(_ context.Context, timeout time.Time) error {
 			// the service has died
 			// we need to restore the stable Agent
 			// return an error to signal the caller to restore the stable Agent
-			return fmt.Errorf("Datadog Agent is not running")
+			return errors.New("Datadog Agent is not running")
 		}
 
 		// wait for the events to be signaled with a timeout
@@ -270,7 +477,7 @@ func startWatchdog(_ context.Context, timeout time.Time) error {
 			return fmt.Errorf("could not wait for events: %w", err)
 		}
 		if events == windows.WAIT_OBJECT_0 {
-			// the premote event was signaled
+			// the promote event was signaled
 			// this means we are done with the experiment
 			// we can return without an error
 			return nil
@@ -278,14 +485,16 @@ func startWatchdog(_ context.Context, timeout time.Time) error {
 
 	}
 
-	return fmt.Errorf("watchdog timeout")
+	return errors.New("watchdog timeout")
 
 }
 
-func installAgentPackage(env *env.Env, target string, args []string, logFileName string) error {
+func installAgentPackage(ctx context.Context, env *env.Env, target string, args []string, logFileName string) (err error) {
+	span, ctx := telemetry.StartSpanFromContext(ctx, "install_agent")
+	defer func() { span.Finish(err) }()
 
 	rootPath := ""
-	_, err := os.Stat(paths.RootTmpDir)
+	_, err = os.Stat(paths.RootTmpDir)
 	// If bootstrap has not been called before, `paths.RootTmpDir` might not exist
 	if err == nil {
 		// we can use the default tmp dir because it exists
@@ -302,40 +511,67 @@ func installAgentPackage(env *env.Env, target string, args []string, logFileName
 	// and we need to reinstall it with the same configuration
 	// and we wipe out our registry keys containing the configuration
 	// that the next install would have used
-	dataDir := fmt.Sprintf(`APPLICATIONDATADIRECTORY="%s"`, env.MsiParams.ApplicationDataDirectory)
-	projectLocation := fmt.Sprintf(`PROJECTLOCATION="%s"`, env.MsiParams.ProjectLocation)
+	props := map[string]string{
+		"FLEET_INSTALL":     "1",
+		"SKIP_INSTALL_INFO": "1",
+		// carry over directories directly
+		"APPLICATIONDATADIRECTORY": env.MsiParams.ApplicationDataDirectory,
+		"PROJECTLOCATION":          env.MsiParams.ProjectLocation,
+	}
 
 	opts := []msi.MsiexecOption{
 		msi.Install(),
-		msi.WithMsiFromPackagePath(target, datadogAgent),
+		msi.WithMsiFromPackagePath(target, agentPackage),
 		msi.WithLogFile(logFile),
 	}
-	if env.MsiParams.AgentUserName != "" {
+	// msi.Cmd() places typed properties after raw args on the command line regardless of
+	// option order, so a getenv() fallback (AgentUserName, AgentUserKeepRights) would
+	// silently win over an explicit value already in args. Guard against that.
+	// AgentUserPassword has no fallback, so it's not at risk.
+	if env.MsiParams.AgentUserName != "" && !argsHaveProperty(args, "DDAGENTUSER_NAME") {
 		opts = append(opts, msi.WithDdAgentUserName(env.MsiParams.AgentUserName))
 	}
 	if env.MsiParams.AgentUserPassword != "" {
 		opts = append(opts, msi.WithDdAgentUserPassword(env.MsiParams.AgentUserPassword))
 	}
-	additionalArgs := []string{"FLEET_INSTALL=1", dataDir, projectLocation}
-
-	// append input args last so they can take precedence
-	additionalArgs = append(additionalArgs, args...)
-	opts = append(opts, msi.WithAdditionalArgs(additionalArgs))
-	cmd, err := msi.Cmd(opts...)
-
-	var output []byte
-	if err == nil {
-		output, err = cmd.Run()
+	if env.MsiParams.AgentUserKeepRights != "" && !argsHaveProperty(args, "DDAGENTUSER_KEEP_RIGHTS") {
+		opts = append(opts, msi.WithDdAgentUserKeepRights(env.MsiParams.AgentUserKeepRights))
 	}
+	opts = append(opts, msi.WithProperties(props))
+	// append input args last so they can take precedence
+	opts = append(opts, msi.WithAdditionalArgs(args))
+
+	cmd, err := msi.Cmd(opts...)
 	if err != nil {
-		return fmt.Errorf("failed to install Agent %s: %w\nLog file located at: %s\n%s", target, err, logFile, string(output))
+		return fmt.Errorf("failed to create MSI command: %w", err)
+	}
+	err = cmd.Run(ctx)
+	if err != nil {
+		err = fmt.Errorf("failed to install Agent %s: %w\nLog file located at: %s", target, err, logFile)
+		var msiErr *msi.MsiexecError
+		if errors.As(err, &msiErr) {
+			err = fmt.Errorf("%w\n%s", err, msiErr.ProcessedLog)
+		}
+		return err
 	}
 	return nil
 }
 
+// argsHaveProperty returns true if args already contains an explicit "property=value" entry
+// for the given MSI property.
+func argsHaveProperty(args []string, property string) bool {
+	prefix := property + "="
+	for _, arg := range args {
+		if strings.HasPrefix(arg, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func removeProductIfInstalled(ctx context.Context, product string) (err error) {
 	if msi.IsProductInstalled(product) {
-		span, _ := telemetry.StartSpanFromContext(ctx, "remove_agent")
+		span, ctx := telemetry.StartSpanFromContext(ctx, "remove_agent")
 		defer func() {
 			if err != nil {
 				// removal failed, this should rarely happen.
@@ -344,8 +580,8 @@ func removeProductIfInstalled(ctx context.Context, product string) (err error) {
 			}
 			span.Finish(err)
 		}()
-		err := msi.RemoveProduct(product,
-			msi.WithAdditionalArgs([]string{"FLEET_INSTALL=1"}),
+		err := msi.RemoveProduct(ctx, product,
+			msi.WithProperties(map[string]string{"FLEET_INSTALL": "1"}),
 		)
 		if err != nil {
 			return err
@@ -354,24 +590,32 @@ func removeProductIfInstalled(ctx context.Context, product string) (err error) {
 		log.Debugf("%s not installed", product)
 	}
 	return nil
-
 }
 
 func removeAgentIfInstalled(ctx context.Context) (err error) {
-	// Stop the Datadog Agent services before trying to remove it
-	// As datadogagent will shutdown the installer service when it stops
-	// we do not need to stop the installer service
-	log.Infof("stopping the datadogagent service")
-	err = winutil.StopService("datadogagent")
+	// Stop all Datadog Agent services before trying to remove the Agent
+	// This helps reduce the chance that we run into the InstallValidate
+	// delay issue from msi.dll.
+	err = windowssvc.NewWinServiceManager().StopAllAgentServices(ctx)
 	if err != nil {
-		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-			log.Infof("the datadogagent service is not present on this machine, skipping stop action")
-		} else {
-			// Only fail if the service exists
-			return fmt.Errorf("failed to stop the datadogagent service: %w", err)
-		}
+		return fmt.Errorf("failed to stop all Agent services: %w", err)
 	}
 	return removeProductIfInstalled(ctx, "Datadog Agent")
+}
+
+func removeAgentIfInstalledAndRestartOnFailure(ctx context.Context) (err error) {
+	err = removeAgentIfInstalled(ctx)
+	if err != nil {
+		// failed to remove existing Agent, try to restart it if we can.
+		// If MSI failed it should rollback to a working state.
+		serviceManager := windowssvc.NewWinServiceManager()
+		startErr := serviceManager.StartAgentServices(ctx)
+		if startErr != nil {
+			err = fmt.Errorf("%w, %w", err, startErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func removeInstallerIfInstalled(ctx context.Context) (err error) {
@@ -445,30 +689,9 @@ func getWatchdogTimeout() time.Duration {
 	return time.Duration(val) * time.Minute
 }
 
-// getAgentUserNameFromRegistry returns the user name for the Agent, stored in the registry by the Agent MSI
-func getAgentUserNameFromRegistry() (string, error) {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, "SOFTWARE\\Datadog\\Datadog Agent", registry.QUERY_VALUE)
-	if err != nil {
-		return "", err
-	}
-	defer k.Close()
-
-	user, _, err := k.GetStringValue("installedUser")
-	if err != nil {
-		return "", fmt.Errorf("could not read installedUser in registry: %w", err)
-	}
-
-	domain, _, err := k.GetStringValue("installedDomain")
-	if err != nil {
-		return "", fmt.Errorf("could not read installedDomain in registry: %w", err)
-	}
-
-	if domain != "" {
-		user = domain + `\` + user
-	}
-
-	return user, nil
-}
+// getAgentUserKeepRightsFromRegistry is a package-level var so tests can override it without
+// touching the real registry.
+var getAgentUserKeepRightsFromRegistry = windowsuser.GetAgentUserKeepRightsFromRegistry
 
 // getenv returns an Env struct with values from the environment, supplemented by values from the registry.
 //
@@ -478,6 +701,7 @@ func getAgentUserNameFromRegistry() (string, error) {
 //   - Agent user name
 //   - Project location
 //   - Application data directory
+//   - Agent user keep-rights opt-out
 //
 // This accomplishes the following:
 //   - ensures setup carries over settings from previous installs (i.e. before remote updates)
@@ -485,11 +709,19 @@ func getAgentUserNameFromRegistry() (string, error) {
 func getenv() *env.Env {
 	env := env.FromEnv()
 
-	// fallback to registry for agent user
+	// This function prefers values from the environment, with a fallback if not set, for values:
+	//   - Agent user name (fallback to service user)
+	//   - Project location
+	//   - Application data directory
+	//   - Agent user keep-rights opt-out (fallback to registry)
+	//
+	// Using service allows for remote updates to work when the hostname changes
 	if env.MsiParams.AgentUserName == "" {
-		user, err := getAgentUserNameFromRegistry()
+		user, err := windowsuser.GetAgentUserFromService()
 		if err != nil {
-			log.Warnf("Could not read Agent user from registry: %v", err)
+			if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+				log.Warnf("Could not read Agent user from service: %v", err)
+			}
 		} else {
 			env.MsiParams.AgentUserName = user
 		}
@@ -503,11 +735,23 @@ func getenv() *env.Env {
 		env.MsiParams.ApplicationDataDirectory = paths.DatadogDataDir
 	}
 
+	// fallback to registry for the DDAGENTUSER_KEEP_RIGHTS opt-out. Fleet upgrades uninstall
+	// then reinstall the MSI as two transactions, wiping the registry copy in between, so we
+	// read it here - before the uninstall - to carry it forward.
+	if env.MsiParams.AgentUserKeepRights == "" {
+		keepRights, err := getAgentUserKeepRightsFromRegistry()
+		if err != nil {
+			log.Warnf("Could not read DDAGENTUSER_KEEP_RIGHTS from registry: %v", err)
+		} else if keepRights != "" {
+			env.MsiParams.AgentUserKeepRights = keepRights
+		}
+	}
+
 	return env
 }
 
 func newInstallerExec(env *env.Env) (*exec.InstallerExec, error) {
-	installerBin, err := os.Executable()
+	installerBin, err := exec.GetExecutable()
 	if err != nil {
 		return nil, fmt.Errorf("could not get installer executable path: %w", err)
 	}
@@ -527,16 +771,15 @@ func newInstallerExec(env *env.Env) (*exec.InstallerExec, error) {
 //
 // The updated repository state will cause the stable daemon to skip the stop-experiment
 // operation received from the backend, which avoids reinstalling the stable Agent again.
-func restoreStableAgentFromExperiment(ctx HookContext, env *env.Env) error {
+func restoreStableAgentFromExperiment(ctx context.Context, env *env.Env) error {
 	installer, err := newInstallerExec(env)
 	if err != nil {
 		return fmt.Errorf("failed to create installer exec: %w", err)
 	}
-	err = installer.RemoveExperiment(ctx, ctx.Package)
+	err = installer.RemoveExperiment(ctx, agentPackage)
 	if err != nil {
 		return fmt.Errorf("failed to restore stable Agent: %w", err)
 	}
-
 	return nil
 }
 
@@ -560,4 +803,265 @@ func getStartExperimentMSIArgs() []string {
 	}
 
 	return args
+}
+
+// setFleetPoliciesDir sets the fleet_policies_dir registry value to the given path.
+//
+// On Agent start, the config package copies this registry key to the Agent config value
+// of the same name using Config.AddOverrideFunc.
+func setFleetPoliciesDir(path string) error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
+		"SOFTWARE\\Datadog\\Datadog Agent",
+		registry.ALL_ACCESS)
+	if err != nil {
+		return fmt.Errorf("failed to open registry key: %w", err)
+	}
+	defer k.Close()
+
+	err = k.SetStringValue("fleet_policies_dir", path)
+	if err != nil {
+		return fmt.Errorf("failed to set fleet_policies_dir registry key: %w", err)
+	}
+	return nil
+}
+
+// postStartConfigExperimentDatadogAgent stops the watchdog, sets the fleet_policies_dir to experiment,
+// and launches a new process to start the experiment in the background.
+func postStartConfigExperimentDatadogAgent(ctx HookContext) error {
+	// open event that signal the end of the experiment
+	// this will terminate other running instances of the watchdog
+	// this allows for running multiple experiments in sequence
+	_ = setWatchdogStopEvent()
+
+	// Set the registry key to point to the experiment config
+	experimentPath := filepath.Join(paths.ConfigsPath, "datadog-agent", "experiment")
+	err := setFleetPoliciesDir(experimentPath)
+	if err != nil {
+		return err
+	}
+
+	return launchPackageCommandInBackground(ctx.Context, getenv(), "postStartConfigExperimentBackground")
+}
+
+// postStartConfigExperimentDatadogAgentBackground restarts the Agent services and then
+// stays running to ensure the experiment is running.
+//
+// Function requirements:
+//   - be its own process, not run within the daemon
+//
+// Rollback notes:
+// The config experiment uses a watchdog to monitor the Agent service.
+// If the service fails to start or stops running, the watchdog will restore
+// the stable config using the remove-config-experiment command.
+// This ensures the system remains in a consistent state even if the experiment
+// config causes issues.
+//   - If the new config is working properly then it will receive "promote"
+//     from the backend and will set an event to stop the watchdog.
+//   - If the new config fails to start the Agent, then after a timeout the
+//     watchdog will restore the stable config.
+func postStartConfigExperimentDatadogAgentBackground(ctx context.Context) error {
+	// Start the agent service to pick up the new config
+	err := windowssvc.NewWinServiceManager().RestartAgentServices(ctx)
+	if err != nil {
+		// Agent failed to start, restore stable config
+		restoreErr := restoreStableConfigFromExperiment(ctx)
+		if restoreErr != nil {
+			log.Error(restoreErr)
+			err = fmt.Errorf("%w, %w", err, restoreErr)
+		}
+		return fmt.Errorf("failed to start agent service: %w", err)
+	}
+
+	// Start watchdog to monitor the agent service
+	timeout := getWatchdogTimeout()
+	err = startWatchdog(ctx, time.Now().Add(timeout))
+	if err != nil {
+		log.Errorf("Config watchdog failed: %s", err)
+		// If watchdog fails, restore stable config
+		restoreErr := restoreStableConfigFromExperiment(ctx)
+		if restoreErr != nil {
+			log.Error(restoreErr)
+			err = fmt.Errorf("%w, %w", err, restoreErr)
+		}
+		return err
+	}
+
+	return nil
+}
+
+// restoreStableConfigFromExperiment restores the stable config using the remove-config-experiment command.
+//
+// call remove-config-experiment to:
+//   - restore stable config
+//   - update repository state / remove experiment link
+//
+// The updated repository state will cause the stable daemon to skip the stop-experiment
+// operation received from the backend, which avoids restarting the services again.
+func restoreStableConfigFromExperiment(ctx context.Context) error {
+	env := getenv()
+	installer, err := newInstallerExec(env)
+	if err != nil {
+		return fmt.Errorf("failed to create installer exec: %w", err)
+	}
+	err = installer.RemoveConfigExperiment(ctx, agentPackage)
+	if err != nil {
+		return fmt.Errorf("failed to restore stable config: %w", err)
+	}
+
+	return nil
+}
+
+// preStopConfigExperimentDatadogAgent stops the watchdog, sets the fleet_policies_dir to stable,
+// and launches a new process to stop the experiment in the background.
+func preStopConfigExperimentDatadogAgent(ctx HookContext) error {
+	// set watchdog stop to make sure the watchdog stops
+	// don't care if it fails cause we will proceed with the stop anyway
+	// this will just stop a watchdog that is running
+	_ = setWatchdogStopEvent()
+
+	// Set the registry key to point to the previous stable config
+	stablePath := filepath.Join(paths.ConfigsPath, "datadog-agent", "stable")
+	err := setFleetPoliciesDir(stablePath)
+	if err != nil {
+		return err
+	}
+
+	return launchPackageCommandInBackground(ctx.Context, getenv(), "preStopConfigExperimentBackground")
+}
+
+// preStopConfigExperimentDatadogAgentBackground restarts the Agent services.
+func preStopConfigExperimentDatadogAgentBackground(ctx context.Context) error {
+	// Start the agent service to pick up the stable config
+	err := windowssvc.NewWinServiceManager().RestartAgentServices(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start agent service: %w", err)
+	}
+	return nil
+}
+
+// postPromoteConfigExperimentDatadogAgent stops the watchdog, sets the fleet_policies_dir to stable,
+// and launches a new process to promote the experiment in the background.
+func postPromoteConfigExperimentDatadogAgent(ctx HookContext) error {
+	err := setWatchdogStopEvent()
+	if err != nil {
+		// if we can't set the event it means the watchdog has failed
+		// In this case, we were already promoting the experiment
+		// so we can continue without error
+		log.Errorf("failed to set promote event: %s", err)
+	}
+
+	// Set the registry key to point to the stable config (which now contains the promoted experiment)
+	stablePath := filepath.Join(paths.ConfigsPath, "datadog-agent", "stable")
+	err = setFleetPoliciesDir(stablePath)
+	if err != nil {
+		return err
+	}
+
+	return launchPackageCommandInBackground(ctx.Context, getenv(), "postPromoteConfigExperimentBackground")
+}
+
+// postPromoteConfigExperimentDatadogAgentBackground restarts the Agent services.
+func postPromoteConfigExperimentDatadogAgentBackground(ctx context.Context) error {
+	// Start the agent service to pick up the promoted config
+	err := windowssvc.NewWinServiceManager().RestartAgentServices(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start agent service: %w", err)
+	}
+	return nil
+}
+
+// updateRegistryInstallSource updates the install source and package name to the current stable MSI.
+//
+// Called from the MSI to ensure the install source is our copy of the MSI and not the path run by the user.
+// This helps ensure the MSI is available even when the original path is a temp dir, which is common
+// with remote deployment scripts, or the Windows installer cache was removed for some reason.
+func updateRegistryInstallSource() error {
+	msiName := fmt.Sprintf("datadog-agent-%s-x86_64.msi", version.AgentPackageVersion)
+
+	stablePath := filepath.Join(paths.PackagesPath, "datadog-agent", "stable")
+	err := msi.SetSourceList("Datadog Agent", stablePath, msiName)
+	if err != nil {
+		return fmt.Errorf("failed to update MSI source list: %w", err)
+	}
+
+	return nil
+}
+
+// runDatadogAgentPackageCommand maps the package specific command names to their corresponding functions.
+func runDatadogAgentPackageCommand(ctx context.Context, command string) (err error) {
+	span, ctx := telemetry.StartSpanFromContext(ctx, command)
+	defer func() { span.Finish(err) }()
+
+	switch command {
+	case "postStartExperimentBackground":
+		return postStartExperimentDatadogAgentBackground(ctx)
+	case "postStopExperimentBackground":
+		return postStopExperimentDatadogAgentBackground(ctx)
+	case "postStartConfigExperimentBackground":
+		return postStartConfigExperimentDatadogAgentBackground(ctx)
+	case "preStopConfigExperimentBackground":
+		return preStopConfigExperimentDatadogAgentBackground(ctx)
+	case "postPromoteConfigExperimentBackground":
+		return postPromoteConfigExperimentDatadogAgentBackground(ctx)
+	case "updateRegistryInstallSource":
+		return updateRegistryInstallSource()
+	default:
+		return fmt.Errorf("unknown command: %s", command)
+	}
+}
+
+// launchPackageCommandInBackground launches a package command in the background using the installer.
+func launchPackageCommandInBackground(ctx context.Context, env *env.Env, command string) error {
+	installer, err := newInstallerExec(env)
+	if err != nil {
+		return fmt.Errorf("failed to create installer exec: %w", err)
+	}
+
+	err = installer.StartPackageCommandDetached(ctx, agentPackage, command)
+	if err != nil {
+		return fmt.Errorf("failed to start background process: %w", err)
+	}
+
+	return nil
+}
+
+// preInstallExtensionDatadogAgent performs pre-installation steps for extensions.
+func preInstallExtensionDatadogAgent(ctx HookContext) error {
+	switch ctx.Extension {
+	case "ddot":
+		return preInstallDDOTExtension(ctx)
+	case "eudm":
+		return preInstallEUDMExtension(ctx)
+	default:
+		return nil
+	}
+}
+
+// postInstallExtensionDatadogAgent performs post-installation steps for extensions.
+func postInstallExtensionDatadogAgent(ctx HookContext) error {
+	switch ctx.Extension {
+	case "ddot":
+		return postInstallDDOTExtension(ctx)
+	case "eudm":
+		return postInstallEUDMExtension(ctx)
+	default:
+		return nil
+	}
+}
+
+// preRemoveExtensionDatadogAgent performs pre-removal steps for extensions.
+func preRemoveExtensionDatadogAgent(ctx HookContext) error {
+	switch ctx.Extension {
+	case "ddot":
+		return preRemoveDDOTExtension(ctx)
+	case "eudm":
+		return preRemoveEUDMExtension(ctx)
+	default:
+		return nil
+	}
+}
+
+// RestartDatadogAgent restarts the datadog-agent service if it is running
+func RestartDatadogAgent(ctx context.Context) error {
+	return windowssvc.NewWinServiceManager().RestartAgentServices(ctx)
 }

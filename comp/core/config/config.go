@@ -6,17 +6,23 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
-	"strings"
+	"time"
 
 	"go.uber.org/fx"
+	"go.yaml.in/yaml/v2"
 
+	configstreamconsumer "github.com/DataDog/datadog-agent/comp/core/configstreamconsumer/def"
+	delegatedauth "github.com/DataDog/datadog-agent/comp/core/delegatedauth/def"
+	delegatedauthnooptypes "github.com/DataDog/datadog-agent/comp/core/delegatedauth/noop-impl/types"
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretnooptypes "github.com/DataDog/datadog-agent/comp/core/secrets/noop-impl/types"
+	pkgconfigenv "github.com/DataDog/datadog-agent/pkg/config/env"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
 
 // Reader is a subset of Config that only allows reading of configuration
@@ -28,30 +34,19 @@ type cfg struct {
 	// and uses globals in that package.
 	pkgconfigmodel.Config
 
-	// warnings are the warnings generated during setup
-	warnings *pkgconfigmodel.Warnings
-}
-
-// configDependencies is an interface that mimics the fx-oriented dependencies struct
-// TODO: (components) investigate whether this interface is worth keeping, otherwise delete it and just use dependencies
-type configDependencies interface {
-	getParams() *Params
-	getSecretResolver() (secrets.Component, bool)
+	// loadError saves the error silenced at loading time when 'WithIgnoreErrors' is used. This option is and should
+	// only be used for flares
+	loadError string
 }
 
 type dependencies struct {
 	fx.In
 
-	Params Params
-	Secret option.Option[secrets.Component]
-}
-
-func (d dependencies) getParams() *Params {
-	return &d.Params
-}
-
-func (d dependencies) getSecretResolver() (secrets.Component, bool) {
-	return d.Secret.Get()
+	Params        Params
+	Secret        secrets.Component
+	DelegatedAuth delegatedauth.Component
+	// When active, the snapshot has populated the global builder and we skip loading datadog.yaml.
+	Cfgstream configstreamconsumer.Component `optional:"true"`
 }
 
 type provides struct {
@@ -67,14 +62,15 @@ func NewServerlessConfig(path string) (Component, error) {
 	options := []func(*Params){WithConfigName("serverless")}
 
 	_, err := os.Stat(path)
-	if os.IsNotExist(err) &&
-		(strings.HasSuffix(path, ".yaml") || strings.HasSuffix(path, ".yml")) {
-		options = append(options, WithConfigMissingOK(true))
-	} else if !os.IsNotExist(err) {
+	if !os.IsNotExist(err) {
 		options = append(options, WithConfFilePath(path))
 	}
 
-	d := dependencies{Params: NewParams(path, options...)}
+	d := dependencies{
+		Params:        NewParams(path, options...),
+		Secret:        &secretnooptypes.SecretNoop{},
+		DelegatedAuth: &delegatedauthnooptypes.DelegatedAuthNoop{},
+	}
 	return newConfig(d)
 }
 
@@ -87,17 +83,27 @@ func newComponent(deps dependencies) (provides, error) {
 }
 
 func newConfig(deps dependencies) (*cfg, error) {
-	config := pkgconfigsetup.Datadog()
-	warnings, err := setupConfig(config, deps)
+	config := pkgconfigsetup.GlobalConfigBuilder()
+	loadError := ""
+
+	if deps.Cfgstream != nil && deps.Cfgstream.IsActive() {
+		// Snapshot already in the global builder; skip disk load to avoid
+		// clobbering streamed values via same-source last-write-wins.
+
+		// Feature detection still needs to run here since LoadDatadog (which
+		// normally triggers it) is skipped on this path.
+		pkgconfigenv.DetectFeatures(config)
+
+		return &cfg{Config: config}, nil
+	}
+
+	err := setupConfig(config, deps.Secret, deps.DelegatedAuth, deps.Params)
 	returnErrFct := func(e error) (*cfg, error) {
 		if e != nil && deps.Params.ignoreErrors {
-			if warnings == nil {
-				warnings = &pkgconfigmodel.Warnings{}
-			}
-			warnings.Errors = []error{e}
+			loadError = e.Error()
 			e = nil
 		}
-		return &cfg{Config: config, warnings: warnings}, e
+		return &cfg{Config: config, loadError: loadError}, e
 	}
 
 	if err != nil {
@@ -110,15 +116,15 @@ func newConfig(deps dependencies) (*cfg, error) {
 		}
 	}
 
-	return &cfg{Config: config, warnings: warnings}, nil
+	return &cfg{Config: config}, nil
 }
 
-func (c *cfg) Warnings() *pkgconfigmodel.Warnings {
-	return c.warnings
+func (c *cfg) StartTime() time.Time {
+	return c.Config.StartTime()
 }
 
 // fillFlare add the Configuration files to flares.
-func (c *cfg) fillFlare(fb flaretypes.FlareBuilder) error {
+func (c *cfg) fillFlare(_ context.Context, fb flaretypes.FlareBuilder) error {
 	if mainConfpath := c.ConfigFileUsed(); mainConfpath != "" {
 		confDir := filepath.Dir(mainConfpath)
 
@@ -131,11 +137,23 @@ func (c *cfg) fillFlare(fb flaretypes.FlareBuilder) error {
 
 		// use best effort to include security-agent.yaml to the flare
 		fb.CopyFileTo(filepath.Join(confDir, "security-agent.yaml"), filepath.Join("etc", "security-agent.yaml")) //nolint:errcheck
+
+		// use best effort to include application_monitoring.yaml to the flare
+		// application_monitoring.yaml is a file that lets customers configure Datadog SDKs at the level of the host
+		fb.CopyFileTo(filepath.Join(confDir, "application_monitoring.yaml"), filepath.Join("etc", "application_monitoring.yaml")) //nolint:errcheck
+	}
+
+	if c.loadError != "" {
+		fb.Logf("Error loading the configuration: %s", c.loadError) // nolint:errcheck
 	}
 
 	for _, path := range c.ExtraConfigFilesUsed() {
 		fb.CopyFileTo(path, filepath.Join("etc/extra_conf/", path)) //nolint:errcheck
 	}
 
-	return nil
+	yamlData, err := yaml.Marshal(c.AllSettingsWithoutSecrets())
+	if err != nil {
+		return err
+	}
+	return fb.AddFile("runtime_config_dump.yaml", yamlData)
 }

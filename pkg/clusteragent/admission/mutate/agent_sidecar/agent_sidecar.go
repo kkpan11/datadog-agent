@@ -24,14 +24,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/DataDog/datadog-agent/cmd/cluster-agent/admission"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/common"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/metrics"
 	mutatecommon "github.com/DataDog/datadog-agent/pkg/clusteragent/admission/mutate/common"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	apiCommon "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
+	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/common/namespace"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/clustername"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/pointer"
@@ -50,25 +51,29 @@ type Webhook struct {
 	name              string
 	isEnabled         bool
 	endpoint          string
-	resources         map[string][]string
+	resources         []common.WebhookResourceRule
 	operations        []admissionregistrationv1.OperationType
 	matchConditions   []admissionregistrationv1.MatchCondition
 	namespaceSelector *metav1.LabelSelector
 	objectSelector    *metav1.LabelSelector
 	containerRegistry string
+	caCertData        map[string]string
 
 	// These fields store datadog agent config parameters
 	// to avoid calling the config resolution each time the webhook
 	// receives requests because the resolution is CPU expensive.
-	profileOverrides             []ProfileOverride
-	provider                     string
-	imageName                    string
-	imageTag                     string
-	isLangDetectEnabled          bool
-	isLangDetectReportingEnabled bool
-	isClusterAgentEnabled        bool
-	clusterAgentCmdPort          int
-	clusterAgentServiceName      string
+	profileOverrides                 []ProfileOverride
+	provider                         string
+	imageName                        string
+	imageTag                         string
+	isLangDetectEnabled              bool
+	isLangDetectReportingEnabled     bool
+	isClusterAgentEnabled            bool
+	isKubeletAPILoggingEnabled       bool
+	isClusterAgentTLSEnabled         bool
+	isClusterAgentTLSCopyCAConfigMap bool
+	clusterAgentCmdPort              int
+	clusterAgentServiceName          string
 }
 
 // NewWebhook returns a new Webhook
@@ -86,7 +91,7 @@ func NewWebhook(datadogConfig config.Component) *Webhook {
 		name:              webhookName,
 		isEnabled:         datadogConfig.GetBool("admission_controller.agent_sidecar.enabled"),
 		endpoint:          datadogConfig.GetString("admission_controller.agent_sidecar.endpoint"),
-		resources:         map[string][]string{"": {"pods"}},
+		resources:         []common.WebhookResourceRule{{APIGroup: "", APIVersion: "v1", Resources: []string{"pods"}}},
 		operations:        []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
 		matchConditions:   []admissionregistrationv1.MatchCondition{},
 		namespaceSelector: nsSelector,
@@ -94,12 +99,17 @@ func NewWebhook(datadogConfig config.Component) *Webhook {
 		containerRegistry: containerRegistry,
 		profileOverrides:  profileOverrides,
 
-		provider:                     datadogConfig.GetString("admission_controller.agent_sidecar.provider"),
-		imageName:                    datadogConfig.GetString("admission_controller.agent_sidecar.image_name"),
-		imageTag:                     datadogConfig.GetString("admission_controller.agent_sidecar.image_tag"),
-		clusterAgentServiceName:      datadogConfig.GetString("cluster_agent.kubernetes_service_name"),
-		clusterAgentCmdPort:          datadogConfig.GetInt("cluster_agent.cmd_port"),
-		isClusterAgentEnabled:        datadogConfig.GetBool("admission_controller.agent_sidecar.cluster_agent.enabled"),
+		provider:                         datadogConfig.GetString("admission_controller.agent_sidecar.provider"),
+		imageName:                        datadogConfig.GetString("admission_controller.agent_sidecar.image_name"),
+		imageTag:                         datadogConfig.GetString("admission_controller.agent_sidecar.image_tag"),
+		clusterAgentServiceName:          datadogConfig.GetString("cluster_agent.kubernetes_service_name"),
+		clusterAgentCmdPort:              datadogConfig.GetInt("cluster_agent.cmd_port"),
+		isClusterAgentEnabled:            datadogConfig.GetBool("admission_controller.agent_sidecar.cluster_agent.enabled"),
+		isKubeletAPILoggingEnabled:       datadogConfig.GetBool("admission_controller.agent_sidecar.kubelet_api_logging.enabled"),
+		isClusterAgentTLSEnabled:         datadogConfig.GetBool("admission_controller.agent_sidecar.cluster_agent.tls_verification.enabled"),
+		isClusterAgentTLSCopyCAConfigMap: datadogConfig.GetBool("admission_controller.agent_sidecar.cluster_agent.tls_verification.copy_ca_configmap"),
+		caCertData:                       readCAFromFilesystem(datadogConfig),
+
 		isLangDetectEnabled:          datadogConfig.GetBool("language_detection.enabled"),
 		isLangDetectReportingEnabled: datadogConfig.GetBool("language_detection.reporting.enabled"),
 	}
@@ -127,8 +137,13 @@ func (w *Webhook) Endpoint() string {
 
 // Resources returns the kubernetes resources for which the webhook should
 // be invoked
-func (w *Webhook) Resources() map[string][]string {
+func (w *Webhook) Resources() []common.WebhookResourceRule {
 	return w.resources
+}
+
+// Timeout returns the timeout for the webhook
+func (w *Webhook) Timeout() int32 {
+	return 0
 }
 
 // Operations returns the operations on the resources specified for which
@@ -152,7 +167,11 @@ func (w *Webhook) MatchConditions() []admissionregistrationv1.MatchCondition {
 // WebhookFunc returns the function that mutates the resources
 func (w *Webhook) WebhookFunc() admission.WebhookFunc {
 	return func(request *admission.Request) *admiv1.AdmissionResponse {
-		return common.MutationResponse(mutatecommon.Mutate(request.Object, request.Namespace, w.Name(), w.injectAgentSidecar, request.DynamicClient))
+		// Create a wrapper function that includes the request context (DryRun and APIClient)
+		injectFunc := func(pod *corev1.Pod, ns string, dc dynamic.Interface) (bool, error) {
+			return w.injectAgentSidecar(pod, ns, dc, request.APIClient, request.DryRun)
+		}
+		return common.MutationResponse(mutatecommon.Mutate(request.Object, request.Namespace, w.Name(), injectFunc, request.DynamicClient))
 	}
 }
 
@@ -168,7 +187,29 @@ func (w *Webhook) isReadOnlyRootFilesystem() bool {
 	return false // default to false (temp)
 }
 
-func (w *Webhook) injectAgentSidecar(pod *corev1.Pod, _ string, _ dynamic.Interface) (bool, error) {
+func attachVolume(p *corev1.Pod, v corev1.Volume) error {
+	for _, vol := range p.Spec.Volumes {
+		if vol.Name == v.Name {
+			return &VolumeAlreadyAttached{vol.Name}
+		}
+	}
+
+	p.Spec.Volumes = append(p.Spec.Volumes, v)
+	return nil
+}
+
+func mountVolume(c *corev1.Container, vm corev1.VolumeMount) error {
+	for _, mnt := range c.VolumeMounts {
+		if mnt.MountPath == vm.MountPath {
+			return &PathAlreadyMounted{mnt.MountPath}
+		}
+	}
+
+	c.VolumeMounts = append(c.VolumeMounts, vm)
+	return nil
+}
+
+func (w *Webhook) injectAgentSidecar(pod *corev1.Pod, namespace string, _ dynamic.Interface, apiClient kubernetes.Interface, dryRun *bool) (bool, error) {
 	if pod == nil {
 		return false, errors.New(metrics.InvalidInput)
 	}
@@ -180,17 +221,87 @@ func (w *Webhook) injectAgentSidecar(pod *corev1.Pod, _ string, _ dynamic.Interf
 	podUpdated := false
 
 	if !agentSidecarExists {
+		// 1. Create the agent sidecar container
 		agentSidecarContainer := w.getDefaultSidecarTemplate()
+
+		// 2. Apply read only root filesystem config if applicable
 		if w.isReadOnlyRootFilesystem() {
-			volumes := w.getSecurityVolumeTemplates()
-			pod.Spec.Volumes = append(pod.Spec.Volumes, *volumes...)
+			// Apply security context to container
 			w.addSecurityConfigToAgent(agentSidecarContainer)
+
 			// Don't want to apply any overrides to the agent sidecar init container
 			defer func() {
 				initContainer := w.getSecurityInitTemplate()
 				pod.Spec.InitContainers = append(pod.Spec.InitContainers, *initContainer)
 			}()
 		}
+
+		// 3. Attach relevant volumes and mounts
+		volumes := w.getVolumeTemplates()
+		for _, vol := range volumes {
+			err := attachVolume(pod, vol)
+			if err != nil {
+				var attached VolumeAlreadyAttached
+				if errors.As(err, &attached) {
+					log.Error(err)
+				} else {
+					// This should never happen
+					log.Errorf("unexpected error: %v", err)
+				}
+			}
+		}
+		mounts := w.getVolumeMountTemplates()
+		for _, m := range mounts {
+			err := mountVolume(agentSidecarContainer, m)
+			if err != nil {
+				var mounted PathAlreadyMounted
+				if errors.As(err, &mounted) {
+					log.Error(err)
+				} else {
+					// This should never happen
+					log.Errorf("unexpected error: %v", err)
+				}
+			}
+		}
+
+		// 4. Handle cluster agent TLS configuration
+		if w.isClusterAgentTLSEnabled {
+			isDryRun := dryRun != nil && *dryRun
+
+			// Gracefully handle cases where the CA certificate fails to be copied to the target namespace
+			configMapSideEffectSucceeded := false
+			if !isDryRun && w.isClusterAgentTLSCopyCAConfigMap && w.caCertData != nil {
+				if err := ensureCACertConfigMapInNamespace(namespace, w.caCertData, apiClient); err != nil {
+					log.Errorf("Failed to ensure CA cert ConfigMap in namespace %s: %v", namespace, err)
+				} else {
+					configMapSideEffectSucceeded = true
+				}
+			}
+
+			if isDryRun {
+				log.Infof("[DRY-RUN] Would create/update CA cert ConfigMap in namespace %s", namespace)
+				// Still add volume, mount, and env vars in dry-run mode for validation
+				configMapSideEffectSucceeded = true
+			}
+
+			// Add volume and mount to use the ConfigMap if
+			// a. the ConfigMap was successfully created/updated/read OR
+			// b. the ConfigMap is self managed by the user
+			if configMapSideEffectSucceeded || !w.isClusterAgentTLSCopyCAConfigMap {
+				if err := attachVolume(pod, clusterCACertVolume); err != nil {
+					log.Errorf("Failed to attach volume: %v", err)
+				}
+				if err := mountVolume(agentSidecarContainer, clusterCACertVolumeMount); err != nil {
+					log.Errorf("Failed to mount volume: %v", err)
+				}
+
+				_, _ = withEnvOverrides(agentSidecarContainer,
+					corev1.EnvVar{Name: "DD_CLUSTER_TRUST_CHAIN_ENABLE_TLS_VERIFICATION", Value: "true"},
+					corev1.EnvVar{Name: "DD_CLUSTER_TRUST_CHAIN_CA_CERT_FILE_PATH", Value: caCertDirPath + "/ca.crt"},
+				)
+			}
+		}
+
 		pod.Spec.Containers = append(pod.Spec.Containers, *agentSidecarContainer)
 		podUpdated = true
 	}
@@ -247,56 +358,43 @@ func (w *Webhook) getSecurityInitTemplate() *corev1.Container {
 	}
 }
 
-func (w *Webhook) getSecurityVolumeTemplates() *[]corev1.Volume {
-	return &[]corev1.Volume{
-		{
-			Name: agentConfigVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: agentOptionsVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: agentTmpVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: agentLogsVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
+func (w *Webhook) getVolumeTemplates() []corev1.Volume {
+	volumes := newPseudoSet[corev1.Volume]()
+
+	if w.isReadOnlyRootFilesystem() {
+		for _, vol := range readOnlyRootFilesystemVolumes {
+			volumes.Add(vol)
+		}
 	}
+
+	if w.isKubeletAPILoggingEnabled {
+		for _, vol := range kubernetesAPILoggingVolumes {
+			volumes.Add(vol)
+		}
+	}
+
+	return volumes.Slice()
+}
+
+func (w *Webhook) getVolumeMountTemplates() []corev1.VolumeMount {
+	volumeMounts := newPseudoSet[corev1.VolumeMount]()
+
+	if w.isReadOnlyRootFilesystem() {
+		for _, vm := range readOnlyRootFilesystemVolumeMounts {
+			volumeMounts.Add(vm)
+		}
+	}
+
+	if w.isKubeletAPILoggingEnabled {
+		for _, vm := range kubernetesAPILoggingVolumeMounts {
+			volumeMounts.Add(vm)
+		}
+	}
+
+	return volumeMounts.Slice()
 }
 
 func (w *Webhook) addSecurityConfigToAgent(agentContainer *corev1.Container) {
-	volumeMounts := []corev1.VolumeMount{
-		{
-			Name:      agentConfigVolumeName,
-			MountPath: "/etc/datadog-agent",
-		},
-		{
-			Name:      agentOptionsVolumeName,
-			MountPath: "/opt/datadog-agent/run",
-		},
-		{
-			Name:      agentTmpVolumeName,
-			MountPath: "/tmp",
-		},
-		{
-			Name:      agentLogsVolumeName,
-			MountPath: "/var/log/datadog",
-		},
-	}
-	agentContainer.VolumeMounts = append(agentContainer.VolumeMounts, volumeMounts...)
-
 	if agentContainer.SecurityContext == nil {
 		agentContainer.SecurityContext = &corev1.SecurityContext{}
 	}
@@ -306,7 +404,7 @@ func (w *Webhook) addSecurityConfigToAgent(agentContainer *corev1.Container) {
 func (w *Webhook) getDefaultSidecarTemplate() *corev1.Container {
 	ddSite := os.Getenv("DD_SITE")
 	if ddSite == "" {
-		ddSite = pkgconfigsetup.DefaultSite
+		ddSite = constants.DefaultSite
 	}
 
 	agentContainer := &corev1.Container{
@@ -360,7 +458,6 @@ func (w *Webhook) getDefaultSidecarTemplate() *corev1.Container {
 	}
 
 	if w.isClusterAgentEnabled {
-
 		_, _ = withEnvOverrides(agentContainer, corev1.EnvVar{
 			Name:  "DD_CLUSTER_AGENT_ENABLED",
 			Value: "true",
@@ -376,11 +473,25 @@ func (w *Webhook) getDefaultSidecarTemplate() *corev1.Container {
 			},
 		}, corev1.EnvVar{
 			Name:  "DD_CLUSTER_AGENT_URL",
-			Value: fmt.Sprintf("https://%s.%s.svc.cluster.local:%v", w.clusterAgentServiceName, apiCommon.GetMyNamespace(), w.clusterAgentCmdPort),
+			Value: fmt.Sprintf("https://%s.%s.svc.cluster.local:%v", w.clusterAgentServiceName, namespace.GetMyNamespace(), w.clusterAgentCmdPort),
 		}, corev1.EnvVar{
 			Name:  "DD_ORCHESTRATOR_EXPLORER_ENABLED",
 			Value: "true",
 		})
+	}
+
+	if w.isKubeletAPILoggingEnabled {
+		_, _ = withEnvOverrides(agentContainer,
+			corev1.EnvVar{
+				Name:  "DD_LOGS_ENABLED",
+				Value: "true",
+			}, corev1.EnvVar{
+				Name:  "DD_LOGS_CONFIG_K8S_CONTAINER_USE_KUBELET_API",
+				Value: "true",
+			}, corev1.EnvVar{
+				Name:  "DD_LOGS_CONFIG_RUN_PATH",
+				Value: "/opt/datadog-agent/run",
+			})
 	}
 
 	return agentContainer

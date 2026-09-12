@@ -3,11 +3,12 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2024-present Datadog, Inc.
 
+//go:build test
+
 // Package ddflareextensionimpl defines the OpenTelemetry Extension implementation.
 package ddflareextensionimpl
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,10 +17,12 @@ import (
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
 	ddflareextension "github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/def"
+	"github.com/DataDog/datadog-agent/pkg/util/option"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/connector/spanmetricsconnector"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/pprofextension"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/cumulativetodeltaprocessor"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +31,7 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/confignet"
 	"go.opentelemetry.io/collector/connector"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
@@ -36,12 +40,10 @@ import (
 	"go.opentelemetry.io/collector/extension/zpagesextension"
 	"go.opentelemetry.io/collector/otelcol"
 	"go.opentelemetry.io/collector/processor"
-	"go.opentelemetry.io/collector/processor/batchprocessor"
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/nopreceiver"
 	"go.opentelemetry.io/collector/receiver/otlpreceiver"
-
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 )
 
 func getExtensionTestConfig(t *testing.T) *Config {
@@ -49,20 +51,28 @@ func getExtensionTestConfig(t *testing.T) *Config {
 	assert.NoError(t, err)
 	return &Config{
 		HTTPConfig: &confighttp.ServerConfig{
-			Endpoint: "localhost:0",
+			NetAddr: confignet.AddrConfig{
+				Endpoint:  "localhost:0",
+				Transport: confignet.TransportTypeTCP,
+			},
 		},
 		configProviderSettings: newConfigProviderSettings(uriFromFile("config.yaml"), false),
 		factories:              &factories,
 	}
 }
 
-func getTestExtension(t *testing.T) (ddflareextension.Component, error) {
-	c := context.Background()
-	telemetry := component.TelemetrySettings{}
+func getTestExtension(t *testing.T, optIpc option.Option[ipc.Component]) (ddflareextension.Component, error) {
+	telemetry := componenttest.NewNopTelemetrySettings()
 	info := component.NewDefaultBuildInfo()
 	cfg := getExtensionTestConfig(t)
 
-	return NewExtension(c, cfg, telemetry, info, true, false)
+	ext, err := NewComponent(t.Context(), cfg, telemetry, info, optIpc, true, false)
+	if err == nil {
+		t.Cleanup(func() {
+			require.NoError(t, ext.Shutdown(t.Context()))
+		})
+	}
+	return ext, err
 }
 
 func getResponseToHandlerRequest(t *testing.T, ipc ipc.Component, tokenOverride string) *httptest.ResponseRecorder {
@@ -84,11 +94,10 @@ func getResponseToHandlerRequest(t *testing.T, ipc ipc.Component, tokenOverride 
 	rr := httptest.NewRecorder()
 
 	// Create an instance of your handler
-	ext, err := getTestExtension(t)
+	ext, err := getTestExtension(t, option.New(ipc))
 	require.NoError(t, err)
 
 	ddExt := ext.(*ddExtension)
-	ddExt.telemetry.Logger = zap.New(zap.NewNop().Core())
 
 	host := newHostWithExtensions(
 		map[component.ID]component.Component{
@@ -96,10 +105,10 @@ func getResponseToHandlerRequest(t *testing.T, ipc ipc.Component, tokenOverride 
 		},
 	)
 
-	ddExt.Start(context.TODO(), host)
+	ddExt.Start(t.Context(), host)
 
 	conf := confmapFromResolverSettings(t, newResolverSettings(uriFromFile("config.yaml"), true))
-	ddExt.NotifyConfig(context.TODO(), conf)
+	ddExt.NotifyConfig(t.Context(), conf)
 	assert.NoError(t, err)
 
 	handler := ddExt.server.srv.Handler
@@ -110,13 +119,22 @@ func getResponseToHandlerRequest(t *testing.T, ipc ipc.Component, tokenOverride 
 	return rr
 }
 
-func TestNewExtension(t *testing.T) {
-	ext, err := getTestExtension(t)
+func TestNewComponent(t *testing.T) {
+	ext, err := getTestExtension(t, option.New[ipc.Component](ipcmock.New(t)))
 	assert.NoError(t, err)
 	assert.NotNil(t, ext)
 
 	_, ok := ext.(*ddExtension)
 	assert.True(t, ok)
+}
+
+// TestNewComponentRequiresIPC ensures the extension fails closed when no IPC component is
+// available. Without IPC there is no authentication middleware, so serving the endpoint
+// would expose the effective configuration, environment and status to any local caller.
+func TestNewComponentRequiresIPC(t *testing.T) {
+	ext, err := getTestExtension(t, option.None[ipc.Component]())
+	require.ErrorIs(t, err, errNoIPCComponent)
+	assert.Nil(t, ext)
 }
 
 func TestExtensionHTTPHandler(t *testing.T) {
@@ -208,7 +226,7 @@ func components() (otelcol.Factories, error) {
 	}
 
 	factories.Processors, err = otelcol.MakeFactoryMap[processor.Factory](
-		batchprocessor.NewFactory(),
+		cumulativetodeltaprocessor.NewFactory(),
 		transformprocessor.NewFactory(),
 	)
 	if err != nil {
@@ -221,6 +239,8 @@ func components() (otelcol.Factories, error) {
 	if err != nil {
 		return otelcol.Factories{}, err
 	}
+
+	factories.Telemetry = otelconftelemetry.NewFactory()
 
 	return factories, nil
 }

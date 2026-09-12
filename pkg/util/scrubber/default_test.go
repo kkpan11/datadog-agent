@@ -26,29 +26,29 @@ func assertClean(t *testing.T, contents, cleanContents string) {
 func TestConfigStripApiKey(t *testing.T) {
 	assertClean(t,
 		`api_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
-		`api_key: "***************************abbbb"`)
+		`api_key: "****************************bbbb"`)
 	assertClean(t,
 		`api_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB`,
-		`api_key: "***************************ABBBB"`)
+		`api_key: "****************************BBBB"`)
 	assertClean(t,
 		`api_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb"`,
-		`api_key: "***************************abbbb"`)
+		`api_key: "****************************bbbb"`)
 	assertClean(t,
 		`api_key: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb'`,
-		`api_key: '***************************abbbb'`)
+		`api_key: '****************************bbbb'`)
 	assertClean(t,
 		`api_key: |
 			aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
 		`api_key: |
-			***************************abbbb`)
+			****************************bbbb`)
 	assertClean(t,
 		`api_key: >
 			aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
 		`api_key: >
-			***************************abbbb`)
+			****************************bbbb`)
 	assertClean(t,
 		`   api_key:   'aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb'   `,
-		`   api_key:   '***************************abbbb'   `)
+		`   api_key:   '****************************bbbb'   `)
 	assertClean(t,
 		`
 		additional_endpoints:
@@ -61,11 +61,11 @@ func TestConfigStripApiKey(t *testing.T) {
 		`
 		additional_endpoints:
 			"https://app.datadoghq.com":
-			- "***************************abbbb",
-			- "***************************baaaa",
+			- "****************************bbbb",
+			- "****************************aaaa",
 			"https://dog.datadoghq.com":
-			- "***************************abbbb",
-			- "***************************baaaa"`)
+			- "****************************bbbb",
+			- "****************************aaaa"`)
 	// make sure we don't strip container ids
 	assertClean(t,
 		`container_id: "b32bd6f9b73ba7ccb64953a04b82b48e29dfafab65fd57ca01d3b94a0e024885"`,
@@ -75,29 +75,49 @@ func TestConfigStripApiKey(t *testing.T) {
 func TestConfigAppKey(t *testing.T) {
 	assertClean(t,
 		`app_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
-		`app_key: "***********************************abbbb"`)
+		`app_key: "************************************bbbb"`)
 	assertClean(t,
 		`app_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB`,
-		`app_key: "***********************************ABBBB"`)
+		`app_key: "************************************BBBB"`)
 	assertClean(t,
 		`app_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb"`,
-		`app_key: "***********************************abbbb"`)
+		`app_key: "************************************bbbb"`)
 	assertClean(t,
 		`app_key: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb'`,
-		`app_key: '***********************************abbbb'`)
+		`app_key: '************************************bbbb'`)
 	assertClean(t,
 		`app_key: |
 			aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
 		`app_key: |
-			***********************************abbbb`)
+			************************************bbbb`)
 	assertClean(t,
 		`app_key: >
 			aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
 		`app_key: >
-			***********************************abbbb`)
+			************************************bbbb`)
 	assertClean(t,
 		`   app_key:   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb'   `,
-		`   app_key:   '***********************************abbbb'   `)
+		`   app_key:   '************************************bbbb'   `)
+}
+
+func TestConfigPrefixedAppKey(t *testing.T) {
+	// Identifiable app key format: ddapp_<random28><checksum6> (40 chars total)
+	// Last 4 chars of the checksum are preserved in output
+	assertClean(t,
+		`ddapp_aaaaaaaaaaaaaaaaaaaaaaaaaaaa_Abcde`,
+		`************************************bcde`)
+	assertClean(t,
+		`app_key: ddapp_aaaaaaaaaaaaaaaaaaaaaaaaaaaa_Abcde`,
+		`app_key: ************************************bcde`)
+	assertClean(t,
+		`config with ddapp_AAAAAAAAAAAAAAAAAAAAAAAAAAAA_aBCDE in the middle`,
+		`config with ************************************BCDE in the middle`)
+	assertClean(t,
+		`api_key: ddapp_7qvWg9fxH76ym3f9gfnrs3EeFoc04bjmf4`, // Generated randomly to look valid
+		`api_key: ************************************jmf4`)
+	assertClean(t,
+		`api_key: ddapp_7qvWg9fxH76ym3f9gfnrs3EeFo_04bjmf4`, // Generated randomly to look valid
+		`api_key: ************************************jmf4`)
 }
 
 func TestConfigRCAppKey(t *testing.T) {
@@ -175,31 +195,31 @@ func TestConfigStripURLPassword(t *testing.T) {
 func TestTextStripApiKey(t *testing.T) {
 	assertClean(t,
 		`Error status code 500 : http://dog.tld/api?key=3290abeefc68e1bbe852a25252bad88c`,
-		`Error status code 500 : http://dog.tld/api?key=***************************ad88c`)
+		`Error status code 500 : http://dog.tld/api?key=****************************d88c`)
 	assertClean(t,
 		`hintedAPIKeyReplacer : http://dog.tld/api_key=InvalidLength12345abbbb`,
-		`hintedAPIKeyReplacer : http://dog.tld/api_key=***************************abbbb`)
+		`hintedAPIKeyReplacer : http://dog.tld/api_key=****************************bbbb`)
 	assertClean(t,
 		`hintedAPIKeyReplacer : http://dog.tld/apikey=InvalidLength12345abbbb`,
-		`hintedAPIKeyReplacer : http://dog.tld/apikey=***************************abbbb`)
+		`hintedAPIKeyReplacer : http://dog.tld/apikey=****************************bbbb`)
 	assertClean(t,
 		`apiKeyReplacer: https://agent-http-intake.logs.datadoghq.com/v1/input/aaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
-		`apiKeyReplacer: https://agent-http-intake.logs.datadoghq.com/v1/input/***************************abbbb`)
+		`apiKeyReplacer: https://agent-http-intake.logs.datadoghq.com/v1/input/****************************bbbb`)
 }
 
 func TestTextStripAppKey(t *testing.T) {
 	assertClean(t,
 		`hintedAPPKeyReplacer : http://dog.tld/app_key=InvalidLength12345abbbb`,
-		`hintedAPPKeyReplacer : http://dog.tld/app_key=***********************************abbbb`)
+		`hintedAPPKeyReplacer : http://dog.tld/app_key=************************************bbbb`)
 	assertClean(t,
 		`hintedAPPKeyReplacer : http://dog.tld/appkey=InvalidLength12345abbbb`,
-		`hintedAPPKeyReplacer : http://dog.tld/appkey=***********************************abbbb`)
+		`hintedAPPKeyReplacer : http://dog.tld/appkey=************************************bbbb`)
 	assertClean(t,
 		`hintedAPPKeyReplacer : http://dog.tld/application_key=InvalidLength12345abbbb`,
-		`hintedAPPKeyReplacer : http://dog.tld/application_key=***********************************abbbb`)
+		`hintedAPPKeyReplacer : http://dog.tld/application_key=************************************bbbb`)
 	assertClean(t,
 		`appKeyReplacer: http://dog.tld/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbb`,
-		`appKeyReplacer: http://dog.tld/***********************************abbbb`)
+		`appKeyReplacer: http://dog.tld/************************************bbbb`)
 }
 
 func TestTextStripURLPassword(t *testing.T) {
@@ -235,6 +255,26 @@ func TestTextStripLogPassword(t *testing.T) {
 			want: `2024-07-02 10:40:18 EDT | CORE | ERROR | (pkg/collector/worker/check_logger.go:71 in Error) | check:sqlserver | Error running check: [{"message": "Unable to connect: {"username": "userme",  "password": "********"}"`,
 		},
 		{
+			name: "logged as json with single quotes (eg. 'password':)",
+			log:  `2024-07-02 10:40:18 EDT | CORE | ERROR | (pkg/collector/worker/check_logger.go:71 in Error) | check:sqlserver | Error running check: [{"message": "Unable to connect: {'username': 'userme',  'password': '$AeVtn8*gbyaf!hnUHx^L.'}`,
+			want: `2024-07-02 10:40:18 EDT | CORE | ERROR | (pkg/collector/worker/check_logger.go:71 in Error) | check:sqlserver | Error running check: [{"message": "Unable to connect: {'username': 'userme',  'password': '********'}`,
+		},
+		{
+			name: "single-quoted key with equals (eg. 'password'=)",
+			log:  `2024-07-02 10:40:18 EDT | CORE | ERROR | Error: 'password'=MyS3cr3t!Pass user='admin'`,
+			want: `2024-07-02 10:40:18 EDT | CORE | ERROR | Error: 'password'=******** user='admin'`,
+		},
+		{
+			name: "single-quoted pwd key (eg. 'pwd':)",
+			log:  `Connection config: {'host': 'localhost', 'pwd': 'Secr3t@123', 'port': 5432}`,
+			want: `Connection config: {'host': 'localhost', 'pwd': '********', 'port': 5432}`,
+		},
+		{
+			name: "single-quoted pswd key (eg. 'pswd'=)",
+			log:  `Auth failed: 'pswd'=P@ssw0rd123`,
+			want: `Auth failed: 'pswd'=********`,
+		},
+		{
 			name: "logged PSWD (eg. PSWD=)",
 			log:  `2024-07-02 10:40:18 EDT | CORE | ERROR | (pkg/collector/worker/check_logger.go:71 in Error) | check:sqlserver | Error running check: [{"message": "Unable to connect: USER=userme PSWD=$AeVtn8*gbyaf!hnUHx^L."`,
 			want: `2024-07-02 10:40:18 EDT | CORE | ERROR | (pkg/collector/worker/check_logger.go:71 in Error) | check:sqlserver | Error running check: [{"message": "Unable to connect: USER=userme PSWD=********"`,
@@ -251,7 +291,7 @@ api_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 proxy: http://user:password@host:port
 password: foo`,
 			want: `dd_url: https://app.datadoghq.com
-api_key: "***************************aaaaa"
+api_key: "****************************aaaa"
 proxy: http://user:********@host:port
 password: "********"`,
 		},
@@ -296,7 +336,7 @@ func TestDockerSelfInspectApiKey(t *testing.T) {
 	]`,
 		`
 	"Env": [
-		"DD_API_KEY=***************************ad88c",
+		"DD_API_KEY=****************************d88c",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"DOCKER_DD_AGENT=yes",
 		"AGENT_VERSION=1:6.0",
@@ -360,11 +400,17 @@ func TestSNMPConfig(t *testing.T) {
 		`authkey: password`,
 		`authkey: "********"`)
 	assertClean(t,
+		`auth_key: password`,
+		`auth_key: "********"`)
+	assertClean(t,
 		`privKey: password`,
 		`privKey: "********"`)
 	assertClean(t,
 		`privkey: password`,
 		`privkey: "********"`)
+	assertClean(t,
+		`priv_key: password`,
+		`priv_key: "********"`)
 	assertClean(t,
 		`community_string: p@ssw0r)`,
 		`community_string: "********"`)
@@ -564,7 +610,7 @@ network_devices:
     - 'password2'
 log_level: info`,
 		`dd_url: https://app.datadoghq.com
-api_key: "***************************aaaaa"
+api_key: "****************************aaaa"
 proxy: http://user:********@host:port
 password: "********"
 auth_token: "********"
@@ -619,6 +665,81 @@ func TestAuthorization(t *testing.T) {
 		`  authorization: "********"`)
 }
 
+func TestOAuthCredentials(t *testing.T) {
+	// Test consumer_key
+	assertClean(t,
+		`consumer_key: my_consumer_key_123`,
+		`consumer_key: "********"`)
+	assertClean(t,
+		`  consumer_key: "my_consumer_key_123"`,
+		`  consumer_key: "********"`)
+
+	// Test consumer_secret
+	assertClean(t,
+		`consumer_secret: my_consumer_secret_456`,
+		`consumer_secret: "********"`)
+	assertClean(t,
+		`  consumer_secret: 'my_consumer_secret_456'`,
+		`  consumer_secret: "********"`)
+
+	// Test token_id
+	assertClean(t,
+		`token_id: my_token_id_789`,
+		`token_id: "********"`)
+	assertClean(t,
+		`  token_id: "my_token_id_789"`,
+		`  token_id: "********"`)
+
+	// Test token_secret
+	assertClean(t,
+		`token_secret: my_token_secret_abc`,
+		`token_secret: "********"`)
+	assertClean(t,
+		`  token_secret: 'my_token_secret_abc'`,
+		`  token_secret: "********"`)
+
+	// Test mixed OAuth configuration
+	assertClean(t,
+		`oauth_config:
+  consumer_key: my_consumer_key
+  consumer_secret: my_consumer_secret
+  token_id: my_token_id
+  token_secret: my_token_secret`,
+		`oauth_config:
+  consumer_key: "********"
+  consumer_secret: "********"
+  token_id: "********"
+  token_secret: "********"`)
+}
+
+func TestSecretBackendCredentials(t *testing.T) {
+	// Verifies that all sensitive credential keys used by secret backend integrations
+	// are scrubbed when they appear under a nested session config block.
+	assertClean(t,
+		`secret_backend_config:
+  session:
+    azure_client_secret: my-sp-secret
+    azure_client_certificate_password: my-cert-password
+    aws_secret_access_key: AKIAIOSFODNN7EXAMPLE
+    vault_secret_id: my-vault-secret-id
+    vault_password: my-vault-password
+    vault_ldap_password: my-ldap-password
+    vault_token: s.my-vault-token
+    vault_kubernetes_jwt: eyJhbGciOiJSUzI1NiJ9
+    akeyless_access_key: my-akeyless-key`,
+		`secret_backend_config:
+  session:
+    azure_client_secret: "********"
+    azure_client_certificate_password: "********"
+    aws_secret_access_key: "********"
+    vault_secret_id: "********"
+    vault_password: "********"
+    vault_ldap_password: "********"
+    vault_token: "********"
+    vault_kubernetes_jwt: "********"
+    akeyless_access_key: "********"`)
+}
+
 func TestScrubCommandsEnv(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -628,11 +749,11 @@ func TestScrubCommandsEnv(t *testing.T) {
 		{
 			"api key",
 			`DD_API_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa agent run`,
-			`DD_API_KEY=***************************aaaaa agent run`,
+			`DD_API_KEY=****************************aaaa agent run`,
 		}, {
 			"app key",
 			`DD_APP_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa agent run`,
-			`DD_APP_KEY=***********************************aaaaa agent run`,
+			`DD_APP_KEY=************************************aaaa agent run`,
 		},
 	}
 
@@ -649,10 +770,120 @@ func TestScrubCommandsEnv(t *testing.T) {
 	}
 }
 
+func TestSecretConfigurationVariablesNotScrubbed(t *testing.T) {
+	// Test that secret-related configuration variables are NOT scrubbed
+	// These should remain unchanged in the output
+	secretConfigTests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			"secret_name",
+			`secret_name: "my-secret-name"`,
+			`secret_name: "my-secret-name"`,
+		},
+		{
+			"secret_audit_file_max_size",
+			`secret_audit_file_max_size: 1048576`,
+			`secret_audit_file_max_size: 1048576`,
+		},
+		{
+			"secret_backend_arguments",
+			`secret_backend_arguments: ["arg1", "arg2"]`,
+			`secret_backend_arguments: ["arg1", "arg2"]`,
+		},
+		{
+			"secret_backend_command",
+			`secret_backend_command: "/usr/local/bin/secret-helper"`,
+			`secret_backend_command: "/usr/local/bin/secret-helper"`,
+		},
+		{
+			"secret_backend_command_allow_group_exec_perm",
+			`secret_backend_command_allow_group_exec_perm: true`,
+			`secret_backend_command_allow_group_exec_perm: true`,
+		},
+		{
+			"secret_backend_config",
+			`secret_backend_config: {"key": "value"}`,
+			`secret_backend_config: {"key": "value"}`,
+		},
+		{
+			"secret_backend_output_max_size",
+			`secret_backend_output_max_size: 1024`,
+			`secret_backend_output_max_size: 1024`,
+		},
+		{
+			"secret_backend_remove_trailing_line_break",
+			`secret_backend_remove_trailing_line_break: false`,
+			`secret_backend_remove_trailing_line_break: false`,
+		},
+		{
+			"secret_backend_skip_checks",
+			`secret_backend_skip_checks: true`,
+			`secret_backend_skip_checks: true`,
+		},
+		{
+			"secret_backend_timeout",
+			`secret_backend_timeout: 30`,
+			`secret_backend_timeout: 30`,
+		},
+		{
+			"secret_backend_type",
+			`secret_backend_type: "vault"`,
+			`secret_backend_type: "vault"`,
+		},
+		{
+			"secret_refresh_interval",
+			`secret_refresh_interval: 3600`,
+			`secret_refresh_interval: 3600`,
+		},
+		{
+			"secret_refresh_scatter",
+			`secret_refresh_scatter: true`,
+			`secret_refresh_scatter: true`,
+		},
+		{
+			"admission_controller.certificate.secret_name",
+			`admission_controller:
+  certificate:
+    secret_name: "webhook-certificate"`,
+			`admission_controller:
+  certificate:
+    secret_name: "webhook-certificate"`,
+		},
+		{
+			"mixed secret configuration with sensitive data",
+			`secret_backend_type: "vault"
+secret_backend_command: "/usr/local/bin/vault-helper"
+secret_backend_arguments: ["--config", "/etc/vault.conf"]
+secret_backend_timeout: 30
+secret_refresh_interval: 3600
+api_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+password: "sensitive_password"
+other_config: "not_secret"`,
+			`secret_backend_type: "vault"
+secret_backend_command: "/usr/local/bin/vault-helper"
+secret_backend_arguments: ["--config", "/etc/vault.conf"]
+secret_backend_timeout: 30
+secret_refresh_interval: 3600
+api_key: "****************************aaaa"
+password: "********"
+other_config: "not_secret"`,
+		},
+	}
+
+	for _, tc := range secretConfigTests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertClean(t, tc.input, tc.expected)
+		})
+	}
+}
+
 func TestConfigFile(t *testing.T) {
 	cleanedConfigFile := `dd_url: https://app.datadoghq.com
 
-api_key: "***************************aaaaa"
+api_key: "****************************aaaa"
 
 proxy: http://user:********@host:port
 
@@ -674,4 +905,182 @@ log_level: info
 	cleanedString := string(cleaned)
 
 	assert.Equal(t, cleanedConfigFile, cleanedString)
+}
+
+func TestNewHTTPHeaderAndExactKeys(t *testing.T) {
+	// Test HTTP header-style API keys with "key" suffix
+	assertClean(t,
+		`x-api-key: abc123def456`,
+		`x-api-key: "********"`)
+	assertClean(t,
+		`x-dreamfactory-api-key: secret123`,
+		`x-dreamfactory-api-key: "********"`)
+	assertClean(t,
+		`x-functions-key: mykey456`,
+		`x-functions-key: "********"`)
+	assertClean(t,
+		`x-lz-api-key: lzkey789`,
+		`x-lz-api-key: "********"`)
+	assertClean(t,
+		`x-octopus-apikey: octopuskey`,
+		`x-octopus-apikey: "********"`)
+	assertClean(t,
+		`x-pm-partner-key: partnerkey123`,
+		`x-pm-partner-key: "********"`)
+	assertClean(t,
+		`x-rapidapi-key: rapidkey456`,
+		`x-rapidapi-key: "********"`)
+	assertClean(t,
+		`x-sungard-idp-api-key: sungardkey`,
+		`x-sungard-idp-api-key: "********"`)
+	assertClean(t,
+		`x-vtex-api-appkey: vtexkey789`,
+		`x-vtex-api-appkey: "********"`)
+	assertClean(t,
+		`x-seel-api-key: seelkey123`,
+		`x-seel-api-key: "********"`)
+	assertClean(t,
+		`x-goog-api-key: googlekey456`,
+		`x-goog-api-key: "********"`)
+	assertClean(t,
+		`x-sonar-passcode: sonarpass789`,
+		`x-sonar-passcode: "********"`)
+
+	// Test HTTP header-style API keys with "token" suffix
+	assertClean(t,
+		`x-auth-token: authtoken123`,
+		`x-auth-token: "********"`)
+	assertClean(t,
+		`x-rundeck-auth-token: rundecktoken`,
+		`x-rundeck-auth-token: "********"`)
+	assertClean(t,
+		`x-consul-token: consultoken123`,
+		`x-consul-token: "********"`)
+	assertClean(t,
+		`x-datadog-monitor-token: ddmonitortoken`,
+		`x-datadog-monitor-token: "********"`)
+	assertClean(t,
+		`x-vault-token: vaulttoken456`,
+		`x-vault-token: "********"`)
+	assertClean(t,
+		`x-vtex-api-apptoken: vtexapptoken`,
+		`x-vtex-api-apptoken: "********"`)
+	assertClean(t,
+		`x-static-token: statictoken789`,
+		`x-static-token: "********"`)
+
+	// Test HTTP header-style API keys with "auth" suffix
+	assertClean(t,
+		`x-auth: authvalue123`,
+		`x-auth: "********"`)
+	assertClean(t,
+		`x-stratum-auth: stratumauth`,
+		`x-stratum-auth: "********"`)
+
+	// Test HTTP header-style API keys with "secret" suffix
+	assertClean(t,
+		`x-api-secret: apisecret123`,
+		`x-api-secret: "********"`)
+	assertClean(t,
+		`x-ibm-client-secret: ibmsecret456`,
+		`x-ibm-client-secret: "********"`)
+	assertClean(t,
+		`x-chalk-client-secret: chalksecret789`,
+		`x-chalk-client-secret: "********"`)
+
+	// Test exact key matches
+	assertClean(t,
+		`auth-tenantid: tenant123`,
+		`auth-tenantid: "********"`)
+	assertClean(t,
+		`authority: auth123`,
+		`authority: "********"`)
+	assertClean(t,
+		`cainzapp-api-key: cainzkey456`,
+		`cainzapp-api-key: "********"`)
+	assertClean(t,
+		`cms-svc-api-key: cmskey789`,
+		`cms-svc-api-key: "********"`)
+	assertClean(t,
+		`dd-api-key: someapikey123`,
+		`dd-api-key: "********"`)
+	assertClean(t,
+		`lodauth: lodauth123`,
+		`lodauth: "********"`)
+	assertClean(t,
+		`sec-websocket-key: websocketkey`,
+		`sec-websocket-key: "********"`)
+	assertClean(t,
+		`statuskey: status123`,
+		`statuskey: "********"`)
+	assertClean(t,
+		`cookie: cookievalue123`,
+		`cookie: "********"`)
+	assertClean(t,
+		`private-token: privatetoken456`,
+		`private-token: "********"`)
+	assertClean(t,
+		`kong-admin-token: kongadmintoken`,
+		`kong-admin-token: "********"`)
+	assertClean(t,
+		`accesstoken: accesstoken789`,
+		`accesstoken: "********"`)
+	assertClean(t,
+		`session_token: sessiontoken123`,
+		`session_token: "********"`)
+
+	// Test that non-matching keys are not scrubbed
+	assertClean(t,
+		`regular_key: should_not_be_scrubbed`,
+		`regular_key: should_not_be_scrubbed`)
+	assertClean(t,
+		`some-other-key: also_not_scrubbed`,
+		`some-other-key: also_not_scrubbed`)
+}
+
+func TestPrivateActionRunnerPrivateKey(t *testing.T) {
+	// Test private action runner key configuration
+	assertClean(t,
+		`private_key: abc123def456`,
+		`private_key: "********"`)
+}
+
+func TestHideKeyExceptLastChars(t *testing.T) {
+	tests := []struct {
+		name     string
+		key      string
+		expected string
+	}{
+		{"empty", "", defaultReplacement},
+		{"1 char", "a", defaultReplacement},
+		{"4 chars", "abcd", defaultReplacement},
+		{"5 chars: show 1", "abcde", "****e"},
+		{"7 chars: show 1", "abcdefg", "******g"},
+		{"8 chars: show 2", "abcdefgh", "******gh"},
+		{"15 chars: show 2", "abcdefghijklmno", "*************no"},
+		{"16 chars: show 3", "abcdefghijklmnop", "*************nop"},
+		{"31 chars: show 3", "abcdefghijklmnopqrstuvwxyz01234", "****************************234"},
+		{"32 chars: show 4 (DD API key length)", "abcdefghijklmnopqrstuvwxyz012345", "****************************2345"},
+		{"40 chars: show 4 (DD app key length)", "abcdefghijklmnopqrstuvwxyz0123456789abcd", "************************************abcd"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, HideKeyExceptLastChars(tt.key))
+		})
+	}
+}
+
+func TestDontScrubNonMapping(t *testing.T) {
+	assertClean(t,
+		`mysql_password:password`,
+		`mysql_password:password`)
+	assertClean(t,
+		`- mysql_password:password`,
+		`- mysql_password:password`)
+	assertClean(t,
+		`"mysql_password:password"`,
+		`"mysql_password:password"`)
+	assertClean(t,
+		`- "mysql_password:password"`,
+		`- "mysql_password:password"`)
 }

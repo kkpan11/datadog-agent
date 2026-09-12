@@ -11,4 +11,32 @@ const (
 	DefaultEBPFLessProbeAddr = "localhost:5678"
 	// ClusterIDCacheKey is the key name for the orchestrator cluster id in the agent in-mem cache
 	ClusterIDCacheKey = "orchestratorClusterID"
+	// NodeKubeDistributionKey is the key name for the node kube distribution in the agent in-mem cache
+	NodeKubeDistributionKey = "nodeKubeDistribution"
+	// ECSClusterMetaCacheKey is the key name for the ecs cluster meta in the agent in-mem cache
+	ECSClusterMetaCacheKey = "ecsOrchestratorClusterMeta"
+	// DefaultNumWorkers default number of workers for our check runner
+	DefaultNumWorkers = 4
+	// MaxNumWorkers maximum number of workers for our check runner
+	MaxNumWorkers = 25
+	// DefaultProcessCmdPort is the default port used by process-agent to run a runtime settings server
+	DefaultProcessCmdPort = 6162
 )
+
+// ConfigurationProviders helps unmarshalling `config_providers` config param
+type ConfigurationProviders struct {
+	Name                    string `mapstructure:"name"`
+	Polling                 bool   `mapstructure:"polling"`
+	PollInterval            string `mapstructure:"poll_interval"`
+	TemplateURL             string `mapstructure:"template_url"`
+	TemplateDir             string `mapstructure:"template_dir"`
+	Username                string `mapstructure:"username"`
+	Password                string `mapstructure:"password"`
+	CAFile                  string `mapstructure:"ca_file"`
+	CAPath                  string `mapstructure:"ca_path"`
+	CertFile                string `mapstructure:"cert_file"`
+	KeyFile                 string `mapstructure:"key_file"`
+	Token                   string `mapstructure:"token"`
+	GraceTimeSeconds        int    `mapstructure:"grace_time_seconds"`
+	DegradedDeadlineMinutes int    `mapstructure:"degraded_deadline_minutes"`
+}

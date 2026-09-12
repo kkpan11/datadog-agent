@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strconv"
 	"syscall"
 	"testing"
 
@@ -24,17 +25,48 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
 )
 
+// getFreePort finds a free port by binding to port 0 and returning the assigned port
+func getFreePort(network string) (int, error) {
+	var addr string
+	switch network {
+	case "tcp", "tcp4", "udp", "udp4":
+		addr = "127.0.0.1:0"
+	default:
+		addr = "127.0.0.1:0"
+	}
+
+	if network == "udp" || network == "udp4" {
+		conn, err := net.ListenPacket(network, addr)
+		if err != nil {
+			return 0, err
+		}
+		defer conn.Close()
+		return conn.LocalAddr().(*net.UDPAddr).Port, nil
+	}
+
+	listener, err := net.Listen(network, addr)
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
 func TestBindEvent(t *testing.T) {
 	SkipIfNotAvailable(t)
 
 	ruleDefs := []*rules.RuleDefinition{
 		{
-			ID:         "test_bind_af_inet",
-			Expression: `bind.addr.family == AF_INET && process.file.name in [ "syscall_tester", "testsuite" ]`,
+			ID:         "test_bind_af_inet_udp",
+			Expression: `bind.addr.family == AF_INET && process.file.name in [ "syscall_tester", "testsuite" ] && bind.addr.ip == 0.0.0.0/32`,
+		},
+		{
+			ID:         "test_bind_af_inet_tcp",
+			Expression: `bind.addr.family == AF_INET && process.file.name in [ "syscall_tester", "testsuite" ] && bind.addr.ip == 0.0.0.0/32`,
 		},
 		{
 			ID:         "test_bind_af_inet6",
-			Expression: `bind.addr.family == AF_INET6 && process.file.name == "syscall_tester"`,
+			Expression: `bind.addr.family == AF_INET6 && process.file.name == "syscall_tester" && bind.addr.ip == ::/128`,
 		},
 		{
 			ID:         "test_bind_af_unix",
@@ -53,11 +85,15 @@ func TestBindEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	test.Run(t, "bind-af-inet-any-success-tcp", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
-		args := []string{"bind", "AF_INET", "any", "tcp"}
+	test.RunMultiMode(t, "bind-af-inet-any-success-tcp", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+		port, err := getFreePort("tcp")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+		args := []string{"bind", "AF_INET", "any", "tcp", strconv.Itoa(port)}
 		envs := []string{}
 
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			cmd := cmdFunc(syscallTester, args, envs)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("%s: %w", out, err)
@@ -67,16 +103,16 @@ func TestBindEvent(t *testing.T) {
 		}, func(event *model.Event, _ *rules.Rule) {
 			assert.Equal(t, "bind", event.GetType(), "wrong event type")
 			assert.Equal(t, uint16(unix.AF_INET), event.Bind.AddrFamily, "wrong address family")
-			assert.Equal(t, uint16(4242), event.Bind.Addr.Port, "wrong address port")
+			assert.Equal(t, uint16(port), event.Bind.Addr.Port, "wrong address port")
 			assert.Equal(t, string("0.0.0.0/32"), event.Bind.Addr.IPNet.String(), "wrong address")
 			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
 			assert.Equal(t, uint16(unix.IPPROTO_TCP), event.Bind.Protocol, "wrong protocol")
 
 			test.validateBindSchema(t, event)
-		})
+		}, "test_bind_af_inet_tcp")
 	})
 
-	test.Run(t, "bind-af-inet-any-success-tcp-io-uring", func(t *testing.T, _ wrapperType, _ func(cmd string, args []string, envs []string) *exec.Cmd) {
+	t.Run("bind-af-inet-any-success-tcp-io-uring", func(t *testing.T) {
 		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, unix.IPPROTO_TCP)
 		if err != nil {
 			t.Fatal(err)
@@ -92,8 +128,13 @@ func TestBindEvent(t *testing.T) {
 		}
 		defer iour.Close()
 
+		port, err := getFreePort("tcp")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+
 		sa := unix.SockaddrInet4{
-			Port: 4242,
+			Port: port,
 			Addr: [4]byte(net.IPv4(0, 0, 0, 0)),
 		}
 
@@ -104,7 +145,7 @@ func TestBindEvent(t *testing.T) {
 
 		ch := make(chan iouring.Result, 1)
 
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			if _, err = iour.SubmitRequest(prepRequest, ch); err != nil {
 				return err
 			}
@@ -126,20 +167,92 @@ func TestBindEvent(t *testing.T) {
 		}, func(event *model.Event, _ *rules.Rule) {
 			assert.Equal(t, "bind", event.GetType(), "wrong event type")
 			assert.Equal(t, uint16(unix.AF_INET), event.Bind.AddrFamily, "wrong address family")
-			assert.Equal(t, uint16(4242), event.Bind.Addr.Port, "wrong address port")
+			assert.Equal(t, uint16(port), event.Bind.Addr.Port, "wrong address port")
 			assert.Equal(t, string("0.0.0.0/32"), event.Bind.Addr.IPNet.String(), "wrong address")
 			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
 			assert.Equal(t, uint16(unix.IPPROTO_TCP), event.Bind.Protocol, "wrong protocol")
 
 			test.validateBindSchema(t, event)
-		})
+		}, "test_bind_af_inet_tcp")
 	})
 
-	test.Run(t, "bind-af-inet-any-success-udp", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
-		args := []string{"bind", "AF_INET", "any", "udp"}
+	t.Run("bind-af-inet-tcp-protocol-zero", func(t *testing.T) {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(fd)
+
+		port, err := getFreePort("tcp")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+
+		sa := &unix.SockaddrInet4{
+			Port: port,
+			Addr: [4]byte{0, 0, 0, 0},
+		}
+
+		test.WaitSignalFromRule(t, func() error {
+			return unix.Bind(fd, sa)
+		}, func(event *model.Event, _ *rules.Rule) {
+			assert.Equal(t, "bind", event.GetType(), "wrong event type")
+			assert.Equal(t, uint16(unix.AF_INET), event.Bind.AddrFamily, "wrong address family")
+			assert.Equal(t, uint16(port), event.Bind.Addr.Port, "wrong address port")
+			assert.Equal(t, string("0.0.0.0/32"), event.Bind.Addr.IPNet.String(), "wrong address")
+			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
+			// socket(AF_INET, SOCK_STREAM, 0) creates a TCP socket; the kernel sets
+			// sk->sk_protocol = IPPROTO_TCP. The eBPFless ptracer mirrors that
+			// resolution so that bind.protocol is consistent with the eBPF path.
+			assert.Equal(t, uint16(unix.IPPROTO_TCP), event.Bind.Protocol, "wrong protocol")
+
+			test.validateBindSchema(t, event)
+		}, "test_bind_af_inet_tcp")
+	})
+
+	t.Run("bind-af-inet-udp-protocol-zero", func(t *testing.T) {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(fd)
+
+		port, err := getFreePort("udp")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+
+		sa := &unix.SockaddrInet4{
+			Port: port,
+			Addr: [4]byte{0, 0, 0, 0},
+		}
+
+		test.WaitSignalFromRule(t, func() error {
+			return unix.Bind(fd, sa)
+		}, func(event *model.Event, _ *rules.Rule) {
+			assert.Equal(t, "bind", event.GetType(), "wrong event type")
+			assert.Equal(t, uint16(unix.AF_INET), event.Bind.AddrFamily, "wrong address family")
+			assert.Equal(t, uint16(port), event.Bind.Addr.Port, "wrong address port")
+			assert.Equal(t, string("0.0.0.0/32"), event.Bind.Addr.IPNet.String(), "wrong address")
+			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
+			// socket(AF_INET, SOCK_DGRAM, 0) creates a UDP socket; the kernel sets
+			// sk->sk_protocol = IPPROTO_UDP. The eBPFless ptracer mirrors that
+			// resolution so that bind.protocol is consistent with the eBPF path.
+			assert.Equal(t, uint16(unix.IPPROTO_UDP), event.Bind.Protocol, "wrong protocol")
+
+			test.validateBindSchema(t, event)
+		}, "test_bind_af_inet_udp")
+	})
+
+	test.RunMultiMode(t, "bind-af-inet-any-success-udp", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+		port, err := getFreePort("udp")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+		args := []string{"bind", "AF_INET", "any", "udp", strconv.Itoa(port)}
 		envs := []string{}
 
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			cmd := cmdFunc(syscallTester, args, envs)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("%s: %w", out, err)
@@ -149,20 +262,24 @@ func TestBindEvent(t *testing.T) {
 		}, func(event *model.Event, _ *rules.Rule) {
 			assert.Equal(t, "bind", event.GetType(), "wrong event type")
 			assert.Equal(t, uint16(unix.AF_INET), event.Bind.AddrFamily, "wrong address family")
-			assert.Equal(t, uint16(4242), event.Bind.Addr.Port, "wrong address port")
+			assert.Equal(t, uint16(port), event.Bind.Addr.Port, "wrong address port")
 			assert.Equal(t, string("0.0.0.0/32"), event.Bind.Addr.IPNet.String(), "wrong address")
 			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
 			assert.Equal(t, uint16(unix.IPPROTO_UDP), event.Bind.Protocol, "wrong protocol")
 
 			test.validateBindSchema(t, event)
-		})
+		}, "test_bind_af_inet_udp")
 	})
 
-	test.Run(t, "bind-af-inet6-any-success", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
-		args := []string{"bind", "AF_INET6", "any"}
+	test.RunMultiMode(t, "bind-af-inet6-any-success", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+		port, err := getFreePort("tcp")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+		args := []string{"bind", "AF_INET6", "any", strconv.Itoa(port)}
 		envs := []string{}
 
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			cmd := cmdFunc(syscallTester, args, envs)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("%s: %w", out, err)
@@ -172,19 +289,19 @@ func TestBindEvent(t *testing.T) {
 		}, func(event *model.Event, _ *rules.Rule) {
 			assert.Equal(t, "bind", event.GetType(), "wrong event type")
 			assert.Equal(t, uint16(unix.AF_INET6), event.Bind.AddrFamily, "wrong address family")
-			assert.Equal(t, uint16(4242), event.Bind.Addr.Port, "wrong address port")
+			assert.Equal(t, uint16(port), event.Bind.Addr.Port, "wrong address port")
 			assert.Equal(t, string("::/128"), event.Bind.Addr.IPNet.String(), "wrong address")
 			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
 
 			test.validateBindSchema(t, event)
-		})
+		}, "test_bind_af_inet6")
 	})
 
-	test.Run(t, "bind-af-unknown-unix", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+	test.RunMultiMode(t, "bind-af-unknown-unix", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
 		args := []string{"bind", "AF_UNIX"}
 		envs := []string{}
 
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			cmd := cmdFunc(syscallTester, args, envs)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("%s: %w", out, err)
@@ -200,6 +317,6 @@ func TestBindEvent(t *testing.T) {
 			assert.Equal(t, int64(0), event.Bind.Retval, "wrong retval")
 
 			test.validateBindSchema(t, event)
-		})
+		}, "test_bind_af_unix")
 	})
 }

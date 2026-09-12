@@ -21,6 +21,9 @@ const (
 	ProductAPMTracing Product = "APM_TRACING"
 	// ProductLiveDebugging is the dynamic instrumentation product
 	ProductLiveDebugging = "LIVE_DEBUGGING"
+	// ProductLiveDebuggingSymbolDB manages the dynamic instrumentation product
+	// symbol database upload process.
+	ProductLiveDebuggingSymbolDB = "LIVE_DEBUGGING_SYMBOL_DB"
 	// ProductTesting1 is a testing product
 	ProductTesting1 Product = "TESTING1"
 	// ProductAgentTask is to receive agent task instruction, like a flare
@@ -33,6 +36,20 @@ const (
 	ProductContainerAutoscalingSettings = "CONTAINER_AUTOSCALING_SETTINGS"
 	// ProductContainerAutoscalingValues receives values for container autoscaling
 	ProductContainerAutoscalingValues = "CONTAINER_AUTOSCALING_VALUES"
+	// ProductClusterAutoscalingValues receives values for cluster autoscaling
+	ProductClusterAutoscalingValues = "CLUSTER_AUTOSCALING_VALUES"
+	// ProductKubeActions receives Kubernetes actions to execute
+	ProductKubeActions = "K8S_ACTIONS"
+	// ProductDataStreamsKafkaActions is to execute Kafka actions remotely
+	ProductDataStreamsKafkaActions = "DSM_KAFKA_ACTIONS"
+	// ProductAgentFlags is to receive remote feature flags
+	ProductAgentFlags = "AGENT_REMOTE_FLAGS"
+	// ProductDOQueryActions is to execute database queries remotely for Data Observability
+	ProductDOQueryActions Product = "DO_QUERY_ACTIONS"
+	// ProductNetworkPath is to configure Network Path scheduled tests
+	ProductNetworkPath Product = "NETWORK_PATH"
+	// ProductDataSecurityDBScanTasks is used to remotely trigger Data Security DB scan tasks
+	ProductDataSecurityDBScanTasks Product = "DATA_SECURITY_DB_SCAN_TASKS"
 )
 
 // ProductListToString converts a product list to string list

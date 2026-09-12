@@ -8,9 +8,11 @@ package framer
 // noFramingMatcher considers the given bytes as already framed.
 type noFramingMatcher struct{}
 
+// FlushFrame implements FrameMatcher. No-framing already emits everything
+// in FindFrame, so there is no remainder to flush.
+func (m *noFramingMatcher) FlushFrame([]byte) ([]byte, int) { return nil, 0 }
+
 // FindFrame considers the given bytes buffer as one full frame.
-//
-//nolint:revive // TODO(AML) Fix revive linter
-func (m *noFramingMatcher) FindFrame(buf []byte, _ int) ([]byte, int) {
-	return buf, len(buf)
+func (m *noFramingMatcher) FindFrame(buf []byte, _ int) ([]byte, int, bool) {
+	return buf, len(buf), false
 }

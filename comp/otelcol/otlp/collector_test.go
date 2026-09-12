@@ -27,17 +27,18 @@ import (
 func TestGetComponents(t *testing.T) {
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
 
-	_, err := getComponents(serializermock.NewMetricSerializer(t), make(chan *message.Message), fakeTagger, hostnameimpl.NewHostnameService())
+	_, err := getComponents(serializermock.NewMetricSerializer(t), make(chan *message.Message), fakeTagger, hostnameimpl.NewHostnameService(), nil)
 	// No duplicate component
 	require.NoError(t, err)
 }
 
-func AssertSucessfulRun(t *testing.T, pcfg PipelineConfig) {
+func AssertSuccessfulRun(t *testing.T, pcfg PipelineConfig) {
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
 
-	p, err := NewPipeline(pcfg, serializermock.NewMetricSerializer(t), make(chan *message.Message), fakeTagger, hostnameimpl.NewHostnameService())
+	p, err := NewPipeline(pcfg, serializermock.NewMetricSerializer(t), make(chan *message.Message), fakeTagger, hostnameimpl.NewHostnameService(), nil)
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	const pipelineTimeout = 10 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), pipelineTimeout)
 	defer cancel()
 
 	colDone := make(chan struct{})
@@ -48,23 +49,21 @@ func AssertSucessfulRun(t *testing.T, pcfg PipelineConfig) {
 
 	assert.Eventually(t, func() bool {
 		return otelcol.StateRunning == p.col.GetState()
-	}, time.Second*2, time.Millisecond*200)
+	}, pipelineTimeout-time.Second, time.Millisecond*200)
 
 	p.Stop()
 	p.Stop()
 	<-colDone
 
-	assert.Eventually(t, func() bool {
-		return otelcol.StateClosed == p.col.GetState()
-	}, time.Second*2, time.Millisecond*200)
+	assert.Equal(t, otelcol.StateClosed, p.col.GetState())
 }
 
 func AssertFailedRun(t *testing.T, pcfg PipelineConfig, expected string) {
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
 
-	p, err := NewPipeline(pcfg, serializermock.NewMetricSerializer(t), make(chan *message.Message), fakeTagger, hostnameimpl.NewHostnameService())
+	p, err := NewPipeline(pcfg, serializermock.NewMetricSerializer(t), make(chan *message.Message), fakeTagger, hostnameimpl.NewHostnameService(), nil)
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	pipelineError := p.Run(ctx)
 	assert.ErrorContains(t, pipelineError, expected)
@@ -72,15 +71,15 @@ func AssertFailedRun(t *testing.T, pcfg PipelineConfig, expected string) {
 
 func TestStartPipeline(t *testing.T) {
 	cfg := pkgconfigmock.New(t)
-	cfg.SetWithoutSource("hostname", "otlp-testhostname")
+	cfg.SetInTest("hostname", "otlp-testhostname")
 
 	pcfg := getTestPipelineConfig()
-	AssertSucessfulRun(t, pcfg)
+	AssertSuccessfulRun(t, pcfg)
 }
 
 func TestStartPipelineFromConfig(t *testing.T) {
 	cfg := pkgconfigmock.New(t)
-	cfg.SetWithoutSource("hostname", "otlp-testhostname")
+	cfg.SetInTest("hostname", "otlp-testhostname")
 
 	tests := []struct {
 		path string
@@ -105,7 +104,7 @@ func TestStartPipelineFromConfig(t *testing.T) {
 			pcfg, err := FromAgentConfig(cfg)
 			require.NoError(t, err)
 			if testInstance.err == "" {
-				AssertSucessfulRun(t, pcfg)
+				AssertSuccessfulRun(t, pcfg)
 			} else {
 				AssertFailedRun(t, pcfg, testInstance.err)
 			}

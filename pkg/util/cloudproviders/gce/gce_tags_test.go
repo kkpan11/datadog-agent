@@ -53,11 +53,10 @@ var (
 		"google-compute-enable-pcid:true",
 		"instance-template:projects/111111111111/global/instanceTemplates/gke-test-cluster-default-pool-0012834b",
 	}
-	expectedTagsWithProviderKind = append(expectedFullTags, "provider_kind:test-provider")
 )
 
 func mockMetadataRequest(t *testing.T) *httptest.Server {
-	content, err := os.ReadFile("test/gce_metadata.json")
+	content, err := os.ReadFile("testdata/gce_metadata.json")
 	if err != nil {
 		assert.Fail(t, fmt.Sprintf("Error getting test data: %v", err))
 	}
@@ -105,7 +104,7 @@ func TestGetHostTagsWithProjectID(t *testing.T) {
 	server := mockMetadataRequest(t)
 	defer server.Close()
 	defer cache.Cache.Delete(tagsCacheKey)
-	mockConfig.SetWithoutSource("gce_send_project_id_tag", true)
+	mockConfig.SetInTest("gce_send_project_id_tag", true)
 	tags, err := GetTags(ctx)
 	require.NoError(t, err)
 	testTags(t, tags, expectedTagsWithProjectID)
@@ -132,7 +131,7 @@ func TestGetHostTagsWithNonDefaultTagFilters(t *testing.T) {
 	mockConfig := configmock.New(t)
 	defaultExclude := mockConfig.GetStringSlice("exclude_gce_tags")
 
-	mockConfig.SetWithoutSource("exclude_gce_tags", append([]string{"cluster-name"}, defaultExclude...))
+	mockConfig.SetInTest("exclude_gce_tags", append([]string{"cluster-name"}, defaultExclude...))
 
 	server := mockMetadataRequest(t)
 	defer server.Close()
@@ -141,18 +140,4 @@ func TestGetHostTagsWithNonDefaultTagFilters(t *testing.T) {
 	tags, err := GetTags(ctx)
 	require.NoError(t, err)
 	testTags(t, tags, expectedExcludedTags)
-}
-
-func TestGetHostTagsWithProviderKind(t *testing.T) {
-	ctx := context.Background()
-	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("provider_kind", "test-provider")
-
-	server := mockMetadataRequest(t)
-	defer server.Close()
-	defer cache.Cache.Delete(tagsCacheKey)
-
-	tags, err := GetTags(ctx)
-	require.NoError(t, err)
-	testTags(t, tags, expectedTagsWithProviderKind)
 }

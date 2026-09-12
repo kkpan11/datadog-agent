@@ -13,11 +13,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/client"
 
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -27,7 +27,7 @@ const eventSendBuffer = 5
 
 // SubscribeToEvents allows a package to subscribe to events from the event stream.
 // A unique subscriber name should be provided.
-func (d *DockerUtil) SubscribeToEvents(name string, filter *containers.Filter) (<-chan *ContainerEvent, <-chan *ImageEvent, error) {
+func (d *DockerUtil) SubscribeToEvents(name string, filter workloadfilter.FilterBundle) (<-chan *ContainerEvent, <-chan *ImageEvent, error) {
 	sub, err := d.eventState.subscribe(name, filter)
 	if err != nil {
 		return nil, nil, err
@@ -37,7 +37,7 @@ func (d *DockerUtil) SubscribeToEvents(name string, filter *containers.Filter) (
 	return sub.containerEventsChan, sub.imageEventsChan, err
 }
 
-func (e *eventStreamState) subscribe(name string, filter *containers.Filter) (*eventSubscriber, error) {
+func (e *eventStreamState) subscribe(name string, filter workloadfilter.FilterBundle) (*eventSubscriber, error) {
 	e.RLock()
 	if _, found := e.subscribers[name]; found {
 		e.RUnlock()
@@ -88,14 +88,15 @@ func (d *DockerUtil) dispatchEvents(sub *eventSubscriber) {
 
 CONNECT: // Outer loop handles re-connecting in case the docker daemon closes the connection
 	for {
-		eventOptions := events.ListOptions{
+		eventOptions := client.EventsListOptions{
 			Since:   strconv.FormatInt(latestTimestamp, 10),
 			Filters: eventFilters(),
 		}
 
 		var ctx context.Context
 		ctx, cancelFunc = context.WithCancel(context.Background())
-		messages, errs := d.cli.Events(ctx, eventOptions)
+		result := d.cli.Events(ctx, eventOptions)
+		messages, errs := result.Messages, result.Err
 
 		// Inner loop iterates over elements in the channel
 		for {
@@ -148,8 +149,8 @@ CONNECT: // Outer loop handles re-connecting in case the docker daemon closes th
 	close(sub.containerEventsChan)
 }
 
-func eventFilters() filters.Args {
-	res := filters.NewArgs()
+func eventFilters() client.Filters {
+	res := make(client.Filters)
 
 	res.Add("type", string(events.ContainerEventType))
 	for _, containerEventAction := range containerEventActions {

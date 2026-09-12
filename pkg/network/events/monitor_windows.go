@@ -27,24 +27,24 @@ func getProcessStartTime(ev *model.Event) time.Time {
 	return time.Time{}
 }
 
-func makeTagsSlice(already map[string]struct{}, apmtags iisconfig.APMTags) []*intern.Value {
+func makeTagsSlice(already map[string]string, apmtags iisconfig.APMTags) []*intern.Value {
 	tags := make([]*intern.Value, 0, 3)
 	if _, found := already["DD_SERVICE"]; !found {
 		if len(apmtags.DDService) > 0 {
 			tags = append(tags, intern.GetByString("service"+":"+apmtags.DDService))
-			already["DD_SERVICE"] = struct{}{}
+			already["DD_SERVICE"] = apmtags.DDService
 		}
 	}
 	if _, found := already["DD_ENV"]; !found {
 		if len(apmtags.DDEnv) > 0 {
 			tags = append(tags, intern.GetByString("env"+":"+apmtags.DDEnv))
-			already["DD_ENV"] = struct{}{}
+			already["DD_ENV"] = apmtags.DDEnv
 		}
 	}
 	if _, found := already["DD_VERSION"]; !found {
 		if len(apmtags.DDVersion) > 0 {
 			tags = append(tags, intern.GetByString("version"+":"+apmtags.DDVersion))
-			already["DD_VERSION"] = struct{}{}
+			already["DD_VERSION"] = apmtags.DDVersion
 		}
 	}
 	if len(tags) == 0 {
@@ -53,7 +53,7 @@ func makeTagsSlice(already map[string]struct{}, apmtags iisconfig.APMTags) []*in
 	return tags
 }
 
-func getAPMTags(already map[string]struct{}, filename string) []*intern.Value {
+func getAPMTags(already map[string]string, filename string) []*intern.Value {
 
 	dir := filepath.Dir(filename)
 	if dir == "" {
@@ -66,8 +66,10 @@ func getAPMTags(already map[string]struct{}, filename string) []*intern.Value {
 	ddJSON := filepath.Join(dir, "datadog.json")
 	if _, err := os.Stat(appConfig); err == nil {
 
-		appcfg, err := iisconfig.ReadDotNetConfig(appConfig)
+		envTags, appSettingsTags, err := iisconfig.ReadDotNetConfig(appConfig)
 		if err == nil {
+			// env (Core) outranks appSettings (Framework); at most one is set.
+			appcfg := appSettingsTags.Overlay(envTags)
 			found := makeTagsSlice(already, appcfg)
 			if len(found) > 0 {
 				tags = append(tags, found...)

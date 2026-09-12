@@ -5,8 +5,7 @@ fit for your use case, please [refer to the official documentation][custom-check
 
 ## JMX-based checks
 JMX-based checks are executed by a component of the Agent called `jmxfetch`.
-Refer to [./jmxfetch.md](./jmxfetch.md) for more.
-
+See the [JMXFetch repo](https://github.com/DataDog/JMXFetch) for more.
 ## Configuration
 
 Every check has its own YAML configuration file. The file has one mandatory key,
@@ -61,6 +60,10 @@ inherits from `AgentCheck` and implements the `check` method:
 from datadog_checks.checks import AgentCheck
 
 class MyCheck(AgentCheck):
+    def __init__(self, name, init_config, instances):
+        super().__init__(name, init_config, instances)
+        # Read config, set up instances, initialize checks
+        # ...
     def check(self, instance):
         # Collect metrics, emit events, submit service checks,
         # ...
@@ -135,11 +138,21 @@ checks code.
 Scenario: You have implemented a custom check called `hello_world` and you would
 like to run this with a local Agent build.
 
+Example contents of `hello_world.yaml`:
+```yaml
+instances:
+  - only_one_instance: true
+```
+
+The contents of the instance item are not important, but if an instance is not present the agent will not run the check.
+
 Example contents of `hello_world.py`:
 ```python
 from datadog_checks.checks import AgentCheck
 
 class MyCheck(AgentCheck):
+    def __init__(self, name, init_config, instances):
+        super().__init__(name, init_config, instances)
     def check(self, instance):
         self.gauge('hello.world', 1.23, tags=['foo:bar'])
 ```
@@ -176,7 +189,8 @@ In order for python to find this package, we must do two things:
 correctly.
 
 #### Example for virtualenv
-(see also the notes in [../agent_dev_env.md](../agent_dev_env.md#python-dependencies)):
+
+(see also the notes in [manual setup](https://datadoghq.dev/datadog-agent/setup/manual/#python-dependencies)):
 
 1. `python3 -m pip install virtualenv`
 1. `virtualenv $GOPATH/src/github.com/DataDog/datadog-agent/venv`
@@ -271,14 +285,20 @@ Linux when trying to run the resulting `agent` binary:
 
 `Could not initialize Python: could not load runtime python for version 3: Unable to open three library: libdatadog-agent-three.so: cannot open shared object file: No such file or directory`
 
-To solve on Linux, use the loader env var `LD_LIBRARY_PATH`.
-For example, `LD_LIBRARY_PATH=$PWD/dev/lib ./bin/agent/agent run`
+**Solution**: Clean and rebuild rtloader to set the correct RPATH:
 
-Why is this needed? This is due to a combination of the way `rtloader` works
-and how library loading works on Linux.
+```bash
+dda inv rtloader.clean
+dda inv agent.build
+```
 
-The very simplified summary is that `libdatadog-agent-rtloader.so` attempts to load
-`libdatadog-agent-three.so` via `dlopen`, however `libdatadog-agent-rtloader`
-does not have its `RUNPATH` set correctly in local builds, so `dlopen` is unable to find
-`libdatadog-agent-three.so`. Using `LD_LIBRARY_PATH` instructs `dlopen` where to
-search for libraries, so using it sidesteps this issue.
+If the issue persists (e.g., with older cached builds), you can use `LD_LIBRARY_PATH` as a workaround:
+
+```bash
+LD_LIBRARY_PATH=$PWD/dev/lib ./bin/agent/agent run
+```
+
+**Why this happens**: `libdatadog-agent-rtloader.so` loads `libdatadog-agent-three.so`
+via `dlopen`. The rtloader build now sets `CMAKE_INSTALL_RPATH` on Linux so that
+libraries can find each other. If you have an old cached build without the RPATH set,
+a clean rebuild will fix it.

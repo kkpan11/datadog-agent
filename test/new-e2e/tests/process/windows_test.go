@@ -8,25 +8,32 @@ package process
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	agentmodel "github.com/DataDog/agent-payload/v5/process"
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams"
-	"github.com/DataDog/test-infra-definitions/components/os"
-	"github.com/DataDog/test-infra-definitions/scenarios/aws/ec2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/os"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
 
+	"github.com/DataDog/datadog-agent/pkg/util/testutil/flake"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client/agentclient"
 	"github.com/DataDog/datadog-agent/test/fakeintake/aggregator"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awshost "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/host"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client/agentclient"
 	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-configuration/secretsutils"
+)
+
+const (
+	mspmEngComm = "Antimalware Service Executable"
+	diskspdComm = "DiskSpd Storage Performance Tool"
 )
 
 type windowsTestSuite struct {
@@ -34,12 +41,15 @@ type windowsTestSuite struct {
 }
 
 func TestWindowsTestSuite(t *testing.T) {
+	flake.Mark(t)
 	t.Parallel()
 	e2e.Run(t, &windowsTestSuite{},
 		e2e.WithProvisioner(
 			awshost.Provisioner(
-				awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-				awshost.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr)),
+				awshost.WithRunOptions(
+					ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+					ec2.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr)),
+				),
 			),
 		),
 	)
@@ -54,15 +64,10 @@ func (s *windowsTestSuite) SetupSuite() {
 	s.Env().RemoteHost.MustExecute("Start-MpScan -ScanType FullScan -AsJob")
 	// Install chocolatey - https://chocolatey.org/install
 	// This may be due to choco rate limits - https://datadoghq.atlassian.net/browse/ADXT-950
-	stdout, err := s.Env().RemoteHost.Execute("Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iwr https://community.chocolatey.org/install.ps1 -UseBasicParsing | iex")
-	if err != nil {
-		s.T().Logf("Failed to install chocolatey: %s, err: %s", stdout, err)
-	}
-	// Install diskspd for IO tests - https://learn.microsoft.com/en-us/azure/azure-local/manage/diskspd-overview
-	stdout, err = s.Env().RemoteHost.Execute("C:\\ProgramData\\chocolatey\\bin\\choco.exe install -y diskspd")
-	if err != nil {
-		s.T().Logf("Failed to install diskspd: %s, err: %s", stdout, err)
-	}
+	stdout, err := s.Env().RemoteHost.Execute("$env:chocolateyVersion = '2.7.1'; Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iwr https://community.chocolatey.org/install.ps1 -UseBasicParsing | iex")
+	require.NoErrorf(s.T(), err, "Failed to install chocolatey: %s, err: %s", stdout, err)
+	// DiskSpd for IO tests: zip on E2E artifact host at processes/DiskSpd.zip (see diskspd.go).
+	require.NoError(s.T(), setupDiskSpd(s.Env().RemoteHost))
 }
 
 func (s *windowsTestSuite) TestAPIKeyRefresh() {
@@ -79,9 +84,11 @@ func (s *windowsTestSuite) TestAPIKeyRefresh() {
 
 	s.UpdateEnv(
 		awshost.Provisioner(
-			awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-			awshost.WithAgentOptions(
-				agentParams...,
+			awshost.WithRunOptions(
+				ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+				ec2.WithAgentOptions(
+					agentParams...,
+				),
 			),
 		),
 	)
@@ -126,9 +133,11 @@ func (s *windowsTestSuite) TestAPIKeyRefreshAdditionalEndpoints() {
 
 	s.UpdateEnv(
 		awshost.Provisioner(
-			awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-			awshost.WithAgentOptions(
-				agentParams...,
+			awshost.WithRunOptions(
+				ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+				ec2.WithAgentOptions(
+					agentParams...,
+				),
 			),
 		),
 	)
@@ -164,7 +173,7 @@ func (s *windowsTestSuite) TestAPIKeyRefreshAdditionalEndpoints() {
 	}, 2*time.Minute, 10*time.Second)
 }
 
-func assertProcessCheck(t *testing.T, env *environments.Host, withIOStats bool, withSystemProbe bool, processName string, processCMDArgs []string) {
+func assertProcessCheck(t *testing.T, env *environments.Host, withIOStats bool, withSystemProbe bool, processName string, processCMDArgs []string, expectedComm string) {
 	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
 		assertRunningChecks(collect, env.Agent.Client, []string{"process", "rtprocess"}, withSystemProbe)
 	}, 1*time.Minute, 5*time.Second)
@@ -175,29 +184,38 @@ func assertProcessCheck(t *testing.T, env *environments.Host, withIOStats bool, 
 		payloads, err = env.FakeIntake.Client().GetProcesses()
 		assert.NoError(c, err, "failed to get process payloads from fakeintake")
 
-		assertProcessCollectedNew(c, payloads, withIOStats, processName)
+		assertProcessCollected(c, payloads, withIOStats, processName)
 
-		procs := filterProcessPayloadsByName(payloads, processName)
+		procs := FilterProcessPayloadsByName(payloads, processName)
 		require.NotEmpty(t, procs, "'%s' process not found in payloads: \n%+v", processName, payloads)
 		assertProcessCommandLineArgs(c, procs, processCMDArgs)
+		if expectedComm != "" {
+			assertCommProperty(c, procs, expectedComm)
+		}
 	}, 2*time.Minute, 10*time.Second)
 }
 
 func (s *windowsTestSuite) TestProtectedProcessCheck() {
 	s.UpdateEnv(awshost.Provisioner(
-		awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-		awshost.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr)),
+		awshost.WithRunOptions(
+			ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr)),
+		),
 	))
 	// MsMpEng.exe is a protected process so we can't access any command line arguments
-	assertProcessCheck(s.T(), s.Env(), false, false, "MsMpEng.exe", []string{"MsMpEng.exe"})
+	assertProcessCheck(s.T(), s.Env(), false, false, "MsMpEng.exe", []string{"MsMpEng.exe"}, mspmEngComm)
 }
 
 func (s *windowsTestSuite) TestProtectedProcessChecksInCoreAgent() {
 	t := s.T()
-	s.UpdateEnv(awshost.Provisioner(awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-		awshost.WithAgentOptions(agentparams.WithAgentConfig(processCheckInCoreAgentConfigStr))))
+	s.UpdateEnv(awshost.Provisioner(
+		awshost.WithRunOptions(
+			ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr)),
+		),
+	))
 	// MsMpEng.exe is a protected process so we can't access any command line arguments
-	assertProcessCheck(t, s.Env(), false, false, "MsMpEng.exe", []string{"MsMpEng.exe"})
+	assertProcessCheck(t, s.Env(), false, false, "MsMpEng.exe", []string{"MsMpEng.exe"}, mspmEngComm)
 
 	// Verify the process component is not running in the core agent
 	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
@@ -209,8 +227,10 @@ func (s *windowsTestSuite) TestProtectedProcessChecksInCoreAgent() {
 func (s *windowsTestSuite) TestProcessDiscoveryCheck() {
 	t := s.T()
 	s.UpdateEnv(awshost.Provisioner(
-		awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-		awshost.WithAgentOptions(agentparams.WithAgentConfig(processDiscoveryCheckConfigStr)),
+		awshost.WithRunOptions(
+			ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(processDiscoveryCheckConfigStr)),
+		),
 	))
 
 	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
@@ -230,23 +250,26 @@ func (s *windowsTestSuite) TestProcessDiscoveryCheck() {
 
 func (s *windowsTestSuite) TestUnprotectedProcessCheckIO() {
 	s.UpdateEnv(awshost.Provisioner(
-		awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-		awshost.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr), agentparams.WithSystemProbeConfig(systemProbeConfigStr)),
+		awshost.WithRunOptions(
+			ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr), agentparams.WithSystemProbeConfig(systemProbeConfigStr)),
+		),
 	))
 
 	// Flush fake intake to remove payloads that won't have IO stats
 	s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
 
-	process, cmd, err := runDiskSpd(s.T(), s.Env().RemoteHost)
+	process, cmd, comm, err := runDiskSpd(s.T(), s.Env().RemoteHost)
 	require.NoError(s.T(), err)
 
-	assertProcessCheck(s.T(), s.Env(), true, true, process, cmd)
+	assertProcessCheck(s.T(), s.Env(), true, true, process, cmd, comm)
 }
 
 func (s *windowsTestSuite) TestManualProcessCheck() {
+	// test can be flaky due to missing CPU stats when cpu usage is extremely low (json output omits 0 values), so we want to re-run a full scan to ensure we have CPU stats
+	s.Env().RemoteHost.MustExecute("Start-MpScan -ScanType FullScan -AsJob")
 	check := s.Env().RemoteHost.
 		MustExecute("& \"C:\\Program Files\\Datadog\\Datadog Agent\\bin\\agent\\process-agent.exe\" check process --json")
-
 	assertManualProcessCheck(s.T(), check, false, "MsMpEng.exe")
 }
 
@@ -258,17 +281,19 @@ func (s *windowsTestSuite) TestManualProcessDiscoveryCheck() {
 
 func (s *windowsTestSuite) TestManualUnprotectedProcessCheckWithIO() {
 	s.UpdateEnv(awshost.Provisioner(
-		awshost.WithEC2InstanceOptions(ec2.WithOS(os.WindowsDefault)),
-		awshost.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr), agentparams.WithSystemProbeConfig(systemProbeConfigStr)),
+		awshost.WithRunOptions(
+			ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(processCheckConfigStr), agentparams.WithSystemProbeConfig(systemProbeConfigStr)),
+		),
 	))
 
-	process, cmd, err := runDiskSpd(s.T(), s.Env().RemoteHost)
+	process, cmd, comm, err := runDiskSpd(s.T(), s.Env().RemoteHost)
 	require.NoError(s.T(), err)
 
 	// Try multiple times as all the I/O data may not be available in a given instant
 	assert.EventuallyWithT(s.T(), func(c *assert.CollectT) {
 		check := s.Env().RemoteHost.
-			MustExecute("& \"C:\\Program Files\\Datadog\\Datadog Agent\\bin\\agent\\process-agent.exe\" check process --json")
+			MustExecuteOn(c, "& \"C:\\Program Files\\Datadog\\Datadog Agent\\bin\\agent\\process-agent.exe\" check process --json")
 		assertManualProcessCheck(c, check, true, process)
 
 		var checkOutput struct {
@@ -281,13 +306,70 @@ func (s *windowsTestSuite) TestManualUnprotectedProcessCheckWithIO() {
 		procs := filterProcesses(process, checkOutput.Processes)
 		require.NotEmpty(c, procs, "'%s' process not found in check:\n%s\n", process, check)
 		assertProcessCommandLineArgs(c, procs, cmd)
+		assertCommProperty(c, procs, comm)
 	}, 1*time.Minute, 5*time.Second)
+}
+
+// TODO(CXP-3410): Unskip once gRPC stream cycling after MSI reinstall is fixed.
+// See https://datadoghq.atlassian.net/browse/CXP-3410
+func (s *windowsTestSuite) TestLanguageDetectionWindows() {
+	s.T().Skip("Skipped: gRPC stream cycling after MSI reinstall prevents language data delivery (CXP-3410)")
+	t := s.T()
+
+	// Enable language detection on the agent
+	s.UpdateEnv(awshost.Provisioner(
+		awshost.WithRunOptions(
+			ec2.WithEC2InstanceOptions(ec2.WithOS(os.WindowsServerDefault)),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(languageDetectionConfigStr)),
+		),
+	))
+
+	// Start Python in a persistent SSH session so it survives across commands
+	s.Env().RemoteHost.MustExecute(`Set-Content -Path C:\sleep.py -Value "import time; time.sleep(600)"`)
+	pythonPath := `"C:\Program Files\Datadog\Datadog Agent\embedded3\python.exe" C:\sleep.py`
+	session, stdin, _, err := s.Env().RemoteHost.Start(pythonPath)
+	require.NoError(t, err, "Failed to start python")
+	t.Cleanup(func() {
+		_ = session.Close()
+		_ = stdin.Close()
+	})
+
+	// Check that any process entity has Language.Name == "python" in the core agent's workload-list.
+	type workloadProcess struct {
+		Kind     string `json:"Kind"`
+		ID       string `json:"ID"`
+		Language *struct {
+			Name string `json:"Name"`
+		} `json:"Language"`
+	}
+	type workloadResponse struct {
+		Entities map[string][]workloadProcess `json:"Entities"`
+	}
+
+	var lastOutput string
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		out := s.Env().RemoteHost.MustExecuteOn(c, `& "C:\Program Files\Datadog\Datadog Agent\bin\agent.exe" workload-list --json`)
+		lastOutput = out
+		var resp workloadResponse
+		if !assert.NoError(c, json.Unmarshal([]byte(lastOutput), &resp), "failed to parse workload-list JSON") {
+			return
+		}
+		for _, p := range resp.Entities["process"] {
+			if p.Language != nil && p.Language.Name == "python" {
+				return
+			}
+		}
+		assert.Fail(c, "no process with language=python found in workload-list")
+	}, 2*time.Minute, 5*time.Second)
+	if t.Failed() {
+		t.Logf("Last workload-list --json output:\n%s", lastOutput)
+	}
 }
 
 // Runs Diskspd in another ssh session
 // https://github.com/Microsoft/diskspd/wiki/Command-line-and-parameters
 // diskspd is an unprotected process, so we can capture the command line
-func runDiskSpd(t *testing.T, remoteHost *components.RemoteHost) (string, []string, error) {
+func runDiskSpd(t *testing.T, remoteHost *components.RemoteHost) (string, []string, string, error) {
 	// Disk speed parameters
 	// -d120: Duration of the test in seconds
 	// -c128M: Size of the test file in bytes
@@ -299,7 +381,7 @@ func runDiskSpd(t *testing.T, remoteHost *components.RemoteHost) (string, []stri
 	// -Sh: Disable both software caching and hardware write caching.
 	// -w50: Write percentage
 	cmd := []string{
-		"diskspd",
+		DiskSpdExe,
 		"-d120",
 		"-c128M",
 		"-t2",
@@ -312,7 +394,7 @@ func runDiskSpd(t *testing.T, remoteHost *components.RemoteHost) (string, []stri
 		"disk-speed-test.dat",
 	}
 	processName, err := runWindowsCommand(t, remoteHost, cmd)
-	return processName, cmd, err
+	return processName, cmd, diskspdComm, err
 }
 
 func runWindowsCommand(t *testing.T, remoteHost *components.RemoteHost, cmd []string) (string, error) {
@@ -325,5 +407,6 @@ func runWindowsCommand(t *testing.T, remoteHost *components.RemoteHost, cmd []st
 		_ = session.Close()
 		_ = stdin.Close()
 	})
-	return fmt.Sprintf("%s.exe", cmd[0]), nil
+	// Payloads use the executable file name (e.g. diskspd.exe), not the full path.
+	return filepath.Base(cmd[0]), nil
 }

@@ -8,13 +8,11 @@
 package checks
 
 import (
-	"fmt"
+	"errors"
 
 	model "github.com/DataDog/agent-payload/v5/process"
-	// difference between methods for collecting macOS platform, kernel version
-	// between shirou and Datadog psutil
-	"github.com/DataDog/gopsutil/host"
 	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/mem"
 	"golang.org/x/sys/unix"
 )
@@ -25,8 +23,7 @@ type statsProvider interface {
 
 type sysctlStatsProvider struct{}
 
-//nolint:revive // TODO(PROC) Fix revive linter
-func (_ *sysctlStatsProvider) getThreadCount() (int32, error) {
+func (*sysctlStatsProvider) getThreadCount() (int32, error) {
 	threadCount, err := unix.SysctlUint32("machdep.cpu.thread_count")
 	return int32(threadCount), err
 }
@@ -44,7 +41,7 @@ func patchCPUInfo(gopsutilCPUInfo []cpu.InfoStat) ([]cpu.InfoStat, error) {
 	physicalCoreCount := int(cpuInfo.Cores)
 	threadCount, err := macosStatsProvider.getThreadCount()
 	if err != nil {
-		return nil, fmt.Errorf("could not get thread count")
+		return nil, errors.New("could not get thread count")
 	}
 
 	cpuStat := make([]cpu.InfoStat, 0, physicalCoreCount)

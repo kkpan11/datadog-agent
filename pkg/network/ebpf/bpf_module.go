@@ -3,15 +3,15 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package ebpf
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
-
-	"golang.org/x/exp/maps"
 
 	"github.com/DataDog/datadog-agent/pkg/ebpf/bytecode"
 )
@@ -24,10 +24,10 @@ var telemetryMu sync.Mutex
 // ModuleFileName constructs the module file name based on the module name
 func ModuleFileName(moduleName string, debug bool) string {
 	if debug {
-		return fmt.Sprintf("%s-debug.o", moduleName)
+		return moduleName + "-debug.o"
 	}
 
-	return fmt.Sprintf("%s.o", moduleName)
+	return moduleName + ".o"
 }
 
 func readModule(bpfDir, moduleName string, debug bool) (bytecode.AssetReader, error) {
@@ -82,5 +82,5 @@ func GetModulesInUse() []string {
 	telemetryMu.Lock()
 	defer telemetryMu.Unlock()
 
-	return maps.Keys(prebuiltModulesInUse)
+	return slices.Collect(maps.Keys(prebuiltModulesInUse))
 }

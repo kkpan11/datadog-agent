@@ -6,18 +6,22 @@
 package checks
 
 import (
+	"crypto/tls"
 	"errors"
-	"fmt"
 	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	model "github.com/DataDog/agent-payload/v5/process"
 	"github.com/DataDog/datadog-go/v5/statsd"
+	"github.com/benbjohnson/clock"
 	"github.com/shirou/gopsutil/v4/cpu"
 
+	taggerdef "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	taggertypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
 	workloadmetacomp "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	gpusubscriber "github.com/DataDog/datadog-agent/comp/process/gpusubscriber/def"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
@@ -29,6 +33,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/process/procutil"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
 	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
+	"github.com/DataDog/datadog-agent/pkg/process/util/coreagent"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/api/client"
 	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -36,27 +41,30 @@ import (
 
 const (
 	emptyCtrID                 = ""
-	configPrefix               = "process_config."
-	configCustomSensitiveWords = configPrefix + "custom_sensitive_words"
-	configScrubArgs            = configPrefix + "scrub_args"
-	configStripProcArgs        = configPrefix + "strip_proc_arguments"
-	configDisallowList         = configPrefix + "blacklist_patterns"
-	configIgnoreZombies        = configPrefix + "ignore_zombie_processes"
+	configCustomSensitiveWords = "process_config.custom_sensitive_words"
+	configScrubArgs            = "process_config.scrub_args"
+	configStripProcArgs        = "process_config.strip_proc_arguments"
+	configDisallowList         = "process_config.blacklist_patterns"
+	configIgnoreZombies        = "process_config.ignore_zombie_processes"
 )
 
 // NewProcessCheck returns an instance of the ProcessCheck.
-func NewProcessCheck(config pkgconfigmodel.Reader, sysprobeYamlConfig pkgconfigmodel.Reader, wmeta workloadmetacomp.Component, gpuSubscriber gpusubscriber.Component, statsd statsd.ClientInterface) *ProcessCheck {
+func NewProcessCheck(config pkgconfigmodel.Reader, sysprobeYamlConfig pkgconfigmodel.Reader, wmeta workloadmetacomp.Component, gpuSubscriber gpusubscriber.Component, statsd statsd.ClientInterface, grpcServerTLSConfig *tls.Config, tagger taggerdef.Component) *ProcessCheck {
 	serviceExtractorEnabled := true
 	useWindowsServiceName := sysprobeYamlConfig.GetBool("system_probe_config.process_service_inference.use_windows_service_name")
 	useImprovedAlgorithm := sysprobeYamlConfig.GetBool("system_probe_config.process_service_inference.use_improved_algorithm")
 	check := &ProcessCheck{
-		config:           config,
-		scrubber:         procutil.NewDefaultDataScrubber(),
-		lookupIdProbe:    NewLookupIDProbe(config),
-		serviceExtractor: parser.NewServiceExtractor(serviceExtractorEnabled, useWindowsServiceName, useImprovedAlgorithm),
-		wmeta:            wmeta,
-		gpuSubscriber:    gpuSubscriber,
-		statsd:           statsd,
+		config:              config,
+		sysConfig:           sysprobeYamlConfig,
+		scrubber:            procutil.NewDefaultDataScrubber(),
+		lookupIDProbe:       NewLookupIDProbe(config),
+		serviceExtractor:    parser.NewServiceExtractor(serviceExtractorEnabled, useWindowsServiceName, useImprovedAlgorithm),
+		wmeta:               wmeta,
+		gpuSubscriber:       gpuSubscriber,
+		statsd:              statsd,
+		grpcServerTLSConfig: grpcServerTLSConfig,
+		tagger:              tagger,
+		clock:               clock.New(),
 	}
 
 	return check
@@ -73,7 +81,8 @@ const (
 // for live and running processes. The instance will store some state between
 // checks that will be used for rates, cpu calculations, etc.
 type ProcessCheck struct {
-	config pkgconfigmodel.Reader
+	config    pkgconfigmodel.Reader
+	sysConfig pkgconfigmodel.Reader
 
 	probe procutil.Probe
 	// scrubber is a DataScrubber to hide command line sensitive words
@@ -86,6 +95,7 @@ type ProcessCheck struct {
 	ignoreZombieProcesses bool
 
 	hostInfo                   *HostInfo
+	clock                      clock.Clock
 	lastCPUTime                cpu.TimesStat
 	lastProcs                  map[int32]*procutil.Process
 	lastRun                    time.Time
@@ -112,8 +122,7 @@ type ProcessCheck struct {
 	checkCount uint32
 	skipAmount uint32
 
-	//nolint:revive // TODO(PROC) Fix revive linter
-	lookupIdProbe *LookupIdProbe
+	lookupIDProbe *LookupIDProbe
 
 	extractors []metadata.Extractor
 
@@ -128,6 +137,10 @@ type ProcessCheck struct {
 	statsd         statsd.ClientInterface
 
 	gpuSubscriber gpusubscriber.Component
+
+	grpcServerTLSConfig *tls.Config
+
+	tagger taggerdef.Component
 }
 
 // Init initializes the singleton ProcessCheck.
@@ -173,12 +186,12 @@ func (p *ProcessCheck) Init(syscfg *SysProbeConfig, info *HostInfo, oneShot bool
 
 	p.extractors = append(p.extractors, p.serviceExtractor)
 
-	if !oneShot && workloadmeta.Enabled(p.config) {
+	if !oneShot && workloadmeta.Enabled(p.config) && !p.WLMProcessCollectionEnabled() {
 		p.workloadMetaExtractor = workloadmeta.GetSharedWorkloadMetaExtractor(pkgconfigsetup.SystemProbe())
 
-		// The server is only needed on the process agent
-		if !p.config.GetBool("process_config.run_in_core_agent.enabled") && flavor.GetFlavor() == flavor.ProcessAgent {
-			p.workloadMetaServer = workloadmeta.NewGRPCServer(p.config, p.workloadMetaExtractor)
+		// The server is only needed on the process agent on non-Linux platforms
+		if !coreagent.ProcessChecksRunInCoreAgent() && flavor.GetFlavor() == flavor.ProcessAgent {
+			p.workloadMetaServer = workloadmeta.NewGRPCServer(p.config, p.workloadMetaExtractor, p.grpcServerTLSConfig)
 			err = p.workloadMetaServer.Start()
 			if err != nil {
 				return log.Error("Failed to start the workloadmeta process entity gRPC server:", err)
@@ -187,16 +200,16 @@ func (p *ProcessCheck) Init(syscfg *SysProbeConfig, info *HostInfo, oneShot bool
 
 		p.extractors = append(p.extractors, p.workloadMetaExtractor)
 	}
+
 	return nil
 }
 
 // IsEnabled returns true if the check is enabled by configuration
 func (p *ProcessCheck) IsEnabled() bool {
-	if p.config.GetBool("process_config.run_in_core_agent.enabled") && flavor.GetFlavor() == flavor.ProcessAgent {
+	if coreagent.ProcessChecksRunInCoreAgent() && flavor.GetFlavor() == flavor.ProcessAgent {
 		return false
 	}
-
-	return p.config.GetBool("process_config.process_collection.enabled")
+	return isProcessCheckEnabled(p.config, p.sysConfig)
 }
 
 // SupportsRunOptions returns true if the check supports RunOptions
@@ -204,8 +217,20 @@ func (p *ProcessCheck) SupportsRunOptions() bool {
 	return true
 }
 
-// Name returns the name of the ProcessCheck.
+// Name returns the operational name of the ProcessCheck.
 func (p *ProcessCheck) Name() string { return ProcessCheckName }
+
+// StatusNames returns the user-facing names of the features using the ProcessCheck for Agent status.
+func (p *ProcessCheck) StatusNames() []string {
+	names := make([]string, 0, 2)
+	if p.config.GetBool("process_config.process_collection.enabled") {
+		names = append(names, ProcessCheckName)
+	}
+	if p.sysConfig.GetBool("discovery.enabled") {
+		names = append(names, ServiceDiscoveryCheckName)
+	}
+	return names
+}
 
 // Realtime indicates if this check only runs in real-time mode.
 func (p *ProcessCheck) Realtime() bool { return false }
@@ -230,9 +255,13 @@ func (p *ProcessCheck) run(groupID int32, collectRealTime bool) (RunResult, erro
 		return nil, errEmptyCPUTime
 	}
 
-	procs, err := p.probe.ProcessesByPID(time.Now(), true)
+	procs, err := p.processesByPID()
 	if err != nil {
 		return nil, err
+	}
+	if len(procs) == 0 {
+		log.Tracef("No processes found")
+		return CombinedRunResult{}, nil
 	}
 
 	// stores lastPIDs to be used by RTProcess
@@ -293,7 +322,7 @@ func (p *ProcessCheck) run(groupID int32, collectRealTime bool) (RunResult, erro
 
 	pidToGPUTags := p.gpuSubscriber.GetGPUTags()
 
-	procsByCtr := fmtProcesses(p.scrubber, p.disallowList, procs, p.lastProcs, pidToCid, cpuTimes[0], p.lastCPUTime, p.lastRun, p.lookupIdProbe, p.ignoreZombieProcesses, p.serviceExtractor, pidToGPUTags)
+	procsByCtr := fmtProcesses(p.scrubber, p.disallowList, procs, p.lastProcs, pidToCid, cpuTimes[0], p.lastCPUTime, p.lastRun, p.lookupIDProbe, p.ignoreZombieProcesses, p.serviceExtractor, pidToGPUTags, p.tagger, time.Now())
 	messages, totalProcs, totalContainers := createProcCtrMessages(p.hostInfo, procsByCtr, containers, p.maxBatchSize, p.maxBatchBytes, groupID, p.networkID, collectorProcHints)
 
 	// Store the last state for comparison on the next run.
@@ -310,7 +339,7 @@ func (p *ProcessCheck) run(groupID int32, collectRealTime bool) (RunResult, erro
 
 		if p.realtimeLastProcs != nil {
 			// TODO: deduplicate chunking with RT collection
-			chunkedStats := fmtProcessStats(p.maxBatchSize, stats, p.realtimeLastProcs, pidToCid, cpuTimes[0], p.realtimeLastCPUTime, p.realtimeLastRun)
+			chunkedStats := fmtProcessStats(p.maxBatchSize, stats, p.realtimeLastProcs, pidToCid, cpuTimes[0], p.realtimeLastCPUTime, p.realtimeLastRun, time.Now())
 			groupSize := len(chunkedStats)
 			chunkedCtrStats := convertAndChunkContainers(containers, groupSize)
 
@@ -335,7 +364,7 @@ func (p *ProcessCheck) run(groupID int32, collectRealTime bool) (RunResult, erro
 		p.realtimeLastRun = p.lastRun
 	}
 
-	agentNameTag := fmt.Sprintf("agent:%s", flavor.GetFlavor())
+	agentNameTag := "agent:" + flavor.GetFlavor()
 	_ = p.statsd.Gauge("datadog.process.containers.host_count", float64(totalContainers), []string{agentNameTag}, 1)
 	_ = p.statsd.Gauge("datadog.process.processes.host_count", float64(totalProcs), []string{agentNameTag}, 1)
 	log.Debugf("collected processes in %s", time.Since(start))
@@ -460,11 +489,12 @@ func fmtProcesses(
 	ctrByProc map[int]string,
 	syst2, syst1 cpu.TimesStat,
 	lastRun time.Time,
-	//nolint:revive // TODO(PROC) Fix revive linter
-	lookupIdProbe *LookupIdProbe,
+	lookupIDProbe *LookupIDProbe,
 	zombiesIgnored bool,
 	serviceExtractor *parser.ServiceExtractor,
 	pidToGPUTags map[int32][]string,
+	tagger taggerdef.Component,
+	now time.Time,
 ) map[string][]*model.Process {
 	procsByCtr := make(map[string][]*model.Process)
 
@@ -475,26 +505,43 @@ func fmtProcesses(
 
 		// Hide disallow-listed args if the Scrubber is enabled
 		fp.Cmdline = scrubber.ScrubProcessCommand(fp)
+		var voluntaryCtxSwitches, involuntaryCtxSwitches uint64
+		if fp.Stats.CtxSwitches != nil {
+			voluntaryCtxSwitches = uint64(fp.Stats.CtxSwitches.Voluntary)
+			involuntaryCtxSwitches = uint64(fp.Stats.CtxSwitches.Involuntary)
+		}
 		proc := &model.Process{
 			Pid:                    fp.Pid,
 			NsPid:                  fp.NsPid,
 			Command:                formatCommand(fp),
-			User:                   formatUser(fp, lookupIdProbe),
+			User:                   formatUser(fp, lookupIDProbe),
 			Memory:                 formatMemory(fp.Stats),
 			Cpu:                    formatCPU(fp.Stats, lastProcs[fp.Pid].Stats, syst2, syst1),
 			CreateTime:             fp.Stats.CreateTime,
 			OpenFdCount:            fp.Stats.OpenFdCount,
 			State:                  model.ProcessState(model.ProcessState_value[fp.Stats.Status]),
-			IoStat:                 formatIO(fp.Stats, lastProcs[fp.Pid].Stats.IOStat, lastRun),
-			VoluntaryCtxSwitches:   uint64(fp.Stats.CtxSwitches.Voluntary),
-			InvoluntaryCtxSwitches: uint64(fp.Stats.CtxSwitches.Involuntary),
+			IoStat:                 formatIO(fp.Stats, lastProcs[fp.Pid].Stats.IOStat, now, lastRun),
+			VoluntaryCtxSwitches:   voluntaryCtxSwitches,
+			InvoluntaryCtxSwitches: involuntaryCtxSwitches,
 			ContainerId:            ctrByProc[int(fp.Pid)],
 			ProcessContext:         serviceExtractor.GetServiceContext(fp.Pid),
+			// SERVICE DISCOVERY FIELDS
+			PortInfo:         formatPorts(fp.PortsCollected, fp.TCPPorts, fp.UDPPorts), // only populated if service discovery is enabled + linux
+			Language:         formatLanguage(fp.Language),                              // only populated if language detection is enabled + linux
+			ServiceDiscovery: formatServiceDiscovery(fp.Service),                       // only populated if service discovery is enabled + linux
+			InjectionState:   formatInjectionState(fp.InjectionState),                  // only populated if service discovery is enabled + linux
 		}
 
 		if tags, ok := pidToGPUTags[fp.Pid]; ok {
 			log.Debugf("Detected GPU, and process is in activePids, adding GPU tags to pid: %d, tags: %v", fp.Pid, tags)
 			proc.Tags = append(proc.Tags, tags...)
+		}
+
+		if tagger != nil {
+			processEntityID := taggertypes.NewEntityID(taggertypes.Process, strconv.Itoa(int(fp.Pid)))
+			if processTags, err := tagger.Tag(processEntityID, taggertypes.HighCardinality); err == nil && len(processTags) > 0 {
+				proc.Tags = append(proc.Tags, processTags...)
+			}
 		}
 
 		_, ok := procsByCtr[proc.ContainerId]
@@ -521,7 +568,7 @@ func formatCommand(fp *procutil.Process) *model.Command {
 	}
 }
 
-func formatIO(fp *procutil.Stats, lastIO *procutil.IOCountersStat, before time.Time) *model.IOStat {
+func formatIO(fp *procutil.Stats, lastIO *procutil.IOCountersStat, now time.Time, before time.Time) *model.IOStat {
 	if fp.IORateStat != nil {
 		return formatIORates(fp.IORateStat)
 	}
@@ -530,7 +577,7 @@ func formatIO(fp *procutil.Stats, lastIO *procutil.IOCountersStat, before time.T
 		return &model.IOStat{}
 	}
 
-	diff := time.Now().Unix() - before.Unix()
+	diff := now.Unix() - before.Unix()
 	if before.IsZero() || diff <= 0 {
 		return &model.IOStat{}
 	}
@@ -654,17 +701,14 @@ func mergeProcWithSysprobeStats(procs map[int32]*procutil.Process, pStats *model
 
 func initScrubber(config pkgconfigmodel.Reader, scrubber *procutil.DataScrubber) {
 	// Enable/Disable the DataScrubber to obfuscate process args
-	if config.IsSet(configScrubArgs) {
-		scrubber.Enabled = config.GetBool(configScrubArgs)
-	}
+	scrubber.Enabled = config.GetBool(configScrubArgs)
 
 	if scrubber.Enabled { // Scrubber is enabled by default when it's created
 		log.Debug("Starting process collection with Scrubber enabled")
 	}
 
 	// A custom word list to enhance the default one used by the DataScrubber
-	if config.IsSet(configCustomSensitiveWords) {
-		words := config.GetStringSlice(configCustomSensitiveWords)
+	if words := config.GetStringSlice(configCustomSensitiveWords); len(words) > 0 {
 		scrubber.AddCustomSensitiveWords(words)
 		log.Debug("Adding custom sensitives words to Scrubber:", words)
 	}
@@ -679,15 +723,13 @@ func initScrubber(config pkgconfigmodel.Reader, scrubber *procutil.DataScrubber)
 func initDisallowList(config pkgconfigmodel.Reader) []*regexp.Regexp {
 	var disallowList []*regexp.Regexp
 	// A list of regex patterns that will exclude a process if matched.
-	if config.IsSet(configDisallowList) {
-		for _, b := range config.GetStringSlice(configDisallowList) {
-			r, err := regexp.Compile(b)
-			if err != nil {
-				log.Warnf("Ignoring invalid disallow list pattern: %s", b)
-				continue
-			}
-			disallowList = append(disallowList, r)
+	for _, b := range config.GetStringSlice(configDisallowList) {
+		r, err := regexp.Compile(b)
+		if err != nil {
+			log.Warnf("Ignoring invalid disallow list pattern: %s", b)
+			continue
 		}
+		disallowList = append(disallowList, r)
 	}
 	return disallowList
 }

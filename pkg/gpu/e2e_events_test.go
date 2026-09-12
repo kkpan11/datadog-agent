@@ -7,7 +7,7 @@
 // gatherered with the event collector. They are placed in a separate file as they don't match
 // with any specific struct but are rather integration tests for the consumer and stats generator.
 
-//go:build linux_bpf && nvml
+//go:build linux && bpf && nvml
 
 package gpu
 
@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-agent/pkg/gpu/config"
-	ddnvml "github.com/DataDog/datadog-agent/pkg/gpu/safenvml"
+	"github.com/DataDog/datadog-agent/pkg/gpu/ebpf"
 	nvmltestutil "github.com/DataDog/datadog-agent/pkg/gpu/safenvml/testutil"
 	"github.com/DataDog/datadog-agent/pkg/gpu/testutil"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
@@ -45,7 +45,7 @@ func injectEventsToConsumer(tb testing.TB, consumer *cudaEventConsumer, events *
 func TestPytorchBatchedKernels(t *testing.T) {
 	cfg := config.New()
 	telemetryMock := testutil.GetTelemetryMock(t)
-	ddnvml.WithMockNVML(t, testutil.GetBasicNvmlMockWithOptions(testutil.WithMIGDisabled()))
+	nvmlMock := nvmltestutil.SetupMockNVML(t)
 	ctx, err := getSystemContext(
 		withProcRoot(kernel.ProcFSRoot()),
 		withWorkloadMeta(testutil.GetWorkloadMetaMock(t)),
@@ -53,25 +53,33 @@ func TestPytorchBatchedKernels(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	handlers := newStreamCollection(ctx, telemetryMock, cfg)
-	consumer := newCudaEventConsumer(ctx, handlers, nil, cfg, telemetryMock)
-	require.NotNil(t, consumer)
-
 	events := testutil.GetGPUTestEvents(t, testutil.DataSamplePytorchBatchedKernels)
+
+	// Have generous limits to avoid any eviction/rejection of data, as we're just testing without
+	// actually having the consumers running.
+	cfg.StreamConfig.MaxKernelLaunches = len(events.Events)
+	cfg.StreamConfig.MaxMemAllocEvents = len(events.Events)
+	cfg.StreamConfig.MaxPendingKernelSpans = len(events.Events)
+	cfg.StreamConfig.MaxPendingMemorySpans = len(events.Events)
+	cfg.StreamConfig.MaxActiveStreams = 1000
+
+	handlers := newStreamCollection(ctx, telemetryMock, cfg)
+	consumer := newTestCudaEventConsumer(t, ctx, cfg, handlers, withTelemetryMock(telemetryMock))
+	require.NotNil(t, consumer)
 
 	// Setup the visibleDevicesCache so that we don't get warnings
 	// about missing devices
 	executingPID := testutil.DataSampleInfos[testutil.DataSamplePytorchBatchedKernels].ActivePID
-	ctx.visibleDevicesCache[executingPID] = nvmltestutil.GetDDNVMLMocksWithIndexes(t, 0, 1)
+	ctx.visibleDevicesCache[executingPID] = nvmltestutil.PhysicalDevices(t, nvmlMock, 0, 1)
 
 	injectEventsToConsumer(t, consumer, events, 0)
 
 	// Check that the consumer has the expected number of streams
-	require.Equal(t, 1, handlers.streamCount())
+	require.Equal(t, 1, handlers.allStreamsCount())
 
 	telemetryMetrics, err := telemetryMock.GetCountMetric("gpu__consumer", "events")
 	require.NoError(t, err)
-	require.Equal(t, 4, len(telemetryMetrics)) // one for each event type
+	require.Equal(t, int(ebpf.CudaEventTypeCount), len(telemetryMetrics)) // one for each event type
 	expectedEventsByType := testutil.DataSampleInfos[testutil.DataSamplePytorchBatchedKernels].EventByType
 	for _, metric := range telemetryMetrics {
 		eventTypeTag := metric.Tags()["event_type"]
@@ -82,7 +90,7 @@ func TestPytorchBatchedKernels(t *testing.T) {
 	// Check the state of those streams. As there's only one we can just get it
 	// by iterating over the map
 	var stream *StreamHandler
-	for s := range handlers.allStreams() {
+	for _, s := range handlers.allStreams() {
 		require.Nil(t, stream) // There should be only one stream, so it should be set to nil at this point
 		stream = s
 	}
@@ -92,17 +100,36 @@ func TestPytorchBatchedKernels(t *testing.T) {
 	// and then a batch of synchronizations.
 
 	require.NotNil(t, stream)
-	require.Len(t, stream.kernelSpans, 10)                             // There are 10 uninterrupted sequences of kernel launches
 	require.Len(t, stream.kernelLaunches, 0)                           // And we should have no kernel launches in the stream pending
+	require.Len(t, stream.pendingKernelSpans, 10)                      // There are 10 uninterrupted sequences of kernel launches
 	require.Equal(t, stream.metadata.gpuUUID, testutil.DefaultGpuUUID) // Ensure the metadata is set correctly
 	require.Equal(t, stream.metadata.pid, uint32(executingPID))
 
 	totalThreadSeconds := 0.0
 	activeSeconds := 0.0
 
-	for _, span := range stream.kernelSpans {
+	// Get all the kernel spans in the channel, keep them in a slice
+	// and resend them to the channel later so that we can check that the stats generator
+	// is able to process them correctly.
+	kernelSpans := make([]*kernelSpan, 0, len(stream.pendingKernelSpans))
+loop:
+	for {
+		select {
+		case span := <-stream.pendingKernelSpans:
+			kernelSpans = append(kernelSpans, span)
+		default:
+			break loop
+		}
+	}
+
+	for _, span := range kernelSpans {
 		totalThreadSeconds += float64(span.avgThreadCount) * float64(span.endKtime-span.startKtime) / 1e9
 		activeSeconds += float64(span.endKtime-span.startKtime) / 1e9
+	}
+
+	// Re-feed the kernel spans to the stream
+	for _, span := range kernelSpans {
+		stream.pendingKernelSpans <- span
 	}
 
 	// Manually calculated
@@ -116,8 +143,8 @@ func TestPytorchBatchedKernels(t *testing.T) {
 	endTs := events.Events[len(events.Events)-1].Header.Ktime_ns
 	firstSyncAfterLastKernelLaunchTs := events.Events[866].Header.Ktime_ns
 
-	firstSpanStart := stream.kernelSpans[0].startKtime
-	lastSpanEnd := stream.kernelSpans[len(stream.kernelSpans)-1].endKtime
+	firstSpanStart := kernelSpans[0].startKtime
+	lastSpanEnd := kernelSpans[len(kernelSpans)-1].endKtime
 
 	require.Equal(t, firstSpanStart, startTs)
 	require.Equal(t, lastSpanEnd, firstSyncAfterLastKernelLaunchTs)
@@ -125,7 +152,7 @@ func TestPytorchBatchedKernels(t *testing.T) {
 
 	// Now let's check the stats generator and see the output
 	statsGen, _, _ := getStatsGeneratorForTest(t)
-	statsGen.streamHandlers = consumer.streamHandlers // Replace the streamHandlers with the ones from the consumer
+	statsGen.streamHandlers = consumer.deps.streamHandlers // Replace the streamHandlers with the ones from the consumer
 
 	// Tell the generator the last generation time is before the start of our first event
 	statsGen.lastGenerationKTime = int64(startTs - 1)
@@ -135,9 +162,9 @@ func TestPytorchBatchedKernels(t *testing.T) {
 	stats, err := statsGen.getStats(int64(endTs + 1))
 	require.NoError(t, err)
 	require.NotNil(t, stats)
-	require.Len(t, stats.Metrics, 1)
+	require.Len(t, stats.ProcessMetrics, 1)
 
-	metrics := stats.Metrics[0]
+	metrics := stats.ProcessMetrics[0]
 
 	require.Equal(t, metrics.Key.PID, uint32(executingPID))
 

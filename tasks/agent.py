@@ -2,7 +2,6 @@
 Agent namespaced tasks
 """
 
-import ast
 import glob
 import os
 import platform
@@ -14,26 +13,37 @@ import tempfile
 from invoke import task
 from invoke.exceptions import Exit
 
-from tasks.build_tags import filter_incompatible_tags, get_build_tags, get_default_build_tags
+from tasks import core_checks, doc
+from tasks.build_tags import (
+    AGENT_TAGS,
+    COMMON_TAGS,
+    compute_build_tags_for_flavor,
+    get_default_build_tags,
+)
 from tasks.devcontainer import run_on_devcontainer
 from tasks.flavor import AgentFlavor
 from tasks.gointegrationtest import (
     CORE_AGENT_WINDOWS_IT_CONF,
     containerized_integration_tests,
 )
+from tasks.libs.build.bazel import bazel, build_binary_with_bazel
+from tasks.libs.common.constants import CONTAINER_PLATFORM_MAPPING
+from tasks.libs.common.go import go_build
 from tasks.libs.common.utils import (
     REPO_PATH,
+    _resolve_target_platform,
     bin_name,
     get_build_flags,
-    get_embedded_path,
-    get_goenv,
     get_version,
     gitlab_section,
 )
 from tasks.libs.releasing.version import create_version_json
 from tasks.rtloader import clean as rtloader_clean
 from tasks.rtloader import install as rtloader_install
+from tasks.rtloader import install_with_bazel as rtloader_install_with_bazel
 from tasks.rtloader import make as rtloader_make
+from tasks.schema.generate import compress as schema_compress
+from tasks.schema.template import CORE_SCHEMA_FILE, SYSPROBE_SCHEMA_FILE, generate_template
 from tasks.windows_resources import build_messagetable, build_rc, versioninfo_vars
 
 # constants
@@ -41,88 +51,8 @@ BIN_DIR = os.path.join(".", "bin")
 BIN_PATH = os.path.join(BIN_DIR, "agent")
 AGENT_TAG = "datadog/agent:master"
 
-if sys.platform == "win32":
-    # Our `ridk enable` toolchain puts Ruby's bin dir at the front of the PATH
-    # This dir contains `aws.rb` which will execute if we just call `aws`,
-    # so we need to be explicit about the executable extension/path
-    # NOTE: awscli seems to have a bug where running "aws.cmd", quoted, without a full path,
-    #       causes it to fail due to not searching the PATH.
-    # NOTE: The full path to `aws.cmd` is likely to contain spaces, so if the full path is
-    #       used instead, it must be quoted when passed to ctx.run.
-    # This unfortunately means that the quoting requirements are different if you use
-    # the full path or just the filename.
-    # aws.cmd -> awscli v1 from Python env
-    AWS_CMD = "aws.cmd"
-    # TODO: can we use use `aws.exe` from AWSCLIv2? E2E expects v2.
-else:
-    AWS_CMD = "aws"
 
-AGENT_CORECHECKS = [
-    "container",
-    "containerd",
-    "container_image",
-    "container_lifecycle",
-    "cpu",
-    "cri",
-    "snmp",
-    "docker",
-    "file_handle",
-    "go_expvar",
-    "io",
-    "jmx",
-    "kubernetes_apiserver",
-    "load",
-    "memory",
-    "ntp",
-    "oom_kill",
-    "oracle",
-    "oracle-dbm",
-    "sbom",
-    "systemd",
-    "tcp_queue_length",
-    "uptime",
-    "jetson",
-    "telemetry",
-    "orchestrator_pod",
-    "orchestrator_ecs",
-    "cisco_sdwan",
-    "network_path",
-    "service_discovery",
-    "gpu",
-    "wlan",
-]
-
-WINDOWS_CORECHECKS = [
-    "agentcrashdetect",
-    "sbom",
-    "windows_registry",
-    "winkmem",
-    "wincrashdetect",
-    "windows_certificate",
-    "winproc",
-    "win32_event_log",
-]
-
-IOT_AGENT_CORECHECKS = [
-    "cpu",
-    "disk",
-    "io",
-    "load",
-    "memory",
-    "network",
-    "ntp",
-    "uptime",
-    "systemd",
-    "jetson",
-]
-
-CACHED_WHEEL_FILENAME_PATTERN = "datadog_{integration}-*.whl"
-CACHED_WHEEL_DIRECTORY_PATTERN = "integration-wheels/{branch}/{hash}/{python_version}/"
-CACHED_WHEEL_FULL_PATH_PATTERN = CACHED_WHEEL_DIRECTORY_PATTERN + CACHED_WHEEL_FILENAME_PATTERN
-LAST_DIRECTORY_COMMIT_PATTERN = "git -C {integrations_dir} rev-list -1 HEAD {integration}"
-
-
-@task(iterable=['bundle'])
+@task
 @run_on_devcontainer
 def build(
     ctx,
@@ -137,37 +67,102 @@ def build(
     embedded_path=None,
     rtloader_root=None,
     python_home_3=None,
-    major_version='7',
     exclude_rtloader=False,
-    include_sds=False,
     go_mod="readonly",
     windows_sysprobe=False,
     cmake_options='',
-    bundle=None,
-    bundle_ebpf=False,
     agent_bin=None,
     run_on=None,  # noqa: U100, F841. Used by the run_on_devcontainer decorator
     glibc=True,
+    legacy_rtloader_cmake=False,
+    enable_bazel=False,
 ):
     """
     Build the agent. If the bits to include in the build are not specified,
     the values from `invoke.yaml` will be used.
 
+    Bazel-backed rtloader install is used by default. Pass
+    `--legacy-rtloader-cmake` to use the old CMake path instead (needed e.g.
+    for a custom cmake_options override, see hacky_dev_image_build).
+
+    Pass `--enable-bazel` to compile the cmd/agent Go binary via
+    `bazel build //cmd/agent` instead of `go build`. This is for local
+    developer-desktop use only: it only supports the base flavor, no --race,
+    no --build-include/--build-exclude/--no-glibc, and is not supported when
+    targeting Windows.
+
     Example invokation:
         dda inv agent.build --build-exclude=systemd
     """
     flavor = AgentFlavor[flavor]
+    target_platform = _resolve_target_platform()
 
-    if flavor.is_ot():
-        # for agent build purposes the UA agent is just like base
-        flavor = AgentFlavor.base
-
-    if not exclude_rtloader and not flavor.is_iot():
-        # If embedded_path is set, we should give it to rtloader as it should install the headers/libs
-        # in the embedded path folder because that's what is used in get_build_flags()
+    if not exclude_rtloader and not flavor.is_iot() and target_platform != "aix":
+        # On AIX, rtloader is built natively in advance as a prerequisite.
         with gitlab_section("Install embedded rtloader", collapsed=True):
-            rtloader_make(ctx, install_prefix=embedded_path, cmake_options=cmake_options)
-            rtloader_install(ctx)
+            if legacy_rtloader_cmake:
+                rtloader_make(ctx, install_prefix=embedded_path, cmake_options=cmake_options)
+                rtloader_install(ctx)
+            else:
+                bazel_embedded = rtloader_install_with_bazel(ctx)
+                embedded_path = bazel_embedded
+                python_home_3 = bazel_embedded
+
+    if flavor.is_iot():
+        # Iot mode overrides whatever passed through `--build-exclude` and `--build-include`
+        build_tags = get_default_build_tags(build="agent", flavor=flavor)
+    else:
+        build_tags = compute_build_tags_for_flavor(
+            build="agent",
+            flavor=flavor,
+            build_include=build_include,
+            build_exclude=build_exclude,
+            platform=target_platform,
+        )
+
+    if not glibc:
+        build_tags = list(set(build_tags).difference({"nvml"}))
+
+    if enable_bazel:
+        if exclude_rtloader:
+            raise Exit(
+                "--enable-bazel requires rtloader to be installed (it needs embedded_path to "
+                "patch the built binary's RPATH). Drop --enable-bazel or --exclude-rtloader.",
+                code=1,
+            )
+        if target_platform == "win32":
+            raise Exit(
+                "--enable-bazel is not supported when targeting Windows yet "
+                "(cmd/agent's Bazel PDB/resource-embedding path is unvalidated). "
+                "Drop --enable-bazel, or unset GOOS=windows, to use the legacy go-build path.",
+                code=1,
+            )
+        if flavor != AgentFlavor.base:
+            raise Exit(
+                f"--enable-bazel only supports the '{AgentFlavor.base.name}' flavor today "
+                f"(no cmd/agent Bazel consumer wired up for '{flavor.name}' in agent.build). "
+                "Drop --enable-bazel for this flavor.",
+                code=1,
+            )
+        if race:
+            raise Exit(
+                "--enable-bazel does not support --race yet (the //cmd/agent Bazel target "
+                "has no race-mode parameterization). Drop --enable-bazel or --race.",
+                code=1,
+            )
+        # //cmd/agent's Bazel target has a static gotags set (AGENT_TAGS | COMMON_TAGS,
+        # see cmd/agent/BUILD.bazel and bazel/rules/go/go_binary.bzl). This is exactly
+        # what build_tags computes above with no --build-include/--build-exclude/--no-glibc
+        # customization, so comparing the two catches any such customization without
+        # hand-duplicating a parallel "which flags are supported" list.
+        if set(build_tags) != AGENT_TAGS | COMMON_TAGS:
+            raise Exit(
+                "--enable-bazel requires the default agent build-tag set (no --build-include, "
+                "--build-exclude, or --no-glibc). Requested tags differ from //cmd/agent's "
+                f"static Bazel gotags by: {sorted(set(build_tags) ^ (AGENT_TAGS | COMMON_TAGS))}. "
+                "Drop --enable-bazel for this combination.",
+                code=1,
+            )
 
     ldflags, gcflags, env = get_build_flags(
         ctx,
@@ -175,11 +170,11 @@ def build(
         embedded_path=embedded_path,
         rtloader_root=rtloader_root,
         python_home_3=python_home_3,
-        major_version=major_version,
+        include_python="python" in build_tags,
+        platform=target_platform,
     )
 
-    bundled_agents = ["agent"]
-    if sys.platform == 'win32' or os.getenv("GOOS") == "windows":
+    if target_platform == 'win32':
         # Important for x-compiling
         env["CGO_ENABLED"] = "1"
 
@@ -187,85 +182,43 @@ def build(
         # Do not call build_rc when cross-compiling on Linux as the intend is more
         # to streamline the development process that producing a working executable / installer
         if sys.platform == 'win32':
-            vars = versioninfo_vars(ctx, major_version=major_version)
+            vars = versioninfo_vars(ctx)
             build_rc(
                 ctx,
                 "cmd/agent/windows_resources/agent.rc",
                 vars=vars,
                 out="cmd/agent/rsrc.syso",
             )
-    else:
-        bundled_agents += bundle or []
-
-    if flavor.is_iot():
-        # Iot mode overrides whatever passed through `--build-exclude` and `--build-include`
-        build_tags = get_default_build_tags(build="agent", flavor=flavor)
-    else:
-        all_tags = set()
-        if bundle_ebpf and "system-probe" in bundled_agents:
-            all_tags.add("ebpf_bindata")
-
-        for build in bundled_agents:
-            all_tags.add("bundle_" + build.replace("-", "_"))
-            include_tags = (
-                get_default_build_tags(build=build, flavor=flavor)
-                if build_include is None
-                else filter_incompatible_tags(build_include.split(","))
-            )
-
-            exclude_tags = [] if build_exclude is None else build_exclude.split(",")
-            build_tags = get_build_tags(include_tags, exclude_tags)
-
-            all_tags |= set(build_tags)
-        build_tags = list(all_tags)
-
-    if not glibc:
-        build_tags = list(set(build_tags).difference({"nvml"}))
-
-    cmd = "go build -mod={go_mod} {race_opt} {build_type} -tags \"{go_build_tags}\" "
 
     if not agent_bin:
         agent_bin = os.path.join(BIN_PATH, bin_name("agent"))
 
-    if include_sds:
-        build_tags.append("sds")
+    flavor_cmd = "iot-agent" if flavor.is_iot() else "agent"
 
-    cmd += "-o {agent_bin} -gcflags=\"{gcflags}\" -ldflags=\"{ldflags}\" {REPO_PATH}/cmd/{flavor}"
-    args = {
-        "go_mod": go_mod,
-        "race_opt": "-race" if race else "",
-        "build_type": "-a" if rebuild else "",
-        "go_build_tags": " ".join(build_tags),
-        "agent_bin": agent_bin,
-        "gcflags": gcflags,
-        "ldflags": ldflags,
-        "REPO_PATH": REPO_PATH,
-        "flavor": "iot-agent" if flavor.is_iot() else "agent",
-    }
+    schema_compress(ctx)
+
     with gitlab_section("Build agent", collapsed=True):
-        ctx.run(cmd.format(**args), env=env)
-
-    if embedded_path is None:
-        embedded_path = get_embedded_path(ctx)
-        assert embedded_path, "Failed to find embedded path"
-
-    for build in bundled_agents:
-        if build == "agent":
-            continue
-
-        bundled_agent_dir = os.path.join(BIN_DIR, build)
-        bundled_agent_bin = os.path.join(bundled_agent_dir, bin_name(build))
-        agent_fullpath = os.path.normpath(os.path.join(embedded_path, "..", "bin", "agent", bin_name("agent")))
-
-        if not os.path.exists(os.path.dirname(bundled_agent_bin)):
-            os.mkdir(os.path.dirname(bundled_agent_bin))
-
-        create_launcher(ctx, build, agent_fullpath, bundled_agent_bin)
+        if enable_bazel:
+            build_binary_with_bazel(f"//cmd/{flavor_cmd}", bin_path=agent_bin, embedded_path=embedded_path)
+        else:
+            go_build(
+                ctx,
+                f"{REPO_PATH}/cmd/{flavor_cmd}",
+                mod=go_mod,
+                env=env,
+                bin_path=agent_bin,
+                race=race,
+                rebuild=rebuild,
+                gcflags=gcflags,
+                ldflags=ldflags,
+                build_tags=build_tags,
+                check_deadcode=os.getenv("DEPLOY_AGENT") == "true",
+                coverage=os.getenv("E2E_COVERAGE_PIPELINE") == "true",
+            )
 
     with gitlab_section("Generate configuration files", collapsed=True):
-        render_config(
+        generate_config_examples(
             ctx,
-            env=env,
             flavor=flavor,
             skip_assets=skip_assets,
             build_tags=build_tags,
@@ -274,38 +227,22 @@ def build(
         )
 
 
-def create_launcher(ctx, agent, src, dst):
-    cc = get_goenv(ctx, "CC")
-    if not cc:
-        print("Failed to find C compiler")
-        raise Exit(code=1)
-
-    cmd = "{cc} -DDD_AGENT_PATH='\"{agent_bin}\"' -DDD_AGENT='\"{agent}\"' -o {launcher_bin} ./cmd/agent/launcher/launcher.c"
-    args = {
-        "cc": cc,
-        "agent": agent,
-        "agent_bin": src,
-        "launcher_bin": dst,
-    }
-    ctx.run(cmd.format(**args))
+_PLATFORM_TO_OS_TARGET = {
+    "linux": "linux",
+    "win32": "windows",
+    "darwin": "darwin",
+    "aix": "aix",
+}
 
 
-def render_config(ctx, env, flavor, skip_assets, build_tags, development, windows_sysprobe):
-    # Remove cross-compiling bits to render config
-    env.update({"GOOS": "", "GOARCH": ""})
+def generate_config_examples(ctx, flavor, skip_assets, build_tags, development, windows_sysprobe):
+    os_target = _PLATFORM_TO_OS_TARGET[sys.platform]
 
-    # Render the Agent configuration file template
-    build_type = "agent-py3"
-    if flavor.is_iot():
-        build_type = "iot-agent"
+    build_type = "iot-agent" if flavor.is_iot() else "datadog-agent"
+    generate_template(CORE_SCHEMA_FILE, "./cmd/agent/dist/datadog.yaml", build_type, os_target)
 
-    generate_config(ctx, build_type=build_type, output_file="./cmd/agent/dist/datadog.yaml", env=env)
-
-    # On Linux and MacOS, render the system-probe configuration file template
     if sys.platform != 'win32' or windows_sysprobe:
-        generate_config(ctx, build_type="system-probe", output_file="./cmd/agent/dist/system-probe.yaml", env=env)
-
-    generate_config(ctx, build_type="security-agent", output_file="./cmd/agent/dist/security-agent.yaml", env=env)
+        generate_template(SYSPROBE_SCHEMA_FILE, "./cmd/agent/dist/system-probe.yaml", "system-probe", os_target)
 
     if not skip_assets:
         refresh_assets(ctx, build_tags, development=development, flavor=flavor.name, windows_sysprobe=windows_sysprobe)
@@ -317,9 +254,8 @@ def refresh_assets(_, build_tags, development=True, flavor=AgentFlavor.base.name
     Clean up and refresh Collector's assets and config files
     """
     flavor = AgentFlavor[flavor]
-    # ensure BIN_PATH exists
-    if not os.path.exists(BIN_PATH):
-        os.mkdir(BIN_PATH)
+    # ensure BIN_PATH exists (makedirs handles missing parents, e.g. on AIX build hosts)
+    os.makedirs(BIN_PATH, exist_ok=True)
 
     dist_folder = os.path.join(BIN_PATH, "dist")
     if os.path.exists(dist_folder):
@@ -327,8 +263,18 @@ def refresh_assets(_, build_tags, development=True, flavor=AgentFlavor.base.name
     os.mkdir(dist_folder)
 
     if "python" in build_tags:
-        shutil.copytree("./cmd/agent/dist/checks/", os.path.join(dist_folder, "checks"), dirs_exist_ok=True)
-        shutil.copytree("./cmd/agent/dist/utils/", os.path.join(dist_folder, "utils"), dirs_exist_ok=True)
+        shutil.copytree(
+            "./cmd/agent/dist/checks/",
+            os.path.join(dist_folder, "checks"),
+            ignore=shutil.ignore_patterns("BUILD.bazel"),
+            dirs_exist_ok=True,
+        )
+        shutil.copytree(
+            "./cmd/agent/dist/utils/",
+            os.path.join(dist_folder, "utils"),
+            ignore=shutil.ignore_patterns("BUILD.bazel"),
+            dirs_exist_ok=True,
+        )
         shutil.copy("./cmd/agent/dist/config.py", os.path.join(dist_folder, "config.py"))
     if not flavor.is_iot():
         shutil.copy("./cmd/agent/dist/dd-agent", os.path.join(dist_folder, "dd-agent"))
@@ -341,31 +287,61 @@ def refresh_assets(_, build_tags, development=True, flavor=AgentFlavor.base.name
         shutil.copy("./cmd/agent/dist/system-probe.yaml", os.path.join(dist_folder, "system-probe.yaml"))
     shutil.copy("./cmd/agent/dist/datadog.yaml", os.path.join(dist_folder, "datadog.yaml"))
 
-    shutil.copy("./cmd/agent/dist/security-agent.yaml", os.path.join(dist_folder, "security-agent.yaml"))
-
-    for check in AGENT_CORECHECKS if not flavor.is_iot() else IOT_AGENT_CORECHECKS:
+    if sys.platform.startswith('aix'):
+        checks_to_copy = core_checks.AIX_CORECHECKS
+    elif flavor.is_iot():
+        checks_to_copy = core_checks.IOT_AGENT_CORECHECKS
+    else:
+        checks_to_copy = core_checks.AGENT_CORECHECKS
+    for check in checks_to_copy:
         check_dir = os.path.join(dist_folder, f"conf.d/{check}.d/")
-        shutil.copytree(f"./cmd/agent/dist/conf.d/{check}.d/", check_dir, dirs_exist_ok=True)
+        shutil.copytree(
+            f"./cmd/agent/dist/conf.d/{check}.d/",
+            check_dir,
+            ignore=shutil.ignore_patterns("BUILD.bazel"),
+            dirs_exist_ok=True,
+        )
         # Ensure the config folders are not world writable
         os.chmod(check_dir, mode=0o755)
 
     # add additional windows-only corechecks, only on windows. Otherwise the check loader
     # on linux will throw an error because the module is not found, but the config is.
     if sys.platform == 'win32':
-        for check in WINDOWS_CORECHECKS:
+        for check in core_checks.WINDOWS_CORECHECKS:
             check_dir = os.path.join(dist_folder, f"conf.d/{check}.d/")
-            shutil.copytree(f"./cmd/agent/dist/conf.d/{check}.d/", check_dir, dirs_exist_ok=True)
+            shutil.copytree(
+                f"./cmd/agent/dist/conf.d/{check}.d/",
+                check_dir,
+                ignore=shutil.ignore_patterns("BUILD.bazel"),
+                dirs_exist_ok=True,
+            )
 
+    # add additional macos-only corechecks, only on macos
     if sys.platform == 'darwin':
+        for check in core_checks.MACOS_CORECHECKS:
+            check_dir = os.path.join(dist_folder, f"conf.d/{check}.d/")
+            shutil.copytree(
+                f"./cmd/agent/dist/conf.d/{check}.d/",
+                check_dir,
+                ignore=shutil.ignore_patterns("BUILD.bazel"),
+                dirs_exist_ok=True,
+            )
+            # Ensure the config folders are not world writable
+            os.chmod(check_dir, mode=0o755)
         shutil.copy("./cmd/agent/dist/conf.d/apm.yaml.default", os.path.join(dist_folder, "conf.d/apm.yaml.default"))
         shutil.copy(
             "./cmd/agent/dist/conf.d/process_agent.yaml.default",
             os.path.join(dist_folder, "conf.d/process_agent.yaml.default"),
         )
 
-    shutil.copytree("./comp/core/gui/guiimpl/views/private", os.path.join(dist_folder, "views"), dirs_exist_ok=True)
+    shutil.copytree(
+        "./comp/core/gui/impl/views/private",
+        os.path.join(dist_folder, "views"),
+        ignore=shutil.ignore_patterns("BUILD.bazel"),
+        dirs_exist_ok=True,
+    )
     if development:
-        shutil.copytree("./dev/dist/", dist_folder, dirs_exist_ok=True)
+        shutil.copytree("./dev/dist/", dist_folder, ignore=shutil.ignore_patterns("BUILD.bazel"), dirs_exist_ok=True)
 
 
 @task
@@ -378,6 +354,7 @@ def run(
     flavor=AgentFlavor.base.name,
     skip_build=False,
     config_path=None,
+    legacy_rtloader_cmake=False,
 ):
     """
     Execute the agent binary.
@@ -386,7 +363,7 @@ def run(
     passed. It accepts the same set of options as agent.build.
     """
     if not skip_build:
-        build(ctx, rebuild, race, build_include, build_exclude, flavor)
+        build(ctx, rebuild, race, build_include, build_exclude, flavor, legacy_rtloader_cmake=legacy_rtloader_cmake)
 
     agent_bin = os.path.join(BIN_PATH, bin_name("agent"))
     config_path = os.path.join(BIN_PATH, "dist", "datadog.yaml") if not config_path else config_path
@@ -454,24 +431,57 @@ def image_build(ctx, arch='amd64', base_dir="omnibus", skip_tests=False, tag=Non
     ctx.run(f"rm {build_context}/{deb_glob}")
 
 
-@task
+@task(
+    help={
+        "base_image": doc.base_image,
+        "target_image": doc.target_image,
+        "process_agent": doc.process_agent,
+        "trace_agent": doc.trace_agent,
+        "system_probe": doc.system_probe,
+        "security_agent": doc.security_agent,
+        "trace_loader": doc.trace_loader,
+        "privateactionrunner": doc.privateactionrunner,
+        "push": doc.push,
+        "race": doc.race,
+        "signed_pull": doc.signed_pull,
+        "arch": doc.arch,
+        "development": doc.development,
+    }
+)
 def hacky_dev_image_build(
     ctx,
     base_image=None,
     target_image="agent",
     process_agent=False,
     trace_agent=False,
+    system_probe=False,
+    security_agent=False,
+    trace_loader=False,
+    privateactionrunner=False,
     push=False,
     race=False,
     signed_pull=False,
+    arch=None,
+    development=True,
+    build_exclude=None,
 ):
+    """
+    Builds the agent or cluster-agent Docker image.
+    """
+    if arch is None:
+        arch = CONTAINER_PLATFORM_MAPPING.get(platform.machine().lower())
+
+    if arch is None:
+        print("Unable to determine architecture to build, please set `arch`", file=sys.stderr)
+        raise Exit(code=1)
+
     if base_image is None:
         import requests
         import semver
 
         # Try to guess what is the latest release of the agent
         latest_release = semver.VersionInfo(0)
-        tags = requests.get("https://gcr.io/v2/datadoghq/agent/tags/list")
+        tags = requests.get("https://registry.datadoghq.com/v2/agent/tags/list", timeout=10)
         for tag in tags.json()['tags']:
             if not semver.VersionInfo.isvalid(tag):
                 continue
@@ -480,38 +490,117 @@ def hacky_dev_image_build(
                 continue
             if ver > latest_release:
                 latest_release = ver
-        base_image = f"gcr.io/datadoghq/agent:{latest_release}"
+        base_image = f"registry.datadoghq.com/agent:{latest_release}"
 
     # Extract the python library of the docker image
     with tempfile.TemporaryDirectory() as extracted_python_dir:
         ctx.run(
-            f"docker run --rm '{base_image}' bash -c 'tar --create /opt/datadog-agent/embedded/{{bin,lib,include}}/*python*' | tar --directory '{extracted_python_dir}' --extract"
+            f"docker run --platform linux/{arch} --rm '{base_image}' bash -c 'tar --create /opt/datadog-agent/embedded/{{bin,lib,include}}/*python*' | tar --directory '{extracted_python_dir}' --extract"
         )
 
-        os.environ["DELVE"] = "1"
+        if development:
+            os.environ["DELVE"] = "1"
         os.environ["LD_LIBRARY_PATH"] = (
             os.environ.get("LD_LIBRARY_PATH", "") + f":{extracted_python_dir}/opt/datadog-agent/embedded/lib"
         )
         build(
             ctx,
             race=race,
+            development=development,
+            build_exclude=build_exclude,
             cmake_options=f'-DPython3_ROOT_DIR={extracted_python_dir}/opt/datadog-agent/embedded -DPython3_FIND_STRATEGY=LOCATION',
+            # TODO: this is the last usage of this flag, we should remove it once this
+            # task has been deprecated long enough
+            legacy_rtloader_cmake=True,
         )
         ctx.run(
             f'perl -0777 -pe \'s|{extracted_python_dir}(/opt/datadog-agent/embedded/lib/python\\d+\\.\\d+/../..)|substr $1."\\0"x length$&,0,length$&|e or die "pattern not found"\' -i dev/lib/libdatadog-agent-three.so'
         )
 
+    copy_checks_d = ""
+    copy_checks_d_final = ""
+    if sys.platform.startswith("linux"):
+        # Stage the enabled Rust shared-library checks via Bazel (single source
+        # of truth: ENABLED_CHECKS in the rustchecks BUILD.bazel). The `:install`
+        # target lays each cdylib into <destdir>/checks.d with 0500 perms.
+        checks_d_staging = "bin/agent/dist/checks.d"
+        bazel("run", "//pkg/collector/sharedlibrary/rustchecks:install", "--", "--destdir=bin/agent/dist")
+        if os.path.isdir(checks_d_staging) and any(
+            f.startswith("libdatadog-agent-") for f in os.listdir(checks_d_staging)
+        ):
+            copy_checks_d = f"COPY {checks_d_staging} /etc/datadog-agent/checks.d\n"
+            copy_checks_d_final = "COPY --from=bin /etc/datadog-agent/checks.d /etc/datadog-agent/checks.d\n"
+
     copy_extra_agents = ""
+    if security_agent:
+        from tasks.security_agent import build as security_agent_build
+
+        security_agent_build(ctx, [""])
+        copy_extra_agents += "COPY bin/security-agent/security-agent /opt/datadog-agent/embedded/bin/security-agent\n"
+
     if process_agent:
         from tasks.process_agent import build as process_agent_build
 
         process_agent_build(ctx)
         copy_extra_agents += "COPY bin/process-agent/process-agent /opt/datadog-agent/embedded/bin/process-agent\n"
+
     if trace_agent:
         from tasks.trace_agent import build as trace_agent_build
 
         trace_agent_build(ctx)
         copy_extra_agents += "COPY bin/trace-agent/trace-agent /opt/datadog-agent/embedded/bin/trace-agent\n"
+
+    if trace_loader:
+        from tasks.loader import build as trace_loader_build
+
+        trace_loader_build(ctx)
+        copy_extra_agents += "COPY bin/trace-loader/trace-loader /opt/datadog-agent/embedded/bin/trace-loader\n"
+
+    if privateactionrunner:
+        from tasks.privateactionrunner import build as privateactionrunner_build
+
+        privateactionrunner_build(ctx)
+        bazel(
+            "run",
+            "//pkg/privateactionrunner/par-control:install",
+            "--",
+            "--destdir=bin/privateactionrunner",
+        )
+        bazel("run", "//pkg/procmgr/rust:install", "--", "--destdir=bin/privateactionrunner")
+        copy_extra_agents += (
+            "COPY bin/privateactionrunner/privateactionrunner /opt/datadog-agent/embedded/bin/privateactionrunner\n"
+            "COPY bin/privateactionrunner/embedded/bin/par-control /opt/datadog-agent/embedded/bin/par-control\n"
+            "COPY bin/privateactionrunner/embedded/bin/dd-procmgrd /opt/datadog-agent/embedded/bin/dd-procmgrd\n"
+            "COPY bin/privateactionrunner/embedded/bin/dd-procmgr /opt/datadog-agent/embedded/bin/dd-procmgr\n"
+        )
+
+    copy_ebpf_assets = ""
+    copy_ebpf_assets_final = ""
+    if system_probe:
+        from tasks.libs.types.arch import Arch
+        from tasks.system_probe import build as system_probe_build
+        from tasks.system_probe import get_ebpf_build_dir, get_ebpf_runtime_dir
+
+        system_probe_build(ctx)
+
+        build_arch = Arch.from_str(arch)
+        build_dir = get_ebpf_build_dir(build_arch)
+        runtime_dir = get_ebpf_runtime_dir()
+
+        copy_extra_agents += (
+            "COPY bin/system-probe/system-probe /opt/datadog-agent/embedded/bin/system-probe\n"
+            "COPY pkg/discovery/module/rust/embedded/bin/system-probe-lite /opt/datadog-agent/embedded/bin/system-probe-lite\n"
+        )
+        copy_ebpf_assets = f"""
+RUN mkdir -p /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re/
+RUN mkdir -p /opt/datadog-agent/embedded/share/system-probe/ebpf/runtime/
+COPY {build_dir}/*.o         /opt/datadog-agent/embedded/share/system-probe/ebpf/
+COPY {build_dir}/co-re/*.o   /opt/datadog-agent/embedded/share/system-probe/ebpf/co-re/
+COPY {runtime_dir}/*.c       /opt/datadog-agent/embedded/share/system-probe/ebpf/runtime/
+"""
+        copy_ebpf_assets_final = """
+COPY --from=bin /opt/datadog-agent/embedded/share/system-probe/ebpf /opt/datadog-agent/embedded/share/system-probe/ebpf
+"""
 
     with tempfile.NamedTemporaryFile(mode='w') as dockerfile:
         dockerfile.write(
@@ -525,12 +614,16 @@ RUN find /usr/src/datadog-agent -type d -empty -print0 | xargs -0 rmdir
 FROM ubuntu:latest AS bin
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && \
+RUN apt-get clean && \
+    apt-get -o Acquire::Retries=4 update && \
     apt-get install -y patchelf
 
 COPY bin/agent/agent                            /opt/datadog-agent/bin/agent/agent
+COPY bin/agent/dist/conf.d                      /etc/datadog-agent/conf.d
+{copy_checks_d}
 COPY dev/lib/libdatadog-agent-rtloader.so.0.1.0 /opt/datadog-agent/embedded/lib/libdatadog-agent-rtloader.so.0.1.0
 COPY dev/lib/libdatadog-agent-three.so          /opt/datadog-agent/embedded/lib/libdatadog-agent-three.so
+{copy_ebpf_assets}
 
 RUN patchelf --set-rpath /opt/datadog-agent/embedded/lib /opt/datadog-agent/bin/agent/agent
 RUN patchelf --set-rpath /opt/datadog-agent/embedded/lib /opt/datadog-agent/embedded/lib/libdatadog-agent-rtloader.so.0.1.0
@@ -538,11 +631,12 @@ RUN patchelf --set-rpath /opt/datadog-agent/embedded/lib /opt/datadog-agent/embe
 
 FROM golang:latest AS dlv
 
-RUN go install github.com/go-delve/delve/cmd/dlv@latest
+RUN go install github.com/go-delve/delve/cmd/dlv@v1.26.0
 
 FROM {base_image} AS bash_completion
 
-RUN apt-get update && \
+RUN apt-get clean && \
+    apt-get -o Acquire::Retries=4 update && \
     apt-get install -y gawk
 
 RUN awk -i inplace '!/^#/ {{uncomment=0}} uncomment {{gsub(/^#/, "")}} /# enable bash completion/ {{uncomment=1}} {{print}}' /etc/bash.bashrc
@@ -550,7 +644,8 @@ RUN awk -i inplace '!/^#/ {{uncomment=0}} uncomment {{gsub(/^#/, "")}} /# enable
 FROM {base_image}
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && \
+RUN apt-get clean && \
+    apt-get -o Acquire::Retries=4 update && \
     apt-get install -y bash-completion less vim tshark && \
     apt-get clean
 
@@ -562,7 +657,10 @@ COPY --from=src /usr/src/datadog-agent {os.getcwd()}
 COPY --from=bin /opt/datadog-agent/bin/agent/agent                                 /opt/datadog-agent/bin/agent/agent
 COPY --from=bin /opt/datadog-agent/embedded/lib/libdatadog-agent-rtloader.so.0.1.0 /opt/datadog-agent/embedded/lib/libdatadog-agent-rtloader.so.0.1.0
 COPY --from=bin /opt/datadog-agent/embedded/lib/libdatadog-agent-three.so          /opt/datadog-agent/embedded/lib/libdatadog-agent-three.so
+COPY --from=bin /etc/datadog-agent/conf.d /etc/datadog-agent/conf.d
+{copy_checks_d_final}
 {copy_extra_agents}
+{copy_ebpf_assets_final}
 RUN agent          completion bash > /usr/share/bash-completion/completions/agent
 RUN process-agent  completion bash > /usr/share/bash-completion/completions/process-agent
 RUN security-agent completion bash > /usr/share/bash-completion/completions/security-agent
@@ -577,7 +675,7 @@ ENV DD_SSLKEYLOGFILE=/tmp/sslkeylog.txt
         pull_env = {}
         if signed_pull:
             pull_env['DOCKER_CONTENT_TRUST'] = '1'
-        ctx.run(f'docker build -t {target_image} -f {dockerfile.name} .', env=pull_env)
+        ctx.run(f'docker build --platform linux/{arch} -t {target_image} -f {dockerfile.name} .', env=pull_env)
 
         if push:
             ctx.run(f'docker push {target_image}')
@@ -592,92 +690,6 @@ def integration_tests(ctx, race=False, go_mod="readonly", timeout=""):
         return containerized_integration_tests(
             ctx, CORE_AGENT_WINDOWS_IT_CONF, race=race, go_mod=go_mod, timeout=timeout
         )
-
-
-def check_supports_python_version(check_dir, python):
-    """
-    Check if a Python project states support for a given major Python version.
-    """
-    import toml
-    from packaging.specifiers import SpecifierSet
-
-    if python not in ['2', '3']:
-        raise Exit("invalid Python version", code=2)
-
-    project_file = os.path.join(check_dir, 'pyproject.toml')
-    setup_file = os.path.join(check_dir, 'setup.py')
-    if os.path.isfile(project_file):
-        with open(project_file) as f:
-            data = toml.loads(f.read())
-
-        project_metadata = data['project']
-        if 'requires-python' not in project_metadata:
-            return True
-
-        specifier = SpecifierSet(project_metadata['requires-python'])
-        # It might be e.g. `>=3.8` which would not immediatelly contain `3`
-        for minor_version in range(100):
-            if specifier.contains(f'{python}.{minor_version}'):
-                return True
-        else:
-            return False
-    elif os.path.isfile(setup_file):
-        with open(setup_file) as f:
-            tree = ast.parse(f.read(), filename=setup_file)
-
-        prefix = f'Programming Language :: Python :: {python}'
-        for node in ast.walk(tree):
-            if isinstance(node, ast.keyword) and node.arg == 'classifiers':
-                classifiers = ast.literal_eval(node.value)
-                return any(cls.startswith(prefix) for cls in classifiers)
-        else:
-            return False
-    else:
-        return False
-
-
-@task
-def collect_integrations(_, integrations_dir, python_version, target_os, excluded):
-    """
-    Collect and print the list of integrations to install.
-
-    `excluded` is a comma-separated list of directories that don't contain an actual integration
-    """
-    import json
-
-    excluded = excluded.split(',')
-    integrations = []
-
-    for entry in os.listdir(integrations_dir):
-        int_path = os.path.join(integrations_dir, entry)
-        if not os.path.isdir(int_path) or entry in excluded:
-            continue
-
-        manifest_file_path = os.path.join(int_path, "manifest.json")
-
-        # If there is no manifest file, then we should assume the folder does not
-        # contain a working check and move onto the next
-        if not os.path.exists(manifest_file_path):
-            continue
-
-        with open(manifest_file_path) as f:
-            manifest = json.load(f)
-
-        # Figure out whether the integration is supported on the target OS
-        if target_os == 'mac_os':
-            tag = 'Supported OS::macOS'
-        else:
-            tag = f'Supported OS::{target_os.capitalize()}'
-
-        if tag not in manifest['tile']['classifier_tags']:
-            continue
-
-        if not check_supports_python_version(int_path, python_version):
-            continue
-
-        integrations.append(entry)
-
-    print(' '.join(sorted(integrations)))
 
 
 @task
@@ -703,7 +715,6 @@ def version(
     url_safe=False,
     omnibus_format=False,
     git_sha_length=7,
-    major_version='7',
     cache_version=False,
     pipeline_id=None,
     include_git=True,
@@ -729,7 +740,6 @@ def version(
         include_git=include_git,
         url_safe=url_safe,
         git_sha_length=git_sha_length,
-        major_version=major_version,
         include_pipeline_id=True,
         pipeline_id=pipeline_id,
         include_pre=include_pre,
@@ -753,135 +763,9 @@ def version(
     print(version)
 
 
-@task
-def get_integrations_from_cache(ctx, python, bucket, branch, integrations_dir, target_dir, integrations):
-    """
-    Get cached integration wheels for given integrations.
-    python: Python version to retrieve integrations for
-    bucket: S3 bucket to retrieve integration wheels from
-    branch: namespace in the bucket to get the integration wheels from
-    integrations_dir: directory with Git repository of integrations
-    target_dir: local directory to put integration wheels to
-    integrations: comma-separated names of the integrations to try to retrieve from cache
-    """
-    integrations_hashes = {}
-    for integration in integrations.strip().split(","):
-        integration_path = os.path.join(integrations_dir, integration)
-        if not os.path.exists(integration_path):
-            raise Exit(f"Integration {integration} given, but doesn't exist in {integrations_dir}", code=2)
-        last_commit = ctx.run(
-            LAST_DIRECTORY_COMMIT_PATTERN.format(integrations_dir=integrations_dir, integration=integration),
-            hide="both",
-            echo=False,
-        )
-        integrations_hashes[integration] = last_commit.stdout.strip()
-
-    print(f"Trying to retrieve {len(integrations_hashes)} integration wheels from cache")
-    # On windows, maximum length of a command line call is 8191 characters, therefore
-    # we do multiple syncs that fit within that limit (we use 8100 as a nice round number
-    # and just to make sure we don't do any of-by-one errors that would break this).
-    # WINDOWS NOTES: we have to not put the * in quotes, as there's no expansion on it, unlike on Linux
-    exclude_wildcard = "*" if platform.system().lower() == "windows" else "'*'"
-    sync_command_prefix = f"{AWS_CMD} s3 sync s3://{bucket} {target_dir} --no-sign-request --exclude {exclude_wildcard}"
-    sync_commands = [[[sync_command_prefix], len(sync_command_prefix)]]
-    for integration, hash in integrations_hashes.items():
-        include_arg = " --include " + CACHED_WHEEL_FULL_PATH_PATTERN.format(
-            hash=hash,
-            integration=integration,
-            python_version=python,
-            branch=branch,
-        )
-        if len(include_arg) + sync_commands[-1][1] > 8100:
-            sync_commands.append([[sync_command_prefix], len(sync_command_prefix)])
-        sync_commands[-1][0].append(include_arg)
-        sync_commands[-1][1] += len(include_arg)
-
-    for sync_command in sync_commands:
-        ctx.run("".join(sync_command[0]))
-
-    found = []
-    # move all wheel files directly to the target_dir, so they're easy to find/work with in Omnibus
-    for integration in sorted(integrations_hashes):
-        hash = integrations_hashes[integration]
-        original_path_glob = os.path.join(
-            target_dir,
-            CACHED_WHEEL_FULL_PATH_PATTERN.format(
-                hash=hash,
-                integration=integration,
-                python_version=python,
-                branch=branch,
-            ),
-        )
-        files_matched = glob.glob(original_path_glob)
-        if len(files_matched) == 0:
-            continue
-        elif len(files_matched) > 1:
-            raise Exit(
-                f"More than 1 wheel for integration {integration} matched by {original_path_glob}: {files_matched}"
-            )
-        wheel_path = files_matched[0]
-        print(f"Found cached wheel for integration {integration}")
-        shutil.move(wheel_path, target_dir)
-        found.append(f"datadog_{integration}")
-
-    print(f"Found {len(found)} cached integration wheels")
-    with open(os.path.join(target_dir, "found.txt"), "w") as f:
-        f.write('\n'.join(found))
-
-
-@task
-def upload_integration_to_cache(ctx, python, bucket, branch, integrations_dir, build_dir, integration):
-    """
-    Upload a built integration wheel for given integration.
-    python: Python version the integration is built for
-    bucket: S3 bucket to upload the integration wheel to
-    branch: namespace in the bucket to upload the integration wheels to
-    integrations_dir: directory with Git repository of integrations
-    build_dir: directory containing the built integration wheel
-    integration: name of the integration being cached
-    """
-    matching_glob = os.path.join(build_dir, CACHED_WHEEL_FILENAME_PATTERN.format(integration=integration))
-    files_matched = glob.glob(matching_glob)
-    if len(files_matched) == 0:
-        raise Exit(f"No wheel for integration {integration} found in {build_dir}")
-    elif len(files_matched) > 1:
-        raise Exit(f"More than 1 wheel for integration {integration} matched by {matching_glob}: {files_matched}")
-
-    wheel_path = files_matched[0]
-
-    last_commit = ctx.run(
-        LAST_DIRECTORY_COMMIT_PATTERN.format(integrations_dir=integrations_dir, integration=integration),
-        hide="both",
-        echo=False,
-    )
-    hash = last_commit.stdout.strip()
-
-    target_name = CACHED_WHEEL_DIRECTORY_PATTERN.format(
-        hash=hash, python_version=python, branch=branch
-    ) + os.path.basename(wheel_path)
-    print(f"Caching wheel {target_name}")
-    ctx.run(f"{AWS_CMD} s3 cp {wheel_path} s3://{bucket}/{target_name} --acl public-read")
-
-
-@task()
-def generate_config(ctx, build_type, output_file, env=None):
-    """
-    Generates the datadog.yaml configuration file.
-    """
-    args = {
-        "go_file": "./pkg/config/render_config.go",
-        "build_type": build_type,
-        "template_file": "./pkg/config/config_template.yaml",
-        "output_file": output_file,
-    }
-    cmd = "go run {go_file} {build_type} {template_file} {output_file}"
-    return ctx.run(cmd.format(**args), env=env or {})
-
-
 @task()
 def build_remote_agent(ctx, env=None):
     """
     Builds the remote-agent example client.
     """
-    cmd = "go build -v -o bin/remote-agent ./internal/remote-agent"
-    return ctx.run(cmd, env=env or {})
+    return go_build(ctx, "./internal/remote-agent", verbose=True, bin_path="bin/remote-agent", env=env or {})

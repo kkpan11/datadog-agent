@@ -117,6 +117,15 @@ var (
 			"persistentvolumeclaim:www2-web-3",
 			"pod_phase:running",
 		},
+		"container_id://resized-container-id": {
+			"kube_container_name:resized-container",
+			"kube_namespace:default",
+		},
+		"kubernetes_pod_uid://resized-pod-uid-0001": {"pod_name:resized-pod"},
+		"kubernetes_pod_uid://dc24642d-e142-11e9-b8b8-42010af002dd": {
+			"pod_name:cassandra-0",
+			"kube_namespace:default",
+		},
 	}
 
 	// InstanceTags are default tags that should be applied to all metrics at the instance level
@@ -206,7 +215,7 @@ func StorePopulatedFromFile(store workloadmetamock.Mock, filename string, podUti
 			podContainer.Image.ID = container.ImageID
 
 			podContainers = append(podContainers, podContainer)
-			store.Set(&workloadmeta.Container{
+			store.Set(&workloadmeta.Container{ // Not all fields are set. Just the ones needed for testing.
 				EntityID: workloadmeta.EntityID{
 					Kind: workloadmeta.KindContainer,
 					ID:   containerID,
@@ -221,7 +230,25 @@ func StorePopulatedFromFile(store workloadmetamock.Mock, filename string, podUti
 			})
 		}
 
-		store.Set(&workloadmeta.KubernetesPod{
+		volumes := make([]workloadmeta.KubernetesPodVolume, len(pod.Spec.Volumes))
+		for i, volume := range pod.Spec.Volumes {
+			volumes[i] = workloadmeta.KubernetesPodVolume{
+				Name: volume.Name,
+			}
+			if volume.PersistentVolumeClaim != nil {
+				volumes[i].PersistentVolumeClaim = &workloadmeta.KubernetesPersistentVolumeClaim{
+					ClaimName: volume.PersistentVolumeClaim.ClaimName,
+				}
+			}
+			if volume.Ephemeral != nil && volume.Ephemeral.VolumeClaimTemplate != nil {
+				volumes[i].Ephemeral = &workloadmeta.KubernetesEphemeralVolume{
+					Name: volume.Ephemeral.VolumeClaimTemplate.Metadata.Name,
+				}
+			}
+		}
+
+		// Not all fields are set. Just the ones needed for testing.
+		wmetaPod := &workloadmeta.KubernetesPod{
 			EntityID: workloadmeta.EntityID{
 				Kind: workloadmeta.KindKubernetesPod,
 				ID:   pod.Metadata.UID,
@@ -233,8 +260,12 @@ func StorePopulatedFromFile(store workloadmetamock.Mock, filename string, podUti
 				Labels:      pod.Metadata.Labels,
 			},
 			Containers: podContainers,
-		})
-		podUtils.PopulateForPod(pod)
+			Phase:      pod.Status.Phase,
+			Volumes:    volumes,
+		}
+
+		store.Set(wmetaPod)
+		podUtils.PopulateForPod(wmetaPod)
 	}
 	return err
 }
@@ -248,8 +279,14 @@ func AssertMetricCallsMatch(t *testing.T, expectedMetrics []string, mockSender *
 	for _, expectedMetric := range expectedMetrics {
 		matches := 0
 		for _, call := range mockSender.Calls {
-			expected := tmock.Arguments{expectedMetric, tmock.AnythingOfType("float64"), "", mocksender.MatchTagsContains(InstanceTags)}
-			if _, diffs := expected.Diff(call.Arguments); diffs == 0 {
+			// Handle both regular metric calls (4 args) and MonotonicCountWithFlushFirstValue calls (5 args)
+			expected4Args := tmock.Arguments{expectedMetric, tmock.AnythingOfType("float64"), "", mocksender.MatchTagsContains(InstanceTags)}
+			expected5Args := tmock.Arguments{expectedMetric, tmock.AnythingOfType("float64"), "", mocksender.MatchTagsContains(InstanceTags), tmock.AnythingOfType("bool")}
+
+			if _, diffs := expected4Args.Diff(call.Arguments); diffs == 0 {
+				matches++
+				matchedAsserts = append(matchedAsserts, call)
+			} else if _, diffs := expected5Args.Diff(call.Arguments); diffs == 0 {
 				matches++
 				matchedAsserts = append(matchedAsserts, call)
 			}

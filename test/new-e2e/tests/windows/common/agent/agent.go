@@ -7,6 +7,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,15 +15,15 @@ import (
 	"testing"
 	"time"
 
-	infraCommon "github.com/DataDog/test-infra-definitions/common"
+	infraCommon "github.com/DataDog/datadog-agent/test/e2e-framework/common"
 
 	"github.com/DataDog/datadog-agent/pkg/version"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner/parameters"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
 	windowsCommon "github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -36,18 +37,18 @@ const (
 	DefaultConfigRoot = `C:\ProgramData\Datadog`
 	// DefaultAgentUserName is the default user name for the Datadog Agent
 	DefaultAgentUserName = `ddagentuser`
+	// AutologgerRegistryKeyPath is the path to the Autologger registry key
+	AutologgerRegistryKeyPath = `HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\Datadog Logon Duration`
 )
 
 // GetCodeSignatureThumbprints returns the allowed code detached thumbprint used for
 // Windows signing
 func GetCodeSignatureThumbprints() map[string]struct{} {
 	return map[string]struct{}{
-		// Non-EV Valid From: May 2023; To: May 2025
-		"B03F29CC07566505A718583E9270A6EE17678742": {},
-		// EV Valid From: Dec 2023; To: Dec 2025
-		"ECAA21456723CB0911183255A683DC01A99392DB": {},
 		// EV Valid From: Jun 2024; To: Jun 2026
 		"59063C826DAA5B628B5CE8A2B32015019F164BF0": {},
+		// Cert nb 1397980425, EV, valid from Nov 26 2025 to Nov 28 2027
+		"A0FB7BEE153FE31431062731306903B3A5CB1824": {},
 	}
 }
 
@@ -69,11 +70,11 @@ func InstallAgent(host *components.RemoteHost, options ...InstallAgentOption) (s
 	}
 
 	if p.Package == nil {
-		return "", fmt.Errorf("missing agent package to install")
+		return "", errors.New("missing agent package to install")
 	}
 	if p.InstallLogFile != "" {
 		// InstallMSI always used a temporary file path
-		return "", fmt.Errorf("Setting the remote MSI log file path is not supported")
+		return "", errors.New("Setting the remote MSI log file path is not supported")
 	}
 
 	if p.LocalInstallLogFile == "" {
@@ -83,11 +84,10 @@ func InstallAgent(host *components.RemoteHost, options ...InstallAgentOption) (s
 	downloadBackOff := p.DownloadMSIBackOff
 	if downloadBackOff == nil {
 		// 5s, 7s, 11s, 17s, 25s, 38s, 60s, 60s...for up to 5 minutes
-		downloadBackOff = backoff.NewExponentialBackOff(
-			backoff.WithInitialInterval(5*time.Second),
-			backoff.WithMaxInterval(60*time.Second),
-			backoff.WithMaxElapsedTime(5*time.Minute),
-		)
+		expBackoff := backoff.NewExponentialBackOff()
+		expBackoff.InitialInterval = 5 * time.Second
+		expBackoff.MaxInterval = 60 * time.Second
+		downloadBackOff = expBackoff
 	}
 
 	args := p.toArgs()
@@ -96,7 +96,8 @@ func InstallAgent(host *components.RemoteHost, options ...InstallAgentOption) (s
 	if err != nil {
 		return "", err
 	}
-	err = windowsCommon.PutOrDownloadFileWithRetry(host, p.Package.URL, remoteMSIPath, downloadBackOff)
+	err = windowsCommon.PutOrDownloadFileWithRetry(host, p.Package.URL, remoteMSIPath,
+		backoff.WithBackOff(downloadBackOff), backoff.WithMaxElapsedTime(5*time.Minute))
 	if err != nil {
 		return "", err
 	}
@@ -191,4 +192,29 @@ func GetInstallPathFromRegistry(host *components.RemoteHost) (string, error) {
 // GetConfigRootFromRegistry gets the config root from the registry, e.g. C:\ProgramData\Datadog
 func GetConfigRootFromRegistry(host *components.RemoteHost) (string, error) {
 	return windowsCommon.GetRegistryValue(host, RegistryKeyPath, "ConfigRoot")
+}
+
+// TestHasNoWorldWritablePaths tests that the given paths do not contain world-writable paths
+func TestHasNoWorldWritablePaths(t *testing.T, host *components.RemoteHost, paths []string) bool {
+	t.Helper()
+	return t.Run("no world writable paths", func(t *testing.T) {
+		t.Helper()
+		if testing.Short() {
+			// test takes ~90 seconds to run on Agent paths
+			t.Skip("skipping world writable files check in short mode")
+		}
+		worldWritableFiles, err := windowsCommon.FindWorldWritablePaths(host, paths)
+		require.NoError(t, err, "should check for world-writable files")
+		assert.Empty(t, worldWritableFiles, "paths %v should not contain world-writable files", paths)
+	})
+}
+
+// TestAgentHasNoWorldWritablePaths tests that the Agent install and config paths do not contain world-writable paths
+func TestAgentHasNoWorldWritablePaths(t *testing.T, host *components.RemoteHost) bool {
+	installPath, err := GetInstallPathFromRegistry(host)
+	require.NoError(t, err, "should get install path")
+	configRoot, err := GetConfigRootFromRegistry(host)
+	require.NoError(t, err, "should get config root")
+
+	return TestHasNoWorldWritablePaths(t, host, []string{installPath, configRoot})
 }

@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewServiceAccountCollectorVersions builds the group of collector versions.
-func NewServiceAccountCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewServiceAccountCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewServiceAccountCollector(metadataAsTags),
+		NewServiceAccountCollector(tagger),
 	)
 }
 
@@ -38,27 +39,22 @@ type ServiceAccountCollector struct {
 
 // NewServiceAccountCollector creates a new collector for the Kubernetes
 // ServiceAccount resource.
-func NewServiceAccountCollector(metadataAsTags utils.MetadataAsTags) *ServiceAccountCollector {
-	resourceType := getResourceType(serviceAccountName, serviceAccountVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewServiceAccountCollector(tagger tagger.Component) *ServiceAccountCollector {
 	return &ServiceAccountCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
-			IsStable:                             true,
-			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
+			IsMetadataProducer:                   true,
+			IsStable:                             true,
 			SupportsManifestBuffering:            true,
-			Name:                                 serviceAccountName,
-			Kind:                                 kubernetes.ServiceAccountKind,
-			NodeType:                             orchestrator.K8sServiceAccount,
-			Version:                              serviceAccountVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
 			SupportsTerminatedResourceCollection: true,
+			Group:                                utilTypes.ServiceAccountGroup,
+			Kind:                                 kubernetes.ServiceAccountKind,
+			Name:                                 utilTypes.ServiceAccountName,
+			Version:                              utilTypes.ServiceAccountVersion,
+			NodeType:                             orchestrator.K8sServiceAccount,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.ServiceAccountHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewServiceAccountHandlers(tagger)),
 	}
 }
 

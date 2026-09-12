@@ -7,15 +7,21 @@ package api
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/trace/api/apiutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 	"github.com/DataDog/datadog-go/v5/statsd"
@@ -23,49 +29,74 @@ import (
 
 const (
 	// profilingURLTemplate specifies the template for obtaining the profiling URL along with the site.
-	profilingURLTemplate = "https://intake.profile.%s/api/v2/profile"
+	profilingURLTemplate = config.ProfilingEndpointPrefix + "%s" + config.ProfilingEndpointPath
 	// profilingURLDefault specifies the default intake API URL.
-	profilingURLDefault = "https://intake.profile.datadoghq.com/api/v2/profile"
+	profilingURLDefault = config.ProfilingEndpointPrefix + "datadoghq.com" + config.ProfilingEndpointPath
 	// profilingV1EndpointSuffix suffix identifying a user-configured V1 endpoint
 	profilingV1EndpointSuffix = "v1/input"
 )
 
 // profilingEndpoints returns the profiling intake urls and their corresponding
-// api keys based on agent configuration. The main endpoint is always returned as
-// the first element in the slice.
+// api keys based on agent configuration. Unless the main endpoint is skipped
+// via MainEndpointMode, it is returned as the first element in the slice.
 func profilingEndpoints(conf *config.AgentConfig) (urls []*url.URL, apiKeys []string, err error) {
-	main := profilingURLDefault
-	if v := conf.ProfilingProxy.DDURL; v != "" {
-		main = v
-		if strings.HasSuffix(main, profilingV1EndpointSuffix) {
-			log.Warnf("The configured url %s for apm_config.profiling_dd_url is deprecated. "+
-				"The updated endpoint path is /api/v2/profile.", v)
+	if conf.ProfilingProxy.MainEndpointMode == config.ProfilingMainEndpointSend {
+		main := mainProfilingURL(conf)
+		u, err := url.Parse(main)
+		if err != nil {
+			// if the main intake URL is invalid we don't use additional endpoints
+			return nil, nil, fmt.Errorf("error parsing main profiling intake URL %s: %v", main, err)
 		}
-	} else if conf.Site != "" {
-		main = fmt.Sprintf(profilingURLTemplate, conf.Site)
+		urls = append(urls, u)
+		apiKeys = append(apiKeys, conf.APIKey())
 	}
-	u, err := url.Parse(main)
-	if err != nil {
-		// if the main intake URL is invalid we don't use additional endpoints
-		return nil, nil, fmt.Errorf("error parsing main profiling intake URL %s: %v", main, err)
-	}
-	urls = append(urls, u)
-	apiKeys = append(apiKeys, conf.APIKey())
 
 	if extra := conf.ProfilingProxy.AdditionalEndpoints; extra != nil {
-		for endpoint, keys := range extra {
+		// Iterate AdditionalEndpoints in sorted order so the target slice is
+		// deterministic across restarts. multiTransport.RoundTrip returns the
+		// response from index 0 to the client; without sorting, when the main
+		// endpoint is skipped the "primary" additional endpoint would be picked
+		// at random from Go's map iteration order.
+		endpoints := make([]string, 0, len(extra))
+		for endpoint := range extra {
+			endpoints = append(endpoints, endpoint)
+		}
+		sort.Strings(endpoints)
+		for _, endpoint := range endpoints {
 			u, err := url.Parse(endpoint)
 			if err != nil {
 				log.Errorf("Error parsing additional profiling intake URL %s: %v", endpoint, err)
 				continue
 			}
-			for _, key := range keys {
+			for _, key := range extra[endpoint] {
 				urls = append(urls, u)
 				apiKeys = append(apiKeys, key)
 			}
 		}
 	}
+	if len(urls) == 0 {
+		return nil, nil, errors.New("profiling proxy has no valid endpoints configured")
+	}
 	return urls, apiKeys, nil
+}
+
+// mainProfilingURL returns the main profiling intake URL, preferring an
+// explicit DDURL override, then deriving from Site, then falling back to the
+// default intake.
+func mainProfilingURL(conf *config.AgentConfig) string {
+	if v := conf.ProfilingProxy.DDURL; v != "" {
+		if strings.HasSuffix(v, profilingV1EndpointSuffix) {
+			log.Warnf("The configured url %s for apm_config.profiling_dd_url is deprecated. "+
+				"The updated endpoint path is /api/v2/profile.", v)
+		}
+		return v
+	}
+	// The component config loader resolves DDURL. Keep the Site/default fallback
+	// for standalone pkg/trace callers that construct AgentConfig directly.
+	if conf.Site != "" {
+		return fmt.Sprintf(profilingURLTemplate, conf.Site)
+	}
+	return profilingURLDefault
 }
 
 // profileProxyHandler returns a new HTTP handler which will proxy requests to the profiling intakes.
@@ -80,14 +111,11 @@ func (r *HTTPReceiver) profileProxyHandler() http.Handler {
 	tags.WriteString(fmt.Sprintf("host:%s,default_env:%s,agent_version:%s", r.conf.Hostname, r.conf.DefaultEnv, r.conf.AgentVersion))
 
 	if orch := r.conf.FargateOrchestrator; orch != config.OrchestratorUnknown {
-		tags.WriteString(fmt.Sprintf(",orchestrator:fargate_%s", strings.ToLower(string(orch))))
+		tags.WriteString(",orchestrator:fargate_" + strings.ToLower(string(orch)))
 	}
-	if r.conf.LambdaFunctionName != "" {
-		tags.WriteString(fmt.Sprintf("functionname:%s", strings.ToLower(r.conf.LambdaFunctionName)))
-		tags.WriteString("_dd.origin:lambda")
-	}
-	if r.conf.AzureContainerAppTags != "" {
-		tags.WriteString(r.conf.AzureContainerAppTags)
+	// Add any additional environment-identifying tags
+	for k, v := range r.conf.AdditionalProfileTags {
+		tags.WriteString(fmt.Sprintf(",%s:%s", k, v))
 	}
 
 	return newProfileProxy(r.conf, targets, keys, tags.String(), r.statsd)
@@ -100,6 +128,34 @@ func errorHandler(err error) http.Handler {
 	})
 }
 
+// isRetryableBodyReadError determines if a body read error should be retried
+func isRetryableBodyReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for specific connection errors during body read
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Op == "read" {
+			return true
+		}
+	}
+
+	// Check for network-level errors that might be transient
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+
+	// Check for context cancellation (might be transient)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// Default to false, this covers EOF and other stream-related errors
+	return false
+}
+
 // newProfileProxy creates an http.ReverseProxy which can forward requests to
 // one or more endpoints.
 //
@@ -109,22 +165,17 @@ func errorHandler(err error) http.Handler {
 // The tags will be added as a header to all proxied requests.
 // For more details please see multiTransport.
 func newProfileProxy(conf *config.AgentConfig, targets []*url.URL, keys []string, tags string, statsd statsd.ClientInterface) *httputil.ReverseProxy {
-	cidProvider := NewIDProvider(conf.ContainerProcRoot, conf.ContainerIDFromOriginInfo)
-	director := func(req *http.Request) {
-		req.Header.Set("Via", fmt.Sprintf("trace-agent %s", conf.AgentVersion))
-		if _, ok := req.Header["User-Agent"]; !ok {
-			// explicitly disable User-Agent so it's not set to the default value
-			// that net/http gives it: Go-http-client/1.1
-			// See https://codereview.appspot.com/7532043
-			req.Header.Set("User-Agent", "")
-		}
-		containerID := cidProvider.GetContainerID(req.Context(), req.Header)
+	cidProvider := NewContainerIDProviderFromConfig(conf)
+	rewrite := func(req *httputil.ProxyRequest) {
+		req.SetXForwarded()
+		req.Out.Header.Set("Via", "trace-agent "+conf.AgentVersion)
+		containerID := cidProvider.GetContainerID(req.In.Context(), req.In.Header)
 		if ctags := getContainerTags(conf.ContainerTags, containerID); ctags != "" {
 			ctagsHeader := normalizeHTTPHeader(ctags)
-			req.Header.Set("X-Datadog-Container-Tags", ctagsHeader)
+			req.Out.Header.Set("X-Datadog-Container-Tags", ctagsHeader)
 			log.Debugf("Setting header X-Datadog-Container-Tags=%s for profiles proxy", ctagsHeader)
 		}
-		req.Header.Set("X-Datadog-Additional-Tags", tags)
+		req.Out.Header.Set("X-Datadog-Additional-Tags", tags)
 		log.Debugf("Setting header X-Datadog-Additional-Tags=%s for profiles proxy", tags)
 		_ = statsd.Count("datadog.trace_agent.profile", 1, nil, 1)
 		// URL, Host and key are set in the transport for each outbound request
@@ -137,11 +188,70 @@ func newProfileProxy(conf *config.AgentConfig, targets []*url.URL, keys []string
 	// overlap with other timeouts or periodicities. It provides sufficient buffer time compared to 60, whilst still
 	// allowing connection reuse for tracer setups that upload multiple profiles per minute.
 	transport.IdleConnTimeout = 47 * time.Second
+	ptransport := newProfilingTransport(transport)
 	logger := log.NewThrottled(5, 10*time.Second) // limit to 5 messages every 10 seconds
 	return &httputil.ReverseProxy{
-		Director:  director,
-		ErrorLog:  stdlog.New(logger, "profiling.Proxy: ", 0),
-		Transport: &multiTransport{transport, targets, keys},
+		Rewrite:      rewrite,
+		ErrorLog:     stdlog.New(logger, "profiling.Proxy: ", 0),
+		Transport:    &multiTransport{rt: ptransport, targets: targets, keys: keys, maxRequestBytes: conf.ProfilingProxy.MaxRequestBytes},
+		ErrorHandler: handleProxyError,
+	}
+}
+
+// handleProxyError handles errors from the profiling reverse proxy with appropriate
+// HTTP status codes and comprehensive logging.
+func handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
+	// Extract useful context for logging
+	var payloadSize int64
+	if r.ContentLength > 0 {
+		payloadSize = r.ContentLength
+	} else if r.Body != nil {
+		// For chunked uploads, ContentLength is 0 but there might still be a body
+		// Try to get a size estimate, but don't consume the body as it may have already been read
+		payloadSize = -1 // Indicate chunked/unknown size
+	}
+
+	var timeoutSetting time.Duration
+	if deadline, ok := r.Context().Deadline(); ok {
+		timeoutSetting = time.Until(deadline)
+	}
+
+	// Determine appropriate HTTP status code based on error type
+	var statusCode int
+	var errorType string
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		// Context deadline exceeded during request processing
+		// This typically means the client was too slow uploading the request body
+		statusCode = http.StatusRequestTimeout // 408 (client timeout)
+		errorType = "request timeout"
+	} else if isRetryableBodyReadError(err) {
+		// Check if this is specifically a timeout error
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			statusCode = http.StatusRequestTimeout // 408 (client timeout)
+			errorType = "body read timeout"
+		} else {
+			statusCode = http.StatusServiceUnavailable // 503 (other retryable errors)
+			errorType = "retryable body read error"
+		}
+	} else { // default case
+		statusCode = http.StatusBadGateway // 502 (default)
+		errorType = "transport error"
+	}
+
+	// Single comprehensive log with all context
+	if payloadSize == -1 {
+		log.Warnf("profiling proxy error: %s (%d) for %s %s - payload_size=chunked timeout_remaining=%v error=%v",
+			errorType, statusCode, r.Method, r.URL.Path, timeoutSetting, err)
+	} else {
+		log.Warnf("profiling proxy error: %s (%d) for %s %s - payload_size=%d timeout_remaining=%v error=%v",
+			errorType, statusCode, r.Method, r.URL.Path, payloadSize, timeoutSetting, err)
+	}
+
+	w.WriteHeader(statusCode)
+	if _, writeErr := w.Write([]byte(err.Error())); writeErr != nil {
+		log.Debugf("Failed to write error response body: %v", writeErr)
 	}
 }
 
@@ -152,9 +262,10 @@ func newProfileProxy(conf *config.AgentConfig, targets []*url.URL, keys []string
 // response is discarded. There is no de-duplication done between endpoint
 // hosts or api keys.
 type multiTransport struct {
-	rt      http.RoundTripper
-	targets []*url.URL
-	keys    []string
+	rt              http.RoundTripper
+	targets         []*url.URL
+	keys            []string
+	maxRequestBytes int64
 }
 
 func (m *multiTransport) RoundTrip(req *http.Request) (rresp *http.Response, rerr error) {
@@ -175,8 +286,14 @@ func (m *multiTransport) RoundTrip(req *http.Request) (rresp *http.Response, rer
 	}()
 	if len(m.targets) == 1 {
 		setTarget(req, m.targets[0], m.keys[0])
-		return m.rt.RoundTrip(req)
+		rresp, rerr = m.rt.RoundTrip(req)
+		// Avoid sub-sequent requests from getting a use of closed network connection error
+		if rerr != nil && req.Body != nil {
+			req.Body.Close()
+		}
+		return rresp, rerr
 	}
+	req.Body = apiutil.NewLimitedReader(req.Body, m.maxRequestBytes)
 	slurp, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
@@ -201,4 +318,59 @@ func (m *multiTransport) RoundTrip(req *http.Request) (rresp *http.Response, rer
 		}
 	}
 	return rresp, rerr
+}
+
+// profilingTransport wraps an *http.Transport to improve connection hygiene after
+// response body copy errors by flushing idle connections and forcing the next
+// outbound request to close instead of reusing a possibly bad connection.
+type profilingTransport struct {
+	*http.Transport
+	forceCloseNext atomic.Bool
+}
+
+func newProfilingTransport(transport *http.Transport) *profilingTransport {
+	return &profilingTransport{Transport: transport}
+}
+
+func (p *profilingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// If a previous response body read error occurred, force this request to not reuse connections.
+	if p.forceCloseNext.Load() {
+		// Clone to avoid mutating caller's request.
+		req = req.Clone(req.Context())
+		req.Close = true
+		req.Header.Set("Connection", "close")
+		p.forceCloseNext.Store(false)
+	}
+
+	resp, err := p.Transport.RoundTrip(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		return resp, err
+	}
+
+	// Wrap the response body to detect mid-stream read errors during reverse proxy copy.
+	origBody := resp.Body
+	resp.Body = &readTrackingBody{
+		ReadCloser: origBody,
+		onReadError: func(rerr error) {
+			if rerr != nil && rerr != io.EOF {
+				p.CloseIdleConnections()
+				p.forceCloseNext.Store(true)
+				log.Warnf("profiling proxy: upstream body read error detected, flushed idle conns and will force close on next request: %v", rerr)
+			}
+		},
+	}
+	return resp, nil
+}
+
+type readTrackingBody struct {
+	io.ReadCloser
+	onReadError func(error)
+}
+
+func (b *readTrackingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF && b.onReadError != nil {
+		b.onReadError(err)
+	}
+	return n, err
 }

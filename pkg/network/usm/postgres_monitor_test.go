@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package usm
 
@@ -24,13 +24,13 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/DataDog/datadog-agent/pkg/ebpf/ebpftest"
-	"github.com/DataDog/datadog-agent/pkg/network"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/http/testutil"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/postgres"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/postgres/ebpf"
 	protocolsUtils "github.com/DataDog/datadog-agent/pkg/network/protocols/testutil"
+	ebpftls "github.com/DataDog/datadog-agent/pkg/network/protocols/tls"
 	gotlstestutil "github.com/DataDog/datadog-agent/pkg/network/protocols/tls/gotls/testutil"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/consts"
 	usmtestutil "github.com/DataDog/datadog-agent/pkg/network/usm/testutil"
@@ -52,12 +52,12 @@ const (
 )
 
 var (
-	longCreateQuery = fmt.Sprintf("CREATE TABLE %s (id SERIAL PRIMARY KEY, foo TEXT)", strings.Repeat("table_", repeatCount))
-	longDropeQuery  = fmt.Sprintf("DROP TABLE IF EXISTS %s", strings.Repeat("table_", repeatCount))
+	longCreateQuery = "CREATE TABLE " + strings.Repeat("table_", repeatCount) + " (id SERIAL PRIMARY KEY, foo TEXT)"
+	longDropeQuery  = "DROP TABLE IF EXISTS " + strings.Repeat("table_", repeatCount)
 )
 
 func createInsertQuery(values ...string) string {
-	return fmt.Sprintf("INSERT INTO dummy (foo) VALUES ('%s')", strings.Join(values, "'), ('"))
+	return "INSERT INTO dummy (foo) VALUES ('" + strings.Join(values, "'), ('") + "')"
 }
 
 func generateTestValues(startingIndex, count int) []string {
@@ -141,7 +141,7 @@ func (s *postgresProtocolParsingSuite) TestDecoding() {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.isTLS && !gotlstestutil.GoTLSSupported(t, utils.NewUSMEmptyConfig()) {
+			if tt.isTLS && !gotlstestutil.GoTLSSupported(t, NewUSMEmptyConfig()) {
 				t.Skip("GoTLS not supported for this setup")
 			}
 			testDecoding(t, tt.isTLS)
@@ -759,7 +759,7 @@ func (s *postgresProtocolParsingSuite) TestCleanupEBPFEntriesOnTermination() {
 }
 
 func getPostgresDefaultTestConfiguration(enableTLS bool) *config.Config {
-	cfg := utils.NewUSMEmptyConfig()
+	cfg := NewUSMEmptyConfig()
 	cfg.EnablePostgresMonitoring = true
 	cfg.MaxTrackedConnections = 1000
 	cfg.EnableGoTLSSupport = enableTLS
@@ -782,7 +782,7 @@ func validatePostgres(t *testing.T, monitor *Monitor, expectedStats map[string]m
 		// We might not have postgres stats, and it might be the expected case (to capture 0).
 		currentStats := postgresProtocolStats.(map[postgres.Key]*postgres.RequestStat)
 		for key, stats := range currentStats {
-			hasTLSTag := stats.StaticTags&network.ConnTagGo != 0
+			hasTLSTag := stats.StaticTags&ebpftls.ConnTagGo != 0
 			if hasTLSTag != tls {
 				continue
 			}

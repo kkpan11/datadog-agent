@@ -10,6 +10,7 @@ package cri
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -18,8 +19,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	criv1 "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/cri-client/pkg/util"
 
-	"github.com/DataDog/datadog-agent/internal/third_party/kubernetes/pkg/kubelet/cri/remote/util"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/retry"
@@ -34,6 +35,7 @@ var (
 type CRIClient interface {
 	ListContainerStats() (map[string]*criv1.ContainerStats, error)
 	GetContainerStats(containerID string) (*criv1.ContainerStats, error)
+	ExecSync(ctx context.Context, containerID string, cmd []string, timeout time.Duration) ([]byte, []byte, int32, error)
 	GetRuntime() string
 	GetRuntimeVersion() string
 }
@@ -57,7 +59,7 @@ type CRIUtil struct {
 // This is not exposed as public API but is called by the retrier embed.
 func (c *CRIUtil) init() error {
 	if c.socketPath == "" {
-		return fmt.Errorf("no cri_socket_path was set")
+		return errors.New("no cri_socket_path was set")
 	}
 
 	var protocol string
@@ -146,6 +148,23 @@ func (c *CRIUtil) GetContainerStats(containerID string) (*criv1.ContainerStats, 
 // ListContainerStats sends a ListContainerStatsRequest to the server, and parses the returned response
 func (c *CRIUtil) ListContainerStats() (map[string]*criv1.ContainerStats, error) {
 	return c.listContainerStatsWithFilter(&criv1.ContainerStatsFilter{})
+}
+
+// ExecSync runs a command in a container synchronously through CRI.
+func (c *CRIUtil) ExecSync(ctx context.Context, containerID string, cmd []string, timeout time.Duration) ([]byte, []byte, int32, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.queryTimeout)
+	defer cancel()
+
+	resp, err := c.clientV1.ExecSync(ctx, &criv1.ExecSyncRequest{
+		ContainerId: containerID,
+		Cmd:         cmd,
+		Timeout:     int64(timeout.Seconds()),
+	})
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	return resp.GetStdout(), resp.GetStderr(), resp.GetExitCode(), nil
 }
 
 // GetRuntime returns the CRI runtime

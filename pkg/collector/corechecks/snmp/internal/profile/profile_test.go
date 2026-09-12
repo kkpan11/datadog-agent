@@ -20,13 +20,13 @@ import (
 func Test_loadProfiles(t *testing.T) {
 	mockConfig := configmock.New(t)
 	tests := []struct {
-		name                      string
-		mockConfd                 string
-		profiles                  ProfileConfigMap
-		expectedProfileMetrics    []string
-		expectedProfileNames      []string
-		expectedHaveLegacyProfile bool
-		expectedErr               string
+		name                   string
+		mockConfd              string
+		profiles               ProfileConfigMap
+		expectedProfileMetrics []string
+		expectedProfileNames   []string
+		expectedLegacyProfiles []string
+		expectedErr            string
 	}{
 		{
 			name:      "OK Use init config profiles",
@@ -53,7 +53,7 @@ func Test_loadProfiles(t *testing.T) {
 			expectedProfileMetrics: []string{
 				"init_config_metric",
 			},
-			expectedHaveLegacyProfile: false,
+			expectedLegacyProfiles: nil,
 		},
 		{
 			name:      "OK init config contains invalid profiles with warnings logs",
@@ -69,8 +69,8 @@ func Test_loadProfiles(t *testing.T) {
 					},
 				},
 			},
-			expectedProfileNames:      []string(nil), // invalid profiles are skipped
-			expectedHaveLegacyProfile: false,
+			expectedProfileNames:   []string(nil), // invalid profiles are skipped
+			expectedLegacyProfiles: nil,
 		},
 		{
 			name:      "OK init config contains legacy profiles",
@@ -89,8 +89,8 @@ func Test_loadProfiles(t *testing.T) {
 					},
 				},
 			},
-			expectedProfileNames:      []string(nil),
-			expectedHaveLegacyProfile: true,
+			expectedProfileNames:   []string(nil),
+			expectedLegacyProfiles: []string{"my-init-config-profile"},
 		},
 		// yaml profiles
 		{
@@ -100,13 +100,13 @@ func Test_loadProfiles(t *testing.T) {
 				"another_profile",
 				"f5-big-ip",
 			},
-			expectedHaveLegacyProfile: false,
+			expectedLegacyProfiles: nil,
 		},
 		{
-			name:                      "OK contains yaml profiles with warning logs",
-			mockConfd:                 "does_not_exist.d",
-			expectedProfileNames:      []string(nil),
-			expectedHaveLegacyProfile: false,
+			name:                   "OK contains yaml profiles with warning logs",
+			mockConfd:              "does_not_exist.d",
+			expectedProfileNames:   []string(nil),
+			expectedLegacyProfiles: nil,
 		},
 		{
 			name:      "OK yaml profiles contains legacy profile (no OID)",
@@ -114,7 +114,7 @@ func Test_loadProfiles(t *testing.T) {
 			expectedProfileNames: []string{
 				"valid",
 			},
-			expectedHaveLegacyProfile: true,
+			expectedLegacyProfiles: []string{"legacy"},
 		},
 		{
 			name:      "OK yaml profiles contains legacy profile (string symbol type)",
@@ -122,16 +122,16 @@ func Test_loadProfiles(t *testing.T) {
 			expectedProfileNames: []string{
 				"valid",
 			},
-			expectedHaveLegacyProfile: true,
+			expectedLegacyProfiles: []string{"legacy"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			SetGlobalProfileConfigMap(nil)
 			path, _ := filepath.Abs(filepath.Join("..", "test", tt.mockConfd))
-			mockConfig.SetWithoutSource("confd_path", path)
+			mockConfig.SetInTest("confd_path", path)
 
-			actualProfiles, haveLegacyProfile, err := loadProfiles(tt.profiles)
+			actualProfiles, legacyProfiles, err := loadProfiles(tt.profiles)
 			if tt.expectedErr != "" {
 				assert.ErrorContains(t, err, tt.expectedErr)
 			}
@@ -153,7 +153,7 @@ func Test_loadProfiles(t *testing.T) {
 				assert.ElementsMatch(t, tt.expectedProfileMetrics, metricsNames)
 			}
 
-			assert.Equal(t, tt.expectedHaveLegacyProfile, haveLegacyProfile)
+			assert.Equal(t, tt.expectedLegacyProfiles, legacyProfiles)
 		})
 	}
 }
@@ -308,6 +308,26 @@ func Test_getProfileForSysObjectID(t *testing.T) {
 			IsUserProfile: true,
 		},
 	}.withNames()
+	mockProfilesWithDifferentNameKeyAndNameDefinition := ProfileConfigMap{
+		"PROFILE1": ProfileConfig{
+			Definition: profiledefinition.ProfileDefinition{
+				Name: "profile1",
+				Metrics: []profiledefinition.MetricsConfig{
+					{Symbol: profiledefinition.SymbolConfig{OID: "1.2.3.4.5", Name: "someMetric"}},
+				},
+				SysObjectIDs: profiledefinition.StringArray{"1.3.6.1.4.1.3375.2.1.3"},
+			},
+			IsUserProfile: true,
+		},
+		"profile2": ProfileConfig{
+			Definition: profiledefinition.ProfileDefinition{
+				Metrics: []profiledefinition.MetricsConfig{
+					{Symbol: profiledefinition.SymbolConfig{OID: "1.2.3.4.5", Name: "someMetric"}},
+				},
+				SysObjectIDs: profiledefinition.StringArray{"1.3.6.1.4.1.3375.2.1.3"},
+			},
+		},
+	}.withNames()
 	tests := []struct {
 		name                string
 		profiles            ProfileConfigMap
@@ -391,6 +411,13 @@ func Test_getProfileForSysObjectID(t *testing.T) {
 			sysObjectID:         "1.3.6.1.4.1.3375.2.1.3",
 			expectedProfileName: "",
 			expectedError:       "has the same sysObjectID (1.3.6.1.4.1.3375.2.1.3) as",
+		},
+		{
+			name:                "different name key and name definition",
+			profiles:            mockProfilesWithDifferentNameKeyAndNameDefinition,
+			sysObjectID:         "1.3.6.1.4.1.3375.2.1.3",
+			expectedProfileName: "profile1",
+			expectedError:       "",
 		},
 	}
 	for _, tt := range tests {

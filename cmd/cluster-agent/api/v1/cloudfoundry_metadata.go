@@ -11,8 +11,6 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/gorilla/mux"
-
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/api"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
@@ -20,32 +18,57 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
-func installCloudFoundryMetadataEndpoints(r *mux.Router) {
-	r.HandleFunc("/tags/cf/apps/{nodeName}", api.WithTelemetryWrapper("getCFAppsMetadataForNode", getCFAppsMetadataForNode)).Methods("GET")
+// CloudFoundryMetadataHandler handles Cloud Foundry metadata HTTP requests
+type CloudFoundryMetadataHandler struct {
+	bbsCache cloudfoundry.BBSCacheI
+	ccCache  cloudfoundry.CCCacheI
+}
 
-	if pkgconfigsetup.Datadog().GetBool("cluster_agent.serve_nozzle_data") {
-		r.HandleFunc("/cf/apps/{guid}", api.WithTelemetryWrapper("getCFApplication", getCFApplication)).Methods("GET")
-		r.HandleFunc("/cf/apps", api.WithTelemetryWrapper("getCFApplications", getCFApplications)).Methods("GET")
-		r.HandleFunc("/cf/org_quotas", api.WithTelemetryWrapper("getCFOrgQuotas", getCFOrgQuotas)).Methods("GET")
-		r.HandleFunc("/cf/orgs", api.WithTelemetryWrapper("getCFOrgs", getCFOrgs)).Methods("GET")
+// NewCloudFoundryMetadataHandler creates a new CloudFoundryMetadataHandler with the given caches
+func NewCloudFoundryMetadataHandler(bbsCache cloudfoundry.BBSCacheI, ccCache cloudfoundry.CCCacheI) *CloudFoundryMetadataHandler {
+	return &CloudFoundryMetadataHandler{
+		bbsCache: bbsCache,
+		ccCache:  ccCache,
 	}
 }
 
-func installKubernetesMetadataEndpoints(r *mux.Router, w workloadmeta.Component) {}
+func installCloudFoundryMetadataEndpoints(r *http.ServeMux) {
+	// Get the Cloud Foundry caches for the metadata handlers
+	bbsCache, err := cloudfoundry.GetGlobalBBSCache()
+	if err != nil {
+		log.Debugf("Could not get BBS cache: %v", err)
+	}
+	ccCache, err := cloudfoundry.GetGlobalCCCache()
+	if err != nil {
+		log.Debugf("Could not get CC cache: %v", err)
+	}
+
+	handler := NewCloudFoundryMetadataHandler(bbsCache, ccCache)
+
+	r.HandleFunc("GET /tags/cf/apps/{nodeName}", api.WithTelemetryWrapper("getCFAppsMetadataForNode", handler.getCFAppsMetadataForNode))
+
+	if pkgconfigsetup.Datadog().GetBool("cluster_agent.serve_nozzle_data") {
+		r.HandleFunc("GET /cf/apps/{guid}", api.WithTelemetryWrapper("getCFApplication", handler.getCFApplication))
+		r.HandleFunc("GET /cf/apps", api.WithTelemetryWrapper("getCFApplications", handler.getCFApplications))
+		r.HandleFunc("GET /cf/org_quotas", api.WithTelemetryWrapper("getCFOrgQuotas", handler.getCFOrgQuotas))
+		r.HandleFunc("GET /cf/orgs", api.WithTelemetryWrapper("getCFOrgs", handler.getCFOrgs))
+	}
+}
+
+func installKubernetesMetadataEndpoints(r *http.ServeMux, w workloadmeta.Component) {}
 
 // getCFAppsMetadataForNode is only used when the node agent hits the DCA for the list of cloudfoundry applications tags
 // It return a list of tags for each application that can be directly used in the tagger
-func getCFAppsMetadataForNode(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	nodename := vars["nodeName"]
-	bbsCache, err := cloudfoundry.GetGlobalBBSCache()
-	if err != nil {
-		log.Errorf("Could not retrieve BBS cache: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (h *CloudFoundryMetadataHandler) getCFAppsMetadataForNode(w http.ResponseWriter, r *http.Request) {
+	nodename := r.PathValue("nodeName")
+
+	if h.bbsCache == nil {
+		log.Errorf("BBS cache is not initialized")
+		http.Error(w, "BBS cache is not initialized", http.StatusInternalServerError)
 		return
 	}
 
-	tags, err := bbsCache.GetTagsForNode(nodename)
+	tags, err := h.bbsCache.GetTagsForNode(nodename)
 	if err != nil {
 		log.Errorf("Error getting tags for node %s: %v", nodename, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -67,15 +90,14 @@ func getCFAppsMetadataForNode(w http.ResponseWriter, r *http.Request) {
 
 // getCFApplications is only used when the PCF firehose nozzle hits the DCA for the list of cloudfoundry applications
 // It return a list of CFApplications
-func getCFApplications(w http.ResponseWriter, r *http.Request) {
-	ccCache, err := cloudfoundry.GetGlobalCCCache()
-	if err != nil {
-		log.Errorf("Could not retrieve CC cache: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (h *CloudFoundryMetadataHandler) getCFApplications(w http.ResponseWriter, r *http.Request) {
+	if h.ccCache == nil {
+		log.Errorf("CC cache is not initialized")
+		http.Error(w, "CC cache is not initialized", http.StatusInternalServerError)
 		return
 	}
 
-	apps, err := ccCache.GetCFApplications()
+	apps, err := h.ccCache.GetCFApplications()
 	if err != nil {
 		log.Errorf("Error getting applications: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -97,17 +119,16 @@ func getCFApplications(w http.ResponseWriter, r *http.Request) {
 
 // getCFApplication is only used when the PCF firehose nozzle hits the DCA for a single cloudfoundry application
 // It return a single CFApplication with the given guid
-func getCFApplication(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	guid := vars["guid"]
-	ccCache, err := cloudfoundry.GetGlobalCCCache()
-	if err != nil {
-		log.Errorf("Could not retrieve CC cache: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (h *CloudFoundryMetadataHandler) getCFApplication(w http.ResponseWriter, r *http.Request) {
+	guid := r.PathValue("guid")
+
+	if h.ccCache == nil {
+		log.Errorf("CC cache is not initialized")
+		http.Error(w, "CC cache is not initialized", http.StatusInternalServerError)
 		return
 	}
 
-	app, err := ccCache.GetCFApplication(guid)
+	app, err := h.ccCache.GetCFApplication(guid)
 	if err != nil {
 		log.Errorf("Error getting application: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -129,15 +150,14 @@ func getCFApplication(w http.ResponseWriter, r *http.Request) {
 
 // getCFOrgs is only used when the PCF firehose nozzle hits the DCA for the list of cloudfoundry organizations
 // It return a list of V3 CF Organizations
-func getCFOrgs(w http.ResponseWriter, r *http.Request) {
-	ccCache, err := cloudfoundry.GetGlobalCCCache()
-	if err != nil {
-		log.Errorf("Could not retrieve CC cache: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (h *CloudFoundryMetadataHandler) getCFOrgs(w http.ResponseWriter, r *http.Request) {
+	if h.ccCache == nil {
+		log.Errorf("CC cache is not initialized")
+		http.Error(w, "CC cache is not initialized", http.StatusInternalServerError)
 		return
 	}
 
-	orgs, err := ccCache.GetOrgs()
+	orgs, err := h.ccCache.GetOrgs()
 	if err != nil {
 		log.Errorf("Error getting organization: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -159,15 +179,14 @@ func getCFOrgs(w http.ResponseWriter, r *http.Request) {
 
 // getCFOrgQuotas is only used when the PCF firehose nozzle hits the DCA for the list of cloudfoundry organization quotas
 // It return a list of V2 CF organization quotas
-func getCFOrgQuotas(w http.ResponseWriter, r *http.Request) {
-	ccCache, err := cloudfoundry.GetGlobalCCCache()
-	if err != nil {
-		log.Errorf("Could not retrieve CC cache: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (h *CloudFoundryMetadataHandler) getCFOrgQuotas(w http.ResponseWriter, r *http.Request) {
+	if h.ccCache == nil {
+		log.Errorf("CC cache is not initialized")
+		http.Error(w, "CC cache is not initialized", http.StatusInternalServerError)
 		return
 	}
 
-	orgQuotas, err := ccCache.GetOrgQuotas()
+	orgQuotas, err := h.ccCache.GetOrgQuotas()
 	if err != nil {
 		log.Errorf("Error getting orgQuotas: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)

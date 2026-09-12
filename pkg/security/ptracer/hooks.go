@@ -20,20 +20,54 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func (ctx *CWSPtracerCtx) resolveProcessContext(process *Process) {
+	if process == nil || process.containerContextResolved {
+		return
+	}
+	process.containerContextResolved = true
+
+	containerID, cgroupID, err := getProcContainerContext(process.Pid)
+	if err != nil {
+		if process.CGroupID == "" {
+			process.CGroupID = ctx.cgroupID
+		}
+		if process.ContainerID == "" {
+			process.ContainerID = ctx.containerID
+		}
+		return
+	}
+	if process.CGroupID == "" {
+		if cgroupID != "" {
+			process.CGroupID = cgroupID
+		} else {
+			process.CGroupID = ctx.cgroupID
+		}
+	}
+	if process.ContainerID == "" {
+		if containerID != "" {
+			process.ContainerID = containerID
+		} else {
+			process.ContainerID = ctx.containerID
+		}
+	}
+}
+
 func (ctx *CWSPtracerCtx) sendSyscallMsg(process *Process, msg *ebpfless.SyscallMsg) {
 	if msg == nil {
 		return
 	}
+	ctx.resolveProcessContext(process)
 	msg.PID = uint32(process.Tgid)
 	msg.Timestamp = uint64(time.Now().UnixNano())
-	msg.ContainerID = ctx.containerID
+	msg.ContainerID = process.ContainerID
+	msg.CGroupID = process.CGroupID
 	_ = ctx.sendMsg(&ebpfless.Message{
 		Type:    ebpfless.MessageTypeSyscall,
 		Syscall: msg,
 	})
 }
 
-func (ctx *CWSPtracerCtx) handlePreHooks(nr int, pid int, regs syscall.PtraceRegs, process *Process, handler syscallHandler) {
+func (ctx *CWSPtracerCtx) handlePreHooks(nr int, regs syscall.PtraceRegs, process *Process, handler syscallHandler) {
 	syscallMsg := &ebpfless.SyscallMsg{}
 	if nr == ExecveatNr {
 		// special case: sometimes, execveat returns as execve, to handle that, we force
@@ -50,15 +84,15 @@ func (ctx *CWSPtracerCtx) handlePreHooks(nr int, pid int, regs syscall.PtraceReg
 		}
 	}
 
-	// if available, gather span
-	syscallMsg.SpanContext = fillSpanContext(&ctx.Tracer, process.Tgid, pid, ctx.processCache.GetSpan(process.Tgid))
-
 	/* internal special cases */
 	switch nr {
 	case ExecveNr:
 		// Top level pids, add ctx.opts.Creds. For the other PIDs the creds will be propagated at the probe side
 		for _, pid := range ctx.PIDs {
-			if process.Pid == pid {
+			if process.Pid == pid && !slices.Contains(ctx.traceesReported, pid) {
+				// report the creds for the first time
+				ctx.traceesReported = append(ctx.traceesReported, pid)
+
 				var uid, gid uint32
 
 				if ctx.opts.Creds.UID != nil {
@@ -94,13 +128,6 @@ func (ctx *CWSPtracerCtx) handlePreHooks(nr int, pid int, regs syscall.PtraceReg
 		// special case for exec since the pre reports the pid while the post reports the tgid
 		if process.Pid != process.Tgid {
 			ctx.processCache.Add(process.Tgid, process)
-		}
-	case IoctlNr:
-		req := handleERPC(&ctx.Tracer, process, regs)
-		if len(req) != 0 {
-			if isTLSRegisterRequest(req) {
-				ctx.processCache.SetSpanTLS(process.Tgid, handleTLSRegister(req))
-			}
 		}
 	}
 }
@@ -142,8 +169,6 @@ func (ctx *CWSPtracerCtx) handlePostHooks(nr int, ppid int, regs syscall.PtraceR
 	case ExecveNr, ExecveatNr:
 		// now the pid is the tgid
 		process.Pid = process.Tgid
-		// remove previously registered TLS
-		ctx.processCache.UnsetSpan(process.Tgid)
 	case CloneNr:
 		ctx.handleClone(ctx.ReadArgUint64(regs, 0), process, ppid)
 	case Clone3Nr:
@@ -193,7 +218,7 @@ func (ctx *CWSPtracerCtx) handleExit(process *Process, waitStatus *syscall.WaitS
 
 func (ctx *CWSPtracerCtx) handleHooks(cbType CallbackType, nr int, pid int, ppid int, regs syscall.PtraceRegs, waitStatus *syscall.WaitStatus) {
 	handler, handlerFound := ctx.syscallHandlers[nr]
-	if !handlerFound && !slices.Contains([]int{ExecveNr, ExecveatNr, IoctlNr, CloneNr, Clone3Nr, ForkNr, VforkNr, ExitNr}, nr) {
+	if !handlerFound && !slices.Contains([]int{ExecveNr, ExecveatNr, CloneNr, Clone3Nr, ForkNr, VforkNr, ExitNr}, nr) {
 		return
 	}
 
@@ -205,7 +230,7 @@ func (ctx *CWSPtracerCtx) handleHooks(cbType CallbackType, nr int, pid int, ppid
 
 	switch cbType {
 	case CallbackPreType:
-		ctx.handlePreHooks(nr, pid, regs, process, handler)
+		ctx.handlePreHooks(nr, regs, process, handler)
 
 	case CallbackPostType:
 		ctx.handlePostHooks(nr, ppid, regs, process, handler)

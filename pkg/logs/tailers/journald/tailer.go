@@ -14,28 +14,31 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/coreos/go-systemd/sdjournal"
+	"github.com/coreos/go-systemd/v22/sdjournal"
 
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	"github.com/DataDog/datadog-agent/comp/logs-library/processor"
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
+	auditor "github.com/DataDog/datadog-agent/comp/logs/auditor/def"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/decoder"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/tag"
 	"github.com/DataDog/datadog-agent/pkg/logs/message"
-	"github.com/DataDog/datadog-agent/pkg/logs/processor"
 	"github.com/DataDog/datadog-agent/pkg/logs/sources"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // defaultWaitDuration represents the delay before which we try to collect a new log from the journal
 const (
-	defaultWaitDuration    = 1 * time.Second
-	defaultApplicationName = "docker"
+	defaultWaitDuration = 1 * time.Second
+
+	dockerApplicationName = "docker" // Legacy compliant default for unset defaultApplicationName
+	emptyApplicationName  = ""       // Empty string is used to indicate that no default application name should be assumed
 )
 
 // Tailer collects logs from a journal.
 type Tailer struct {
-	decoder    *decoder.Decoder
+	decoder    decoder.Decoder
 	source     *sources.LogSource
 	outputChan chan *message.Message
 	journal    Journal
@@ -50,14 +53,20 @@ type Tailer struct {
 	// instead of on the logs content.
 	processRawMessage bool
 
+	// entryReady is true when seek() has already positioned the journal on a
+	// readable entry (via SeekHead+Next). tail() should read this entry before
+	// calling Next() again.
+	entryReady bool
 	// tagProvider provides additional tags to be attached to each log message.  It
 	// is called once for each log message.
-	tagProvider tag.Provider
-	tagger      tagger.Component
+	tagProvider            tag.Provider
+	tagger                 tagger.Component
+	registry               auditor.Registry
+	defaultApplicationName *string
 }
 
 // NewTailer returns a new tailer.
-func NewTailer(source *sources.LogSource, outputChan chan *message.Message, journal Journal, processRawMessage bool, tagger tagger.Component) *Tailer {
+func NewTailer(source *sources.LogSource, outputChan chan *message.Message, journal Journal, processRawMessage bool, tagger tagger.Component, registry auditor.Registry) *Tailer {
 	if len(source.Config.ProcessingRules) > 0 && processRawMessage {
 		log.Warn("The logs processing rules currently apply to the raw journald JSON-structured log. These rules can now be applied to the message content only, and we plan to make this the default behavior in the future.")
 		log.Warn("In order to immediately switch to this new behavior, set 'process_raw_message' to 'false' in your logs integration config and adapt your processing rules accordingly.")
@@ -66,30 +75,33 @@ func NewTailer(source *sources.LogSource, outputChan chan *message.Message, jour
 	}
 
 	return &Tailer{
-		decoder:           decoder.NewNoopDecoder(),
-		source:            source,
-		outputChan:        outputChan,
-		journal:           journal,
-		stop:              make(chan struct{}, 1),
-		done:              make(chan struct{}, 1),
-		processRawMessage: processRawMessage,
-		tagProvider:       tag.NewLocalProvider([]string{}),
-		tagger:            tagger,
+		decoder:                decoder.NewNoopDecoder(),
+		source:                 source,
+		outputChan:             outputChan,
+		journal:                journal,
+		stop:                   make(chan struct{}, 1),
+		done:                   make(chan struct{}, 1),
+		processRawMessage:      processRawMessage,
+		tagProvider:            tag.NewLocalProvider(source.Config.Tags),
+		tagger:                 tagger,
+		registry:               registry,
+		defaultApplicationName: source.Config.DefaultApplicationName,
 	}
 }
 
 // Start starts tailing the journal from a given offset.
 func (t *Tailer) Start(cursor string) error {
 	if err := t.setup(); err != nil {
-		t.source.Status.Error(err)
+		t.source.Status().Error(err)
 		return err
 	}
 	if err := t.seek(cursor); err != nil {
-		t.source.Status.Error(err)
+		t.source.Status().Error(err)
 		return err
 	}
-	t.source.Status.Success()
+	t.source.Status().Success()
 	t.source.AddInput(t.Identifier())
+	t.registry.SetTailed(t.Identifier(), true)
 	log.Info("Start tailing journal ", t.journalPath(), " with id: ", t.Identifier())
 
 	go t.forwardMessages()
@@ -102,6 +114,8 @@ func (t *Tailer) Start(cursor string) error {
 // Stop stops the tailer
 func (t *Tailer) Stop() {
 	log.Info("Stop tailing journal ", t.journalPath(), " with id: ", t.Identifier())
+
+	t.registry.SetTailed(t.Identifier(), false)
 
 	// stop the tail() routine
 	t.stop <- struct{}{}
@@ -195,8 +209,16 @@ func (t *Tailer) forwardMessages() {
 		close(t.done)
 	}()
 
-	for decodedMessage := range t.decoder.OutputChan {
+	for decodedMessage := range t.decoder.OutputChan() {
+		// This tailer produces StateStructured messages where "message" is
+		// populated from the journal MESSAGE field. Currently, entries without
+		// a MESSAGE field result in an empty "message" and are silently dropped
+		// here -- the structured metadata (unit name, priority, etc.) is
+		// discarded along with it. If that becomes a real concern, replace this
+		// check with decodedMessage.HasContent() (see stream_tailer.go).
 		if len(decodedMessage.GetContent()) > 0 {
+			// Preserve the original message structure and ParsingExtra information (including IsTruncated)
+			// The decodedMessage already has the proper origin with tags set
 			t.outputChan <- decodedMessage
 		}
 	}
@@ -211,7 +233,10 @@ func (t *Tailer) seek(cursor string) error {
 		if err := t.journal.SeekHead(); err != nil {
 			return err
 		}
-		_, err := t.journal.Next() // SeekHead must be followed by Next
+		// SeekHead must be followed by Next before any Get* call.
+		// Set entryReady so tail() reads this entry before calling Next().
+		n, err := t.journal.Next()
+		t.entryReady = n > 0
 		return err
 	}
 	seekTail := func() error {
@@ -253,22 +278,28 @@ func (t *Tailer) tail() {
 		t.journal.Close()
 		t.decoder.Stop()
 	}()
+
 	for {
 		select {
 		case <-t.stop:
 			return
 		default:
-			n, err := t.journal.Next()
-			if err != nil && err != io.EOF {
-				err := fmt.Errorf("cant't tail journal %s: %s", t.journalPath(), err)
-				t.source.Status.Error(err)
-				log.Error(err)
-				return
-			}
-			if n < 1 {
-				// no new entry
-				t.journal.Wait(defaultWaitDuration)
-				continue
+			if t.entryReady {
+				// seek() already positioned the journal on a readable entry.
+				t.entryReady = false
+			} else {
+				n, err := t.journal.Next()
+				if err != nil && err != io.EOF {
+					err := fmt.Errorf("cant't tail journal %s: %s", t.journalPath(), err)
+					t.source.Status().Error(err)
+					log.Error(err)
+					return
+				}
+				if n < 1 {
+					// no new entry
+					t.journal.Wait(defaultWaitDuration)
+					continue
+				}
 			}
 			entry, err := t.journal.GetEntry()
 			if err != nil {
@@ -300,7 +331,7 @@ func (t *Tailer) tail() {
 			select {
 			case <-t.stop:
 				return
-			case t.decoder.InputChan <- msg:
+			case t.decoder.InputChan() <- msg:
 			}
 		}
 	}
@@ -405,6 +436,7 @@ func (t *Tailer) getOrigin(entry *sdjournal.JournalEntry) *message.Origin {
 	origin.SetSource(applicationName)
 	origin.SetService(applicationName)
 	origin.SetTags(append(tags, t.tagProvider.GetTags()...))
+
 	return origin
 }
 
@@ -425,7 +457,14 @@ func (t *Tailer) getApplicationName(entry *sdjournal.JournalEntry, tags []string
 			}
 		}
 
-		return defaultApplicationName
+		// If no default application name is set in the config, use the legacy compliant default
+		if t.defaultApplicationName == nil {
+			return dockerApplicationName
+		}
+
+		if *t.defaultApplicationName != emptyApplicationName {
+			return *t.defaultApplicationName
+		}
 	}
 
 	for _, key := range applicationKeys {
@@ -483,8 +522,8 @@ func (t *Tailer) Identifier() string {
 // Identifier returns the unique identifier of the current journald config
 func Identifier(config *config.LogsConfig) string {
 	id := "default"
-	if config.ConfigId != "" {
-		id = config.ConfigId
+	if config.ConfigID != "" {
+		id = config.ConfigID
 	} else if config.Path != "" {
 		id = config.Path
 	}

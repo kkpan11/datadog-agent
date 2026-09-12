@@ -10,6 +10,7 @@ package crio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -43,6 +44,7 @@ func (c *collector) generateImageEventFromContainer(ctx context.Context, contain
 
 // convertImageToEvent converts a CRI-O image and additional metadata into a workloadmeta CollectorEvent.
 func (c *collector) convertImageToEvent(img *v1.Image, info map[string]string, namespace string) *workloadmeta.CollectorEvent {
+
 	var annotations map[string]string
 	if img.GetSpec() == nil {
 		annotations = nil
@@ -54,15 +56,14 @@ func (c *collector) convertImageToEvent(img *v1.Image, info map[string]string, n
 	if len(img.GetRepoTags()) > 0 {
 		name = img.GetRepoTags()[0]
 	}
-	imgID := img.GetId()
-	imgInfo := parseImageInfo(info, crio.GetOverlayImagePath(), imgID)
+	rawID := img.GetId()
+	imgInfo := parseImageInfo(info, crio.GetOverlayImagePath(), rawID)
 
-	imgIDAsDigest, err := parseDigests(img.GetRepoDigests())
-	if err == nil {
-		imgID = imgIDAsDigest
-	} else if sbomCollectionIsEnabled() {
-		log.Warnf("Failed to parse digest for image with ID %s: %v. As a result, SBOM vulnerabilities may not be properly linked to this image.", imgID, err)
-	}
+	// The image ID is the OCI config digest: containers-storage keys each image
+	// by it (so rawID is that digest), and containerd reports the same identity.
+	// Normalize to sha256: form. This previously used the manifest RepoDigest,
+	// which diverged from containerd and from the config digest crane resolves.
+	imgID := normalizeImageID(rawID)
 
 	imgMeta := workloadmeta.ContainerImageMetadata{
 		EntityID: workloadmeta.EntityID{
@@ -102,11 +103,21 @@ func generateUnsetImageEvent(seenID workloadmeta.EntityID) *workloadmeta.Collect
 	}
 }
 
+// normalizeImageID returns the OCI config digest in sha256: form. CRI-O's image
+// ID (the containers-storage image ID) is that config digest, sometimes without
+// the algorithm prefix.
+func normalizeImageID(id string) string {
+	if id != "" && !strings.HasPrefix(id, "sha256:") {
+		return "sha256:" + id
+	}
+	return id
+}
+
 // parseDigests extracts the SHA from the image reference digest.
 // The backend requires the image ID to be set as the SHA to correctly associate the SBOM with the image.
 func parseDigests(imageRefs []string) (string, error) {
 	if len(imageRefs) == 0 {
-		return "", fmt.Errorf("empty digests list")
+		return "", errors.New("empty digests list")
 	}
 	parts := strings.SplitN(imageRefs[0], "@", 2)
 	if len(parts) < 2 {
@@ -137,7 +148,7 @@ func parseImageInfo(info map[string]string, layerFilePath string, imgID string) 
 
 			// Match layers with their history entries, including empty layers
 			historyIndex := 0
-			for layerIndex, layerDigest := range parsed.ImageSpec.RootFS.DiffIDs {
+			for layerIndex, diffID := range parsed.ImageSpec.RootFS.DiffIDs {
 				// Append all empty layers encountered before this layer
 				for historyIndex < len(parsed.ImageSpec.History) {
 					history := parsed.ImageSpec.History[historyIndex]
@@ -176,7 +187,7 @@ func parseImageInfo(info map[string]string, layerFilePath string, imgID string) 
 
 				// Create and append the layer with the matched history
 				layer := workloadmeta.ContainerImageLayer{
-					Digest:  layerDigest,
+					DiffID:  diffID,
 					History: historyEntry,
 				}
 
@@ -213,6 +224,61 @@ func parseImageInfo(info map[string]string, layerFilePath string, imgID string) 
 	}
 
 	return imgInfo
+}
+
+// generateImageEventsFromImageList creates workloadmeta image events from the full image list.
+// Returns events for new images and IDs of all current images (for seenImages tracking).
+func (c *collector) generateImageEventsFromImageList(ctx context.Context) ([]workloadmeta.CollectorEvent, []workloadmeta.EntityID, error) {
+	images, err := c.client.ListImages(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to list images: %w", err)
+	}
+
+	imageEvents := make([]workloadmeta.CollectorEvent, 0)
+	allImageIDs := make([]workloadmeta.EntityID, 0, len(images))
+
+	for _, img := range images {
+		// The image ID is the OCI config digest (what GetId returns), normalized to
+		// sha256 form, matching convertImageToEvent.
+		rawID := img.GetId()
+		imgID := normalizeImageID(rawID)
+
+		// Always track with the computed ID (same as what convertImageToEvent would use)
+		entityID := workloadmeta.EntityID{Kind: workloadmeta.KindContainerImageMetadata, ID: imgID}
+		allImageIDs = append(allImageIDs, entityID)
+
+		// Check if image already exists in workloadmeta store
+		// Try computed ID first, then raw ID as fallback for edge cases
+		var existsInStore bool
+		if _, err := c.store.GetImage(imgID); err == nil {
+			existsInStore = true
+		} else if imgID != rawID {
+			// Only try raw ID if it's different from computed ID
+			if _, err := c.store.GetImage(rawID); err == nil {
+				existsInStore = true
+			}
+		}
+
+		if existsInStore {
+			// Image already exists in store - no need to send event, metadata persists automatically
+			continue
+		}
+
+		imageSpec := &v1.ImageSpec{Image: img.GetId()}
+		imageResp, err := c.client.GetContainerImage(ctx, imageSpec, true)
+		if err != nil {
+			log.Warnf("Failed to get image status for image %s: %v", img.GetId(), err)
+			continue
+		}
+
+		// Get namespace from any container using this image - use empty string as default
+		namespace := ""
+
+		imageEvent := c.convertImageToEvent(imageResp.GetImage(), imageResp.GetInfo(), namespace)
+		imageEvents = append(imageEvents, *imageEvent)
+	}
+
+	return imageEvents, allImageIDs, nil
 }
 
 // parseLayerInfo reads a JSON file from the given path and returns a list of layerInfo

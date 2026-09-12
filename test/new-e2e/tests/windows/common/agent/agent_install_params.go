@@ -9,13 +9,13 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams/msi"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams/msi"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner/parameters"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v7"
 )
 
 // InstallAgentParams are the parameters used for installing the Agent using msiexec.
@@ -49,6 +49,10 @@ type InstallAgentParams struct {
 	ProcessEnabled          string `installer_arg:"PROCESS_ENABLED"`
 	ProcessDiscoveryEnabled string `installer_arg:"PROCESS_DISCOVERY_ENABLED"`
 	APMEnabled              string `installer_arg:"APM_ENABLED"`
+	RemoteUpdates           string `installer_arg:"DD_REMOTE_UPDATES"`
+	InfrastructureMode      string `installer_arg:"DD_INFRASTRUCTURE_MODE"`
+	InstallOnly             string `installer_arg:"DD_INSTALL_ONLY"`
+	KeepUserRights          string `installer_arg:"DDAGENTUSER_KEEP_RIGHTS"`
 }
 
 // InstallAgentOption is an optional function parameter type for InstallAgentParams options
@@ -84,6 +88,16 @@ func WithAgentUser(username string) InstallAgentOption {
 func WithAgentUserPassword(password string) InstallAgentOption {
 	return func(i *InstallAgentParams) error {
 		i.AgentUserPassword = password
+		return nil
+	}
+}
+
+// WithKeepUserRights specifies the DDAGENTUSER_KEEP_RIGHTS parameter. When set to a
+// truthy value (1/true/yes), the installer skips re-applying the ddagentuser
+// SeDeny*LogonRight assignments so operator customizations survive upgrades.
+func WithKeepUserRights(value string) InstallAgentOption {
+	return func(i *InstallAgentParams) error {
+		i.KeepUserRights = value
 		return nil
 	}
 }
@@ -324,6 +338,39 @@ func WithAddLocal(addLocal string) InstallAgentOption {
 func WithIntegrationsPersistence(IntegrationsPersistence string) InstallAgentOption {
 	return func(i *InstallAgentParams) error {
 		i.IntegrationsPersistence = IntegrationsPersistence
+		return nil
+	}
+}
+
+// WithRemoteUpdates specifies the DD_REMOTE_UPDATES parameter.
+func WithRemoteUpdates(remoteUpdates string) InstallAgentOption {
+	return func(i *InstallAgentParams) error {
+		i.RemoteUpdates = remoteUpdates
+		return nil
+	}
+}
+
+// WithInfrastructureMode specifies the DD_INFRASTRUCTURE_MODE parameter.
+func WithInfrastructureMode(infrastructureMode string) InstallAgentOption {
+	return func(i *InstallAgentParams) error {
+		i.InfrastructureMode = infrastructureMode
+		return nil
+	}
+}
+
+// WithInstallOnly specifies the DD_INSTALL_ONLY parameter.
+// When set to "1", the MSI will skip starting the Agent services.
+func WithInstallOnly(installOnly string) InstallAgentOption {
+	return func(i *InstallAgentParams) error {
+		i.InstallOnly = installOnly
+		return nil
+	}
+}
+
+// WithLogLevel specifies the DD_LOG_LEVEL parameter.
+func WithLogLevel(logLevel string) InstallAgentOption {
+	return func(i *InstallAgentParams) error {
+		i.InstallAgentParams.LogLevel = logLevel
 		return nil
 	}
 }

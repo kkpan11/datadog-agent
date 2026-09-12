@@ -11,19 +11,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/multierr"
+	"go.uber.org/zap"
 
+	"github.com/tinylib/msgp/msgp"
+
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
+	otlpmetrics "github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/metrics"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/otel"
-	otlpmetrics "github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/metrics"
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/quantile"
-	"github.com/tinylib/msgp/msgp"
+	"github.com/DataDog/datadog-agent/pkg/util/quantile"
 )
 
 var metricOriginsMappings = map[otlpmetrics.OriginProductDetail]metrics.MetricSource{
@@ -48,6 +54,7 @@ var metricOriginsMappings = map[otlpmetrics.OriginProductDetail]metrics.MetricSo
 	otlpmetrics.OriginProductDetailNginxReceiver:             metrics.MetricSourceOpenTelemetryCollectorNginxReceiver,
 	otlpmetrics.OriginProductDetailNSXTReceiver:              metrics.MetricSourceOpenTelemetryCollectorNsxtReceiver,
 	otlpmetrics.OriginProductDetailOracleDBReceiver:          metrics.MetricSourceOpenTelemetryCollectorOracledbReceiver,
+	otlpmetrics.OriginProductDetailPodmanReceiver:            metrics.MetricSourceOpenTelemetryCollectorPodmanReceiver,
 	otlpmetrics.OriginProductDetailPostgreSQLReceiver:        metrics.MetricSourceOpenTelemetryCollectorPostgresqlReceiver,
 	otlpmetrics.OriginProductDetailPrometheusReceiver:        metrics.MetricSourceOpenTelemetryCollectorPrometheusReceiver,
 	otlpmetrics.OriginProductDetailRabbitMQReceiver:          metrics.MetricSourceOpenTelemetryCollectorRabbitmqReceiver,
@@ -79,17 +86,36 @@ type SerializerConsumer interface {
 	otlpmetrics.Consumer
 	Send(s serializer.MetricSerializer) error
 	addRuntimeTelemetryMetric(hostname string, languageTags []string)
-	addTelemetryMetric(hostname string)
-	addGatewayUsage(hostname string, gatewayUsage otel.GatewayUsage)
+	addTelemetryMetric(hostname string, params exporter.Settings, coatUsageMetric telemetry.Gauge)
+	addGatewayUsage(hostname string, params exporter.Settings, gatewayUsage otel.GatewayUsage, coatGwUsageMetric telemetry.Gauge)
 }
 
 type serializerConsumer struct {
-	enricher        tagenricher
 	extraTags       []string
 	series          metrics.Series
 	sketches        metrics.SketchSeriesList
 	apmstats        []io.Reader
 	apmReceiverAddr string
+	ipath           ingestionPath
+	hosts           map[string]struct{}
+	ecsFargateTags  map[string]struct{}
+}
+
+// ingestionPath specifies which ingestion path is using the serializer exporter
+type ingestionPath int
+
+const (
+	ossCollector ingestionPath = iota
+	ddot
+	agentOTLPIngest
+)
+
+func (c *serializerConsumer) ConsumeExplicitBoundHistogram(_ context.Context, _ *otlpmetrics.Dimensions, _ pmetric.HistogramDataPointSlice) {
+	// TODO noop for now
+}
+
+func (c *serializerConsumer) ConsumeExponentialHistogram(_ context.Context, _ *otlpmetrics.Dimensions, _ pmetric.ExponentialHistogramDataPointSlice) {
+	// TODO noop for now
 }
 
 func (c *serializerConsumer) ConsumeAPMStats(ss *pb.ClientStatsPayload) {
@@ -103,21 +129,30 @@ func (c *serializerConsumer) ConsumeAPMStats(ss *pb.ClientStatsPayload) {
 	c.apmstats = append(c.apmstats, body)
 }
 
-func (c *serializerConsumer) ConsumeSketch(ctx context.Context, dimensions *otlpmetrics.Dimensions, ts uint64, qsketch *quantile.Sketch) {
+func enrichTags(extraTags []string, dimensions *otlpmetrics.Dimensions) []string {
+	enrichedTags := make([]string, 0, len(extraTags)+len(dimensions.Tags()))
+	enrichedTags = append(enrichedTags, extraTags...)
+	enrichedTags = append(enrichedTags, dimensions.Tags()...)
+	return enrichedTags
+}
+
+func (c *serializerConsumer) ConsumeSketch(_ context.Context, dimensions *otlpmetrics.Dimensions, ts uint64, interval int64, qsketch *quantile.Sketch) {
 	msrc, ok := metricOriginsMappings[dimensions.OriginProductDetail()]
 	if !ok {
 		msrc = metrics.MetricSourceOpenTelemetryCollectorUnknown
 	}
 	c.sketches = append(c.sketches, &metrics.SketchSeries{
-		Name:     dimensions.Name(),
-		Tags:     tagset.CompositeTagsFromSlice(c.enricher.Enrich(ctx, c.extraTags, dimensions)),
-		Host:     dimensions.Host(),
-		Interval: 0, // OTLP metrics do not have an interval.
+		DistributionMetadata: metrics.DistributionMetadata{
+			Name:     dimensions.Name(),
+			Tags:     tagset.CompositeTagsFromSlice(enrichTags(c.extraTags, dimensions)),
+			Host:     dimensions.Host(),
+			Interval: interval,
+			Source:   msrc,
+		},
 		Points: []metrics.SketchPoint{{
 			Ts:     int64(ts / 1e9),
 			Sketch: qsketch,
 		}},
-		Source: msrc,
 	})
 }
 
@@ -127,11 +162,13 @@ func apiTypeFromTranslatorType(typ otlpmetrics.DataType) metrics.APIMetricType {
 		return metrics.APICountType
 	case otlpmetrics.Gauge:
 		return metrics.APIGaugeType
+	case otlpmetrics.Rate:
+		return metrics.APIRateType
 	}
-	panic(fmt.Sprintf("unreachable: received non-count non-gauge type: %d", typ))
+	panic(fmt.Sprintf("unreachable: received unexpected metric type: %d", typ))
 }
 
-func (c *serializerConsumer) ConsumeTimeSeries(ctx context.Context, dimensions *otlpmetrics.Dimensions, typ otlpmetrics.DataType, ts uint64, value float64) {
+func (c *serializerConsumer) ConsumeTimeSeries(_ context.Context, dimensions *otlpmetrics.Dimensions, typ otlpmetrics.DataType, ts uint64, interval int64, value float64) {
 	msrc, ok := metricOriginsMappings[dimensions.OriginProductDetail()]
 	if !ok {
 		msrc = metrics.MetricSourceOpenTelemetryCollectorUnknown
@@ -140,25 +177,49 @@ func (c *serializerConsumer) ConsumeTimeSeries(ctx context.Context, dimensions *
 		&metrics.Serie{
 			Name:     dimensions.Name(),
 			Points:   []metrics.Point{{Ts: float64(ts / 1e9), Value: value}},
-			Tags:     tagset.CompositeTagsFromSlice(c.enricher.Enrich(ctx, c.extraTags, dimensions)),
+			Tags:     tagset.CompositeTagsFromSlice(enrichTags(c.extraTags, dimensions)),
 			Host:     dimensions.Host(),
 			MType:    apiTypeFromTranslatorType(typ),
-			Interval: 0, // OTLP metrics do not have an interval.
+			Interval: interval,
 			Source:   msrc,
+			Unit:     dimensions.Unit(),
 		},
 	)
 }
 
 // addTelemetryMetric to know if an Agent is using OTLP metrics.
-func (c *serializerConsumer) addTelemetryMetric(hostname string) {
+func (c *serializerConsumer) addTelemetryMetric(agentHostname string, params exporter.Settings, coatUsageMetric telemetry.Gauge) {
+	timestamp := float64(time.Now().Unix())
 	c.series = append(c.series, &metrics.Serie{
 		Name:           "datadog.agent.otlp.metrics",
-		Points:         []metrics.Point{{Value: 1, Ts: float64(time.Now().Unix())}},
+		Points:         []metrics.Point{{Value: 1, Ts: timestamp}},
 		Tags:           tagset.CompositeTagsFromSlice([]string{}),
-		Host:           hostname,
+		Host:           agentHostname,
 		MType:          metrics.APIGaugeType,
 		SourceTypeName: "System",
 	})
+
+	if coatUsageMetric == nil {
+		return
+	}
+
+	buildInfo := params.BuildInfo
+	switch c.ipath {
+	case ddot:
+		for host := range c.hosts {
+			coatUsageMetric.Set(1.0, buildInfo.Version, buildInfo.Command, host, "")
+		}
+		for ecsFargateTag := range c.ecsFargateTags {
+			taskArn := strings.Split(ecsFargateTag, ":")[1]
+			coatUsageMetric.Set(1.0, buildInfo.Version, buildInfo.Command, "", taskArn)
+		}
+	case agentOTLPIngest:
+		coatUsageMetric.Set(1.0, buildInfo.Version, buildInfo.Command, agentHostname)
+	case ossCollector:
+		params.Logger.Fatal("wrong consumer implementation used in OSS datadog exporter, should use collectorConsumer")
+	default:
+		params.Logger.Fatal("ingestion path unset or unknown", zap.Int("ingestion path enum", int(c.ipath)))
+	}
 }
 
 // addRuntimeTelemetryMetric to know if an Agent is using OTLP runtime metrics.
@@ -175,8 +236,11 @@ func (c *serializerConsumer) addRuntimeTelemetryMetric(hostname string, language
 	}
 }
 
-func (c *serializerConsumer) addGatewayUsage(hostname string, gatewayUsage otel.GatewayUsage) {
+func (c *serializerConsumer) addGatewayUsage(hostname string, params exporter.Settings,
+	gatewayUsage otel.GatewayUsage, coatGwUsageMetric telemetry.Gauge) {
+	buildInfo := params.BuildInfo
 	value, enabled := gatewayUsage.Gauge()
+	gateWayEnvVar := gatewayUsage.EnvVarValue()
 	if enabled {
 		c.series = append(c.series, &metrics.Serie{
 			Name:           "datadog.otel.gateway",
@@ -186,6 +250,32 @@ func (c *serializerConsumer) addGatewayUsage(hostname string, gatewayUsage otel.
 			MType:          metrics.APIGaugeType,
 			SourceTypeName: "System",
 		})
+	} else {
+		value = 0
+	}
+
+	c.series = append(c.series, &metrics.Serie{
+		Name:           "datadog.otel.gateway.configured",
+		Points:         []metrics.Point{{Value: gateWayEnvVar, Ts: float64(time.Now().Unix())}},
+		Tags:           tagset.CompositeTagsFromSlice([]string{}),
+		Host:           hostname,
+		MType:          metrics.APIGaugeType,
+		SourceTypeName: "System",
+	})
+
+	if coatGwUsageMetric == nil {
+		return
+	}
+
+	switch c.ipath {
+	case ddot:
+		coatGwUsageMetric.Set(value, buildInfo.Version, buildInfo.Command)
+	case agentOTLPIngest:
+		params.Logger.Info("unexpected GW operation at OTLP Ingest, will not export COAT metric")
+	case ossCollector:
+		params.Logger.Fatal("wrong consumer implementation used in OSS datadog exporter, should use collectorConsumer")
+	default:
+		params.Logger.Fatal("ingestion path unset or unknown", zap.Int("ingestion path enum", int(c.ipath)))
 	}
 }
 
@@ -227,4 +317,14 @@ func (c *serializerConsumer) sendAPMStats() error {
 		}
 	}
 	return nil
+}
+
+// ConsumeHost implements the metrics.HostConsumer interface.
+func (c *serializerConsumer) ConsumeHost(host string) {
+	c.hosts[host] = struct{}{}
+}
+
+// ConsumeTag implements the metrics.TagsConsumer interface.
+func (c *serializerConsumer) ConsumeTag(tag string) {
+	c.ecsFargateTags[tag] = struct{}{}
 }

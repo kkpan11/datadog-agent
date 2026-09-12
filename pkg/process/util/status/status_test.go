@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
-	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl/utils"
+	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/impl/utils"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/version"
@@ -62,11 +62,9 @@ func TestGetStatus(t *testing.T) {
 			ProcessQueueSize:                1,
 			RTProcessQueueSize:              3,
 			ConnectionsQueueSize:            4,
-			PodQueueSize:                    5,
 			ProcessQueueBytes:               2 * 1024,
 			RTProcessQueueBytes:             512,
 			ConnectionsQueueBytes:           8 * 1024,
-			PodQueueBytes:                   4 * 1024,
 			SystemProbeProcessModuleEnabled: true,
 			LanguageDetectionEnabled:        true,
 			WlmExtractorCacheSize:           36,
@@ -80,8 +78,9 @@ func TestGetStatus(t *testing.T) {
 	// when the datadog.yaml file is loaded
 	cfg := configmock.New(t)
 	env.SetFeatures(t)
-	cfg.SetWithoutSource("hostname", "test") // Prevents panic since feature detection has not run
-	cfg.SetWithoutSource("language_detection.enabled", true)
+	cfg.SetInTest("hostname", "test") // Prevents panic since feature detection has not run
+	cfg.SetInTest("language_detection.enabled", true)
+	cfg.SetInTest("cloud_provider_metadata", []string{}) // Avoid real HTTP calls to cloud metadata
 
 	expectedStatus := &Status{
 		Date: float64(testTime.UnixNano()),

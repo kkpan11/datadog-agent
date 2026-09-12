@@ -16,7 +16,6 @@ import (
 	metricscompression "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/impl"
 	"github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
-	"github.com/DataDog/datadog-agent/pkg/serializer/marshaler"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
 	"github.com/DataDog/datadog-agent/pkg/util/compression"
 
@@ -26,7 +25,8 @@ import (
 
 func check(t *testing.T, in metrics.SketchPoint, pb gogen.SketchPayload_Sketch_Dogsketch) {
 	t.Helper()
-	s, b := in.Sketch, in.Sketch.Basic
+	s := in.Sketch
+	bCnt, bMin, bMax, bSum, bAvg := in.Sketch.BasicStats()
 	require.Equal(t, in.Ts, pb.Ts)
 
 	// sketch
@@ -35,59 +35,11 @@ func check(t *testing.T, in metrics.SketchPoint, pb gogen.SketchPayload_Sketch_D
 	require.Equal(t, n, pb.N)
 
 	// summary
-	require.Equal(t, b.Cnt, pb.Cnt)
-	require.Equal(t, b.Min, pb.Min)
-	require.Equal(t, b.Max, pb.Max)
-	require.Equal(t, b.Avg, pb.Avg)
-	require.Equal(t, b.Sum, pb.Sum)
-}
-
-func TestSketchSeriesListMarshal(t *testing.T) {
-	sl := metrics.NewSketchesSourceTest()
-
-	for i := 0; i < 2; i++ {
-		sl.Append(Makeseries(i))
-	}
-
-	serializer := SketchSeriesList{SketchesSource: sl}
-	b, err := serializer.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pl := new(gogen.SketchPayload)
-	if err := pl.Unmarshal(b); err != nil {
-		t.Fatal(err)
-	}
-
-	require.Len(t, pl.Sketches, int(sl.Count()))
-
-	for i, pb := range pl.Sketches {
-		in := sl.Get(i)
-		require.Equal(t, Makeseries(i), in, "make sure we don't modify input")
-
-		assert.Equal(t, in.Host, pb.Host)
-		assert.Equal(t, in.Name, pb.Metric)
-		metrics.AssertCompositeTagsEqual(t, in.Tags, tagset.CompositeTagsFromSlice(pb.Tags))
-		assert.Len(t, pb.Distributions, 0)
-
-		require.Len(t, pb.Dogsketches, len(in.Points))
-		for j, pointPb := range pb.Dogsketches {
-
-			check(t, in.Points[j], pointPb)
-			// require.Equal(t, pointIn.Ts, pointPb.Ts)
-			// require.Equal(t, pointIn.Ts, pointPb.Ts)
-
-			// fmt.Printf("%#v %#v\n", pin, s)
-		}
-	}
-}
-
-func TestSketchSeriesSplitEmptyPayload(t *testing.T) {
-	sl := SketchSeriesList{SketchesSource: metrics.NewSketchesSourceTest()}
-	pieces, err := sl.SplitPayload(10)
-	require.Len(t, pieces, 0)
-	require.Nil(t, err)
+	require.Equal(t, bCnt, pb.Cnt)
+	require.Equal(t, bMin, pb.Min)
+	require.Equal(t, bMax, pb.Max)
+	require.Equal(t, bAvg, pb.Avg)
+	require.Equal(t, bSum, pb.Sum)
 }
 
 func TestSketchSeriesMarshalSplitCompressEmpty(t *testing.T) {
@@ -101,21 +53,21 @@ func TestSketchSeriesMarshalSplitCompressEmpty(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 			sl := SketchSeriesList{SketchesSource: metrics.NewSketchesSourceTest()}
-			payload, _ := sl.Marshal()
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
-			payloads, err := sl.MarshalSplitCompress(marshaler.NewBufferContext(), mockConfig, compressor, logger)
-
+			pipelines := testPipelines()
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+			err := sl.MarshalSplitCompressPipelines(mockConfig, compressor, pipelines, logger)
 			assert.Nil(t, err)
+			payloads := pipelines.GetPayloads()
 
 			firstPayload := payloads[0]
 			assert.Equal(t, 0, firstPayload.GetPointCount())
 
 			decompressed, _ := compressor.Decompress(firstPayload.GetContent())
-			// Check that we encoded the protobuf correctly
-			assert.Equal(t, decompressed, payload)
+			// 0b00010 010 - field 2 (metadata) type 2 (bytes), 0 length
+			assert.Equal(t, []byte{0x12, 0x00}, decompressed)
 		})
 	}
 }
@@ -132,8 +84,8 @@ func TestSketchSeriesMarshalSplitCompressItemTooBigIsDropped(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
-			mockConfig.SetWithoutSource("serializer_max_uncompressed_payload_size", tc.maxUncompressedSize)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_max_uncompressed_payload_size", tc.maxUncompressedSize)
 
 			sl := metrics.NewSketchesSourceTest()
 			// A big item (to be dropped)
@@ -141,16 +93,19 @@ func TestSketchSeriesMarshalSplitCompressItemTooBigIsDropped(t *testing.T) {
 
 			// A small item (no dropped)
 			sl.Append(&metrics.SketchSeries{
-				Name:     "small",
-				Tags:     tagset.CompositeTagsFromSlice([]string{}),
-				Host:     "",
-				Interval: 0,
+				DistributionMetadata: metrics.DistributionMetadata{
+					Name:     "small",
+					Tags:     tagset.CompositeTagsFromSlice([]string{}),
+					Host:     "",
+					Interval: 0,
+				},
 			})
 
+			pipelines := testPipelines()
 			serializer := SketchSeriesList{SketchesSource: sl}
-
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
-			payloads, err := serializer.MarshalSplitCompress(marshaler.NewBufferContext(), mockConfig, compressor, logger)
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+			err := serializer.MarshalSplitCompressPipelines(mockConfig, compressor, pipelines, logger)
+			payloads := pipelines.GetPayloads()
 
 			assert.Nil(t, err)
 
@@ -182,19 +137,20 @@ func TestSketchSeriesMarshalSplitCompress(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 			sl := metrics.NewSketchesSourceTest()
 
 			for i := 0; i < 2; i++ {
 				sl.Append(Makeseries(i))
 			}
-
 			sl.Reset()
-			serializer2 := SketchSeriesList{SketchesSource: sl}
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
-			payloads, err := serializer2.MarshalSplitCompress(marshaler.NewBufferContext(), mockConfig, compressor, logger)
+			pipelines := testPipelines()
+			serializer2 := SketchSeriesList{SketchesSource: sl}
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+			err := serializer2.MarshalSplitCompressPipelines(mockConfig, compressor, pipelines, logger)
 			require.NoError(t, err)
+			payloads := pipelines.GetPayloads()
 
 			firstPayload := payloads[0]
 			assert.Equal(t, 11, firstPayload.GetPointCount())
@@ -240,8 +196,8 @@ func TestSketchSeriesMarshalSplitCompressSplit(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
-			mockConfig.SetWithoutSource("serializer_max_uncompressed_payload_size", tc.maxUncompressedSize)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_max_uncompressed_payload_size", tc.maxUncompressedSize)
 
 			sl := metrics.NewSketchesSourceTest()
 
@@ -251,11 +207,12 @@ func TestSketchSeriesMarshalSplitCompressSplit(t *testing.T) {
 				expectedPointCount += i + 5
 			}
 
+			pipelines := testPipelines()
 			serializer := SketchSeriesList{SketchesSource: sl}
-
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
-			payloads, err := serializer.MarshalSplitCompress(marshaler.NewBufferContext(), mockConfig, compressor, logger)
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+			err := serializer.MarshalSplitCompressPipelines(mockConfig, compressor, pipelines, logger)
 			assert.Nil(t, err)
+			payloads := pipelines.GetPayloads()
 
 			recoveredSketches := []gogen.SketchPayload{}
 			recoveredCount := 0
@@ -308,7 +265,7 @@ func TestSketchSeriesMarshalSplitCompressMultiple(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 			sl := metrics.NewSketchesSourceTest()
 
 			for i := 0; i < 2; i++ {
@@ -317,11 +274,24 @@ func TestSketchSeriesMarshalSplitCompressMultiple(t *testing.T) {
 
 			sl.Reset()
 			serializer2 := SketchSeriesList{SketchesSource: sl}
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
-			payloads, filteredPayloads, err := serializer2.MarshalSplitCompressMultiple(mockConfig, compressor, func(ss *metrics.SketchSeries) bool {
-				return ss.Name == "name.0"
-			}, logmock.New(t))
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+
+			primaryConf := PipelineConfig{
+				Filter: AllowAllFilter{},
+			}
+			secondaryConf := PipelineConfig{
+				Filter: NewMapFilter(map[string]struct{}{"name.0": {}}),
+			}
+			pipelines := PipelineSet{
+				primaryConf:   {},
+				secondaryConf: {},
+			}
+
+			err := serializer2.MarshalSplitCompressPipelines(mockConfig, compressor, pipelines, logmock.New(t))
 			require.NoError(t, err)
+
+			payloads := pipelines[primaryConf].payloads
+			filteredPayloads := pipelines[secondaryConf].payloads
 
 			assert.Equal(t, 1, len(payloads))
 			assert.Equal(t, 1, len(filteredPayloads))
@@ -333,35 +303,27 @@ func TestSketchSeriesMarshalSplitCompressMultiple(t *testing.T) {
 			assert.Equal(t, 5, firstFilteredPayload.GetPointCount())
 		})
 	}
-
 }
 
-func TestSketchSeriesListMarshalWithOriginMapping(t *testing.T) {
-	sl := metrics.NewSketchesSourceTest()
-
-	// Create a sketch series with a specific source
-	ss := Makeseries(0)
-	ss.Source = metrics.MetricSourceDogstatsd
-	sl.Append(ss)
-
-	serializer := SketchSeriesList{SketchesSource: sl}
-	b, err := serializer.Marshal()
-	if err != nil {
-		t.Fatal(err)
+func BenchmarkSketchSerialization(b *testing.B) {
+	src := metrics.NewSketchesSourceTest()
+	for i := 0; i < 10000; i++ {
+		src.Append(Makeseries(0))
 	}
+	serializer := SketchSeriesList{SketchesSource: src}
 
-	pl := new(gogen.SketchPayload)
-	if err := pl.Unmarshal(b); err != nil {
-		t.Fatal(err)
+	mockConfig := mock.New(b)
+	compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+	logger := logmock.New(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		pipelines := testPipelines()
+		err := serializer.MarshalSplitCompressPipelines(mockConfig, compressor, pipelines, logger)
+		require.NoError(b, err)
+		// Reset the source iterator so the next iteration serializes the same data.
+		src.Reset()
 	}
-
-	require.Len(t, pl.Sketches, 1)
-	pb := pl.Sketches[0]
-
-	// Verify the metadata and origin mapping
-	require.NotNil(t, pb.Metadata)
-	require.NotNil(t, pb.Metadata.Origin)
-	assert.Equal(t, uint32(metricSourceToOriginProduct(metrics.MetricSourceDogstatsd)), pb.Metadata.Origin.OriginProduct)
-	assert.Equal(t, uint32(metricSourceToOriginCategory(metrics.MetricSourceDogstatsd)), pb.Metadata.Origin.OriginCategory)
-	assert.Equal(t, uint32(metricSourceToOriginService(metrics.MetricSourceDogstatsd)), pb.Metadata.Origin.OriginService)
 }

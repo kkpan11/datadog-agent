@@ -9,22 +9,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"slices"
 	"sort"
 	"text/tabwriter"
+	"time"
 
 	"github.com/fatih/color"
 
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/flare"
 )
 
 // GetClusterChecks dumps the clustercheck dispatching state to the writer
-func GetClusterChecks(w io.Writer, checkName string) error {
+func GetClusterChecks(w io.Writer, checkName string, c ipc.HTTPClient) error {
 	urlstr := fmt.Sprintf("https://localhost:%v/api/v1/clusterchecks", pkgconfigsetup.Datadog().GetInt("cluster_agent.cmd_port"))
+	urlValues := url.Values{}
+	urlValues.Set("scrub", "true")
 
 	if w != color.Output {
 		color.NoColor = true
@@ -35,15 +41,7 @@ func GetClusterChecks(w io.Writer, checkName string) error {
 		return nil
 	}
 
-	c := util.GetClient()
-
-	// Set session token
-	err := util.SetAuthToken(pkgconfigsetup.Datadog())
-	if err != nil {
-		return err
-	}
-
-	r, err := util.DoGet(c, urlstr, util.LeaveConnectionOpen)
+	r, err := c.Get(urlstr, ipchttp.WithLeaveConnectionOpen, ipchttp.WithValues(urlValues))
 	if err != nil {
 		if r != nil && string(r) != "" {
 			fmt.Fprintf(w, "The agent ran into an error while checking config: %s\n", string(r))
@@ -76,7 +74,7 @@ func GetClusterChecks(w io.Writer, checkName string) error {
 	if len(cr.Dangling) > 0 {
 		fmt.Fprintf(w, "=== %s configurations ===\n", color.RedString("Unassigned"))
 		for _, c := range cr.Dangling {
-			flare.PrintClusterCheckConfig(w, c, checkName)
+			flare.PrintClusterCheckConfig(w, c, checkName, nil)
 		}
 		fmt.Fprintln(w, "")
 	}
@@ -96,22 +94,64 @@ func GetClusterChecks(w io.Writer, checkName string) error {
 	}
 	table.Flush()
 
-	// Print per-node configurations
+	// Print per-node configurations with execution status
 	for _, node := range cr.Nodes {
 		if len(node.Configs) == 0 {
 			continue
 		}
 		fmt.Fprintf(w, "\n===== Checks on %s =====\n", color.HiMagentaString(node.Name))
-		for _, c := range node.Configs {
-			flare.PrintClusterCheckConfig(w, c, checkName)
+		for _, configResp := range node.Configs {
+			flare.PrintClusterCheckConfig(w, configResp.Config, checkName, configResp.InstanceIDs)
+			if len(node.Stats) > 0 {
+				printCheckExecutionStatus(w, configResp.Config, node.Stats, checkName, configResp.InstanceIDs)
+			}
 		}
 	}
 
 	return nil
 }
 
+// printCheckExecutionStatus prints the execution status for each instance of a config,
+// matching the node agent `agent status collector` output format.
+func printCheckExecutionStatus(w io.Writer, c integration.Config, stats types.CLCRunnersStats, checkName string, instanceIDs []string) {
+	if checkName != "" && c.Name != checkName {
+		return
+	}
+	if len(stats) == 0 {
+		return
+	}
+
+	for _, id := range instanceIDs {
+		s, found := stats[id]
+		if !found {
+			continue
+		}
+
+		statusStr := color.GreenString("OK")
+		if s.LastExecFailed {
+			statusStr = color.RedString("ERROR")
+		}
+		fmt.Fprintf(w, "  Instance ID: %s [%s]\n", id, statusStr)
+		fmt.Fprintf(w, "  Total Runs: %d\n", s.TotalRuns)
+		fmt.Fprintf(w, "  Metric Samples: Last Run: %d, Total: %d\n", s.MetricSamples, s.TotalMetricSamples)
+		fmt.Fprintf(w, "  Events: Last Run: %d, Total: %d\n", s.Events, s.TotalEvents)
+		fmt.Fprintf(w, "  Service Checks: Last Run: %d, Total: %d\n", s.ServiceChecks, s.TotalServiceChecks)
+		fmt.Fprintf(w, "  Average Execution Time : %s\n", (time.Duration(s.AverageExecutionTime) * time.Millisecond).String())
+		if s.LastExecutionDate > 0 {
+			fmt.Fprintf(w, "  Last Execution Date : %s\n", time.UnixMilli(s.LastExecutionDate).UTC().Format("2006-01-02 15:04:05 MST"))
+		}
+		if s.LastSuccessDate > 0 {
+			fmt.Fprintf(w, "  Last Successful Execution Date : %s\n", time.Unix(s.LastSuccessDate, 0).UTC().Format("2006-01-02 15:04:05 MST"))
+		}
+		if s.LastError != "" {
+			fmt.Fprintf(w, "  %s: %s\n", color.RedString("Last Error"), s.LastError)
+		}
+		fmt.Fprintln(w, "")
+	}
+}
+
 // GetEndpointsChecks dumps the endpointschecks dispatching state to the writer
-func GetEndpointsChecks(w io.Writer, checkName string) error {
+func GetEndpointsChecks(w io.Writer, checkName string, c ipc.HTTPClient) error {
 	if !endpointschecksEnabled() {
 		return nil
 	}
@@ -122,15 +162,8 @@ func GetEndpointsChecks(w io.Writer, checkName string) error {
 		color.NoColor = true
 	}
 
-	c := util.GetClient()
-
-	// Set session token
-	if err := util.SetAuthToken(pkgconfigsetup.Datadog()); err != nil {
-		return err
-	}
-
 	// Query the cluster agent API
-	r, err := util.DoGet(c, urlstr, util.LeaveConnectionOpen)
+	r, err := c.Get(urlstr, ipchttp.WithLeaveConnectionOpen)
 	if err != nil {
 		if r != nil && string(r) != "" {
 			fmt.Fprintf(w, "The agent ran into an error while checking config: %s\n", string(r))
@@ -148,7 +181,7 @@ func GetEndpointsChecks(w io.Writer, checkName string) error {
 	// Print summary of pod-backed endpointschecks
 	fmt.Fprintf(w, "\n===== %d Pod-backed Endpoints-Checks scheduled =====\n", len(cr.Configs))
 	for _, c := range cr.Configs {
-		flare.PrintClusterCheckConfig(w, c, checkName)
+		flare.PrintClusterCheckConfig(w, c, checkName, nil)
 	}
 
 	return nil

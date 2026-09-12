@@ -3,11 +3,12 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build (windows && npm) || linux_bpf
+//go:build (windows && npm) || (linux && bpf)
 
 package http
 
 import (
+	"regexp"
 	"slices"
 	"strconv"
 	"sync"
@@ -15,7 +16,24 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/utils"
+	"github.com/DataDog/datadog-agent/pkg/util/common"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	ddsync "github.com/DataDog/datadog-agent/pkg/util/sync"
+)
+
+var (
+	requestStatsPool = ddsync.NewTypedPool[RequestStats](NewRequestStats)
+
+	// emptyInternedPath is the shared interned representation of an empty
+	// path used in discovery mode, where the path is not part of the key.
+	emptyInternedPath = Interner.Get([]byte{})
+)
+
+const (
+	// discoveryMaxStatsBuffered is the max entries for discovery mode.
+	// With path+method removed from the key, cardinality drops by orders
+	// of magnitude so a much smaller buffer suffices.
+	discoveryMaxStatsBuffered = 5000
 )
 
 // StatKeeper is responsible for aggregating HTTP stats.
@@ -24,6 +42,7 @@ type StatKeeper struct {
 	stats                map[Key]*RequestStats
 	incomplete           IncompleteBuffer
 	maxEntries           int
+	discoveryMode        bool
 	quantizer            *URLQuantizer
 	telemetry            *Telemetry
 	connectionAggregator *utils.ConnectionAggregator
@@ -41,7 +60,7 @@ type StatKeeper struct {
 func NewStatkeeper(c *config.Config, telemetry *Telemetry, incompleteBuffer IncompleteBuffer) *StatKeeper {
 	var quantizer *URLQuantizer
 	// For now we're only enabling path quantization for HTTP/1 traffic
-	if c.EnableUSMQuantization && telemetry.protocol == "http" {
+	if c.EnableUSMQuantization {
 		quantizer = NewURLQuantizer()
 	}
 
@@ -66,10 +85,17 @@ func NewStatkeeper(c *config.Config, telemetry *Telemetry, incompleteBuffer Inco
 		})
 	}
 
+	maxEntries := c.MaxHTTPStatsBuffered
+	if c.DiscoveryServiceMapEnabled {
+		maxEntries = discoveryMaxStatsBuffered
+		log.Infof("http statkeeper running in discovery mode: path/method dropped from key, max_stats_buffered=%d", maxEntries)
+	}
+
 	return &StatKeeper{
 		stats:                make(map[Key]*RequestStats),
 		incomplete:           incompleteBuffer,
-		maxEntries:           c.MaxHTTPStatsBuffered,
+		maxEntries:           maxEntries,
+		discoveryMode:        c.DiscoveryServiceMapEnabled,
 		quantizer:            quantizer,
 		replaceRules:         c.HTTPReplaceRules,
 		connectionAggregator: connectionAggregator,
@@ -99,7 +125,7 @@ func (h *StatKeeper) GetAndResetAllStats() (stats map[Key]*RequestStats) {
 		h.mux.Lock()
 		defer h.mux.Unlock()
 
-		for _, tx := range h.incomplete.Flush(time.Now()) {
+		for _, tx := range h.incomplete.Flush() {
 			h.add(tx)
 		}
 
@@ -125,7 +151,18 @@ func (h *StatKeeper) GetAndResetAllStats() (stats map[Key]*RequestStats) {
 func (h *StatKeeper) Close() {
 }
 
+var (
+	// grpcPattern is a regex pattern to match gRPC paths by the pattern of `/<package>.<service>/<url>`
+	// Note - <service> can contain dots by itself. For instance `/google.pubsub.v2.PublisherService/CreateTopic`
+	grpcPattern = regexp.MustCompile(`^/([^./]+(\.[^./]+)*?)\.([^./]+(\.[^./]+)*?)/([^./]+?)$`)
+)
+
 func (h *StatKeeper) add(tx Transaction) {
+	if h.discoveryMode {
+		h.addDiscovery(tx)
+		return
+	}
+
 	rawPath, fullPath := tx.Path(h.buffer)
 	if rawPath == nil {
 		h.telemetry.emptyPath.Add(1)
@@ -135,7 +172,10 @@ func (h *StatKeeper) add(tx Transaction) {
 	// Quantize HTTP path
 	// (eg. this turns /orders/123/view` into `/orders/*/view`)
 	if h.quantizer != nil {
-		rawPath = h.quantizer.Quantize(rawPath)
+		// Quantize the endpoint if and only if, it is not a gRPC captured by HTTP2 monitoring
+		if tx.Method() != MethodPost || !grpcPattern.Match(rawPath) {
+			rawPath = h.quantizer.Quantize(rawPath)
+		}
 	}
 
 	path, rejected := h.processHTTPPath(tx, rawPath)
@@ -155,7 +195,17 @@ func (h *StatKeeper) add(tx Transaction) {
 	if latency <= 0 {
 		h.telemetry.invalidLatency.Add(1)
 		if h.oversizedLogLimit.ShouldLog() {
-			log.Warnf("latency should never be equal to 0: %s", tx.String())
+			log.Warnf("latency should never be non positive: %s", tx.String())
+		}
+		return
+	}
+
+	// Validate HTTP status code
+	statusCode := tx.StatusCode()
+	if !isValidStatusCode(statusCode) {
+		h.telemetry.invalidStatusCode.Add(1)
+		if h.oversizedLogLimit.ShouldLog() {
+			log.Warnf("invalid status code: %s", tx.String())
 		}
 		return
 	}
@@ -172,11 +222,64 @@ func (h *StatKeeper) add(tx Transaction) {
 			return
 		}
 		h.telemetry.aggregations.Add(1)
-		stats = NewRequestStats()
+		stats = requestStatsPool.Get()
 		h.stats[key] = stats
 	}
 
-	stats.AddRequest(tx.StatusCode(), latency, tx.StaticTags(), tx.DynamicTags())
+	dynamicTagsSet := common.StringSet(nil)
+	if dynamicTags := tx.DynamicTags(); len(dynamicTags) > 0 {
+		dynamicTagsSet = common.NewStringSet(dynamicTags...)
+	}
+	stats.AddRequest(tx.StatusCode(), latency, tx.StaticTags(), dynamicTagsSet)
+}
+
+// addDiscovery is the fast path for discovery mode.
+// It skips path extraction, path validation, path-based filter rules,
+// and malformed path checks. The aggregation key is just the ConnectionKey
+// (no path, no method), so 1000 unique URLs to the same service:port
+// collapse into one entry.
+func (h *StatKeeper) addDiscovery(tx Transaction) {
+	latency := tx.RequestLatency()
+	if latency <= 0 {
+		h.telemetry.invalidLatency.Add(1)
+		return
+	}
+
+	if tx.Method() == MethodUnknown {
+		h.telemetry.unknownMethod.Add(1)
+		return
+	}
+
+	statusCode := tx.StatusCode()
+	if !isValidStatusCode(statusCode) {
+		h.telemetry.invalidStatusCode.Add(1)
+		return
+	}
+
+	key := Key{
+		ConnectionKey: tx.ConnTuple(),
+		Path:          Path{Content: emptyInternedPath},
+	}
+	if h.connectionAggregator != nil {
+		key.ConnectionKey = h.connectionAggregator.RollupKey(key.ConnectionKey)
+	}
+
+	stats, ok := h.stats[key]
+	if !ok {
+		if len(h.stats) >= h.maxEntries {
+			h.telemetry.dropped.Add(1)
+			return
+		}
+		h.telemetry.aggregations.Add(1)
+		stats = requestStatsPool.Get()
+		h.stats[key] = stats
+	}
+
+	dynamicTagsSet := common.StringSet(nil)
+	if dynamicTags := tx.DynamicTags(); len(dynamicTags) > 0 {
+		dynamicTagsSet = common.NewStringSet(dynamicTags...)
+	}
+	stats.AddDiscoveryRequest(statusCode, latency, tx.StaticTags(), dynamicTagsSet)
 }
 
 func pathIsMalformed(fullPath []byte) bool {

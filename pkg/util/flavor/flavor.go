@@ -6,7 +6,10 @@
 // Package flavor defines the various flavors of the agent
 package flavor
 
-import pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+import (
+	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
+	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+)
 
 const (
 	// DefaultAgent is the default Agent flavor
@@ -31,20 +34,26 @@ const (
 	OTelAgent = "otel_agent"
 	// SystemProbe is the System Probe flavor
 	SystemProbe = "system_probe"
+	// HostProfiler is the Host Profiler flavor
+	HostProfiler = "host_profiler"
+	// PrivateActionRunner is the Private Action Runner flavor
+	PrivateActionRunner = "private_action_runner"
 )
 
 var agentFlavors = map[string]string{
-	DefaultAgent:    "Agent",
-	IotAgent:        "IoT Agent",
-	ClusterAgent:    "Cluster Agent",
-	Dogstatsd:       "DogStatsD",
-	SecurityAgent:   "Security Agent",
-	ServerlessAgent: "Serverless Agent",
-	HerokuAgent:     "Heroku Agent",
-	ProcessAgent:    "Process Agent",
-	TraceAgent:      "Trace Agent",
-	OTelAgent:       "OpenTelemetry Collector",
-	SystemProbe:     "System Probe",
+	DefaultAgent:        "Agent",
+	IotAgent:            "IoT Agent",
+	ClusterAgent:        "Cluster Agent",
+	Dogstatsd:           "DogStatsD",
+	SecurityAgent:       "Security Agent",
+	ServerlessAgent:     "Serverless Agent",
+	HerokuAgent:         "Heroku Agent",
+	ProcessAgent:        "Process Agent",
+	TraceAgent:          "Trace Agent",
+	OTelAgent:           "OpenTelemetry Collector",
+	SystemProbe:         "System Probe",
+	HostProfiler:        "Host Profiler",
+	PrivateActionRunner: "Private Action Runner",
 }
 
 const unknownAgent = "Unknown Agent"
@@ -56,14 +65,19 @@ func SetFlavor(flavor string) {
 	agentFlavor = flavor
 
 	if agentFlavor == IotAgent {
-		pkgconfigsetup.Datadog().SetDefault("iot_host", true)
+		pkgconfigsetup.Datadog().Set("iot_host", true, pkgconfigmodel.SourceAgentRuntime)
 	}
 }
 
-// GetFlavor gets the running Agent flavor
-// it MUST NOT be called before the main package is initialized;
+// GetFlavor gets the running Agent flavor.
+// It returns IotAgent if either the flavor was set to IotAgent at startup or
+// the iot_host config key is true (which allows a non-IoT binary to report as IoT).
+// It MUST NOT be called before the main package is initialized;
 // e.g. in init functions or to initialize package constants or variables.
 func GetFlavor() string {
+	if agentFlavor != IotAgent && pkgconfigsetup.Datadog().GetBool("iot_host") {
+		return IotAgent
+	}
 	return agentFlavor
 }
 

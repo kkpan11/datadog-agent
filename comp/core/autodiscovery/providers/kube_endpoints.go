@@ -10,6 +10,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
@@ -21,22 +22,21 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
+	healthplatformdef "github.com/DataDog/datadog-agent/comp/healthplatform/store/def"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
-type endpointResolveMode string
-
 const (
-	kubeEndpointID               = "endpoints"
-	kubeEndpointAnnotationPrefix = "ad.datadoghq.com/endpoints."
-	kubeEndpointResolvePath      = "resolve"
-
-	kubeEndpointResolveAuto endpointResolveMode = "auto"
-	kubeEndpointResolveIP   endpointResolveMode = "ip"
+	kubeEndpointID                     = "endpoints"
+	kubeEndpointAnnotationPrefix       = "ad.datadoghq.com/endpoints."
+	kubeEndpointAnnotationPrefixLegacy = "service-discovery.datadoghq.com/endpoints."
+	kubeEndpointResolvePath            = "resolve"
 )
 
 // kubeEndpointsConfigProvider implements the ConfigProvider interface for the apiserver.
@@ -46,8 +46,9 @@ type kubeEndpointsConfigProvider struct {
 	endpointsLister    listersv1.EndpointsLister
 	upToDate           bool
 	monitoredEndpoints map[string]bool
-	configErrors       map[string]ErrorMsgSet
+	configErrors       map[string]types.ErrorMsgSet
 	telemetryStore     *telemetry.Store
+	healthPlatform     healthplatformdef.Component
 }
 
 // configInfo contains an endpoint check config template with its name and namespace
@@ -60,7 +61,7 @@ type configInfo struct {
 
 // NewKubeEndpointsConfigProvider returns a new ConfigProvider connected to apiserver.
 // Connectivity is not checked at this stage to allow for retries, Collect will do it.
-func NewKubeEndpointsConfigProvider(_ *pkgconfigsetup.ConfigurationProviders, telemetryStore *telemetry.Store) (ConfigProvider, error) {
+func NewKubeEndpointsConfigProvider(_ *constants.ConfigurationProviders, hp healthplatformdef.Component, telemetryStore *telemetry.Store) (types.ConfigProvider, error) {
 	// Using GetAPIClient (no wait) as Client should already be initialized by Cluster Agent main entrypoint before
 	ac, err := apiserver.GetAPIClient()
 	if err != nil {
@@ -75,14 +76,15 @@ func NewKubeEndpointsConfigProvider(_ *pkgconfigsetup.ConfigurationProviders, te
 	p := &kubeEndpointsConfigProvider{
 		serviceLister:      servicesInformer.Lister(),
 		monitoredEndpoints: make(map[string]bool),
-		configErrors:       make(map[string]ErrorMsgSet),
+		configErrors:       make(map[string]types.ErrorMsgSet),
 		telemetryStore:     telemetryStore,
+		healthPlatform:     hp,
 	}
 
 	if _, err := servicesInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    p.invalidate,
-		UpdateFunc: p.invalidateIfChangedService,
-		DeleteFunc: p.invalidate,
+		AddFunc:    p.invalidateOnServiceAdd,
+		UpdateFunc: p.invalidateOnServiceUpdate,
+		DeleteFunc: p.invalidateOnServiceDelete,
 	}); err != nil {
 		return nil, fmt.Errorf("cannot add event handler to service informer: %s", err)
 	}
@@ -95,7 +97,7 @@ func NewKubeEndpointsConfigProvider(_ *pkgconfigsetup.ConfigurationProviders, te
 	p.endpointsLister = endpointsInformer.Lister()
 
 	if _, err := endpointsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: p.invalidateIfChangedEndpoints,
+		UpdateFunc: p.invalidateOnEndpointsUpdate,
 	}); err != nil {
 		return nil, fmt.Errorf("cannot add event handler to endpoint informer: %s", err)
 	}
@@ -145,7 +147,21 @@ func (k *kubeEndpointsConfigProvider) IsUpToDate(context.Context) (bool, error) 
 	return k.upToDate, nil
 }
 
-func (k *kubeEndpointsConfigProvider) invalidate(obj interface{}) {
+func (k *kubeEndpointsConfigProvider) invalidateOnServiceAdd(obj interface{}) {
+	castedObj, ok := obj.(*v1.Service)
+	if !ok {
+		log.Errorf("Received unexpected object: %T", obj)
+		return
+	}
+
+	if !hasEndpointAnnotations(castedObj) {
+		return
+	}
+
+	k.setUpToDate(false)
+}
+
+func (k *kubeEndpointsConfigProvider) invalidateOnServiceDelete(obj interface{}) {
 	castedObj, ok := obj.(*v1.Service)
 	if !ok {
 		// It's possible that we got a DeletedFinalStateUnknown here
@@ -161,15 +177,24 @@ func (k *kubeEndpointsConfigProvider) invalidate(obj interface{}) {
 			return
 		}
 	}
+
 	endpointsID := apiserver.EntityForEndpoints(castedObj.Namespace, castedObj.Name, "")
-	log.Tracef("Invalidating configs on new/deleted service, endpoints entity: %s", endpointsID)
 	k.Lock()
 	defer k.Unlock()
-	delete(k.monitoredEndpoints, endpointsID)
-	k.upToDate = false
+
+	_, wasMonitored := k.monitoredEndpoints[endpointsID]
+	if wasMonitored {
+		delete(k.monitoredEndpoints, endpointsID)
+	}
+
+	// Check annotations too: a service with unparseable annotations is never monitored but may have a reported issue to resolve.
+	if wasMonitored || hasEndpointAnnotations(castedObj) {
+		log.Tracef("Invalidating configs on deleted service, endpoints entity: %s", endpointsID)
+		k.upToDate = false
+	}
 }
 
-func (k *kubeEndpointsConfigProvider) invalidateIfChangedService(old, obj interface{}) {
+func (k *kubeEndpointsConfigProvider) invalidateOnServiceUpdate(old, obj interface{}) {
 	// Cast the updated object, don't invalidate on casting error.
 	// nil pointers are safely handled by the casting logic.
 	castedObj, ok := obj.(*v1.Service)
@@ -188,14 +213,32 @@ func (k *kubeEndpointsConfigProvider) invalidateIfChangedService(old, obj interf
 	if castedObj.ResourceVersion == castedOld.ResourceVersion {
 		return
 	}
+
+	endpointsID := apiserver.EntityForEndpoints(castedObj.Namespace, castedObj.Name, "")
+	hasEndpointAnnotationsNow := hasEndpointAnnotations(castedObj)
+	hadEndpointAnnotationsBefore := hasEndpointAnnotations(castedOld)
+
+	k.Lock()
+	defer k.Unlock()
+	isMonitored := k.monitoredEndpoints[endpointsID]
+
+	// Only invalidate if the service has endpoint annotations (now or before) or is being monitored
+	if !hasEndpointAnnotationsNow && !hadEndpointAnnotationsBefore && !isMonitored {
+		return
+	}
+
+	if !hasEndpointAnnotationsNow {
+		delete(k.monitoredEndpoints, endpointsID)
+	}
+
 	if valuesDiffer(castedObj.Annotations, castedOld.Annotations, kubeEndpointAnnotationPrefix) {
-		log.Trace("Invalidating configs on service end annotations change")
-		k.setUpToDate(false)
+		log.Trace("Invalidating configs on service endpoint annotations change")
+		k.upToDate = false
 		return
 	}
 }
 
-func (k *kubeEndpointsConfigProvider) invalidateIfChangedEndpoints(old, obj interface{}) {
+func (k *kubeEndpointsConfigProvider) invalidateOnEndpointsUpdate(old, obj interface{}) {
 	// Cast the updated object, don't invalidate on casting error.
 	// nil pointers are safely handled by the casting logic.
 	castedObj, ok := obj.(*v1.Endpoints)
@@ -236,6 +279,11 @@ func (k *kubeEndpointsConfigProvider) parseServiceAnnotationsForEndpoints(servic
 
 	setEndpointIDs := map[string]struct{}{}
 
+	previousErrorIDs := make(map[string]struct{}, len(k.configErrors))
+	for endpointsID := range k.configErrors {
+		previousErrorIDs[endpointsID] = struct{}{}
+	}
+
 	for _, svc := range services {
 		if svc == nil || svc.ObjectMeta.UID == "" {
 			log.Debug("Ignoring a nil service")
@@ -245,18 +293,20 @@ func (k *kubeEndpointsConfigProvider) parseServiceAnnotationsForEndpoints(servic
 		endpointsID := apiserver.EntityForEndpoints(svc.Namespace, svc.Name, "")
 		setEndpointIDs[endpointsID] = struct{}{}
 
-		endptConf, errors := utils.ExtractTemplatesFromAnnotations(endpointsID, svc.GetAnnotations(), kubeEndpointID)
+		hybridIgnoreADTags := cfg.GetBool("cluster_checks.support_hybrid_ignore_ad_tags")
+		endptConf, errors := utils.ExtractTemplatesFromAnnotations(endpointsID, svc.GetAnnotations(), kubeEndpointID, hybridIgnoreADTags)
 		for _, err := range errors {
 			log.Errorf("Cannot parse endpoint template for service %s/%s: %s", svc.Namespace, svc.Name, err)
 		}
 
 		if len(errors) > 0 {
-			errMsgSet := make(ErrorMsgSet)
+			errMsgSet := make(types.ErrorMsgSet)
 			for _, err := range errors {
 				log.Errorf("Cannot parse endpoint template for service %s/%s: %s", svc.Namespace, svc.Name, err)
 				errMsgSet[err.Error()] = struct{}{}
 			}
 			k.configErrors[endpointsID] = errMsgSet
+			reportConfigurationError(k.healthPlatform, endpointsID, errMsgSet, types.KubeEndpointAnnotationSource)
 		} else {
 			delete(k.configErrors, endpointsID)
 		}
@@ -283,11 +333,32 @@ func (k *kubeEndpointsConfigProvider) parseServiceAnnotationsForEndpoints(servic
 
 	k.cleanErrorsOfDeletedEndpoints(setEndpointIDs)
 
+	for endpointsID := range previousErrorIDs {
+		if _, stillErroring := k.configErrors[endpointsID]; !stillErroring {
+			clearConfigurationErrors(k.healthPlatform, endpointsID)
+		}
+	}
+
 	if k.telemetryStore != nil {
 		k.telemetryStore.Errors.Set(float64(len(k.configErrors)), names.KubeEndpoints)
 	}
 
 	return configsInfo
+}
+
+// hasEndpointAnnotations checks if a service has any endpoint-related annotations
+func hasEndpointAnnotations(svc *v1.Service) bool {
+	if svc == nil {
+		return false
+	}
+
+	for key := range svc.Annotations {
+		if strings.HasPrefix(key, kubeEndpointAnnotationPrefix) || strings.HasPrefix(key, kubeEndpointAnnotationPrefixLegacy) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // generateConfigs creates a config template for each Endpoints IP
@@ -297,24 +368,10 @@ func generateConfigs(tpl integration.Config, resolveMode endpointResolveMode, ke
 		return []integration.Config{tpl}
 	}
 	generatedConfigs := make([]integration.Config, 0)
-	namespace := kep.Namespace
-	name := kep.Name
+	namespace, name := kep.Namespace, kep.Name
 
 	// Check resolve annotation to know how we should process this endpoint
-	var resolveFunc func(*integration.Config, v1.EndpointAddress)
-	switch resolveMode {
-	// IP: we explicitly ignore what's behind this address (nothing to do)
-	case kubeEndpointResolveIP:
-	// In case of unknown value, fallback to auto
-	default:
-		log.Warnf("Unknown resolve value: %s for endpoint: %s/%s - fallback to auto mode", resolveMode, namespace, name)
-		fallthrough
-	// Auto or empty (default to auto): we try to resolve the POD behind this address
-	case "":
-		fallthrough
-	case kubeEndpointResolveAuto:
-		resolveFunc = utils.ResolveEndpointConfigAuto
-	}
+	resolveFunc := getEndpointResolveFunc(resolveMode, namespace, name)
 
 	for i := range kep.Subsets {
 		for j := range kep.Subsets[i].Addresses {
@@ -358,6 +415,6 @@ func (k *kubeEndpointsConfigProvider) cleanErrorsOfDeletedEndpoints(setCurrentEn
 }
 
 // GetConfigErrors returns a map of configuration errors for each Kubernetes endpoint
-func (k *kubeEndpointsConfigProvider) GetConfigErrors() map[string]ErrorMsgSet {
+func (k *kubeEndpointsConfigProvider) GetConfigErrors() map[string]types.ErrorMsgSet {
 	return k.configErrors
 }

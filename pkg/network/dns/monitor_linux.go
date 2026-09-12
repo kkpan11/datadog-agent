@@ -3,18 +3,19 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package dns
 
 import (
+	"errors"
 	"fmt"
 	"math"
 
 	manager "github.com/DataDog/ebpf-manager"
 	"github.com/vishvananda/netns"
 
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/ebpf/probes"
@@ -78,7 +79,7 @@ func NewReverseDNS(cfg *config.Config, _ telemetry.Component) (ReverseDNS, error
 
 		filter, _ := p.GetProbe(manager.ProbeIdentificationPair{EBPFFuncName: probes.SocketDNSFilter, UID: probeUID})
 		if filter == nil {
-			return nil, fmt.Errorf("error retrieving socket filter")
+			return nil, errors.New("error retrieving socket filter")
 		}
 
 		if err = packetSrc.SetEbpf(filter); err != nil {
@@ -86,10 +87,11 @@ func NewReverseDNS(cfg *config.Config, _ telemetry.Component) (ReverseDNS, error
 		}
 	}
 
-	snoop, err := newSocketFilterSnooper(cfg, packetSrc)
+	snoop, err := newSocketFilterSnooper(cfg, packetSrc, nil)
 	if err != nil {
 		return nil, err
 	}
+	snoop.startPolling()
 
 	return &dnsMonitor{
 		snoop,

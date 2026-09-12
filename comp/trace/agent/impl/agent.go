@@ -25,13 +25,15 @@ import (
 	"go.uber.org/fx"
 
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/statsd"
+	statsd "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd/def"
 	traceagent "github.com/DataDog/datadog-agent/comp/trace/agent/def"
 	compression "github.com/DataDog/datadog-agent/comp/trace/compression/def"
-	"github.com/DataDog/datadog-agent/comp/trace/config"
+	traceconfigdef "github.com/DataDog/datadog-agent/comp/trace/config/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
 	"github.com/DataDog/datadog-agent/pkg/pidfile"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 	agentrt "github.com/DataDog/datadog-agent/pkg/runtime"
@@ -40,12 +42,9 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/trace/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/trace/watchdog"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
-	"github.com/DataDog/datadog-agent/pkg/util/option"
 	"github.com/DataDog/datadog-agent/pkg/version"
 
 	ddgostatsd "github.com/DataDog/datadog-go/v5/statsd"
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes"
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes/source"
 )
 
 const messageAgentDisabled = `trace-agent not enabled. Set the environment variable
@@ -61,24 +60,30 @@ type dependencies struct {
 	Lc         fx.Lifecycle
 	Shutdowner fx.Shutdowner
 
-	Config             config.Component
-	Secrets            option.Option[secrets.Component]
-	Context            context.Context
-	Params             *Params
-	TelemetryCollector telemetry.TelemetryCollector
-	Statsd             statsd.Component
-	Tagger             tagger.Component
-	Compressor         compression.Component
-	IPC                ipc.Component
+	Config                traceconfigdef.Component
+	Secrets               secrets.Component
+	Context               context.Context
+	Params                *Params
+	TelemetryCollector    telemetry.TelemetryCollector
+	Statsd                statsd.Component
+	Tagger                tagger.Component
+	Compressor            compression.Component
+	IPC                   ipc.Component
+	TracerPayloadModifier pkgagent.TracerPayloadModifier
 }
 
 var _ traceagent.Component = (*component)(nil)
 
 func (c component) SetOTelAttributeTranslator(attrstrans *attributes.Translator) {
+	// c.Agent is nil when the trace-agent is disabled (see NewAgent). Guard
+	// against it so callers such as the Datadog exporter do not nil-panic.
+	if c.Agent == nil || c.Agent.OTLPReceiver == nil {
+		return
+	}
 	c.Agent.OTLPReceiver.SetOTelAttributeTranslator(attrstrans)
 }
 
-func (c component) ReceiveOTLPSpans(ctx context.Context, rspans ptrace.ResourceSpans, httpHeader http.Header, hostFromAttributesHandler attributes.HostFromAttributesHandler) source.Source {
+func (c component) ReceiveOTLPSpans(ctx context.Context, rspans ptrace.ResourceSpans, httpHeader http.Header, hostFromAttributesHandler attributes.HostFromAttributesHandler) (source.Source, error) {
 	return c.Agent.OTLPReceiver.ReceiveResourceSpans(ctx, rspans, httpHeader, hostFromAttributesHandler)
 }
 
@@ -98,8 +103,9 @@ type component struct {
 	*pkgagent.Agent
 
 	cancel             context.CancelFunc
-	config             config.Component
-	secrets            option.Option[secrets.Component]
+	ctx                context.Context
+	config             traceconfigdef.Component
+	secrets            secrets.Component
 	params             *Params
 	tagger             tagger.Component
 	telemetryCollector telemetry.TelemetryCollector
@@ -113,7 +119,7 @@ func NewAgent(deps dependencies) (traceagent.Component, error) {
 	tracecfg := deps.Config.Object()
 	if !tracecfg.Enabled {
 		log.Info(messageAgentDisabled)
-		deps.TelemetryCollector.SendStartupError(telemetry.TraceAgentNotEnabled, fmt.Errorf(""))
+		deps.TelemetryCollector.SendStartupError(telemetry.TraceAgentNotEnabled, errors.New(""))
 		// Required to signal that the whole app must stop.
 		_ = deps.Shutdowner.Shutdown()
 		return c, nil
@@ -121,6 +127,7 @@ func NewAgent(deps dependencies) (traceagent.Component, error) {
 	ctx, cancel := context.WithCancel(deps.Context) // Several related non-components require a shared context to gracefully stop.
 	c = component{
 		cancel:             cancel,
+		ctx:                ctx,
 		config:             deps.Config,
 		secrets:            deps.Secrets,
 		params:             deps.Params,
@@ -137,13 +144,28 @@ func NewAgent(deps dependencies) (traceagent.Component, error) {
 
 	prepGoRuntime(tracecfg)
 
+	tracecfg.SecretsRefreshFn = func() (string, error) {
+		if deps.Secrets == nil {
+			log.Error("Secrets component not available, cannot trigger refresh")
+			return "", errors.New("secrets component not available")
+		}
+		return deps.Secrets.RefreshNow()
+	}
+	tracecfg.APIKeyIsFromSecretFn = func(apiKey string) bool {
+		return deps.Secrets != nil && deps.Secrets.IsValueFromSecret(apiKey)
+	}
+
 	c.Agent = pkgagent.NewAgent(
 		ctx,
-		c.config.Object(),
+		tracecfg,
 		c.telemetryCollector,
 		statsdCl,
 		deps.Compressor,
 	)
+	c.Agent.TracerPayloadModifier = deps.TracerPayloadModifier
+	if m, ok := deps.TracerPayloadModifier.(pkgagent.TracerPayloadModifierV1); ok {
+		c.Agent.TracerPayloadModifierV1 = m
+	}
 
 	c.config.OnUpdateAPIKey(c.UpdateAPIKey)
 
@@ -227,7 +249,7 @@ func start(ag component) error {
 	return nil
 }
 
-func setupMetrics(statsd statsd.Component, cfg config.Component, telemetryCollector telemetry.TelemetryCollector) (ddgostatsd.ClientInterface, error) {
+func setupMetrics(statsd statsd.Component, cfg traceconfigdef.Component, telemetryCollector telemetry.TelemetryCollector) (ddgostatsd.ClientInterface, error) {
 	addr, err := findAddr(cfg.Object())
 	if err != nil {
 		return nil, err

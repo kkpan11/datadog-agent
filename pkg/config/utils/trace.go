@@ -15,16 +15,16 @@ import (
 // GetTraceAgentDefaultEnv returns the default env for the trace agent
 func GetTraceAgentDefaultEnv(c pkgconfigmodel.Reader) string {
 	defaultEnv := ""
-	if c.IsSet("apm_config.env") {
+	if c.IsConfigured("apm_config.env") {
 		defaultEnv = c.GetString("apm_config.env")
 		log.Debugf("Setting DefaultEnv to %q (from apm_config.env)", defaultEnv)
-	} else if c.IsSet("env") {
+	} else if c.IsConfigured("env") {
 		defaultEnv = c.GetString("env")
 		log.Debugf("Setting DefaultEnv to %q (from 'env' config option)", defaultEnv)
 	} else {
 		for _, tag := range GetConfiguredTags(c, false) {
-			if strings.HasPrefix(tag, "env:") {
-				defaultEnv = strings.TrimPrefix(tag, "env:")
+			if after, ok := strings.CutPrefix(tag, "env:"); ok {
+				defaultEnv = after
 				log.Debugf("Setting DefaultEnv to %q (from `env:` entry under the 'tags' config option: %q)", defaultEnv, tag)
 				return defaultEnv
 			}

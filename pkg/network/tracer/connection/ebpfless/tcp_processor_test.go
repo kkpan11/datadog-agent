@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2024-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package ebpfless
 
@@ -558,7 +558,7 @@ func TestConnRefusedSyn(t *testing.T) {
 		RecvPackets:    1,
 		Retransmits:    0,
 		TCPEstablished: 0,
-		TCPClosed:      0,
+		TCPClosed:      1,
 	}
 	require.Equal(t, expectedStats, f.conn.Monotonic)
 }
@@ -591,7 +591,7 @@ func TestConnRefusedSynAck(t *testing.T) {
 		RecvPackets:    1,
 		Retransmits:    0,
 		TCPEstablished: 0,
-		TCPClosed:      0,
+		TCPClosed:      1,
 	}
 	require.Equal(t, expectedStats, f.conn.Monotonic)
 }
@@ -801,6 +801,75 @@ func TestPreexistingConn(t *testing.T) {
 		TCPClosed:      1,
 	}
 	require.Equal(t, expectedStats, f.conn.Monotonic)
+}
+
+func TestPreexistingConnUnknownDirection(t *testing.T) {
+	pb := newPacketBuilder(lowerSeq, higherSeq)
+
+	makeUnknownDirConn := func() *network.ConnectionStats {
+		return &network.ConnectionStats{
+			ConnectionTuple: network.ConnectionTuple{
+				Source:    util.AddressFromNetIP(localhost),
+				Dest:      util.AddressFromNetIP(remoteIP),
+				SPort:     defaultLocalPort,
+				DPort:     defaultRemotePort,
+				Type:      network.TCP,
+				Family:    network.AFINET,
+				Direction: network.UNKNOWN,
+			},
+			TCPFailures: make(map[uint16]uint32),
+		}
+	}
+
+	t.Run("not persisted", func(t *testing.T) {
+		f := newTCPTestFixture(t)
+		f.conn = makeUnknownDirConn()
+		// non-SYN packets should return ProcessResultNone (not persisted)
+		// but TCP state is still tracked internally
+		pkt := pb.outgoing(1, 10, 10, ACK)
+		result := f.runPkt(pkt)
+		require.Equal(t, ProcessResultNone, result)
+		require.Equal(t, network.UNKNOWN, f.conn.Direction)
+
+		tuple := MakeEbpflessTuple(f.conn.ConnectionTuple)
+		st, ok := f.tcp.getConn(tuple)
+		require.True(t, ok, "TCP state should still be tracked internally")
+		require.Equal(t, connStatAttempted, st.tcpState)
+	})
+
+	t.Run("SYN sets direction", func(t *testing.T) {
+		f := newTCPTestFixture(t)
+		f.conn = makeUnknownDirConn()
+		// SYN should create state and set direction even when direction was UNKNOWN
+		pkt := pb.outgoing(0, 0, 0, SYN)
+		result := f.runPkt(pkt)
+		require.Equal(t, ProcessResultNone, result) // still pending (not established yet)
+		require.Equal(t, network.OUTGOING, f.conn.Direction)
+
+		tuple := MakeEbpflessTuple(f.conn.ConnectionTuple)
+		_, ok := f.tcp.getConn(tuple)
+		require.True(t, ok, "TCP state should be created when SYN sets the direction")
+	})
+
+	t.Run("out-of-order data then SYN-ACK then SYN", func(t *testing.T) {
+		f := newTCPTestFixture(t)
+		f.conn = makeUnknownDirConn()
+
+		// packet 1: data ACK arrives first (out of order) — state tracked, not persisted
+		result := f.runPkt(pb.outgoing(1, 10, 10, ACK))
+		require.Equal(t, ProcessResultNone, result)
+		require.Equal(t, network.UNKNOWN, f.conn.Direction)
+
+		// packet 2: SYN-ACK arrives — direction still unknown (SYN-ACK doesn't set connDirection)
+		result = f.runPkt(pb.incoming(0, 0, 1, SYN|ACK))
+		require.Equal(t, ProcessResultNone, result)
+		require.Equal(t, network.UNKNOWN, f.conn.Direction)
+
+		// packet 3: SYN arrives — sets direction, connection now persistable
+		result = f.runPkt(pb.outgoing(0, 0, 0, SYN))
+		require.Equal(t, ProcessResultStoreConn, result)
+		require.Equal(t, network.OUTGOING, f.conn.Direction)
+	})
 }
 
 func TestPendingConnExpiry(t *testing.T) {

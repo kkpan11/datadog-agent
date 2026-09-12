@@ -1,0 +1,3 @@
+# MinGW cc_toolchain lives in @winlibs_mingw64//: (see winlibs.BUILD.bazel).
+# This file exists only to mark the package; the toolchain config rule is
+# loaded from //bazel/toolchains/mingw:toolchain.bzl by the WinLibs repo.

@@ -103,6 +103,67 @@ var (
 				},
 			},
 		},
+		{
+			name: "detect container.id from PID",
+			inMetrics: testResourceMetrics([]metricWithResource{
+				{
+					metricNames: inMetricNames,
+					resourceAttributes: map[string]any{
+						"process.pid": int64(12345),
+					},
+				},
+			}),
+			outResourceAttributes: []map[string]any{
+				{
+					"global":       "tag",
+					"process.pid":  int64(12345),
+					"container.id": "test",
+					"container":    "id",
+				},
+			},
+		},
+		{
+			name: "detect container.id from cgroup inode",
+			inMetrics: testResourceMetrics([]metricWithResource{
+				{
+					metricNames: inMetricNames,
+					resourceAttributes: map[string]any{
+						"datadog.container.cgroup_inode": int64(12345),
+					},
+				},
+			}),
+			outResourceAttributes: []map[string]any{
+				{
+					"global":                         "tag",
+					"datadog.container.cgroup_inode": int64(12345),
+					"container.id":                   "test",
+					"container":                      "id",
+				},
+			},
+		},
+		{
+			name: "detect container.id from pod UID + container name",
+			inMetrics: testResourceMetrics([]metricWithResource{
+				{
+					metricNames: inMetricNames,
+					resourceAttributes: map[string]any{
+						"k8s.pod.uid":               "01234567-89ab-cdef-0123-456789abcdef",
+						"k8s.container.name":        "mycontainer",
+						"datadog.container.is_init": true,
+					},
+				},
+			}),
+			outResourceAttributes: []map[string]any{
+				{
+					"global":                    "tag",
+					"k8s.pod.uid":               "01234567-89ab-cdef-0123-456789abcdef",
+					"k8s.container.name":        "mycontainer",
+					"datadog.container.is_init": true,
+					"container.id":              "test",
+					"container":                 "id",
+				},
+			},
+		},
 	}
 )
 
@@ -127,13 +188,15 @@ func TestInfraAttributesMetricProcessor(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			next := new(consumertest.MetricsSink)
 			cfg := &Config{
-				Metrics:     MetricInfraAttributes{},
 				Cardinality: types.LowCardinality,
 			}
 			tc := testutil.NewTestTaggerClient()
 			tc.TagMap["container_id://test"] = []string{"container:id"}
 			tc.TagMap["deployment://namespace/deployment"] = []string{"deployment:name"}
 			tc.TagMap[types.NewEntityID("internal", "global-entity-id").String()] = []string{"global:tag"}
+			tc.ContainerIDMap["pid:12345"] = "test"
+			tc.ContainerIDMap["inode:12345"] = "test"
+			tc.ContainerIDMap["pod:01234567-89ab-cdef-0123-456789abcdef,name:mycontainer,init:true"] = "test"
 
 			factory := NewFactoryForAgent(tc, func(_ context.Context) (string, error) {
 				return "test-host", nil
@@ -162,6 +225,117 @@ func TestInfraAttributesMetricProcessor(t *testing.T) {
 				assert.NotNil(t, rms)
 				assert.EqualValues(t, out, rms.Resource().Attributes().AsRaw())
 			}
+		})
+	}
+}
+
+// TestInfraAttributesMetricProcessorIgnoresContainerTagPromotion is a
+// regression guard: container_tag_promotion only makes sense for traces
+// (_dd.tags.container is a trace-agent-specific mechanism), so the metrics
+// processor must always behave as "off" even when the option is set to
+// duplicate/rename.
+func TestInfraAttributesMetricProcessorIgnoresContainerTagPromotion(t *testing.T) {
+	for _, mode := range []ContainerTagPromotionMode{ContainerTagPromotionDuplicate, ContainerTagPromotionRename} {
+		t.Run(string(mode), func(t *testing.T) {
+			next := new(consumertest.MetricsSink)
+			cfg := &Config{
+				Cardinality:                types.LowCardinality,
+				TraceContainerTagPromotion: mode,
+			}
+			tc := testutil.NewTestTaggerClient()
+			tc.TagMap["container_id://test"] = []string{"test_tag:bar"}
+
+			factory := NewFactoryForAgent(tc, func(_ context.Context) (string, error) {
+				return "test-host", nil
+			})
+			fmp, err := factory.CreateMetrics(
+				context.Background(),
+				processortest.NewNopSettings(Type),
+				cfg,
+				next,
+			)
+			assert.NoError(t, err)
+			ctx := context.Background()
+			assert.NoError(t, fmp.Start(ctx, nil))
+
+			md := testResourceMetrics([]metricWithResource{{
+				metricNames:        inMetricNames,
+				resourceAttributes: map[string]any{"container.id": "test"},
+			}})
+			assert.NoError(t, fmp.ConsumeMetrics(ctx, md))
+			assert.NoError(t, fmp.Shutdown(ctx))
+
+			assert.Len(t, next.AllMetrics(), 1)
+			out := next.AllMetrics()[0].ResourceMetrics().At(0).Resource().Attributes().AsRaw()
+			assert.EqualValues(t, map[string]any{
+				"container.id": "test",
+				"test_tag":     "bar",
+			}, out, "metrics must never gain a datadog.container.tag.* copy, regardless of container_tag_promotion")
+		})
+	}
+}
+
+// TestInfraAttributesMetricProcessorMetricsAttributesAsTags verifies that a custom
+// tagger tag is promoted under the `datadog.container.tag.` prefix (so the
+// metrics translator keeps it as a metric tag) only when metrics_attributes_as_tags
+// is enabled. This is the OTELS-1131 fix.
+func TestInfraAttributesMetricProcessorMetricsAttributesAsTags(t *testing.T) {
+	tests := []struct {
+		name             string
+		attributesAsTags bool
+		expected         map[string]any
+	}{
+		{
+			name:             "disabled: custom tag dropped by translator (stays unprefixed)",
+			attributesAsTags: false,
+			expected: map[string]any{
+				"container.id": "test",
+				"test_tag":     "bar",
+			},
+		},
+		{
+			name:             "enabled: custom tag duplicated under prefixed key",
+			attributesAsTags: true,
+			expected: map[string]any{
+				"container.id":                   "test",
+				"test_tag":                       "bar",
+				"datadog.container.tag.test_tag": "bar",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			next := new(consumertest.MetricsSink)
+			cfg := &Config{
+				Cardinality:             types.LowCardinality,
+				MetricsAttributesAsTags: tt.attributesAsTags,
+			}
+			tc := testutil.NewTestTaggerClient()
+			tc.TagMap["container_id://test"] = []string{"test_tag:bar"}
+
+			factory := NewFactoryForAgent(tc, func(_ context.Context) (string, error) {
+				return "test-host", nil
+			})
+			fmp, err := factory.CreateMetrics(
+				context.Background(),
+				processortest.NewNopSettings(Type),
+				cfg,
+				next,
+			)
+			assert.NoError(t, err)
+			ctx := context.Background()
+			assert.NoError(t, fmp.Start(ctx, nil))
+
+			md := testResourceMetrics([]metricWithResource{{
+				metricNames:        inMetricNames,
+				resourceAttributes: map[string]any{"container.id": "test"},
+			}})
+			assert.NoError(t, fmp.ConsumeMetrics(ctx, md))
+			assert.NoError(t, fmp.Shutdown(ctx))
+
+			assert.Len(t, next.AllMetrics(), 1)
+			out := next.AllMetrics()[0].ResourceMetrics().At(0).Resource().Attributes().AsRaw()
+			assert.EqualValues(t, tt.expected, out)
 		})
 	}
 }
@@ -254,7 +428,7 @@ func TestEntityIDsFromAttributes(t *testing.T) {
 				})
 				return attributes
 			}(),
-			entityIDs: []string{"kubernetes_metadata:///nodes//k8s_node_name_goes_here"},
+			entityIDs: []string{"kubernetes_node://k8s_node_name_goes_here"},
 		},
 		{
 			name: "only process pid",

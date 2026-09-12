@@ -17,12 +17,18 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/paths"
 
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/env"
+	installerErrors "github.com/DataDog/datadog-agent/pkg/fleet/installer/errors"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/exec"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/oci"
+	"github.com/DataDog/datadog-agent/pkg/fleet/installer/telemetry"
 )
 
-func install(ctx context.Context, env *env.Env, url string, experiment bool) error {
-	err := os.MkdirAll(paths.RootTmpDir, 0755)
+func install(ctx context.Context, env *env.Env, url string, experiment bool) (err error) {
+	span, ctx := telemetry.StartSpanFromContext(ctx, "bootstrap.install")
+	defer func() { span.Finish(err) }()
+	span.SetTag("url", url)
+	span.SetTag("experiment", experiment)
+	err = os.MkdirAll(paths.RootTmpDir, 0755)
 	if err != nil {
 		return fmt.Errorf("failed to create temporary directory: %w", err)
 	}
@@ -33,7 +39,10 @@ func install(ctx context.Context, env *env.Env, url string, experiment bool) err
 	defer os.RemoveAll(tmpDir)
 	cmd, err := downloadInstaller(ctx, env, url, tmpDir)
 	if err != nil {
-		return err
+		return installerErrors.Wrap(
+			installerErrors.ErrDownloadFailed,
+			err,
+		)
 	}
 	if experiment {
 		return cmd.InstallExperiment(ctx, url)
@@ -42,18 +51,23 @@ func install(ctx context.Context, env *env.Env, url string, experiment bool) err
 }
 
 // extractInstallerFromOCI downloads the installer binary from the agent package in the registry and returns an installer executor
-func downloadInstaller(ctx context.Context, env *env.Env, url string, tmpDir string) (*exec.InstallerExec, error) {
+func downloadInstaller(ctx context.Context, env *env.Env, url string, tmpDir string) (_ *exec.InstallerExec, err error) {
+	span, ctx := telemetry.StartSpanFromContext(ctx, "bootstrap.download_installer")
+	defer func() { span.Finish(err) }()
 	downloader := oci.NewDownloader(env, env.HTTPClient())
 	downloadedPackage, err := downloader.Download(ctx, url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download installer package: %w", err)
+		return nil, installerErrors.Wrap(
+			installerErrors.ErrDownloadFailed,
+			fmt.Errorf("could not download package: %w", err),
+		)
 	}
 	if downloadedPackage.Name != AgentPackage {
 		return getLocalInstaller(env)
 	}
 
 	installerBinPath := filepath.Join(tmpDir, "installer")
-	err = downloadedPackage.ExtractLayers(oci.DatadogPackageInstallerLayerMediaType, installerBinPath) // Returns nil if the layer doesn't exist
+	err = downloadedPackage.ExtractLayers(ctx, oci.DatadogPackageInstallerLayerMediaType, installerBinPath) // Returns nil if the layer doesn't exist
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract layers: %w", err)
 	}

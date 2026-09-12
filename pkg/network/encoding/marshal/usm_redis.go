@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && linux_bpf
+//go:build linux && bpf
 
 package marshal
 
@@ -12,6 +12,7 @@ import (
 	"io"
 
 	model "github.com/DataDog/agent-payload/v5/process"
+	"github.com/DataDog/sketches-go/ddsketch"
 
 	"github.com/DataDog/datadog-agent/pkg/network"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols/redis"
@@ -20,6 +21,7 @@ import (
 
 type redisEncoder struct {
 	redisAggregationsBuilder *model.DatabaseAggregationsBuilder
+	sketchBuilder            *ddsketch.DDSketchCollectionBuilder
 	byConnection             *USMConnectionIndex[redis.Key, *redis.RequestStats]
 }
 
@@ -30,30 +32,30 @@ func newRedisEncoder(redisPayloads map[redis.Key]*redis.RequestStats) *redisEnco
 
 	return &redisEncoder{
 		redisAggregationsBuilder: model.NewDatabaseAggregationsBuilder(nil),
+		sketchBuilder:            ddsketch.NewDDSketchCollectionBuilder(nil),
 		byConnection: GroupByConnection("redis", redisPayloads, func(key redis.Key) types.ConnectionKey {
 			return key.ConnectionKey
 		}),
 	}
 }
 
-func (e *redisEncoder) EncodeConnection(c network.ConnectionStats, builder *model.ConnectionBuilder) (uint64, map[string]struct{}) {
+func (e *redisEncoder) EncodeConnection(c network.ConnectionStats, builder *model.ConnectionBuilder) (staticTags uint64, dynamicTags map[string]struct{}) {
+	builder.SetDatabaseAggregations(func(b *bytes.Buffer) {
+		staticTags = e.encodeData(c, b)
+	})
+	return
+}
+
+func (e *redisEncoder) encodeData(c network.ConnectionStats, w io.Writer) uint64 {
 	if e == nil {
-		return 0, nil
+		return 0
 	}
 
 	connectionData := e.byConnection.Find(c)
 	if connectionData == nil || len(connectionData.Data) == 0 || connectionData.IsPIDCollision(c) {
-		return 0, nil
+		return 0
 	}
 
-	staticTags := uint64(0)
-	builder.SetDatabaseAggregations(func(b *bytes.Buffer) {
-		staticTags |= e.encodeData(connectionData, b)
-	})
-	return staticTags, nil
-}
-
-func (e *redisEncoder) encodeData(connectionData *USMConnectionData[redis.Key, *redis.RequestStats], w io.Writer) uint64 {
 	var staticTags uint64
 	e.redisAggregationsBuilder.Reset(w)
 
@@ -67,11 +69,15 @@ func (e *redisEncoder) encodeData(connectionData *USMConnectionData[redis.Key, *
 					aggregationBuilder.SetCommand(uint64(model.RedisCommand_RedisGetCommand))
 				case redis.SetCommand:
 					aggregationBuilder.SetCommand(uint64(model.RedisCommand_RedisSetCommand))
+				case redis.PingCommand:
+					aggregationBuilder.SetCommand(uint64(model.RedisCommand_RedisPingCommand))
 				default:
 					aggregationBuilder.SetCommand(uint64(model.RedisCommand_RedisUnknownCommand))
 				}
 				aggregationBuilder.SetTruncated(key.Truncated)
-				aggregationBuilder.SetKeyName(key.KeyName.Get())
+				if key.KeyName != nil {
+					aggregationBuilder.SetKeyName(key.KeyName.Get())
+				}
 
 				for isErr, stats := range errorToStats.ErrorToStats {
 					if stats.Count == 0 {
@@ -88,7 +94,8 @@ func (e *redisEncoder) encodeData(connectionData *USMConnectionData[redis.Key, *
 							statsBuilder.SetCount(uint32(stats.Count))
 							if latencies := stats.Latencies; latencies != nil {
 								statsBuilder.SetLatencies(func(b *bytes.Buffer) {
-									latencies.EncodeProto(b)
+									e.sketchBuilder.Reset(b)
+									e.sketchBuilder.AddSketch(latencies)
 								})
 							} else {
 								statsBuilder.SetFirstLatencySample(stats.FirstLatencySample)

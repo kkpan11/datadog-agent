@@ -7,6 +7,7 @@ package clusteragent
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -25,7 +26,9 @@ import (
 	"github.com/stretchr/testify/suite"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
 	"github.com/DataDog/datadog-agent/pkg/api/security"
+	pkgapiutil "github.com/DataDog/datadog-agent/pkg/api/util"
 	apiv1 "github.com/DataDog/datadog-agent/pkg/clusteragent/api/v1"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
@@ -36,6 +39,7 @@ import (
 type dummyClusterAgent struct {
 	nodeLabels      map[string]map[string]string
 	nodeAnnotations map[string]map[string]string
+	nodeUIDs        map[string]string
 	responses       map[string][]string
 	responsesByNode apiv1.MetadataResponse
 	rawResponses    map[string]string
@@ -63,6 +67,10 @@ func newDummyClusterAgent(conf model.Config) (*dummyClusterAgent, error) {
 				"annotation1": "value",
 				"annotation2": "value2",
 			},
+		},
+		nodeUIDs: map[string]string{
+			"node/node1": "uid-00001",
+			"node/node2": "uid-00002",
 		},
 		responses: map[string][]string{
 			"pod/node1/foo/pod-00001": {"kube_service:svc1"},
@@ -130,7 +138,7 @@ func (d *dummyClusterAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	if token != fmt.Sprintf("Bearer %s", d.token) {
+	if token != "Bearer "+d.token {
 		log.Errorf("wrong token %s", token)
 		w.WriteHeader(http.StatusForbidden)
 		return
@@ -212,7 +220,7 @@ func (d *dummyClusterAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "node":
 			switch s[3] {
 			case "tags":
-				key := fmt.Sprintf("node/%s", nodeName)
+				key := "node/" + nodeName
 				labels, found := d.nodeLabels[key]
 				if found {
 					b, err := json.Marshal(labels)
@@ -224,10 +232,23 @@ func (d *dummyClusterAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case "annotations":
-				key := fmt.Sprintf("node/%s", nodeName)
+				key := "node/" + nodeName
 				labels, found := d.nodeAnnotations[key]
 				if found {
 					b, err := json.Marshal(labels)
+					if err != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					w.Write(b)
+					return
+				}
+			case "uid":
+				key := "node/" + nodeName
+				uid, found := d.nodeUIDs[key]
+				if found {
+					uidResp := map[string]string{"uid": uid}
+					b, err := json.Marshal(uidResp)
 					if err != nil {
 						w.WriteHeader(http.StatusInternalServerError)
 						return
@@ -264,6 +285,13 @@ func (d *dummyClusterAgent) StartTLS() (*httptest.Server, int, error) {
 	return d.parsePort(ts)
 }
 
+func (d *dummyClusterAgent) StartTLSWithConfig(config *tls.Config) (*httptest.Server, int, error) {
+	ts := httptest.NewUnstartedServer(d)
+	ts.TLS = config
+	ts.StartTLS()
+	return d.parsePort(ts)
+}
+
 func (d *dummyClusterAgent) PopRequest() *http.Request {
 	select {
 	case r := <-d.requests:
@@ -286,21 +314,21 @@ const (
 
 func (suite *clusterAgentSuite) SetupTest() {
 	os.Remove(suite.authTokenPath)
-	suite.config.SetWithoutSource("cluster_agent.auth_token", clusterAgentTokenValue)
-	suite.config.SetWithoutSource("cluster_agent.url", "")
-	suite.config.SetWithoutSource("cluster_agent.kubernetes_service_name", "")
-	suite.config.SetWithoutSource("clc_runner_host", clcRunnerIP)
+	suite.config.SetInTest("cluster_agent.auth_token", clusterAgentTokenValue)
+	suite.config.SetInTest("cluster_agent.url", "")
+	suite.config.SetInTest("cluster_agent.kubernetes_service_name", "")
+	suite.config.SetInTest("clc_runner_host", clcRunnerIP)
 }
 
 func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenEmpty() {
-	suite.config.SetWithoutSource("cluster_agent.auth_token", "")
+	suite.config.SetInTest("cluster_agent.auth_token", "")
 
 	_, err := security.CreateOrGetClusterAgentAuthToken(context.Background(), suite.config)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 }
 
 func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenEmptyFile() {
-	suite.config.SetWithoutSource("cluster_agent.auth_token", "")
+	suite.config.SetInTest("cluster_agent.auth_token", "")
 	err := os.WriteFile(suite.authTokenPath, []byte(""), os.ModePerm)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	_, err = security.GetClusterAgentAuthToken(suite.config)
@@ -308,7 +336,7 @@ func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenEmptyFile() {
 }
 
 func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenFileInvalid() {
-	suite.config.SetWithoutSource("cluster_agent.auth_token", "")
+	suite.config.SetInTest("cluster_agent.auth_token", "")
 	err := os.WriteFile(suite.authTokenPath, []byte("tooshort"), os.ModePerm)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 
@@ -318,7 +346,7 @@ func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenFileInvalid() {
 
 func (suite *clusterAgentSuite) TestGetClusterAgentAuthToken() {
 	const tokenFileValue = "abcdefabcdefabcdefabcdefabcdefabcdefabcdef"
-	suite.config.SetWithoutSource("cluster_agent.auth_token", "")
+	suite.config.SetInTest("cluster_agent.auth_token", "")
 	err := os.WriteFile(suite.authTokenPath, []byte(tokenFileValue), os.ModePerm)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 
@@ -329,7 +357,7 @@ func (suite *clusterAgentSuite) TestGetClusterAgentAuthToken() {
 
 func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenConfigPriority() {
 	const tokenFileValue = "abcdefabcdefabcdefabcdefabcdefabcdefabcdef"
-	suite.config.SetWithoutSource("cluster_agent.auth_token", clusterAgentTokenValue)
+	suite.config.SetInTest("cluster_agent.auth_token", clusterAgentTokenValue)
 	err := os.WriteFile(suite.authTokenPath, []byte(tokenFileValue), os.ModePerm)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 
@@ -341,7 +369,7 @@ func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenConfigPriority() {
 
 func (suite *clusterAgentSuite) TestGetClusterAgentAuthTokenTooShort() {
 	const tokenValue = "tooshort"
-	suite.config.SetWithoutSource("cluster_agent.auth_token", "")
+	suite.config.SetInTest("cluster_agent.auth_token", "")
 	err := os.WriteFile(suite.authTokenPath, []byte(tokenValue), os.ModePerm)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 
@@ -357,7 +385,10 @@ func (suite *clusterAgentSuite) TestGetKubernetesNodeLabels() {
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	defer ts.Close()
 
-	suite.config.SetWithoutSource("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+	// IPC component is responsible for initializing TLS configurations globally
+	ipcmock.New(suite.T())
 
 	ca, err := GetClusterAgentClient()
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -410,7 +441,10 @@ func (suite *clusterAgentSuite) TestGetKubernetesNodeAnnotations() {
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	defer ts.Close()
 
-	suite.config.SetWithoutSource("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+	// IPC component is responsible for initializing TLS configurations globally
+	ipcmock.New(suite.T())
 
 	ca, err := GetClusterAgentClient()
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -447,6 +481,50 @@ func (suite *clusterAgentSuite) TestGetKubernetesNodeAnnotations() {
 	}
 }
 
+func (suite *clusterAgentSuite) TestGetNodeUID() {
+	dca, err := newDummyClusterAgent(suite.config)
+	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
+
+	ts, p, err := dca.StartTLS()
+	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
+	defer ts.Close()
+
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+	// IPC component is responsible for initializing TLS configurations globally
+	ipcmock.New(suite.T())
+
+	ca, err := GetClusterAgentClient()
+	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
+
+	testSuite := []struct {
+		nodeName string
+		expected string
+		errors   error
+	}{
+		{
+			nodeName: "node1",
+			expected: "uid-00001",
+		},
+		{
+			nodeName: "node2",
+			expected: "uid-00002",
+		},
+		{
+			nodeName: "fake",
+			expected: "",
+			errors:   errors.NewRemoteServiceError(fmt.Sprintf("https://127.0.0.1:%d/api/v1/uid/node/fake", p), "404 Not Found"),
+		},
+	}
+	for _, testCase := range testSuite {
+		suite.T().Run("", func(t *testing.T) {
+			uid, err := ca.GetNodeUID(testCase.nodeName)
+			require.Equal(t, err, testCase.errors)
+			require.Equal(t, testCase.expected, uid)
+		})
+	}
+}
+
 func (suite *clusterAgentSuite) TestGetKubernetesMetadataNames() {
 	dca, err := newDummyClusterAgent(suite.config)
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -455,7 +533,10 @@ func (suite *clusterAgentSuite) TestGetKubernetesMetadataNames() {
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	defer ts.Close()
 
-	suite.config.SetWithoutSource("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+	// IPC component is responsible for initializing TLS configurations globally
+	ipcmock.New(suite.T())
 
 	ca, err := GetClusterAgentClient()
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -525,7 +606,10 @@ func (suite *clusterAgentSuite) TestGetCFAppsMetadataForNode() {
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	defer ts.Close()
 
-	suite.config.SetWithoutSource("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+	// IPC component is responsible for initializing TLS configurations globally
+	ipcmock.New(suite.T())
 
 	ca, err := GetClusterAgentClient()
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -567,7 +651,7 @@ func (suite *clusterAgentSuite) TestGetPodsMetadataForNode() {
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	defer ts.Close()
 
-	suite.config.SetWithoutSource("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
 
 	ca, err := GetClusterAgentClient()
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -639,7 +723,10 @@ func (suite *clusterAgentSuite) TestGetKubernetesClusterID() {
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
 	defer ts.Close()
 
-	suite.config.SetWithoutSource("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+	suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+	// IPC component is responsible for initializing TLS configurations globally
+	ipcmock.New(suite.T())
 
 	ca, err := GetClusterAgentClient()
 	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
@@ -658,8 +745,9 @@ func TestClusterAgentSuite(t *testing.T) {
 	require.Nil(t, err, fmt.Errorf("%v", err))
 	defer os.Remove(f.Name())
 
-	s := &clusterAgentSuite{config: configmock.New(t)}
-	s.config.SetConfigFile(f.Name())
+	cfg := configmock.New(t)
+	cfg.SetConfigFile(f.Name())
+	s := &clusterAgentSuite{config: cfg}
 	s.authTokenPath = filepath.Join(fakeDir, clusterAgentAuthTokenFilename)
 	_, err = os.Stat(s.authTokenPath)
 	require.NotNil(t, err, fmt.Sprintf("%v", err))
@@ -719,4 +807,140 @@ func TestBuildFilterQuery(t *testing.T) {
 			require.Equal(t, tt.expected, actual)
 		})
 	}
+}
+
+func (suite *clusterAgentSuite) TestDCAClientCertificateVerification() {
+	// Reset the global ClusterAgentClient/CrossNodeClientTLSConfig to ensure a clean state for next tests
+	defer resetGlobalClusterAgentClient()
+	defer pkgapiutil.TestOnlyResetCrossNodeClientTLSConfig()
+
+	ipccomp := ipcmock.New(suite.T())
+
+	tests := []struct {
+		name              string
+		clientCheckTLS    bool // Whether the client should check the TLS certificate
+		serverUsesIPCCert bool
+		shouldFail        bool
+	}{
+		{
+			name:              "Test with known CA",
+			clientCheckTLS:    true,
+			serverUsesIPCCert: true,
+			shouldFail:        false,
+		},
+		{
+			name:              "Test with unknown CA",
+			clientCheckTLS:    true,
+			serverUsesIPCCert: false,
+			shouldFail:        true,
+		},
+		{
+			name:              "Test with unknown CA with cluster_agent.client_check_tls set to false",
+			clientCheckTLS:    false,
+			serverUsesIPCCert: false,
+			shouldFail:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		suite.T().Run(tt.name, func(t *testing.T) {
+			// Reset every global state before each test
+			resetGlobalClusterAgentClient()
+			pkgapiutil.TestOnlyResetCrossNodeClientTLSConfig()
+
+			// Configure the cluster agent server
+
+			// First, create a dummy cluster agent
+			dca, err := newDummyClusterAgent(suite.config)
+			require.Nil(t, err, fmt.Sprintf("%v", err))
+
+			startFunc := dca.StartTLS
+
+			if tt.serverUsesIPCCert {
+				startFunc = func() (*httptest.Server, int, error) {
+					// Start a TLS server with self-signed certificate
+					return dca.StartTLSWithConfig(ipccomp.GetTLSServerConfig())
+				}
+			}
+			// Start a TLS server with self-signed certificate
+			ts, p, err := startFunc()
+			require.Nil(t, err, fmt.Sprintf("%v", err))
+			defer ts.Close()
+
+			// Configure the cluster agent client
+
+			if tt.clientCheckTLS {
+				// Set the TLS configuration for cross-node communication
+				pkgapiutil.SetCrossNodeClientTLSConfig(ipccomp.GetTLSClientConfig())
+			} else {
+				// Set the TLS configuration for cross-node communication to nil
+				pkgapiutil.SetCrossNodeClientTLSConfig(&tls.Config{
+					InsecureSkipVerify: true, // Skip TLS verification
+				})
+			}
+
+			// Configure the cluster agent URL
+			suite.config.SetInTest("cluster_agent.url", fmt.Sprintf("https://127.0.0.1:%d", p))
+
+			// Try to connect to the cluster agent - should fail due to certificate verification
+			ca, err := GetClusterAgentClient()
+			if tt.shouldFail {
+				assert.NotNil(t, err, "Expected an error due to certificate verification")
+			} else {
+				require.Nil(t, err, "Connection should succeed")
+				require.NotNil(t, ca, "Client should not be nil")
+			}
+		})
+	}
+}
+
+// TestInitHTTPClientConcurrent calls initHTTPClient() concurrently to catch data races on DCAClient state.
+func (suite *clusterAgentSuite) TestInitHTTPClientConcurrent() {
+	defer pkgapiutil.TestOnlyResetCrossNodeClientTLSConfig()
+	pkgapiutil.TestOnlyResetCrossNodeClientTLSConfig()
+
+	dca, err := newDummyClusterAgent(suite.config)
+	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
+
+	ts, p, err := dca.StartTLS()
+	require.Nil(suite.T(), err, fmt.Sprintf("%v", err))
+	defer ts.Close()
+
+	pkgapiutil.SetCrossNodeClientTLSConfig(&tls.Config{
+		InsecureSkipVerify: true,
+	})
+
+	c := &DCAClient{
+		clusterAgentAPIEndpoint: fmt.Sprintf("https://127.0.0.1:%d", p),
+	}
+	c.clusterAgentAPIRequestHeaders = http.Header{}
+	c.clusterAgentAPIRequestHeaders.Set(authorizationHeaderKey, "Bearer "+clusterAgentTokenValue)
+	c.clusterAgentAPIRequestHeaders.Set(RealIPHeader, clcRunnerIP)
+
+	// dummyClusterAgent.requests is a bounded channel that nothing else drains here;
+	// keep it flowing so ServeHTTP never blocks on a full channel and slows the test down.
+	stopDrain := make(chan struct{})
+	defer close(stopDrain)
+	go func() {
+		for {
+			select {
+			case <-dca.requests:
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+
+	const goroutines = 10
+	const iterations = 10
+
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Go(func() {
+			for j := 0; j < iterations; j++ {
+				_ = c.initHTTPClient()
+			}
+		})
+	}
+	wg.Wait()
 }

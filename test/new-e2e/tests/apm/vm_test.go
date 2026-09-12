@@ -21,13 +21,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams"
-	"github.com/DataDog/test-infra-definitions/scenarios/aws/ec2"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awshost "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/host"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client/agentclient"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/apps"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client/agentclient"
 	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-configuration/secretsutils"
 )
 
@@ -49,6 +50,16 @@ func NewVMFakeintakeSuite(tr transport) *VMFakeintakeSuite {
 	}
 }
 
+// SetupSuite is called once before all tests in the suite.
+// This function is called by [testify Suite].
+func (s *VMFakeintakeSuite) SetupSuite() {
+	s.BaseSuite.SetupSuite()
+	defer s.CleanupOnSetupFailure() // cleanup if setup fails
+
+	// Pre-pull Docker image once for all tests to avoid network timeout issues during test execution
+	s.Env().RemoteHost.MustExecute("docker pull ghcr.io/datadog/apps-tracegen:" + apps.Version)
+}
+
 func vmProvisionerOpts(opts ...awshost.ProvisionerOption) []awshost.ProvisionerOption {
 	setupScript := `#!/bin/bash
 # /var/run/datadog directory is necessary for UDS socket creation
@@ -63,11 +74,13 @@ sudo groupadd -f -r docker
 sudo usermod -a -G docker dd-agent
 `
 	opts = append(opts,
-		awshost.WithDocker(),
-		// Create the /var/run/datadog directory and ensure
-		// permissions are correct so the agent can create
-		// unix sockets for the UDS transport and communicate with the docker socket.
-		awshost.WithEC2InstanceOptions(ec2.WithUserData(setupScript)),
+		awshost.WithRunOptions(
+			ec2.WithDocker(),
+			// Create the /var/run/datadog directory and ensure
+			// permissions are correct so the agent can create
+			// unix sockets for the UDS transport and communicate with the docker socket.
+			ec2.WithEC2InstanceOptions(ec2.WithUserData(setupScript), ec2.WithInternetAccess()),
+		),
 	)
 	return opts
 }
@@ -101,18 +114,18 @@ apm_config.enabled: true
 func TestVMFakeintakeSuiteUDS(t *testing.T) {
 	options := vmSuiteOpts(uds,
 		// Enable the UDS receiver in the trace-agent
-		awshost.WithAgentOptions(agentparams.WithAgentConfig(vmAgentConfig(uds, ""))))
+		awshost.WithRunOptions(ec2.WithAgentOptions(agentparams.WithAgentConfig(vmAgentConfig(uds, "")))))
 	e2e.Run(t, NewVMFakeintakeSuite(uds), options...)
 }
 
 // TestVMFakeintakeSuiteTCP runs basic Trace Agent tests over the TCP transport
 func TestVMFakeintakeSuiteTCP(t *testing.T) {
 	options := vmSuiteOpts(tcp,
-		awshost.WithAgentOptions(
+		awshost.WithRunOptions(
 			// Enable the UDS receiver in the trace-agent
-			agentparams.WithAgentConfig(vmAgentConfig(tcp, "")),
+			ec2.WithAgentOptions(agentparams.WithAgentConfig(vmAgentConfig(tcp, ""))),
+			ec2.WithEC2InstanceOptions(),
 		),
-		awshost.WithEC2InstanceOptions(),
 	)
 	e2e.Run(t, NewVMFakeintakeSuite(tcp), options...)
 }
@@ -126,7 +139,7 @@ func (s *VMFakeintakeSuite) TestTraceAgentMetrics() {
 	s.Require().NoError(err)
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testTraceAgentMetrics(s.T(), c, s.Env().FakeIntake)
+		testTraceAgentMetrics(s.T(), c, s.Env().FakeIntake, !s.Env().Agent.FIPSEnabled)
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed finding datadog.trace_agent.* metrics")
 }
@@ -230,7 +243,7 @@ func (s *VMFakeintakeSuite) TestAutoVersionTraces() {
 
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testAutoVersionTraces(s.T(), c, s.Env().FakeIntake)
+		testAutoVersionTraces(s.T(), c, service, s.Env().FakeIntake)
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed finding traces")
 }
@@ -253,7 +266,7 @@ func (s *VMFakeintakeSuite) TestAutoVersionStats() {
 
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testAutoVersionStats(s.T(), c, s.Env().FakeIntake)
+		testAutoVersionStats(s.T(), c, service, s.Env().FakeIntake)
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed finding stats")
 }
@@ -276,7 +289,7 @@ func (s *VMFakeintakeSuite) TestIsTraceRootTag() {
 
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testIsTraceRootTag(s.T(), c, s.Env().FakeIntake)
+		testIsTraceRootTag(s.T(), c, service, s.Env().FakeIntake)
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed finding stats")
 }
@@ -313,18 +326,18 @@ func (s *VMFakeintakeSuite) TestProcessTagsHeaderTrace() {
 	s.T().Log("Waiting for Trace Agent to be live.")
 	s.Require().NoError(waitRemotePort(s, 8126))
 
-	traceWithProcessTagsWithHeader(s.Env().RemoteHost, "binary:generator", "test-service")
+	traceWithProcessTagsWithHeader(s.Env().RemoteHost, "binary:generator-1", "test-service")
 
 	s.T().Log("Waiting for traces.")
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testProcessTraces(c, s.Env().FakeIntake, "binary:generator")
+		testProcessTraces(c, s.Env().FakeIntake, "binary:generator-1")
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed to find traces with process tags")
 
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testStatsHaveProcessTags(c, s.Env().FakeIntake, "binary:generator")
+		testStatsHaveProcessTags(c, s.Env().FakeIntake, "binary:generator-1")
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed to find traces with process tags")
 }
@@ -337,28 +350,33 @@ func (s *VMFakeintakeSuite) TestProcessTagsTrace() {
 	s.T().Log("Waiting for Trace Agent to be live.")
 	s.Require().NoError(waitRemotePort(s, 8126))
 
-	traceWithProcessTags(s.Env().RemoteHost, "binary:generator", "test-service")
+	traceWithProcessTags(s.Env().RemoteHost, "binary:generator-2", "test-service")
 
 	s.T().Log("Waiting for traces.")
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testProcessTraces(c, s.Env().FakeIntake, "binary:generator")
+		testProcessTraces(c, s.Env().FakeIntake, "binary:generator-2")
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed to find traces with process tags")
 
 	s.EventuallyWithTf(func(c *assert.CollectT) {
 		s.logStatus()
-		testStatsHaveProcessTags(c, s.Env().FakeIntake, "binary:generator")
+		testStatsHaveProcessTags(c, s.Env().FakeIntake, "binary:generator-2")
 		s.logJournal(false)
 	}, 3*time.Minute, 10*time.Second, "Failed to find traces with process tags")
 }
 
 func (s *VMFakeintakeSuite) TestProbabilitySampler() {
-	s.UpdateEnv(awshost.Provisioner(vmProvisionerOpts(awshost.WithAgentOptions(agentparams.WithAgentConfig(vmAgentConfig(s.transport, `
-apm_config.probabilistic_sampler.enabled: true
+	cfg := `apm_config.probabilistic_sampler.enabled: true
 apm_config.probabilistic_sampler.sampling_percentage: 50
 apm_config.probabilistic_sampler.hash_seed: 22
-`))))...))
+`
+	opts := vmProvisionerOpts(awshost.WithRunOptions(
+		ec2.WithAgentOptions(
+			agentparams.WithAgentConfig(vmAgentConfig(s.transport, cfg)),
+		),
+	))
+	s.UpdateEnv(awshost.Provisioner(opts...))
 
 	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
 	s.Require().NoError(err)
@@ -377,9 +395,66 @@ apm_config.probabilistic_sampler.hash_seed: 22
 
 	s.T().Log("Waiting for traces.")
 	s.EventuallyWithTf(func(c *assert.CollectT) {
-		tracesSampledByProbabilitySampler(s.T(), c, s.Env().FakeIntake)
+		tracesSampledByProbabilitySampler(s.T(), c, service, s.Env().FakeIntake)
 	}, 2*time.Minute, 10*time.Second, "Failed to find traces sampled by the probability sampler")
 }
+
+func (s *VMFakeintakeSuite) TestAPMModeDefault() {
+	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
+	s.Require().NoError(err)
+
+	service := fmt.Sprintf("tracegen-apm-mode-%s", s.transport)
+
+	// Wait for agent to be live
+	s.T().Log("Waiting for Trace Agent to be live.")
+	s.Require().NoError(waitRemotePort(s, 8126))
+
+	// Run Trace Generator
+	s.T().Log("Starting Trace Generator.")
+	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
+	shutdown := runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})
+	defer shutdown()
+
+	s.EventuallyWithTf(func(c *assert.CollectT) {
+		s.logStatus()
+		testAPMMode(c, s.Env().FakeIntake, service, "")
+		s.logJournal(false)
+	}, 2*time.Minute, 10*time.Second, "Failed finding traces with correct APM mode")
+}
+
+func (s *VMFakeintakeSuite) TestAPMModeEdge() {
+	cfg := `apm_config.mode: edge`
+	opts := vmProvisionerOpts(awshost.WithRunOptions(
+		ec2.WithAgentOptions(
+			agentparams.WithAgentConfig(vmAgentConfig(s.transport, cfg)),
+		),
+	))
+	s.UpdateEnv(awshost.Provisioner(opts...))
+
+	err := s.Env().FakeIntake.Client().FlushServerAndResetAggregators()
+	s.Require().NoError(err)
+
+	service := fmt.Sprintf("tracegen-apm-mode-edge-%s", s.transport)
+
+	// Wait for agent to be live
+	s.T().Log("Waiting for Trace Agent to be live.")
+	s.Require().NoError(waitRemotePort(s, 8126))
+
+	// Run Trace Generator
+	s.T().Log("Starting Trace Generator.")
+	defer waitTracegenShutdown(&s.Suite, s.Env().FakeIntake)
+	shutdown := runTracegenDocker(s.Env().RemoteHost, service, tracegenCfg{transport: s.transport})
+	defer shutdown()
+
+	s.T().Log("Waiting for traces.")
+	s.EventuallyWithTf(func(c *assert.CollectT) {
+		s.logStatus()
+		testAPMMode(c, s.Env().FakeIntake, service, "edge")
+		s.logJournal(false)
+	}, 2*time.Minute, 10*time.Second, "Failed to find traces with _dd.apm_mode=edge")
+}
+
+// TODO: TestAPMMode with DD_APM_MODE env var configured
 
 func (s *VMFakeintakeSuite) TestSIGTERM() {
 	output := s.Env().RemoteHost.MustExecute("cat /opt/datadog-agent/run/trace-agent.pid")
@@ -502,10 +577,12 @@ agent_ipc:
 
 	s.UpdateEnv(awshost.Provisioner(
 		vmProvisionerOpts(
-			awshost.WithAgentOptions(
-				agentparams.WithAgentConfig(vmAgentConfig(s.transport, extraconfig)),
-				secretsutils.WithUnixSetupScript(secretResolverPath, true),
-				agentparams.WithSkipAPIKeyInConfig(), // api_key is already provided in the config
+			awshost.WithRunOptions(
+				ec2.WithAgentOptions(
+					agentparams.WithAgentConfig(vmAgentConfig(s.transport, extraconfig)),
+					secretsutils.WithUnixSetupScript(secretResolverPath, true),
+					agentparams.WithSkipAPIKeyInConfig(), // api_key is already provided in the config
+				),
 			),
 		)...),
 	)

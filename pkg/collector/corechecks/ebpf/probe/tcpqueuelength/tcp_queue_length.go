@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 //go:generate $GOPATH/bin/include_headers pkg/collector/corechecks/ebpf/c/runtime/tcp-queue-length-kern.c pkg/ebpf/bytecode/build/runtime/tcp-queue-length.c pkg/ebpf/c
 //go:generate $GOPATH/bin/integrity pkg/ebpf/bytecode/build/runtime/tcp-queue-length.c pkg/ebpf/bytecode/runtime/tcp-queue-length.go runtime
@@ -14,14 +14,14 @@ package tcpqueuelength
 import (
 	"fmt"
 
-	"golang.org/x/sys/unix"
-
 	manager "github.com/DataDog/ebpf-manager"
+	"golang.org/x/sys/unix"
 
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/ebpf/probe/tcpqueuelength/model"
 	"github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/bytecode"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/bytecode/runtime"
+	"github.com/DataDog/datadog-agent/pkg/ebpf/features"
 	ebpfmaps "github.com/DataDog/datadog-agent/pkg/ebpf/maps"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -44,7 +44,7 @@ type Tracer struct {
 // NewTracer creates a [Tracer]
 func NewTracer(cfg *ebpf.Config) (*Tracer, error) {
 	if cfg.EnableCORE {
-		probe, err := loadTCPQueueLengthCOREProbe(cfg)
+		probe, err := loadTCPQueueLengthCOREProbe()
 		if err != nil {
 			if !cfg.AllowRuntimeCompiledFallback {
 				return nil, fmt.Errorf("error loading CO-RE tcp-queue-length probe: %s. set system_probe_config.allow_runtime_compiled_fallback to true to allow fallback to runtime compilation", err)
@@ -59,26 +59,46 @@ func NewTracer(cfg *ebpf.Config) (*Tracer, error) {
 }
 
 func startTCPQueueLengthProbe(buf bytecode.AssetReader, managerOptions manager.Options) (*Tracer, error) {
-	probes := []*manager.Probe{
-		{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kprobe__tcp_recvmsg", UID: "tcpq"}},
-		{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kretprobe__tcp_recvmsg", UID: "tcpq"}},
-		{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kprobe__tcp_sendmsg", UID: "tcpq"}},
-		{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kretprobe__tcp_sendmsg", UID: "tcpq"}},
-	}
-
-	maps := []*manager.Map{
-		{Name: "tcp_queue_stats"},
-		{Name: "who_recvmsg"},
-		{Name: "who_sendmsg"},
-	}
-
 	m := &manager.Manager{
-		Probes: probes,
-		Maps:   maps,
+		Probes: []*manager.Probe{
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kprobe__tcp_recvmsg", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kretprobe__tcp_recvmsg", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kprobe__tcp_sendmsg", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "kretprobe__tcp_sendmsg", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "tcp_recvmsg_entry", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "tcp_recvmsg_exit", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "tcp_sendmsg_entry", UID: "tcpq"}},
+			{ProbeIdentificationPair: manager.ProbeIdentificationPair{EBPFFuncName: "tcp_sendmsg_exit", UID: "tcpq"}},
+		},
+		Maps: []*manager.Map{
+			{Name: "tcp_queue_stats"},
+			{Name: "who_recvmsg"},
+			{Name: "who_sendmsg"},
+		},
 	}
 
 	managerOptions.RemoveRlimit = true
-	managerOptions.DefaultKProbeMaxActive = maxActive
+
+	if features.SupportsFentry("tcp_recvmsg") == nil {
+		managerOptions.ExcludedFunctions = append(managerOptions.ExcludedFunctions,
+			"kprobe__tcp_recvmsg",
+			"kretprobe__tcp_recvmsg",
+			"kprobe__tcp_sendmsg",
+			"kretprobe__tcp_sendmsg",
+		)
+		managerOptions.ExcludedMaps = append(managerOptions.ExcludedMaps,
+			"who_recvmsg",
+			"who_sendmsg",
+		)
+	} else {
+		managerOptions.DefaultKProbeMaxActive = maxActive
+		managerOptions.ExcludedFunctions = append(managerOptions.ExcludedFunctions,
+			"tcp_recvmsg_entry",
+			"tcp_recvmsg_exit",
+			"tcp_sendmsg_entry",
+			"tcp_sendmsg_exit",
+		)
+	}
 
 	if err := m.InitWithOptions(buf, managerOptions); err != nil {
 		return nil, fmt.Errorf("failed to init manager: %w", err)
@@ -150,7 +170,7 @@ func (t *Tracer) GetAndFlush() model.TCPQueueLengthStats {
 	return result
 }
 
-func loadTCPQueueLengthCOREProbe(cfg *ebpf.Config) (*Tracer, error) {
+func loadTCPQueueLengthCOREProbe() (*Tracer, error) {
 	kv, err := kernel.HostVersion()
 	if err != nil {
 		return nil, fmt.Errorf("error detecting kernel version: %s", err)
@@ -159,13 +179,8 @@ func loadTCPQueueLengthCOREProbe(cfg *ebpf.Config) (*Tracer, error) {
 		return nil, fmt.Errorf("detected kernel version %s, but tcp-queue-length probe requires a kernel version of at least 4.8.0", kv)
 	}
 
-	filename := "tcp-queue-length.o"
-	if cfg.BPFDebug {
-		filename = "tcp-queue-length-debug.o"
-	}
-
 	var probe *Tracer
-	err = ebpf.LoadCOREAsset(filename, func(buf bytecode.AssetReader, opts manager.Options) error {
+	err = ebpf.LoadCOREAsset("tcp-queue-length.o", func(buf bytecode.AssetReader, opts manager.Options) error {
 		probe, err = startTCPQueueLengthProbe(buf, opts)
 		return err
 	})

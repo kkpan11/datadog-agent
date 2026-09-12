@@ -3,12 +3,11 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build kubeapiserver
-
 // Package config holds config related files
 package config
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -17,9 +16,11 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/security-agent/command"
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
 	"github.com/DataDog/datadog-agent/pkg/config/fetcher"
 	"github.com/DataDog/datadog-agent/pkg/config/settings"
 	settingshttp "github.com/DataDog/datadog-agent/pkg/config/settings/http"
@@ -30,9 +31,8 @@ import (
 type cliParams struct {
 	*command.GlobalParams
 
-	command   *cobra.Command
-	args      []string
-	getClient settings.ClientBuilder
+	command *cobra.Command
+	args    []string
 }
 
 // Commands returns the config commands
@@ -48,9 +48,6 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			cliParams.command = cmd
 			cliParams.args = args
-			cliParams.getClient = func(cmd *cobra.Command, args []string) (settings.Client, error) {
-				return getSettingsClient(cmd, args)
-			}
 		},
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return fxutil.OneShot(
@@ -58,9 +55,9 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 				fx.Supply(cliParams),
 				fx.Supply(core.BundleParams{
 					ConfigParams: config.NewSecurityAgentParams(globalParams.ConfigFilePaths, config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-					SecretParams: secrets.NewEnabledParams(),
 					LogParams:    log.ForOneShot(command.LoggerName, "off", true)}),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -76,9 +73,9 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					fx.Supply(cliParams),
 					fx.Supply(core.BundleParams{
 						ConfigParams: config.NewSecurityAgentParams(globalParams.ConfigFilePaths, config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-						SecretParams: secrets.NewEnabledParams(),
 						LogParams:    log.ForOneShot(command.LoggerName, "off", true)}),
 					core.Bundle(),
+					ipcfx.ModuleReadOnly(),
 				)
 			},
 		},
@@ -96,9 +93,9 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					fx.Supply(cliParams),
 					fx.Supply(core.BundleParams{
 						ConfigParams: config.NewSecurityAgentParams(globalParams.ConfigFilePaths, config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-						SecretParams: secrets.NewEnabledParams(),
 						LogParams:    log.ForOneShot(command.LoggerName, "off", true)}),
 					core.Bundle(),
+					ipcfx.ModuleReadOnly(),
 				)
 			},
 		},
@@ -116,9 +113,9 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					fx.Supply(cliParams),
 					fx.Supply(core.BundleParams{
 						ConfigParams: config.NewSecurityAgentParams(globalParams.ConfigFilePaths, config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-						SecretParams: secrets.NewEnabledParams(),
 						LogParams:    log.ForOneShot(command.LoggerName, "off", true)}),
 					core.Bundle(),
+					ipcfx.ModuleReadOnly(),
 				)
 			},
 		},
@@ -136,9 +133,9 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					fx.Supply(cliParams),
 					fx.Supply(core.BundleParams{
 						ConfigParams: config.NewSecurityAgentParams(globalParams.ConfigFilePaths, config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-						SecretParams: secrets.NewEnabledParams(),
 						LogParams:    log.ForOneShot(command.LoggerName, "off", true)}),
 					core.Bundle(),
+					ipcfx.ModuleReadOnly(),
 				)
 			},
 		},
@@ -146,20 +143,14 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 
 	return []*cobra.Command{cmd}
 }
-func getSettingsClient(_ *cobra.Command, _ []string) (settings.Client, error) {
-	err := util.SetAuthToken(pkgconfigsetup.Datadog())
-	if err != nil {
-		return nil, err
-	}
-
-	c := util.GetClient()
+func getSettingsClient(client ipc.HTTPClient) (settings.Client, error) {
 	apiConfigURL := fmt.Sprintf("https://localhost:%v/agent/config", pkgconfigsetup.Datadog().GetInt("security_agent.cmd_port"))
 
-	return settingshttp.NewClient(c, apiConfigURL, "security-agent", settingshttp.NewHTTPClientOptions(util.LeaveConnectionOpen)), nil
+	return settingshttp.NewSecureClient(client, apiConfigURL, "security-agent", ipchttp.WithLeaveConnectionOpen), nil
 }
 
-func showRuntimeConfiguration(_ log.Component, cfg config.Component, _ secrets.Component, _ *cliParams) error {
-	runtimeConfig, err := fetcher.SecurityAgentConfig(cfg)
+func showRuntimeConfiguration(_ log.Component, cfg config.Component, _ secrets.Component, _ *cliParams, client ipc.HTTPClient) error {
+	runtimeConfig, err := fetcher.SecurityAgentConfig(cfg, client)
 	if err != nil {
 		return err
 	}
@@ -168,12 +159,12 @@ func showRuntimeConfiguration(_ log.Component, cfg config.Component, _ secrets.C
 	return nil
 }
 
-func setConfigValue(_ log.Component, _ config.Component, _ secrets.Component, params *cliParams) error {
+func setConfigValue(_ log.Component, _ config.Component, _ secrets.Component, client ipc.HTTPClient, params *cliParams) error {
 	if len(params.args) != 2 {
-		return fmt.Errorf("exactly two parameters are required: the setting name and its value")
+		return errors.New("exactly two parameters are required: the setting name and its value")
 	}
 
-	c, err := params.getClient(params.command, params.args)
+	c, err := getSettingsClient(client)
 	if err != nil {
 		return err
 	}
@@ -192,12 +183,12 @@ func setConfigValue(_ log.Component, _ config.Component, _ secrets.Component, pa
 	return nil
 }
 
-func getConfigValue(_ log.Component, _ config.Component, _ secrets.Component, params *cliParams) error {
+func getConfigValue(_ log.Component, _ config.Component, _ secrets.Component, client ipc.HTTPClient, params *cliParams) error {
 	if len(params.args) != 1 {
-		return fmt.Errorf("a single setting name must be specified")
+		return errors.New("a single setting name must be specified")
 	}
 
-	c, err := params.getClient(params.command, params.args)
+	c, err := getSettingsClient(client)
 	if err != nil {
 		return err
 	}
@@ -212,8 +203,8 @@ func getConfigValue(_ log.Component, _ config.Component, _ secrets.Component, pa
 	return nil
 }
 
-func showRuntimeConfigurationBySource(_ log.Component, _ config.Component, _ secrets.Component, params *cliParams) error {
-	c, err := params.getClient(params.command, params.args)
+func showRuntimeConfigurationBySource(_ log.Component, _ secrets.Component, client ipc.HTTPClient, _ *cliParams) error {
+	c, err := getSettingsClient(client)
 	if err != nil {
 		return err
 	}
@@ -228,8 +219,8 @@ func showRuntimeConfigurationBySource(_ log.Component, _ config.Component, _ sec
 	return nil
 }
 
-func listRuntimeConfigurableValue(_ log.Component, _ config.Component, _ secrets.Component, params *cliParams) error {
-	c, err := params.getClient(params.command, params.args)
+func listRuntimeConfigurableValue(_ log.Component, _ secrets.Component, client ipc.HTTPClient, _ *cliParams) error {
+	c, err := getSettingsClient(client)
 	if err != nil {
 		return err
 	}

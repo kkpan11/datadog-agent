@@ -7,25 +7,53 @@ package installer
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
 	"github.com/DataDog/datadog-agent/test/new-e2e/tests/installer/windows/consts"
 
-	e2eos "github.com/DataDog/test-infra-definitions/components/os"
+	e2eos "github.com/DataDog/datadog-agent/test/e2e-framework/components/os"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner/parameters"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/optional"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/optional"
 	installer "github.com/DataDog/datadog-agent/test/new-e2e/tests/installer/unix"
 	windowsCommon "github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common"
 )
+
+// DatadogInstallerRunner represents an interface for the Datadog Installer
+type DatadogInstallerRunner interface {
+	// type  helpers
+	SetBinaryPath(path string)
+
+	// subcommands
+	Version() (string, error)
+	SetCatalog(newCatalog Catalog) (string, error)
+	StartExperiment(packageName string, packageVersion string) (string, error)
+	PromoteExperiment(packageName string) (string, error)
+	StopExperiment(packageName string) (string, error)
+	InstallPackage(packageName string, opts ...installer.PackageOption) (string, error)
+	InstallExperiment(packageName string, opts ...installer.PackageOption) (string, error)
+	RemovePackage(packageName string) (string, error)
+	RemoveExperiment(packageName string) (string, error)
+	Status() (string, error)
+	Purge() (string, error)
+	GarbageCollect() (string, error)
+	SetConfigExperiment(config ConfigExperiment) (string, error)
+	StartConfigExperiment(packageName string, config ConfigExperiment) (string, error)
+	PromoteConfigExperiment(packageName string) (string, error)
+	StopConfigExperiment(packageName string) (string, error)
+
+	// MSI commands
+	// TODO: we should separate installation from the command line interface
+	Install(opts ...MsiOption) error
+	Uninstall(opts ...MsiOption) error
+}
 
 // DatadogInstaller represents an interface to the Datadog Installer on the remote host.
 type DatadogInstaller struct {
@@ -57,16 +85,8 @@ func (d *DatadogInstaller) SetBinaryPath(path string) {
 
 func (d *DatadogInstaller) execute(cmd string, options ...client.ExecuteOption) (string, error) {
 	// Ensure the API key and site are set for telemetry
-	apiKey := os.Getenv("DD_API_KEY")
-	if apiKey == "" {
-		var err error
-		apiKey, err = runner.GetProfile().SecretStore().Get(parameters.APIKey)
-		if apiKey == "" || err != nil {
-			apiKey = "deadbeefdeadbeefdeadbeefdeadbeef"
-		}
-	}
 	envVars := map[string]string{
-		"DD_API_KEY": apiKey,
+		"DD_API_KEY": installer.GetAPIKey(),
 		"DD_SITE":    "datadoghq.com",
 	}
 
@@ -156,27 +176,20 @@ func (d *DatadogInstaller) SetCatalog(newCatalog Catalog) (string, error) {
 	return d.execute(fmt.Sprintf("daemon set-catalog '%s'", catalog))
 }
 
-// StartExperiment will use the Datadog Installer service to start an experiment.
-func (d *DatadogInstaller) StartExperiment(packageName string, packageVersion string) (string, error) {
-	if packageName == consts.AgentPackage {
-		// workaround for 7.65 daemon which must use the start-installer-experiment subcommand to start an experiment for the Agent package
-		// through the local API.
-		ver, err := d.Version()
-		if err != nil {
-			return "", err
-		}
-		if strings.HasPrefix(ver, "7.65.") {
-			return d.StartInstallerExperiment(consts.AgentPackage, packageVersion)
-		}
+// ignoreEOF ignores EOF errors
+//
+// Prior to 7.68, the daemon kills the connection for daemon commands that restart the daemon.
+// Starting with 7.68, the daemon responds properly so the tests assert for it
+func ignoreEOF(err error) error {
+	if err != nil && strings.Contains(err.Error(), "EOF") {
+		return nil
 	}
-	return d.execute(fmt.Sprintf("daemon start-experiment '%s' '%s'", packageName, packageVersion))
+	return err
 }
 
-// StartInstallerExperiment will use the Datadog Installer service to start an experiment for the Agent package.
-//
-// Only neeeded for 7.65, future versions use the start-experiment subcommand instead.
-func (d *DatadogInstaller) StartInstallerExperiment(packageName string, packageVersion string) (string, error) {
-	return d.execute(fmt.Sprintf("daemon start-installer-experiment '%s' '%s'", packageName, packageVersion))
+// StartExperiment will use the Datadog Installer service to start an experiment.
+func (d *DatadogInstaller) StartExperiment(packageName string, packageVersion string) (string, error) {
+	return d.execute(fmt.Sprintf("daemon start-experiment '%s' '%s'", packageName, packageVersion))
 }
 
 // PromoteExperiment will use the Datadog Installer service to promote an experiment.
@@ -205,12 +218,12 @@ func (d *DatadogInstaller) InstallExperiment(packageName string, opts ...install
 
 // RemovePackage requests that the Datadog Installer removes a package on the remote host.
 func (d *DatadogInstaller) RemovePackage(packageName string) (string, error) {
-	return d.execute(fmt.Sprintf("remove %s", packageName))
+	return d.execute("remove " + packageName)
 }
 
 // RemoveExperiment requests that the Datadog Installer removes a package on the remote host.
 func (d *DatadogInstaller) RemoveExperiment(packageName string) (string, error) {
-	return d.execute(fmt.Sprintf("remove-experiment %s", packageName))
+	return d.execute("remove-experiment " + packageName)
 }
 
 // Status returns the status provided by the running daemon
@@ -247,9 +260,9 @@ func (d *DatadogInstaller) Install(opts ...MsiOption) error {
 
 	// MSI can install from a URL or a local file
 	remoteMSIPath := params.installerURL
-	if strings.HasPrefix(remoteMSIPath, "file://") {
+	if after, ok := strings.CutPrefix(remoteMSIPath, "file://"); ok {
 		// developer provided a local file, put it on the remote host
-		localMSIPath := strings.TrimPrefix(remoteMSIPath, "file://")
+		localMSIPath := after
 		remoteMSIPath, err = windowsCommon.GetTemporaryFile(d.env.RemoteHost)
 		if err != nil {
 			return err
@@ -257,7 +270,7 @@ func (d *DatadogInstaller) Install(opts ...MsiOption) error {
 		d.env.RemoteHost.CopyFile(localMSIPath, remoteMSIPath)
 	}
 	if remoteMSIPath == "" {
-		return fmt.Errorf("MSI URL/path is required but was not provided")
+		return errors.New("MSI URL/path is required but was not provided")
 	}
 	logPath := filepath.Join(d.outputDir, params.msiLogFilename)
 	if _, err := os.Stat(logPath); err == nil {
@@ -265,7 +278,7 @@ func (d *DatadogInstaller) Install(opts ...MsiOption) error {
 	}
 	msiArgList := params.msiArgs[:]
 	if params.agentUser != "" {
-		msiArgList = append(msiArgList, fmt.Sprintf("DDAGENTUSER_NAME=%s", params.agentUser))
+		msiArgList = append(msiArgList, fmt.Sprintf(`DDAGENTUSER_NAME="%s"`, params.agentUser))
 	}
 	msiArgs := ""
 	if msiArgList != nil {
@@ -330,20 +343,24 @@ func createFileRegistryFromLocalOCI(host *components.RemoteHost, localPackagePat
 func CreatePackageSourceIfLocal(host *components.RemoteHost, pkg TestPackageConfig) (TestPackageConfig, error) {
 	url := pkg.URL()
 	// If the URL is a file, upload it to the remote host
-	if strings.HasPrefix(url, "file://") {
-		localPath := strings.TrimPrefix(url, "file://")
+	if after, ok := strings.CutPrefix(url, "file://"); ok {
+		localPath := after
 		outPath, err := createFileRegistryFromLocalOCI(host, localPath)
 		if err != nil {
 			return pkg, err
 		}
 		// Must replace slashes so that daemon can parse it correctly
 		outPath = strings.ReplaceAll(outPath, "\\", "/")
-		pkg.urloverride = fmt.Sprintf("file://%s", outPath)
+		pkg.urloverride = "file://" + outPath
 	}
 	return pkg, nil
 }
 
-// NewPackageConfig is a struct that regroups the fields necessary to install a package from an OCI Registry
+// NewPackageConfig creates a TestPackageConfig with the provided options.
+//
+// After all options are applied, Resolve() is called to fill in derived fields
+// (e.g. Registry from Version). Options that set the registry or URL directly
+// make Resolve() a no-op for that field.
 func NewPackageConfig(opts ...PackageOption) (TestPackageConfig, error) {
 	c := TestPackageConfig{}
 	for _, opt := range opts {
@@ -364,7 +381,29 @@ func NewPackageConfig(opts ...PackageOption) (TestPackageConfig, error) {
 			return c, err
 		}
 	}
+	if err := c.Resolve(); err != nil {
+		return c, err
+	}
 	return c, nil
+}
+
+// Resolve fills in derived fields after all options have been applied.
+//
+// Resolution priority:
+//  1. urloverride set -- no-op
+//  2. Registry already set -- no-op
+//  3. Version set -- infers Registry (stable vs beta) from version string
+func (c *TestPackageConfig) Resolve() error {
+	if c.urloverride != "" || c.Registry != "" {
+		return nil
+	}
+	if c.Version != "" {
+		c.Registry = consts.StableS3OCIRegistry
+		if strings.Contains(strings.ToLower(c.Version), `-rc.`) {
+			c.Registry = consts.BetaS3OCIRegistry
+		}
+	}
+	return nil
 }
 
 // TestPackageConfig is a struct that regroups the fields necessary to install a package from an OCI Registry
@@ -456,8 +495,10 @@ func WithURLOverride(url string) PackageOption {
 // WithPipeline configures the package to be installed from a pipeline.
 func WithPipeline(pipeline string) PackageOption {
 	return func(params *TestPackageConfig) error {
-		params.Version = fmt.Sprintf("pipeline-%s", pipeline)
-		params.Registry = consts.PipelineOCIRegistry
+		params.Version = "pipeline-" + pipeline
+		if err := WithRegistry(consts.PipelineOCIRegistry)(params); err != nil {
+			return err
+		}
 		return nil
 	}
 }
@@ -470,59 +511,221 @@ func WithPackage(pkg TestPackageConfig) PackageOption {
 	}
 }
 
-// WithDevEnvOverrides applies overrides to the package config based on environment variables.
+// applyOCIEnvOverrides reads environment variables with the given prefix and applies
+// them to the TestPackageConfig struct. This is the shared implementation used by both
+// [WithArtifactOverrides] and [WithDevEnvOverrides].
+func applyOCIEnvOverrides(prefix string, params *TestPackageConfig) error {
+	// Resolution: _SOURCE_VERSION and _PIPELINE are mutually exclusive
+	_, hasSourceVersion := os.LookupEnv(prefix + "_SOURCE_VERSION")
+	_, hasPipeline := os.LookupEnv(prefix + "_PIPELINE")
+	if hasSourceVersion && hasPipeline {
+		return fmt.Errorf("%s_SOURCE_VERSION and %s_PIPELINE are mutually exclusive", prefix, prefix)
+	}
+	if hasSourceVersion {
+		params.Version = os.Getenv(prefix + "_SOURCE_VERSION")
+		params.Registry = ""
+	}
+	if hasPipeline {
+		params.Version = "pipeline-" + os.Getenv(prefix+"_PIPELINE")
+		params.Registry = consts.PipelineOCIRegistry
+	}
+
+	// OCI-specific overrides (highest priority)
+	if url, ok := os.LookupEnv(prefix + "_OCI_URL"); ok {
+		params.urloverride = url
+	}
+	if pipelineID, ok := os.LookupEnv(prefix + "_OCI_PIPELINE"); ok {
+		params.Version = "pipeline-" + pipelineID
+		params.Registry = consts.PipelineOCIRegistry
+	}
+	if version, ok := os.LookupEnv(prefix + "_OCI_VERSION"); ok {
+		params.Version = version
+	}
+	if registry, ok := os.LookupEnv(prefix + "_OCI_REGISTRY"); ok {
+		params.Registry = registry
+	}
+	if auth, ok := os.LookupEnv(prefix + "_OCI_AUTH"); ok {
+		params.Auth = auth
+	}
+
+	return nil
+}
+
+// WithArtifactOverrides applies environment variable overrides to the TestPackageConfig.
+// Overrides are always applied, regardless of whether the code is running in CI.
 //
-// Example: local OCI package file
+// Use this for default/CI flows where the pipeline controls the version, e.g.
+// createCurrentAgent and the default createStableAgent in base_suite.go.
 //
+// This is a pure field-setter: it reads environment variables and sets struct fields,
+// but does not perform any I/O. Registry inference is deferred to [TestPackageConfig.Resolve],
+// which is called automatically at the end of [NewPackageConfig].
+//
+// # Resolution variables (mutually exclusive)
+//
+//	{PREFIX}_SOURCE_VERSION - Package version (e.g. "7.75.0-1"), used as OCI tag, clears registry for fresh inference
+//	{PREFIX}_PIPELINE       - Pipeline ID, sets version to "pipeline-{id}" and registry to pipeline registry
+//
+// # OCI-specific overrides (take priority over resolution vars)
+//
+//	{PREFIX}_OCI_URL      - Direct OCI URL (skips Resolve)
+//	{PREFIX}_OCI_PIPELINE - Pipeline ID (overrides _PIPELINE)
+//	{PREFIX}_OCI_VERSION  - OCI version tag
+//	{PREFIX}_OCI_REGISTRY - OCI registry URL (skips Resolve registry inference)
+//	{PREFIX}_OCI_AUTH     - Authentication method
+//
+// Examples:
+//
+//	export STABLE_AGENT_SOURCE_VERSION="7.75.0-1"
+//	export STABLE_AGENT_PIPELINE="123456"
 //	export CURRENT_AGENT_OCI_URL="file:///path/to/oci/package.tar"
+func WithArtifactOverrides(prefix string) PackageOption {
+	return func(params *TestPackageConfig) error {
+		return applyOCIEnvOverrides(prefix, params)
+	}
+}
+
+// WithDevEnvOverrides applies environment variable overrides to the TestPackageConfig,
+// but only when not running in CI (i.e. when the CI environment variable is unset).
 //
-// Example: from a different pipeline
+// Use this for tests that pin a specific version and only want local-dev overrides.
+// In CI, the test's hardcoded version is always used; locally, the developer can
+// override anything via environment variables.
 //
-//	export CURRENT_AGENT_OCI_PIPELINE="123456"
-//
-// Example: from a different pipeline
-// (assumes that the package being overridden is already from a pipeline)
-//
-//	export CURRENT_AGENT_OCI_VERSION="pipeline-123456"
-//
-// Example: custom URL
-//
-//	export CURRENT_AGENT_OCI_URL="oci://installtesting.datad0g.com/agent-package:pipeline-123456"
+// The supported environment variables are the same as [WithArtifactOverrides].
 func WithDevEnvOverrides(prefix string) PackageOption {
 	return func(params *TestPackageConfig) error {
-		// env vars for convenience
-		if url, ok := os.LookupEnv(fmt.Sprintf("%s_OCI_URL", prefix)); ok {
-			err := WithURLOverride(url)(params)
-			if err != nil {
-				return err
-			}
+		if os.Getenv("CI") != "" {
+			return nil
 		}
-		if pipeline, ok := os.LookupEnv(fmt.Sprintf("%s_OCI_PIPELINE", prefix)); ok {
-			err := WithPipeline(pipeline)(params)
-			if err != nil {
-				return err
-			}
-		}
-
-		// env vars for specific fields
-		if version, ok := os.LookupEnv(fmt.Sprintf("%s_OCI_VERSION", prefix)); ok {
-			err := WithVersion(version)(params)
-			if err != nil {
-				return err
-			}
-		}
-		if registry, ok := os.LookupEnv(fmt.Sprintf("%s_OCI_REGISTRY", prefix)); ok {
-			err := WithRegistry(registry)(params)
-			if err != nil {
-				return err
-			}
-		}
-		if auth, ok := os.LookupEnv(fmt.Sprintf("%s_OCI_AUTH", prefix)); ok {
-			err := WithAuthentication(auth)(params)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+		return applyOCIEnvOverrides(prefix, params)
 	}
+}
+
+// SetConfigExperiment sets the config catalog for the Datadog Installer daemon.
+func (d *DatadogInstaller) SetConfigExperiment(config ConfigExperiment) (string, error) {
+	// Convert ConfigExperiment to installerConfig format
+	installerConfig := map[string]interface{}{
+		config.ID: map[string]interface{}{
+			"deployment_id":   config.ID,
+			"file_operations": convertFilesToOperations(config.Files),
+		},
+	}
+	serializedConfig, err := json.Marshal(installerConfig)
+	if err != nil {
+		return "", err
+	}
+	// Escape quotes in the JSON string to handle PowerShell quoting properly
+	configStr := strings.ReplaceAll(string(serializedConfig), `"`, `\"`)
+	return d.execute(fmt.Sprintf("daemon set-config-catalog '%s'", configStr))
+}
+
+// StartConfigExperiment starts a config experiment using the provided InstallerConfig through the daemon.
+// It first sets the config catalog and then starts the experiment.
+func (d *DatadogInstaller) StartConfigExperiment(packageName string, config ConfigExperiment) (string, error) {
+	// Convert ConfigExperiment to installerConfig format
+	operations := map[string]interface{}{
+		"deployment_id":   config.ID,
+		"file_operations": convertFilesToOperations(config.Files),
+	}
+
+	serializedOps, err := json.Marshal(operations)
+	if err != nil {
+		return "", err
+	}
+	// Escape quotes in the JSON string to handle PowerShell quoting properly
+	opsStr := strings.ReplaceAll(string(serializedOps), `"`, `\"`)
+
+	// Then start the config experiment
+	return d.execute(fmt.Sprintf("daemon start-config-experiment %s '%s'", packageName, opsStr))
+}
+
+// PromoteConfigExperiment promotes a config experiment through the daemon.
+func (d *DatadogInstaller) PromoteConfigExperiment(packageName string) (string, error) {
+	return d.execute("daemon promote-config-experiment " + packageName)
+}
+
+// StopConfigExperiment stops a config experiment through the daemon.
+func (d *DatadogInstaller) StopConfigExperiment(packageName string) (string, error) {
+	return d.execute("daemon stop-config-experiment " + packageName)
+}
+
+// ConfigExperiment represents a configuration experiment for the Datadog Installer.
+type ConfigExperiment struct {
+	ID    string                 `json:"id"`
+	Files []ConfigExperimentFile `json:"files"`
+}
+
+// ConfigExperimentFile represents a configuration file in a config experiment.
+type ConfigExperimentFile struct {
+	Path          string          `json:"path"`
+	Contents      json.RawMessage `json:"contents"`
+	FileOperation string          `json:"file_op,omitempty"`
+}
+
+// DatadogInstallerGA represents an interface to the Datadog Installer on the remote host for GA versions (7.65.x).
+// It handles special cases for the 7.65.x versions of the installer.
+//
+// We still check the version because the version may change during the test run, e.g. during MustStartExperiment,
+// so this type mainly serves to keep the special case logic out of the normal DatadogInstaller type so we don't
+// unintentially apply it to other tests.
+type DatadogInstallerGA struct {
+	*DatadogInstaller
+}
+
+// StartExperiment will use the Datadog Installer service to start an experiment.
+// For 7.65.x versions, it uses the start-installer-experiment subcommand.
+func (d *DatadogInstallerGA) StartExperiment(packageName string, packageVersion string) (string, error) {
+	if packageName == consts.AgentPackage {
+		ver, err := d.Version()
+		if err != nil {
+			return "", err
+		}
+		if strings.HasPrefix(ver, "7.65.") {
+			return d.StartInstallerExperiment(consts.AgentPackage, packageVersion)
+		}
+		out, err := d.DatadogInstaller.StartExperiment(packageName, packageVersion)
+		return out, ignoreEOF(err)
+	}
+	return d.DatadogInstaller.StartExperiment(packageName, packageVersion)
+}
+
+// StartInstallerExperiment will use the Datadog Installer service to start an experiment for the Agent package.
+//
+// Only needed for 7.65, future versions use the start-experiment subcommand instead.
+func (d *DatadogInstallerGA) StartInstallerExperiment(packageName string, packageVersion string) (string, error) {
+	out, err := d.execute(fmt.Sprintf("daemon start-installer-experiment '%s' '%s'", packageName, packageVersion))
+	return out, ignoreEOF(err)
+}
+
+// StopExperiment will use the Datadog Installer service to stop an experiment for the Agent package.
+//
+// Workarounds:
+// - ignore EOF errors
+func (d *DatadogInstallerGA) StopExperiment(packageName string) (string, error) {
+	out, err := d.DatadogInstaller.StopExperiment(packageName)
+	if packageName == consts.AgentPackage {
+		return out, ignoreEOF(err)
+	}
+	return out, err
+}
+
+// convertFilesToOperations converts ConfigExperimentFiles to file operations
+func convertFilesToOperations(files []ConfigExperimentFile) []map[string]interface{} {
+	operations := make([]map[string]interface{}, len(files))
+	for i, file := range files {
+		fileOp := file.FileOperation
+		if fileOp == "" {
+			fileOp = "merge-patch"
+		}
+		operation := map[string]interface{}{
+			"file_op":   fileOp,
+			"file_path": file.Path,
+		}
+		if file.Contents != nil {
+			operation["patch"] = file.Contents
+		}
+		operations[i] = operation
+	}
+	return operations
 }

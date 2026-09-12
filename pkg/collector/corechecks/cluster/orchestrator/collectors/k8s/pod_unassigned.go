@@ -14,7 +14,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -25,9 +25,9 @@ import (
 )
 
 // NewUnassignedPodCollectorVersions builds the group of collector versions.
-func NewUnassignedPodCollectorVersions(cfg config.Component, store workloadmeta.Component, tagger tagger.Component, metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewUnassignedPodCollectorVersions(cfg config.Component, store workloadmeta.Component, tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewUnassignedPodCollector(cfg, store, tagger, metadataAsTags),
+		NewUnassignedPodCollector(cfg, store, tagger),
 	)
 }
 
@@ -42,25 +42,19 @@ type UnassignedPodCollector struct {
 
 // NewUnassignedPodCollector creates a new collector for the Kubernetes Pod
 // resource that is not assigned to any node.
-func NewUnassignedPodCollector(cfg config.Component, store workloadmeta.Component, tagger tagger.Component, metadataAsTags utils.MetadataAsTags) *UnassignedPodCollector {
-	resourceType := getResourceType(podName, podVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewUnassignedPodCollector(cfg config.Component, store workloadmeta.Component, tagger tagger.Component) *UnassignedPodCollector {
 	return &UnassignedPodCollector{
 		metadata: &collectors.CollectorMetadata{
-			IsDefaultVersion:                     true,
-			IsStable:                             true,
-			IsMetadataProducer:                   true,
-			IsManifestProducer:                   true,
-			SupportsManifestBuffering:            true,
-			Name:                                 podName,
-			Kind:                                 kubernetes.PodKind,
-			NodeType:                             orchestrator.K8sPod,
-			Version:                              podVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
-			SupportsTerminatedResourceCollection: false,
+			IsDefaultVersion:          true,
+			IsManifestProducer:        true,
+			IsMetadataProducer:        true,
+			IsStable:                  true,
+			SupportsManifestBuffering: true,
+			Group:                     utilTypes.PodGroup,
+			Kind:                      kubernetes.PodKind,
+			Name:                      utilTypes.PodName,
+			Version:                   utilTypes.PodVersion,
+			NodeType:                  orchestrator.K8sPod,
 		},
 		processor: processors.NewProcessor(k8sProcessors.NewPodHandlers(cfg, store, tagger)),
 	}

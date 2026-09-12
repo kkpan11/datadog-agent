@@ -15,18 +15,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners"
 
-	"github.com/DataDog/test-infra-definitions/common/utils"
-	"github.com/DataDog/test-infra-definitions/components/datadog/agent"
-	"github.com/DataDog/test-infra-definitions/components/datadog/dockeragentparams"
-	"github.com/DataDog/test-infra-definitions/components/docker"
-	"github.com/DataDog/test-infra-definitions/components/os"
-	"github.com/DataDog/test-infra-definitions/resources/aws"
-	"github.com/DataDog/test-infra-definitions/scenarios/aws/ec2"
-	"github.com/DataDog/test-infra-definitions/scenarios/aws/fakeintake"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agent"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/dockeragentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/docker"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/resources/aws"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/fakeintake"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
@@ -47,7 +45,7 @@ func netflowDockerProvisioner() provisioners.Provisioner {
 			return err
 		}
 
-		host, err := ec2.NewVM(awsEnv, name, ec2.WithOS(os.AmazonLinuxECSDefault))
+		host, err := ec2.NewVM(awsEnv, name)
 		if err != nil {
 			return err
 		}
@@ -77,12 +75,7 @@ func netflowDockerProvisioner() provisioners.Provisioner {
 			return err
 		}
 
-		installEcrCredsHelperCmd, err := ec2.InstallECRCredentialsHelper(awsEnv, host)
-		if err != nil {
-			return err
-		}
-
-		dockerManager, err := docker.NewManager(&awsEnv, host, utils.PulumiDependsOn(installEcrCredsHelperCmd))
+		dockerManager, err := docker.NewAWSManager(&awsEnv, host)
 		if err != nil {
 			return err
 		}
@@ -152,6 +145,8 @@ func (s *netflowDockerSuite) TestNetflow() {
 		for _, ndmflow := range ndmflows {
 			stats.flowTypes[ndmflow.FlowType]++
 			stats.ipProtocols[ndmflow.IPProtocol]++
+			assert.NotEmpty(c, ndmflow.DSCPName, "dscp_name should always be populated (falls back to DSCP-<n>)")
+			assert.Equal(c, ndmflow.TOS>>2, ndmflow.DSCP, "dscp should be the top 6 bits of the tos byte")
 		}
 		s.T().Logf("flows_flushed metric shows that agent sent %d flows, fakeintake received %d ndmflows", int(totalFlowsFlushed), len(ndmflows))
 		s.T().Logf("stats: %+v", stats)

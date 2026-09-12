@@ -18,17 +18,19 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"maps"
 	"strconv"
 	"strings"
 
-	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
-	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	conventions "go.opentelemetry.io/otel/semconv/v1.6.1"
 	"go.uber.org/zap"
+
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
 )
 
 const (
@@ -40,6 +42,11 @@ const (
 	otelSeverityNumber = otelNamespace + ".severity_number"
 	otelSeverityText   = otelNamespace + ".severity_text"
 	otelTimestamp      = otelNamespace + ".timestamp"
+	otelScopeName      = otelNamespace + ".scope.name"
+	otelScopeVersion   = otelNamespace + ".scope.version"
+	otelLibraryName    = otelNamespace + ".library.name"    // deprecated alias for otel.scope.name
+	otelLibraryVersion = otelNamespace + ".library.version" // deprecated alias for otel.scope.version
+	otelEventName      = otelNamespace + ".event_name"
 )
 const (
 	// This set of constants specify the keys of the attributes that will be used to represent Datadog
@@ -89,6 +96,16 @@ func transform(lr plog.LogRecord, host, service string, res pcommon.Resource, sc
 			l.Message = v.AsString()
 		case "status", "severity", "level", "syslog.severity":
 			status = v.AsString()
+		case otelLibraryName:
+			// Deprecated alias: only takes effect if the canonical otel.scope.name attribute
+			// isn't also present, since attribute iteration order isn't guaranteed.
+			if _, ok := lr.Attributes().Get(otelScopeName); !ok {
+				l.AdditionalProperties[otelScopeName] = v.AsString()
+			}
+		case otelLibraryVersion:
+			if _, ok := lr.Attributes().Get(otelScopeVersion); !ok {
+				l.AdditionalProperties[otelScopeVersion] = v.AsString()
+			}
 		case "traceid", "trace_id", "contextmap.traceid", "oteltraceid":
 			traceID, err := decodeTraceID(v.AsString())
 			if err != nil {
@@ -119,24 +136,43 @@ func transform(lr plog.LogRecord, host, service string, res pcommon.Resource, sc
 			l.Ddtags = datadog.PtrString(tagStr)
 		default:
 			m := flattenAttribute(k, v, 1)
-			for k, v := range m {
-				l.AdditionalProperties[k] = v
-			}
+			maps.Copy(l.AdditionalProperties, m)
 		}
 		return true
 	})
 	res.Attributes().Range(func(k string, v pcommon.Value) bool {
-		// "hostname" and "service" are reserved keywords in HTTPLogItem
-		// Prefix the keys so they aren't overwritten when marshalling
-		if k == "hostname" || k == "service" {
+		switch k {
+		case "hostname", "service":
+			// "hostname" and "service" are reserved keywords in HTTPLogItem
+			// Prefix the keys so they aren't overwritten when marshalling
 			l.AdditionalProperties["otel."+k] = v.AsString()
-		} else {
+		case otelLibraryName:
+			if _, ok := res.Attributes().Get(otelScopeName); !ok {
+				l.AdditionalProperties[otelScopeName] = v.AsString()
+			}
+		case otelLibraryVersion:
+			if _, ok := res.Attributes().Get(otelScopeVersion); !ok {
+				l.AdditionalProperties[otelScopeVersion] = v.AsString()
+			}
+		default:
 			l.AdditionalProperties[k] = v.AsString()
 		}
 		return true
 	})
 	for k, v := range scope.Attributes().Range {
 		l.AdditionalProperties[k] = v.AsString()
+	}
+	// The instrumentation scope's Name/Version are canonical but processed last, so only
+	// fill them in if a log or resource attribute hasn't already set otel.scope.name/version.
+	if name := scope.Name(); name != "" {
+		if _, ok := l.AdditionalProperties[otelScopeName]; !ok {
+			l.AdditionalProperties[otelScopeName] = name
+		}
+	}
+	if version := scope.Version(); version != "" {
+		if _, ok := l.AdditionalProperties[otelScopeVersion]; !ok {
+			l.AdditionalProperties[otelScopeVersion] = version
+		}
 	}
 	if traceID := lr.TraceID(); !traceID.IsEmpty() {
 		l.AdditionalProperties[ddTraceID] = strconv.FormatUint(traceIDToUint64(traceID), 10)
@@ -162,11 +198,19 @@ func transform(lr plog.LogRecord, host, service string, res pcommon.Resource, sc
 		l.AdditionalProperties[otelSeverityNumber] = strconv.Itoa(int(lr.SeverityNumber()))
 	}
 	l.AdditionalProperties[ddStatus] = status
-	// for Datadog to use the same timestamp we need to set the additional property of "@timestamp"
-	if lr.Timestamp() != 0 {
+	// for Datadog to use the same timestamp we need to set the additional property of "@timestamp".
+	// Fall back to ObservedTimestamp when Timestamp is unset (e.g. when the SDK only sets observed_time_unix_nano).
+	ts := lr.Timestamp()
+	if ts == 0 {
+		ts = lr.ObservedTimestamp()
+	}
+	if ts != 0 {
 		// we are retaining the nano second precision in this property
-		l.AdditionalProperties[otelTimestamp] = strconv.FormatInt(lr.Timestamp().AsTime().UnixNano(), 10)
-		l.AdditionalProperties[ddTimestamp] = lr.Timestamp().AsTime().Format("2006-01-02T15:04:05.000Z07:00")
+		l.AdditionalProperties[otelTimestamp] = strconv.FormatInt(ts.AsTime().UnixNano(), 10)
+		l.AdditionalProperties[ddTimestamp] = ts.AsTime().Format("2006-01-02T15:04:05.000Z07:00")
+	}
+	if eventName := lr.EventName(); eventName != "" {
+		l.AdditionalProperties[otelEventName] = eventName
 	}
 	if l.Message == "" {
 		// set the Message to the Body in case it wasn't already parsed as part of the attributes
@@ -182,20 +226,43 @@ func transform(lr plog.LogRecord, host, service string, res pcommon.Resource, sc
 	return l
 }
 
-func flattenAttribute(key string, val pcommon.Value, depth int) map[string]string {
-	result := make(map[string]string)
+func flattenAttribute(key string, val pcommon.Value, depth int) map[string]any {
+	result := make(map[string]any)
+
+	if val.Type() == pcommon.ValueTypeSlice {
+		slice := val.Slice()
+		flattened := make([]any, slice.Len())
+		for i := 0; i < slice.Len(); i++ {
+			elemResult := flattenAttribute("", slice.At(i), depth+1)
+			if val, ok := elemResult[""]; ok {
+				flattened[i] = val
+			} else {
+				flattened[i] = elemResult
+			}
+		}
+		result[key] = flattened
+		return result
+	}
 
 	if val.Type() != pcommon.ValueTypeMap || depth == 10 {
-		result[key] = val.AsString()
+		if val.Type() == pcommon.ValueTypeStr ||
+			val.Type() == pcommon.ValueTypeInt ||
+			val.Type() == pcommon.ValueTypeBool ||
+			val.Type() == pcommon.ValueTypeDouble {
+			result[key] = val.AsRaw()
+		} else {
+			result[key] = val.AsString()
+		}
 		return result
 	}
 
 	val.Map().Range(func(k string, v pcommon.Value) bool {
-		newKey := key + "." + k
-		nestedResult := flattenAttribute(newKey, v, depth+1)
-		for nk, nv := range nestedResult {
-			result[nk] = nv
+		newKey := k
+		if key != "" {
+			newKey = key + "." + k
 		}
+		nestedResult := flattenAttribute(newKey, v, depth+1)
+		maps.Copy(result, nestedResult)
 		return true
 	})
 

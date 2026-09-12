@@ -14,25 +14,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestGetKnownKeysLowercased(t *testing.T) {
-	cfg := NewNodeTreeConfig("test", "", nil)
-	cfg.SetDefault("a", 1234)
-	cfg.SetDefault("b.C", "test")
-	cfg.SetKnown("d.E.f")
-	cfg.BuildSchema()
-
-	assert.Equal(t,
-		map[string]interface{}{
-			"a":     struct{}{},
-			"b":     struct{}{},
-			"b.c":   struct{}{},
-			"d":     struct{}{},
-			"d.e":   struct{}{},
-			"d.e.f": struct{}{},
-		},
-		cfg.GetKnownKeysLowercased())
-}
-
 func TestGet(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "", nil)
 	cfg.SetDefault("a", 1234)
@@ -45,15 +26,15 @@ func TestGet(t *testing.T) {
 
 	assert.Equal(t, nil, cfg.Get("does_not_exists"))
 
-	// test implicit conversion
+	// set converts to default type at insert
 	cfg.Set("a", "1111", model.SourceAgentRuntime)
 	assert.Equal(t, 1111, cfg.Get("a"))
 }
 
 func TestGetDefaultType(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "", nil)
-	cfg.SetKnown("a")
-	cfg.SetKnown("b")
+	cfg.BindEnvAndSetDefault("a", map[string]interface{}{})
+	cfg.BindEnvAndSetDefault("b", map[string]interface{}{})
 	cfg.BuildSchema()
 
 	cfg.ReadConfig(strings.NewReader(`---
@@ -77,9 +58,9 @@ b:
 	}
 	assert.Equal(t, expected, cfg.Get("a"))
 
-	expected2 := map[interface{}]interface{}{
-		1: []interface{}{"a", "b"},
-		2: []interface{}{"c"},
+	expected2 := map[string]interface{}{
+		"1": []interface{}{"a", "b"},
+		"2": []interface{}{"c"},
 	}
 	assert.Equal(t, expected2, cfg.Get("b"))
 }
@@ -107,9 +88,7 @@ func TestGetCastToDefault(t *testing.T) {
 	cfg.SetDefault("a", []string{})
 	cfg.BuildSchema()
 
-	// This test that we mimic viper's behavior on Get where we convert the value from the config to the same type
-	// from the default.
-
+	// set converts to default type at insert
 	cfg.Set("a", 9876, model.SourceAgentRuntime)
 	assert.Equal(t, []string{"9876"}, cfg.Get("a"))
 
@@ -297,41 +276,61 @@ float_list:
 }
 
 func TestGetFloat64SliceStringFromEnv(t *testing.T) {
-	cfg := NewNodeTreeConfig("test", "", nil)
-	cfg.SetDefault("float_list", []string{})
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BindEnvAndSetDefault("float_list", []string{})
+	t.Setenv("TEST_FLOAT_LIST", "1.1 2.2 3.3")
 	cfg.BuildSchema()
-	cfg.Set("float_list", "1.1 2.2 3.3", model.SourceEnvVar)
 
 	assert.Equal(t, []float64{1.1, 2.2, 3.3}, cfg.GetFloat64Slice("float_list"))
 }
 
 func TestGetAllSources(t *testing.T) {
-	cfg := NewNodeTreeConfig("test", "", nil)
-	cfg.SetDefault("a", 0)
+	t.Setenv("TEST_A", "4")
+
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BindEnvAndSetDefault("a", 0)
 	cfg.BuildSchema()
 
 	cfg.Set("a", 1, model.SourceUnknown)
-	cfg.Set("a", 2, model.SourceFile)
-	cfg.Set("a", 3, model.SourceEnvVar)
-	cfg.Set("a", 4, model.SourceFleetPolicies)
-	cfg.Set("a", 5, model.SourceAgentRuntime)
-	cfg.Set("a", 6, model.SourceLocalConfigProcess)
-	cfg.Set("a", 7, model.SourceRC)
-	cfg.Set("a", 8, model.SourceCLI)
+	cfg.Set("a", 2, model.SourceInfraMode)
+	cfg.Set("a", 3, model.SourceFile)
+	cfg.Set("a", 5, model.SourceFleetPolicies)
+	cfg.Set("a", 6, model.SourceConfigPostInit)
+	cfg.Set("a", 7, model.SourceSecret)
+	cfg.Set("a", 8, model.SourceLocalConfigProcess)
+	cfg.Set("a", 9, model.SourceAgentRuntime)
+	cfg.Set("a", 10, model.SourceRC)
+	cfg.Set("a", 11, model.SourceCLI)
 
 	res := cfg.GetAllSources("a")
 	assert.Equal(t,
 		[]model.ValueWithSource{
 			{Source: model.SourceDefault, Value: 0},
 			{Source: model.SourceUnknown, Value: 1},
-			{Source: model.SourceFile, Value: 2},
-			{Source: model.SourceEnvVar, Value: 3},
-			{Source: model.SourceFleetPolicies, Value: 4},
-			{Source: model.SourceAgentRuntime, Value: 5},
-			{Source: model.SourceLocalConfigProcess, Value: 6},
-			{Source: model.SourceRC, Value: 7},
-			{Source: model.SourceCLI, Value: 8},
+			{Source: model.SourceInfraMode, Value: 2},
+			{Source: model.SourceFile, Value: 3},
+			{Source: model.SourceEnvVar, Value: 4},
+			{Source: model.SourceFleetPolicies, Value: 5},
+			{Source: model.SourceConfigPostInit, Value: 6},
+			{Source: model.SourceSecret, Value: 7},
+			{Source: model.SourceLocalConfigProcess, Value: 8},
+			{Source: model.SourceAgentRuntime, Value: 9},
+			{Source: model.SourceRC, Value: 10},
+			{Source: model.SourceCLI, Value: 11},
 		},
 		res,
 	)
+}
+
+func TestGetEnvVars(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+
+	cfg.BindEnvAndSetDefault("d", 0, "D")
+	cfg.BindEnvAndSetDefault("a", 0, "ABC")
+	cfg.BindEnvAndSetDefault("b", 0, "ABC", "DEF")
+	cfg.BindEnvAndSetDefault("c", 0, "DEF")
+	cfg.BindEnvAndSetDefault("x", 0)
+
+	// testing that duplicate are removed and result is sorted
+	assert.Equal(t, []string{"ABC", "D", "DEF", "TEST_X"}, cfg.GetEnvVars())
 }

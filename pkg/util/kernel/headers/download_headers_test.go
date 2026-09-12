@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && linux_bpf
+//go:build linux && bpf
 
 package headers
 
@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/DataDog/nikos/apt"
-	"github.com/DataDog/nikos/types"
+	"github.com/DataDog/datadog-agent/pkg/util/kernel/headers/download/apt"
+	"github.com/DataDog/datadog-agent/pkg/util/kernel/headers/download/types"
 )
 
 const reposSource = "%s/sources.list"

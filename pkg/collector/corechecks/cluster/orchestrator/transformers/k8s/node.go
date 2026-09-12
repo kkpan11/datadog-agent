@@ -9,8 +9,9 @@ package k8s
 
 import (
 	"fmt"
-	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	"strings"
+
+	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 
 	model "github.com/DataDog/agent-payload/v5/process"
 
@@ -24,6 +25,8 @@ import (
 
 // ExtractNode returns the protobuf model corresponding to a Kubernetes Node
 // resource.
+//
+//nolint:revive
 func ExtractNode(ctx processors.ProcessorContext, n *corev1.Node) *model.Node {
 	msg := &model.Node{
 		Metadata:      extractMetadata(&n.ObjectMeta),
@@ -89,9 +92,8 @@ func ExtractNode(ctx processors.ProcessorContext, n *corev1.Node) *model.Node {
 
 	addAdditionalNodeTags(msg)
 
-	pctx := ctx.(*processors.K8sProcessorContext)
 	msg.Tags = append(msg.Tags, transformers.RetrieveUnifiedServiceTags(n.ObjectMeta.Labels)...)
-	msg.Tags = append(msg.Tags, transformers.RetrieveMetadataTags(n.ObjectMeta.Labels, n.ObjectMeta.Annotations, pctx.LabelsAsTags, pctx.AnnotationsAsTags)...)
+	msg.Tags = append(msg.Tags, transformers.RetrieveTeamTag(n.ObjectMeta.Labels, n.ObjectMeta.Annotations)...)
 
 	return msg
 }
@@ -139,7 +141,7 @@ func computeNodeStatus(n *corev1.Node) string {
 func convertNodeStatusToTags(nodeStatus string) []string {
 	var tags []string
 	unschedulable := false
-	for _, status := range strings.Split(nodeStatus, ",") {
+	for status := range strings.SplitSeq(nodeStatus, ",") {
 		if status == "" {
 			continue
 		}
@@ -148,7 +150,7 @@ func convertNodeStatusToTags(nodeStatus string) []string {
 			tags = append(tags, "node_schedulable:false")
 			continue
 		}
-		tags = append(tags, fmt.Sprintf("node_status:%s", strings.ToLower(status)))
+		tags = append(tags, "node_status:"+strings.ToLower(status))
 	}
 	if !unschedulable {
 		tags = append(tags, "node_schedulable:true")

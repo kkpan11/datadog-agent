@@ -8,7 +8,9 @@
 package systemd
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"testing"
@@ -22,7 +24,8 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	nooptagger "github.com/DataDog/datadog-agent/comp/core/tagger/impl-noop"
-	"github.com/DataDog/datadog-agent/comp/metadata/inventorychecks/inventorychecksimpl"
+	filterlistimpl "github.com/DataDog/datadog-agent/comp/filterlist/impl"
+	inventorychecksmock "github.com/DataDog/datadog-agent/comp/metadata/inventorychecks/mock"
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/mocksender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
@@ -90,9 +93,7 @@ func getCreatePropertieWithDefaults(props map[string]interface{}) map[string]int
 		"MemoryAccounting": true,
 		"TasksAccounting":  true,
 	}
-	for k, v := range props {
-		defaultProps[k] = v
-	}
+	maps.Copy(defaultProps, props)
 	return defaultProps
 }
 
@@ -103,7 +104,7 @@ unit_names:
  - ssh.service
  - syslog.socket
 `)
-	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 
 	assert.Nil(t, err)
 	assert.ElementsMatch(t, []string{"ssh.service", "syslog.socket"}, check.config.instance.UnitNames)
@@ -112,7 +113,7 @@ unit_names:
 // Either 'unit_names' or 'unit_regexes' config fields must be present!
 func TestMissingUnitNamesOrRegexShouldRaiseError(t *testing.T) {
 	check := SystemdCheck{}
-	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, []byte(``), []byte(``), "test")
+	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, []byte(``), []byte(``), "test", "provider")
 
 	expectedErrorMsg := "please set either `unit_names` or `unit_regexes` in the instance config"
 	assert.EqualError(t, err, expectedErrorMsg)
@@ -126,7 +127,7 @@ func TestCannotCompileUnitRegex(t *testing.T) {
 unit_regexes:
   - "+"
 `)
-	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	expectedErrorMsg := "cannot compile regular expression \"+\" to monitor systemd units: error parsing regexp: missing argument to repetition operator: `+`"
 	assert.EqualError(t, err, expectedErrorMsg)
 }
@@ -141,7 +142,7 @@ substate_status_mapping:
     exited: critical
     running: ok
 `)
-	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 
 	expectedErrorMsg := "instance config specifies a custom substate mapping for unit 'bar' but this unit is not monitored. Please add 'bar' to 'unit_names'"
 	assert.EqualError(t, err, expectedErrorMsg)
@@ -157,7 +158,7 @@ substate_status_mapping:
     running: ok
     exited: Critical
 `)
-	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 
 	expectedErrorMsg := "Status 'Critical' for unit 'foo' in 'substate_status_mapping' is invalid. It should be one of 'ok, warning, critical, unknown'"
 	assert.EqualError(t, err, expectedErrorMsg)
@@ -180,7 +181,7 @@ substate_status_mapping:
     plugged: ok
     running: ok
 `)
-	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	err := check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	assert.Nil(t, err)
 }
 
@@ -194,8 +195,8 @@ unit_names:
 private_socket: /tmp/foo/private_socket
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	conn, err := check.getDbusConnection()
 
 	assert.Nil(t, err)
@@ -206,7 +207,7 @@ private_socket: /tmp/foo/private_socket
 
 func TestPrivateSocketConnectionErrorCase(t *testing.T) {
 	stats := &mockSystemdStats{}
-	stats.On("PrivateSocketConnection", mock.Anything).Return((*dbus.Conn)(nil), fmt.Errorf("some error"))
+	stats.On("PrivateSocketConnection", mock.Anything).Return((*dbus.Conn)(nil), errors.New("some error"))
 
 	rawInstanceConfig := []byte(`
 unit_names:
@@ -214,8 +215,8 @@ unit_names:
 private_socket: /tmp/foo/private_socket
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	conn, err := check.getDbusConnection()
 
 	assert.EqualError(t, err, "some error")
@@ -226,7 +227,7 @@ private_socket: /tmp/foo/private_socket
 
 func TestDefaultPrivateSocketConnection(t *testing.T) {
 	stats := &mockSystemdStats{}
-	stats.On("SystemBusSocketConnection").Return((*dbus.Conn)(nil), fmt.Errorf("some error"))
+	stats.On("SystemBusSocketConnection").Return((*dbus.Conn)(nil), errors.New("some error"))
 	stats.On("PrivateSocketConnection", mock.Anything).Return(&dbus.Conn{}, nil)
 
 	rawInstanceConfig := []byte(`
@@ -234,8 +235,8 @@ unit_names:
 - ssh.service
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	conn, err := check.getDbusConnection()
 
 	assert.Nil(t, err)
@@ -253,8 +254,8 @@ unit_names:
 - ssh.service
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	conn, err := check.getDbusConnection()
 
 	assert.Nil(t, err)
@@ -274,8 +275,8 @@ unit_names:
 - ssh.service
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	conn, err := check.getDbusConnection()
 
 	assert.Nil(t, err)
@@ -287,7 +288,7 @@ unit_names:
 func TestDefaultDockerAgentSystemBusSocketConnectionNotCalled(t *testing.T) {
 	t.Setenv("DOCKER_DD_AGENT", "true")
 	stats := &mockSystemdStats{}
-	stats.On("PrivateSocketConnection", mock.Anything).Return((*dbus.Conn)(nil), fmt.Errorf("some error"))
+	stats.On("PrivateSocketConnection", mock.Anything).Return((*dbus.Conn)(nil), errors.New("some error"))
 	stats.On("SystemBusSocketConnection").Return(&dbus.Conn{}, nil)
 
 	rawInstanceConfig := []byte(`
@@ -295,8 +296,8 @@ unit_names:
 - ssh.service
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, []byte(``), "test", "provider")
 	conn, err := check.getDbusConnection()
 
 	assert.NotNil(t, err)
@@ -307,12 +308,12 @@ unit_names:
 
 func TestDbusConnectionErr(t *testing.T) {
 	stats := &mockSystemdStats{}
-	stats.On("PrivateSocketConnection", mock.Anything).Return((*dbus.Conn)(nil), fmt.Errorf("some error"))
-	stats.On("SystemBusSocketConnection").Return((*dbus.Conn)(nil), fmt.Errorf("some error"))
+	stats.On("PrivateSocketConnection", mock.Anything).Return((*dbus.Conn)(nil), errors.New("some error"))
+	stats.On("SystemBusSocketConnection").Return((*dbus.Conn)(nil), errors.New("some error"))
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
 	mockSender.On("ServiceCheck", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
@@ -327,13 +328,13 @@ func TestDbusConnectionErr(t *testing.T) {
 func TestSystemStateCallFailGracefully(t *testing.T) {
 	stats := &mockSystemdStats{}
 	stats.On("SystemBusSocketConnection").Return(&dbus.Conn{}, nil)
-	stats.On("SystemState", mock.Anything).Return((*dbus.Property)(nil), fmt.Errorf("some error"))
+	stats.On("SystemState", mock.Anything).Return((*dbus.Property)(nil), errors.New("some error"))
 	stats.On("ListUnits", mock.Anything).Return([]dbus.UnitStatus{}, nil)
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
 	mockSender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
@@ -348,12 +349,12 @@ func TestSystemStateCallFailGracefully(t *testing.T) {
 
 func TestListUnitErr(t *testing.T) {
 	stats := createDefaultMockSystemdStats()
-	stats.On("ListUnits", mock.Anything).Return(([]dbus.UnitStatus)(nil), fmt.Errorf("some error"))
+	stats.On("ListUnits", mock.Anything).Return(([]dbus.UnitStatus)(nil), errors.New("some error"))
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
 	mockSender.On("ServiceCheck", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
@@ -388,8 +389,8 @@ unit_names:
  - unit2.service
 `)
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectations
 	stats.On("GetUnitTypeProperties", mock.Anything, mock.Anything, mock.Anything).Return(map[string]interface{}{}, nil)
@@ -450,8 +451,8 @@ unit_names:
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectation
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
@@ -508,8 +509,8 @@ unit_names:
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectation
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
@@ -573,8 +574,8 @@ unit_names:
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectation
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
@@ -649,8 +650,8 @@ unit_names:
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectation
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
@@ -760,8 +761,8 @@ unit_names: [%s]
 unit_regexes: [%s]
 `, test.unitNames, test.unitRegexes))
 			check := SystemdCheck{stats: stats}
-			senderManager := mocksender.CreateDefaultDemultiplexer()
-			check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+			senderManager := mocksender.CreateDefaultDemultiplexer(t)
+			check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 			mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
 			mockSender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
@@ -774,7 +775,7 @@ unit_regexes: [%s]
 			// Then
 			mockSender.AssertCalled(t, "ServiceCheck", canConnectServiceCheck, servicecheck.ServiceCheckOK, "", []string(nil), mock.Anything)
 			for unitName, metrics := range unitsToMetrics {
-				tags := []string{fmt.Sprintf("unit:%s", unitName)}
+				tags := []string{"unit:" + unitName}
 				assertSenderCall := mockSender.AssertNotCalled
 				if slices.Contains(test.monitoredUnits, unitName) {
 					assertSenderCall = mockSender.AssertCalled
@@ -810,8 +811,8 @@ func TestServiceCheckSystemStateAndCanConnect(t *testing.T) {
 			stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 			check := SystemdCheck{stats: stats}
-			senderManager := mocksender.CreateDefaultDemultiplexer()
-			check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test")
+			senderManager := mocksender.CreateDefaultDemultiplexer(t)
+			check.Configure(senderManager, integration.FakeConfigHash, []byte(``), []byte(``), "test", "provider")
 
 			mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
 			mockSender.On("ServiceCheck", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
@@ -858,8 +859,8 @@ unit_names:
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectation
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
@@ -924,8 +925,8 @@ substate_status_mapping:
 	stats.On("GetVersion", mock.Anything).Return(systemdVersion)
 
 	check := SystemdCheck{stats: stats}
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	check.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	// setup expectation
 	mockSender := mocksender.NewMockSenderWithSenderManager(check.ID(), senderManager)
@@ -1010,7 +1011,7 @@ func TestSendServicePropertyAsGaugeSkipAndWarnOnMissingProperty(t *testing.T) {
 	serviceUnitConfigNRestart := metricConfigItem{metricName: "systemd.service.restart_count", propertyName: "NRestarts", accountingProperty: "", optional: false}
 
 	check := SystemdCheck{}
-	mockSender := mocksender.NewMockSender(check.ID())
+	mockSender := mocksender.NewMockSender(t, check.ID())
 	mockSender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 
 	sendServicePropertyAsGauge(mockSender, serviceProperties, serviceUnitConfigCPU, nil)
@@ -1028,7 +1029,7 @@ unit_names:
 `)
 
 	check := SystemdCheck{}
-	check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	data := []struct {
 		unitName              string
@@ -1048,7 +1049,7 @@ unit_names:
 func TestIsMonitoredEmptyConfigShouldNone(t *testing.T) {
 	rawInstanceConfig := []byte(``)
 	check := SystemdCheck{}
-	check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	check.Configure(aggregator.NewNoOpSenderManager(), integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 
 	data := []struct {
 		unitName              string
@@ -1095,20 +1096,24 @@ func TestGetPropertyUint64(t *testing.T) {
 	data := map[string]struct {
 		propertyName   string
 		expectedNumber uint64
-		expectedError  error
+		expectedError  string
 	}{
-		"prop_uint property retrieved": {"prop_uint", 3, nil},
-		"uint32 property retrieved":    {"prop_uint32", 5, nil},
-		"uint64 property retrieved":    {"prop_uint64", 10, nil},
-		"error int64 not valid":        {"prop_int64", 0, fmt.Errorf("property prop_int64 (int64) cannot be converted to uint64")},
-		"error string not valid":       {"prop_string", 0, fmt.Errorf("property prop_string (string) cannot be converted to uint64")},
-		"error prop not exist":         {"prop_not_exist", 0, fmt.Errorf("property prop_not_exist not found")},
+		"prop_uint property retrieved": {"prop_uint", 3, ""},
+		"uint32 property retrieved":    {"prop_uint32", 5, ""},
+		"uint64 property retrieved":    {"prop_uint64", 10, ""},
+		"error int64 not valid":        {"prop_int64", 0, "property prop_int64 (int64) cannot be converted to uint64"},
+		"error string not valid":       {"prop_string", 0, "property prop_string (string) cannot be converted to uint64"},
+		"error prop not exist":         {"prop_not_exist", 0, "property prop_not_exist not found"},
 	}
 	for name, d := range data {
 		t.Run(name, func(t *testing.T) {
 			num, err := getPropertyUint64(properties, d.propertyName)
 			assert.Equal(t, d.expectedNumber, num)
-			assert.Equal(t, d.expectedError, err)
+			if d.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, d.expectedError)
+			}
 		})
 	}
 }
@@ -1122,17 +1127,21 @@ func TestGetPropertyString(t *testing.T) {
 	data := map[string]struct {
 		propertyName   string
 		expectedString string
-		expectedError  error
+		expectedError  string
 	}{
-		"valid string":         {"prop_string", "foo bar", nil},
-		"prop_uint not valid":  {"prop_uint", "", fmt.Errorf("property prop_uint (uint) cannot be converted to string")},
-		"error prop not exist": {"prop_not_exist", "", fmt.Errorf("property prop_not_exist not found")},
+		"valid string":         {"prop_string", "foo bar", ""},
+		"prop_uint not valid":  {"prop_uint", "", "property prop_uint (uint) cannot be converted to string"},
+		"error prop not exist": {"prop_not_exist", "", "property prop_not_exist not found"},
 	}
 	for name, d := range data {
 		t.Run(name, func(t *testing.T) {
 			num, err := getPropertyString(properties, d.propertyName)
 			assert.Equal(t, d.expectedString, num)
-			assert.Equal(t, d.expectedError, err)
+			if d.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, d.expectedError)
+			}
 		})
 	}
 }
@@ -1147,18 +1156,22 @@ func TestGetPropertyBool(t *testing.T) {
 	data := map[string]struct {
 		propertyName      string
 		expectedBoolValue bool
-		expectedError     error
+		expectedError     string
 	}{
-		"valid bool true":      {"prop_bool_true", true, nil},
-		"valid bool false":     {"prop_bool_false", false, nil},
-		"prop_uint not valid":  {"prop_uint", false, fmt.Errorf("property prop_uint (uint) cannot be converted to bool")},
-		"error prop not exist": {"prop_not_exist", false, fmt.Errorf("property prop_not_exist not found")},
+		"valid bool true":      {"prop_bool_true", true, ""},
+		"valid bool false":     {"prop_bool_false", false, ""},
+		"prop_uint not valid":  {"prop_uint", false, "property prop_uint (uint) cannot be converted to bool"},
+		"error prop not exist": {"prop_not_exist", false, "property prop_not_exist not found"},
 	}
 	for name, d := range data {
 		t.Run(name, func(t *testing.T) {
 			num, err := getPropertyBool(properties, d.propertyName)
 			assert.Equal(t, d.expectedBoolValue, num)
-			assert.Equal(t, d.expectedError, err)
+			if d.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, d.expectedError)
+			}
 		})
 	}
 }
@@ -1179,7 +1192,7 @@ func (m mockCollector) GetChecks() []check.Check {
 }
 
 func TestGetVersion(t *testing.T) {
-	invChecks := inventorychecksimpl.NewMock().Comp
+	invChecks := inventorychecksmock.NewMock().Comp
 	check.InitializeInventoryChecksContext(invChecks)
 	defer check.ReleaseContext()
 
@@ -1196,12 +1209,12 @@ unit_names:
 		stats:     stats,
 		CheckBase: core.NewCheckBase(CheckName),
 	}
-	mockSender := mocksender.NewMockSender(systemdCheck.ID())
+	mockSender := mocksender.NewMockSender(t, systemdCheck.ID())
 	mockSender.On("Gauge", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 	mockSender.On("ServiceCheck", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 	mockSender.On("Commit").Return()
 
-	systemdCheck.Configure(mockSender.GetSenderManager(), integration.FakeConfigHash, rawInstanceConfig, nil, "test")
+	systemdCheck.Configure(mockSender.GetSenderManager(), integration.FakeConfigHash, rawInstanceConfig, nil, "test", "provider")
 	// run
 	systemdCheck.Run()
 
@@ -1213,7 +1226,7 @@ unit_names:
 func TestCheckID(t *testing.T) {
 	check1 := newCheck()
 	check2 := newCheck()
-	aggregator.NewBufferedAggregator(nil, nil, nil, nooptagger.NewComponent(), "", 1*time.Hour)
+	aggregator.NewBufferedAggregator(nil, nil, nil, nooptagger.NewComponent(), "", 1*time.Hour, filterlistimpl.NewNoopFilterList())
 
 	// language=yaml
 	rawInstanceConfig1 := []byte(`
@@ -1228,11 +1241,11 @@ unit_names:
  - ssh.service2
 `)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	err := check1.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig1, []byte(``), "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	err := check1.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig1, []byte(``), "test", "provider")
 	assert.Nil(t, err)
 
-	err = check2.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig2, []byte(``), "test")
+	err = check2.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig2, []byte(``), "test", "provider")
 	assert.Nil(t, err)
 
 	assert.Equal(t, checkid.ID("systemd:71ee0a4fef872b6d"), check1.ID())

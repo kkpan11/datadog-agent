@@ -45,18 +45,25 @@ func newSenders(cfg *config.AgentConfig, r eventRecorder, path string, climit, q
 			log.Criticalf("Invalid host endpoint: %q", endpoint.Host)
 			os.Exit(1)
 		}
-		senders[i] = newSender(&senderConfig{
+		scfg := &senderConfig{
 			client:         cfg.NewHTTPClient(),
 			maxConns:       int(maxConns),
 			maxQueued:      qsize,
 			maxRetries:     cfg.MaxSenderRetries,
 			url:            url,
-			apiKey:         endpoint.APIKey,
 			recorder:       r,
 			userAgent:      fmt.Sprintf("Datadog Trace Agent/%s/%s", cfg.AgentVersion, cfg.GitCommit),
 			isMRF:          endpoint.IsMRF,
 			MRFFailoverAPM: cfg.MRFFailoverAPM,
-		}, statsd)
+		}
+		apiKeyManager := &apiKeyManager{
+			apiKey:           endpoint.APIKey,
+			refreshFn:        cfg.SecretsRefreshFn,
+			throttleInterval: cfg.APIKeyRefreshThrottleInterval,
+			isFromSecret:     cfg.APIKeyIsFromSecretFn,
+		}
+
+		senders[i] = newSender(scfg, apiKeyManager, statsd)
 	}
 	return senders
 }
@@ -117,9 +124,11 @@ func (t eventType) String() string { return eventTypeStrings[t] }
 type eventData struct {
 	// host specifies the host which the sender is sending to.
 	host string
-	// bytes represents the number of bytes affected by this event.
+	// bytes represents the number of compressed bytes affected by this event.
 	bytes int
-	// count specfies the number of payloads that this events refers to.
+	// uncompressedBytes represents the number of uncompressed bytes affected by this event.
+	uncompressedBytes int
+	// count specifies the number of payloads that this event refers to.
 	count int
 	// duration specifies the time it took to complete this event. It
 	// is set for eventType{Sent,Retry,Rejected}.
@@ -140,8 +149,6 @@ type senderConfig struct {
 	client *config.ResetClient
 	// url specifies the URL to send requests too.
 	url *url.URL
-	// apiKey specifies the Datadog API key to use.
-	apiKey string
 	// maxConns specifies the maximum number of allowed concurrent ougoing
 	// connections.
 	maxConns int
@@ -162,10 +169,73 @@ type senderConfig struct {
 	MRFFailoverAPM func() bool
 }
 
+// apiKeyManager handles API Key access for concurrent use
+type apiKeyManager struct {
+	sync.RWMutex
+	// apiKey specifies the Datadog API key to use.
+	apiKey string
+
+	// refreshFn triggers blocking API key refresh from the secrets backend
+	refreshFn func() (string, error)
+
+	// isFromSecret reports whether the current key is secret-backed (nil = unknown, treated as yes)
+	isFromSecret func(apiKey string) bool
+
+	// throttleInterval specifies minimum time between refresh calls
+	throttleInterval time.Duration
+
+	// lastRefresh tracks when the last refresh occurred
+	lastRefresh time.Time
+}
+
+func (m *apiKeyManager) Get() string {
+	m.RLock()
+	defer m.RUnlock()
+	return m.apiKey
+}
+
+func (m *apiKeyManager) Update(newKey string) {
+	m.Lock()
+	defer m.Unlock()
+	m.apiKey = newKey
+}
+
+// refresh triggers a throttled API key refresh and reports whether the refresh
+// mechanism is available (false = disabled, so a 403 must not be retried).
+func (m *apiKeyManager) refresh() bool {
+	if m.refreshFn == nil || m.throttleInterval == 0 {
+		return false
+	}
+	// A refresh can only change a secret-backed key; a static/plaintext key
+	// won't change, so don't retry the 403.
+	if m.isFromSecret != nil && !m.isFromSecret(m.Get()) {
+		return false
+	}
+
+	m.Lock()
+	if time.Since(m.lastRefresh) < m.throttleInterval {
+		m.Unlock()
+		log.Debugf("API Key refresh throttled, last refresh was %v ago", time.Since(m.lastRefresh))
+		return true
+	}
+
+	// Update the last refresh time before calling refresh to prevent concurrent calls
+	m.lastRefresh = time.Now()
+	m.Unlock()
+
+	if result, err := m.refreshFn(); err != nil {
+		log.Debugf("API Key refresh failed: %v", err)
+	} else if result != "" {
+		log.Infof("API Key refresh completed: %s", result)
+	}
+	return true
+}
+
 // sender is responsible for sending payloads to a given URL. It uses a size-limited
 // retry queue with a backoff mechanism in case of retriable errors.
 type sender struct {
-	cfg *senderConfig
+	cfg           *senderConfig
+	apiKeyManager *apiKeyManager
 
 	queue      chan *payload // payload queue
 	inflight   *atomic.Int32 // inflight payloads
@@ -174,18 +244,19 @@ type sender struct {
 	mu      sync.RWMutex // guards closed
 	closed  bool         // closed reports if the loop is stopped
 	statsd  statsd.ClientInterface
-	enabled bool // false on inactive MRF senders. True otherwise
+	enabled *atomic.Bool // false on inactive MRF senders. True otherwise
 }
 
 // newSender returns a new sender based on the given config cfg.
-func newSender(cfg *senderConfig, statsd statsd.ClientInterface) *sender {
+func newSender(cfg *senderConfig, apiKeyManager *apiKeyManager, statsd statsd.ClientInterface) *sender {
 	s := sender{
-		cfg:        cfg,
-		queue:      make(chan *payload, cfg.maxQueued),
-		inflight:   atomic.NewInt32(0),
-		maxRetries: int32(cfg.maxRetries),
-		statsd:     statsd,
-		enabled:    true,
+		cfg:           cfg,
+		apiKeyManager: apiKeyManager,
+		queue:         make(chan *payload, cfg.maxQueued),
+		inflight:      atomic.NewInt32(0),
+		maxRetries:    int32(cfg.maxRetries),
+		statsd:        statsd,
+		enabled:       atomic.NewBool(true),
 	}
 	for i := 0; i < cfg.maxConns; i++ {
 		go s.loop()
@@ -276,10 +347,11 @@ func (s *sender) sendOnce(p *payload) bool {
 	start := time.Now()
 	err = s.do(req)
 	stats := &eventData{
-		bytes:    p.body.Len(),
-		count:    1,
-		duration: time.Since(start),
-		err:      err,
+		bytes:             p.body.Len(),
+		uncompressedBytes: p.uncompressedSize,
+		count:             1,
+		duration:          time.Since(start),
+		err:               err,
 	}
 	if err != nil {
 		log.Tracef("Error submitting payload: %v\n", err)
@@ -360,15 +432,13 @@ func (s *sender) isEnabled() bool {
 	}
 	// Endpoint is MRF and MRF is enabled. Figure out if we need to failover APM data
 	if s.cfg.MRFFailoverAPM() {
-		if !s.enabled {
+		if s.enabled.CompareAndSwap(false, true) {
 			log.Infof("Sender for domain %v has been failed over to, enabling it for MRF.", s.cfg.url)
-			s.enabled = true
 		}
 		return true
 	}
 
-	if s.enabled {
-		s.enabled = false
+	if s.enabled.CompareAndSwap(true, false) {
 		log.Infof("Sender for domain %v was disabled; payloads will be dropped for this domain.", s.cfg.url)
 	} else {
 		log.Debugf("Sender for domain %v is disabled; dropping payload for this domain.", s.cfg.url)
@@ -388,7 +458,7 @@ const (
 )
 
 func (s *sender) do(req *http.Request) error {
-	req.Header.Set(headerAPIKey, s.cfg.apiKey)
+	req.Header.Set(headerAPIKey, s.apiKeyManager.Get())
 	req.Header.Set(headerUserAgent, s.cfg.userAgent)
 	resp, err := s.cfg.client.Do(req)
 	if err != nil {
@@ -404,6 +474,19 @@ func (s *sender) do(req *http.Request) error {
 	}
 	resp.Body.Close()
 
+	if resp.StatusCode == http.StatusForbidden {
+		// Retry a 403 only if a key refresh is available; otherwise the key can't
+		// change, so drop immediately instead of retrying against the same bad key.
+		if s.apiKeyManager.refresh() {
+			log.Debugf("API Key invalid (403), triggered secret refresh; retrying payload")
+			return &retriableError{
+				fmt.Errorf("server responded with %q", resp.Status),
+			}
+		}
+		log.Debugf("API Key invalid (403) and secret refresh is unavailable; dropping payload")
+		return errors.New(resp.Status)
+	}
+
 	if isRetriable(resp.StatusCode) {
 		return &retriableError{
 			fmt.Errorf("server responded with %q", resp.Status),
@@ -417,9 +500,10 @@ func (s *sender) do(req *http.Request) error {
 	return nil
 }
 
-// isRetriable reports whether the give HTTP status code should be retried.
+// isRetriable reports whether an HTTP status code is inherently retriable.
+// 403 is excluded on purpose: it is only retried when refresh is available
 func isRetriable(code int) bool {
-	if code == http.StatusRequestTimeout {
+	if code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
 		return true
 	}
 	// 5xx errors can be retried
@@ -428,9 +512,10 @@ func isRetriable(code int) bool {
 
 // payloads specifies a payload to be sent by the sender.
 type payload struct {
-	body    *bytes.Buffer     // request body
-	headers map[string]string // request headers
-	retries *atomic.Int32     // number of retries sending this payload
+	body             *bytes.Buffer     // request body (compressed)
+	headers          map[string]string // request headers
+	retries          *atomic.Int32     // number of retries sending this payload
+	uncompressedSize int               // size of the payload before compression
 }
 
 // ppool is a pool of payloads.
@@ -451,6 +536,7 @@ func newPayload(headers map[string]string) *payload {
 	p.body.Reset()
 	p.headers = headers
 	p.retries.Store(0)
+	p.uncompressedSize = 0
 	return p
 }
 
@@ -461,6 +547,7 @@ func (p *payload) clone() *payload {
 	if _, err := clone.body.ReadFrom(bytes.NewBuffer(p.body.Bytes())); err != nil {
 		log.Errorf("Error cloning writer payload: %v", err)
 	}
+	clone.uncompressedSize = p.uncompressedSize
 	return clone
 }
 

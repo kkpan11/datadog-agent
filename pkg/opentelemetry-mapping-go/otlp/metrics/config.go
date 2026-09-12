@@ -29,6 +29,7 @@ type translatorConfig struct {
 	InitialCumulMonoValueMode            InitialCumulMonoValueMode
 	InstrumentationLibraryMetadataAsTags bool
 	InstrumentationScopeMetadataAsTags   bool
+	InferDeltaInterval                   bool
 
 	originProduct OriginProduct
 
@@ -42,6 +43,9 @@ type translatorConfig struct {
 	// Agent from computing metrics with the same names.
 	withOTelPrefix bool
 
+	// withRuntimeRemapping reports whether runtime metrics should be mapped to Datadog counterparts.
+	withRuntimeRemapping bool
+
 	// cache configuration
 	sweepInterval int64
 	deltaTTL      int64
@@ -49,6 +53,13 @@ type translatorConfig struct {
 	fallbackSourceProvider source.Provider
 	// statsOut is the channel where the translator will send its APM statsPayload bytes
 	statsOut chan<- []byte
+
+	// customMapper allows overriding the default metric mapping behavior.
+	// If nil, the Translator uses itself as the mapper.
+	customMapper mapper
+
+	// withUnits reports whether to set Datadog units on metrics.
+	withUnits bool
 }
 
 // TranslatorOption is a translator creation option.
@@ -208,7 +219,8 @@ func WithStatsOut(statsOut chan<- []byte) TranslatorOption {
 
 // InitialCumulMonoValueMode defines what the exporter should do with the initial value
 // of a cumulative monotonic sum when under the 'cumulative_to_delta' mode.
-// It is not used when the mode is 'raw_value'.
+// It also affects the count field for summary metrics.
+// It is not used for cumulative monotonic sums when the mode is 'raw_value'.
 type InitialCumulMonoValueMode string
 
 const (
@@ -228,6 +240,31 @@ const (
 func WithInitialCumulMonoValueMode(mode InitialCumulMonoValueMode) TranslatorOption {
 	return func(t *translatorConfig) error {
 		t.InitialCumulMonoValueMode = mode
+		return nil
+	}
+}
+
+// WithInferDeltaInterval infers the interval for delta sums.
+// By default the interval is set to 0.
+func WithInferDeltaInterval() TranslatorOption {
+	return func(t *translatorConfig) error {
+		t.InferDeltaInterval = true
+		return nil
+	}
+}
+
+// WithoutRuntimeMetricMappings enables mapping of runtime metrics.
+func WithoutRuntimeMetricMappings() TranslatorOption {
+	return func(t *translatorConfig) error {
+		t.withRuntimeRemapping = false
+		return nil
+	}
+}
+
+// WithUnits maps OTLP UCUM units to Datadog units.
+func WithUnits() TranslatorOption {
+	return func(t *translatorConfig) error {
+		t.withUnits = true
 		return nil
 	}
 }

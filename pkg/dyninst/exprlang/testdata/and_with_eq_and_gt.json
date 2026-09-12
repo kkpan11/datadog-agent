@@ -1,0 +1,44 @@
+{
+  "type": "and",
+  "operation": "",
+  "left": {
+    "type": "eq",
+    "operation": "",
+    "left": {
+      "type": "ref",
+      "ref": "hits",
+      "operation": "",
+      "error": ""
+    },
+    "right": {
+      "type": "literal",
+      "operation": "",
+      "value": 42,
+      "error": ""
+    },
+    "error": ""
+  },
+  "right": {
+    "type": "gt",
+    "operation": "",
+    "left": {
+      "type": "len",
+      "operation": "",
+      "left": {
+        "type": "ref",
+        "ref": "payload",
+        "operation": "",
+        "error": ""
+      },
+      "error": ""
+    },
+    "right": {
+      "type": "literal",
+      "operation": "",
+      "value": 5,
+      "error": ""
+    },
+    "error": ""
+  },
+  "error": ""
+}

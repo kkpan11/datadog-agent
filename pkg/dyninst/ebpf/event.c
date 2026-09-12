@@ -1,74 +1,233 @@
 #ifndef __EVENT_H__
 #define __EVENT_H__
 
+#include "bpf_metadata.h"
 #include "bpf_helpers.h"
-#include "kconfig.h"
+#include "bpf_tracing.h"
+#include "cfa.h"
 #include "compiler.h"
 #include "context.h"
 #include "framing.h"
 #include "murmur2.h"
 #include "walk_stack.h"
 #include "scratch.h"
+#include "throttler.h"
 
 char _license[] SEC("license") = "GPL";
 
-extern const probe_params_t probe_params[];
-extern const uint32_t num_probe_params;
-
-SEC("uprobe") int probe_run_with_cookie(struct pt_regs* regs) {
-  uint64_t start = bpf_ktime_get_ns();
-
-  const uint64_t cookie = bpf_get_attach_cookie(regs);
-  if (cookie >= num_probe_params) {
-    return 0;
+static inline __attribute__((always_inline)) void
+read_g_fields(uint64_t g_ptr, uint64_t stack_ptr, uint64_t* goid, uint32_t* stack_byte_depth) {
+  if (OFFSET_runtime_dot_g__goid == 0 && OFFSET_runtime_dot_g__m == 0) {
+    return;
   }
-  const probe_params_t* params = &probe_params[cookie];
+  if (bpf_probe_read_user(
+          goid, sizeof(*goid),
+          (void*)(g_ptr + OFFSET_runtime_dot_g__goid))) {
+    LOG(2, "failed to read goid %llx", g_ptr);
+    return;
+  }
+  if (*goid == 0) {
+    // This is pseudo-g. Extract g_ptr->m->curg->goid.
+    uint64_t m_ptr;
+    if (bpf_probe_read_user(
+            &m_ptr, sizeof(m_ptr),
+            (void*)(g_ptr + OFFSET_runtime_dot_g__m))) {
+      LOG(2, "failed to read m %llx", g_ptr);
+      return;
+    }
+    if (bpf_probe_read_user(
+            &g_ptr, sizeof(g_ptr),
+            (void*)(m_ptr + OFFSET_runtime_dot_m__curg))) {
+      LOG(2, "failed to read curg %llx", m_ptr);
+      return;
+    }
+    if (bpf_probe_read_user(
+            goid, sizeof(*goid),
+            (void*)(g_ptr + OFFSET_runtime_dot_g__goid))) {
+      LOG(2, "failed to read goid %llx", g_ptr);
+      return;
+    }
+  }
+  uint64_t stack_hi;
+  if (bpf_probe_read_user(
+          &stack_hi, sizeof(stack_hi),
+          (void*)(g_ptr + OFFSET_runtime_dot_g__stack + OFFSET_runtime_dot_stack__hi))) {
+    LOG(2, "failed to read stack.lo %llx", g_ptr);
+    return;
+  }
+  *stack_byte_depth = (stack_hi - stack_ptr);
+  return;
+}
 
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, uint32_t);
+  __type(value, call_depths_t);
+} in_progress_calls_buf SEC(".maps");
+
+// notify_panic_unwound_lost publishes a DROP_REASON_PANIC_UNWOUND_LOST
+// notification carrying the unwound range from the recovery probe's
+// event header. Probe_id, stack_byte_depth, last_seq and entry_ktime_ns
+// are zero — the notification applies to every buffered invocation on
+// header->goid whose depth falls in (panic_lo_depth, panic_hi_depth].
+static inline __attribute__((always_inline)) void
+notify_panic_unwound_lost(uint32_t prog_id, const di_event_header_t* header) {
+  stats_t* stats = bpf_map_lookup_elem(&stats_buf, &zero_uint32);
+  if (stats) {
+    __sync_fetch_and_add(&stats->recovery_submit_failures, 1);
+  }
+  di_drop_notification_t* dn = drop_notify_prepare();
+  if (dn) {
+    *dn = (di_drop_notification_t){
+        .prog_id = prog_id,
+        .goid = header->goid,
+        .drop_reason = DROP_REASON_PANIC_UNWOUND_LOST,
+        .panic_lo_depth = header->panic_lo_depth,
+        .panic_hi_depth = header->panic_hi_depth,
+    };
+    (void)send_drop_notification();
+  }
+}
+
+static inline __attribute__((always_inline)) void
+probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs) {
+  LOG(4, "probe_run: %d %d %llx", params->probe_id, params->stack_machine_pc);
   global_ctx_t global_ctx;
-  global_ctx.stack_machine = stack_machine_ctx_load();
+  global_ctx.stack_machine = stack_machine_ctx_load(params);
   if (!global_ctx.stack_machine) {
-    return 0;
+    return;
   }
   global_ctx.stack_walk = stack_walk_ctx_load();
   if (!global_ctx.stack_walk) {
-    return 0;
+    return;
   }
   global_ctx.regs = NULL;
+  // Continuation state lives in stack_machine_t (a per-CPU map value) so
+  // it does not bloat probe_run_with_cookie's stack frame. stack_machine_ctx_load
+  // initializes continuation_seq / last_submitted_seq / continuation_aborted.
+  global_ctx.stack_machine->start_ns = start_ns;
+  // entry_ktime_ns defaults to this probe's own start_ns. Return probes
+  // overwrite this with the entry's timestamp after call_depths_delete.
+  global_ctx.stack_machine->entry_ktime_ns = start_ns;
 
-  const int64_t out_ringbuf_avail_data =
-      bpf_ringbuf_query(&out_ringbuf, BPF_RB_AVAIL_DATA);
-  const int64_t out_ringbuf_avail_space =
-      (int64_t)(RINGBUF_CAPACITY)-out_ringbuf_avail_data;
-  if (out_ringbuf_avail_space < (int64_t)SCRATCH_BUF_LEN) {
-    // TODO: Report dropped events metric.
-    return 0;
-  }
-
-  event_header_t* header = events_scratch_buf_init(&global_ctx.buf);
+  di_event_header_t* header = events_scratch_buf_init(&global_ctx.buf);
   if (!header) {
-    return 0;
+    return;
   }
-  *header = (event_header_t){
-      .data_byte_len = sizeof(event_header_t),
+  *header = (di_event_header_t){
+      .data_byte_len = sizeof(di_event_header_t),
       .stack_byte_len = 0, // set this if we collect stacks
-      .ktime_ns = start,
+      .ktime_ns = start_ns,
+      // Default to start_ns (the invocation ID for entry / line / inlined /
+      // no-body events). For return events, this is overwritten below with
+      // the value pulled from in_progress_calls.
+      .entry_ktime_ns = start_ns,
+      .prog_id = prog_id,
+      .probe_id = params->probe_id,
   };
+#if defined(bpf_target_x86)
+  if (params->frameless) {
+    read_g_fields(regs->DWARF_REGISTER_14, regs->DWARF_SP_REG, &header->goid, &header->stack_byte_depth);
+  } else {
+    read_g_fields(regs->DWARF_REGISTER_14, regs->DWARF_BP_REG, &header->goid, &header->stack_byte_depth);
+  }
+#elif defined(bpf_target_arm64)
+  read_g_fields(regs->DWARF_REGISTER(28), regs->DWARF_SP_REG, &header->goid, &header->stack_byte_depth);
+#else
+#error "Unsupported architecture"
+#endif
 
+  if (params->kind == EVENT_KIND_RETURN) {
+    // There was no corresponding call, so the deletion failed.
+    call_depths_t* depths = bpf_map_lookup_elem(&in_progress_calls, &header->goid);
+    if (!depths) {
+      // Common case where the associated call was not found.
+      LOG(4, "failed to lookup in_progress_calls %lld (%lld): %d",
+          header->goid, header->stack_byte_depth, params->probe_id);
+      return;
+    }
+    int remaining;
+    uint64_t entry_ktime_ns = 0;
+    // Write directly into stack_machine_t fields where possible so the
+    // verifier doesn't have to track extra stack-local addresses; this
+    // keeps probe_run_with_cookie's frame within budget.
+    if (!call_depths_delete(
+            depths, header->stack_byte_depth, (uint16_t)params->probe_id,
+            &remaining, &global_ctx.stack_machine->saved_dict_ptr,
+            &entry_ktime_ns,
+            &global_ctx.stack_machine->condition_state)) {
+      // Somewhat common case where the goroutine has open calls, but it's not
+      // this one.
+      LOG(4, "failed to delete in_progress_calls %lld (%lld): %d",
+          header->goid, header->stack_byte_depth, params->probe_id);
+      return;
+    }
+    // Stamp the entry's timestamp on the return event so userspace can
+    // correlate entry and return for the same invocation. Also record it
+    // on stack_machine for any drop notifications this probe sends.
+    header->entry_ktime_ns = entry_ktime_ns;
+    global_ctx.stack_machine->entry_ktime_ns = entry_ktime_ns;
+    // If we're the last call for this goid, delete the entry.
+    if (remaining == 0) {
+      int ret = bpf_map_delete_elem(&in_progress_calls, &header->goid);
+      if (ret != 0) {
+        // No clue why this would happen.
+        LOG(1, "failed to delete in_progress_calls %lld (%lld) %d: %d",
+            header->goid, header->stack_byte_depth, params->probe_id, ret);
+      }
+    }
+    header->event_pairing_expectation = EVENT_PAIRING_ENTRY_PAIRING_EXPECTED;
+  } else if (params->kind == EVENT_KIND_ENTRY && params->has_associated_return) {
+    // Defer in_progress_calls insertion until after condition + throttle gates.
+    // Set the pairing expectation tentatively; actual insertion happens later.
+    header->event_pairing_expectation = EVENT_PAIRING_RETURN_PAIRING_EXPECTED;
+  } else {
+    switch (params->no_return_reason) {
+    case NO_RETURN_REASON_INLINED:
+      LOG(4, "no return reason: inlined for goid %lld stack byte depth %d probe id %d", header->goid, header->stack_byte_depth, params->probe_id);
+      header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_NONE_INLINED;
+      break;
+    case NO_RETURN_REASON_NO_BODY:
+      LOG(4, "no return body for goid %lld stack byte depth %d probe id %d", header->goid, header->stack_byte_depth, params->probe_id);
+      header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_NONE_NO_BODY;
+      break;
+    default:
+      header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_NONE;
+      break;
+    }
+  }
   __maybe_unused int process_steps = 0;
   __maybe_unused int chase_steps = 0;
   uint64_t stack_hash = 0;
   global_ctx.stack_walk->regs = *regs;
-  global_ctx.stack_walk->stack.pcs.pcs[0] = regs->DWARF_PC_REG;
+  global_ctx.stack_walk->stack.pcs.pcs[0] = regs->DWARF_PC_REG + params->top_pc_offset;
+  LOG(5, "wrote event pairing expectation %d %lld %d %d %llx",
+      header->event_pairing_expectation, header->goid, header->stack_byte_depth,
+      params->probe_id, global_ctx.stack_walk->stack.pcs.pcs[0]);
+#if defined(bpf_target_x86)
   global_ctx.stack_walk->stack.fps[0] = regs->DWARF_BP_REG;
   if (params->frameless) {
+    // Call instruction saves return address on the stack.
     if (bpf_probe_read_user(&global_ctx.stack_walk->stack.pcs.pcs[1],
                             sizeof(global_ctx.stack_walk->stack.pcs.pcs[1]),
                             (void*)(regs->sp))) {
-      return 1;
+      return;
     }
     global_ctx.stack_walk->stack.fps[1] = regs->DWARF_BP_REG;
     global_ctx.stack_walk->idx_shift = 1;
   }
+#elif defined(bpf_target_arm64)
+  global_ctx.stack_walk->stack.fps[0] = regs->DWARF_SP_REG - 8;
+  if (params->frameless) {
+    // Call instruction saves return address in the link register.
+    global_ctx.stack_walk->stack.pcs.pcs[1] = regs->DWARF_REGISTER(30);
+    global_ctx.stack_walk->stack.fps[1] = regs->DWARF_SP_REG - 8;
+    global_ctx.stack_walk->idx_shift = 1;
+  }
+#else
+#error "Unsupported architecture"
+#endif
   global_ctx.stack_walk->stack.pcs.len =
       bpf_loop(STACK_DEPTH, populate_stack_frame, &global_ctx.stack_walk, 0) +
       1;
@@ -84,29 +243,263 @@ SEC("uprobe") int probe_run_with_cookie(struct pt_regs* regs) {
         .buf = global_ctx.buf,
     };
     bpf_loop(global_ctx.stack_walk->stack.pcs.len, copy_stack_loop,
-              &copy_stack_ctx, 0);
+             &copy_stack_ctx, 0);
     scratch_buf_increment_len(global_ctx.buf, header->stack_byte_len);
   } else {
     stack_hash = 0;
   }
   global_ctx.regs = &global_ctx.stack_walk->regs;
-
   frame_data_t frame_data = {
-      .fp = global_ctx.regs->DWARF_BP_REG,
       .stack_idx = 0,
   };
+  frame_data.cfa = calculate_cfa(global_ctx.regs, params->frameless);
+  LOG(5, "cfa: %llx %d %llx %llx", frame_data.cfa, params->frameless, regs->DWARF_BP_REG, regs->DWARF_SP_REG);
   if (params->stack_machine_pc != 0) {
     process_steps = stack_machine_process_frame(&global_ctx, &frame_data,
                                                 params->stack_machine_pc);
   }
-  chase_steps = stack_machine_chase_pointers(&global_ctx);
-  if (!events_scratch_buf_submit(global_ctx.buf)) {
-    // TODO: Report dropped events metric.
+  header->condition_eval_error = global_ctx.stack_machine->condition_eval_error ? (global_ctx.stack_machine->condition_nil_deref ? 2 : 1) : 0;
+  if (global_ctx.stack_machine->condition_failed) {
+    LOG(4, "probe_run: condition failed, skipping event");
+    if (params->kind == EVENT_KIND_RETURN) {
+      // Send minimal event so userspace can discard the orphaned entry.
+      scratch_buf_set_len(global_ctx.buf, sizeof(di_event_header_t));
+      header->data_byte_len = sizeof(di_event_header_t);
+      header->stack_byte_len = 0;
+      header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_CONDITION_FAILED;
+      if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
+        // The condition-failed signal couldn't reach userspace. Notify via
+        // the side channel so the buffered entry can be emitted alone rather
+        // than leaking until process shutdown.
+        LOG(1, "probe_run: failed to submit condition-failed signal for return event");
+        {
+          di_drop_notification_t* dn = drop_notify_prepare();
+          if (dn) {
+            *dn = (di_drop_notification_t){
+                .prog_id = prog_id,
+                .probe_id = params->probe_id,
+                .goid = header->goid,
+                .stack_byte_depth = header->stack_byte_depth,
+                .entry_ktime_ns = global_ctx.stack_machine->entry_ktime_ns,
+                .drop_reason = DROP_REASON_RETURN_LOST,
+            };
+            (void)send_drop_notification();
+          }
+        }
+      }
+    }
+    // Entry: in_progress_calls insertion was deferred, so nothing to clean up.
+    return;
   }
-  if (stack_hash != 0) {
-    upsert_stack_hash(stack_hash);
+  if (params->throttle_mode == THROTTLE_AFTER_COND_CHECK &&
+      should_throttle(params->throttler_idx, start_ns)) {
+    if (params->kind == EVENT_KIND_RETURN) {
+      // Return throttled after condition passed — send signal to discard buffered entry.
+      scratch_buf_set_len(global_ctx.buf, sizeof(di_event_header_t));
+      header->data_byte_len = sizeof(di_event_header_t);
+      header->stack_byte_len = 0;
+      header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_CONDITION_FAILED;
+      if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
+        LOG(1, "probe_run: failed to submit throttled condition-failed signal");
+        {
+          di_drop_notification_t* dn = drop_notify_prepare();
+          if (dn) {
+            *dn = (di_drop_notification_t){
+                .prog_id = prog_id,
+                .probe_id = params->probe_id,
+                .goid = header->goid,
+                .stack_byte_depth = header->stack_byte_depth,
+                .entry_ktime_ns = global_ctx.stack_machine->entry_ktime_ns,
+                .drop_reason = DROP_REASON_RETURN_LOST,
+            };
+            (void)send_drop_notification();
+          }
+        }
+      }
+    }
+    // Entry: in_progress_calls insertion was deferred, so nothing to clean up.
+    return;
+  }
+  // Deferred insertion: only insert after condition + throttle gates have passed.
+  if (params->kind == EVENT_KIND_ENTRY && params->has_associated_return) {
+    call_depths_t* depths = bpf_map_lookup_elem(&in_progress_calls_buf, &zero_uint32);
+    if (!depths) {
+      LOG(1, "failed to get in_progress_calls_buf for %lld", header->goid);
+      return;
+    }
+    depths->depths[0].depth = header->stack_byte_depth;
+    depths->depths[0].probe_id = (uint16_t)params->probe_id;
+    depths->depths[0].condition_state = global_ctx.stack_machine->condition_state;
+    depths->depths[0].dict_ptr = global_ctx.stack_machine->saved_dict_ptr;
+    depths->depths[0].entry_ktime_ns = start_ns;
+    int ret = bpf_map_update_elem(&in_progress_calls, &header->goid, depths, BPF_NOEXIST);
+    if (ret != 0) {
+      if (ret == -E2BIG) {
+        header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_CALL_MAP_FULL;
+      } else if (ret == -EEXIST) {
+        depths = bpf_map_lookup_elem(&in_progress_calls, &header->goid);
+        if (!depths) {
+          LOG(1, "failed to lookup in_progress_calls for goid %lld after failing to insert", header->goid);
+          return;
+        }
+        if (!call_depths_insert(depths, header->stack_byte_depth, (uint16_t)params->probe_id,
+                                global_ctx.stack_machine->condition_state,
+                                global_ctx.stack_machine->saved_dict_ptr, start_ns)) {
+          header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_CALL_COUNT_EXCEEDED;
+        }
+      }
+    }
+  }
+  chase_steps = stack_machine_chase_pointers(&global_ctx);
+  stack_machine_t* sm = global_ctx.stack_machine;
+  if (sm->continuation_aborted) {
+    // A mid-chase flush failed. Skip the final submit — sending it now
+    // would leave a gap in the fragment sequence — and notify userspace
+    // so it can finalize whatever (if anything) reached it.
+    if (header->event_pairing_expectation ==
+        EVENT_PAIRING_RETURN_PANIC_UNWOUND) {
+      // Recovery probe: in_progress_calls slots in (lo, hi] were already
+      // evicted by SM_OP_PANIC_UNWIND_EVICT_SLOTS, so any fragments that
+      // reached userspace cannot be re-paired with their entries. Tell
+      // userspace to range-scan its buffer; the partial-fragment
+      // semantics of PARTIAL_ENTRY do not apply here.
+      notify_panic_unwound_lost(prog_id, header);
+    } else if (sm->last_submitted_seq != LAST_SUBMITTED_SEQ_NONE) {
+      // Earlier fragments reached userspace; tell it to emit them as
+      // truncated.
+      uint8_t reason = (params->kind == EVENT_KIND_RETURN)
+                           ? DROP_REASON_PARTIAL_RETURN
+                           : DROP_REASON_PARTIAL_ENTRY;
+      {
+        di_drop_notification_t* dn = drop_notify_prepare();
+        if (dn) {
+          *dn = (di_drop_notification_t){
+              .prog_id = prog_id,
+              .probe_id = params->probe_id,
+              .goid = header->goid,
+              .stack_byte_depth = header->stack_byte_depth,
+              .last_seq = sm->last_submitted_seq,
+              .entry_ktime_ns = sm->entry_ktime_ns,
+              .drop_reason = reason,
+          };
+          (void)send_drop_notification();
+        }
+      }
+    } else if (params->kind == EVENT_KIND_RETURN) {
+      // The very first flush failed; no return fragments are in flight.
+      // Tell userspace to emit the matching entry alone.
+      {
+        di_drop_notification_t* dn = drop_notify_prepare();
+        if (dn) {
+          *dn = (di_drop_notification_t){
+              .prog_id = prog_id,
+              .probe_id = params->probe_id,
+              .goid = header->goid,
+              .stack_byte_depth = header->stack_byte_depth,
+              .entry_ktime_ns = sm->entry_ktime_ns,
+              .drop_reason = DROP_REASON_RETURN_LOST,
+          };
+          (void)send_drop_notification();
+        }
+      }
+    }
+    // Entry probe with no fragments: no userspace state to clean up.
+    LOG(1, "probe_run: continuation aborted at seq=%d", sm->last_submitted_seq);
+    return;
+  }
+  // Set final fragment metadata. If continuation_seq > 0, earlier fragments
+  // were already submitted inline by SM_OP_CHASE_POINTERS.
+  di_event_header_t* final_header = (di_event_header_t*)global_ctx.buf;
+  final_header->continuation_seq = sm->continuation_seq;
+  final_header->continuation_flags = 0; // final fragment
+  if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
+    LOG(1, "probe_run output dropped");
+    if (header->event_pairing_expectation ==
+        EVENT_PAIRING_RETURN_PANIC_UNWOUND) {
+      // Recovery probe: in_progress_calls slots in (lo, hi] were already
+      // evicted by SM_OP_PANIC_UNWIND_EVICT_SLOTS, so any fragments that
+      // reached userspace cannot be re-paired with their entries. Tell
+      // userspace to range-scan its buffer; the partial-fragment
+      // semantics of PARTIAL_ENTRY do not apply here.
+      notify_panic_unwound_lost(prog_id, header);
+    } else if (sm->last_submitted_seq != LAST_SUBMITTED_SEQ_NONE) {
+      // Some fragments already reached userspace; this final fragment is
+      // lost. Notify userspace to emit the partial event as truncated.
+      uint8_t reason = (params->kind == EVENT_KIND_RETURN)
+                           ? DROP_REASON_PARTIAL_RETURN
+                           : DROP_REASON_PARTIAL_ENTRY;
+      {
+        di_drop_notification_t* dn = drop_notify_prepare();
+        if (dn) {
+          *dn = (di_drop_notification_t){
+              .prog_id = prog_id,
+              .probe_id = params->probe_id,
+              .goid = header->goid,
+              .stack_byte_depth = header->stack_byte_depth,
+              .last_seq = sm->last_submitted_seq,
+              .entry_ktime_ns = sm->entry_ktime_ns,
+              .drop_reason = reason,
+          };
+          (void)send_drop_notification();
+        }
+      }
+    } else if (params->kind == EVENT_KIND_RETURN) {
+      // No fragments were submitted; the return probe produced nothing in
+      // userspace. Tell userspace to emit the matching entry alone.
+      {
+        di_drop_notification_t* dn = drop_notify_prepare();
+        if (dn) {
+          *dn = (di_drop_notification_t){
+              .prog_id = prog_id,
+              .probe_id = params->probe_id,
+              .goid = header->goid,
+              .stack_byte_depth = header->stack_byte_depth,
+              .entry_ktime_ns = sm->entry_ktime_ns,
+              .drop_reason = DROP_REASON_RETURN_LOST,
+          };
+          (void)send_drop_notification();
+        }
+      }
+    }
+    // Entry probe with no fragments (and not the recovery probe): no
+    // userspace state to clean up.
+  } else {
+    sm->last_submitted_seq = sm->continuation_seq;
+    if (stack_hash != 0) {
+      upsert_stack_hash(stack_hash);
+    }
   }
   LOG(1, "probe_run done: %d steps", process_steps + chase_steps);
+  return;
+}
+
+SEC("uprobe")
+int probe_run_with_cookie(struct pt_regs* regs) {
+  uint64_t start_ns = bpf_ktime_get_ns();
+
+  const uint64_t cookie = bpf_get_attach_cookie(regs);
+  if (cookie >= num_probe_params) {
+    return 0;
+  }
+  const probe_params_t* params = bpf_map_lookup_elem(&probe_params, &cookie);
+  if (!params) {
+    return 0;
+  }
+
+  uint32_t probe_id = params->probe_id;
+  stats_t* stats = bpf_map_lookup_elem(&stats_buf, &probe_id);
+  if (!stats) {
+    return 0;
+  }
+  __sync_fetch_and_add(&stats->hit_cnt, 1);
+
+  if (params->throttle_mode == THROTTLE_AT_START && should_throttle(params->throttler_idx, start_ns)) {
+    __sync_fetch_and_add(&stats->throttled_cnt, 1);
+  } else {
+    probe_run(start_ns, params, regs);
+  }
+
+  __sync_fetch_and_add(&stats->cpu_ns, bpf_ktime_get_ns() - start_ns);
   return 0;
 }
 

@@ -9,24 +9,32 @@
 package tests
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/cenkalti/backoff/v7"
 	"github.com/cilium/ebpf"
-	"github.com/docker/docker/libnetwork/resolvconf"
+	"github.com/oliveagle/jsonpath"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/DataDog/datadog-agent/pkg/config/env"
 	"github.com/DataDog/datadog-agent/pkg/security/ebpf/kernel"
+	ebpfprobes "github.com/DataDog/datadog-agent/pkg/security/ebpf/probes"
 	"github.com/DataDog/datadog-agent/pkg/security/ebpf/probes/rawpacket"
+	"github.com/DataDog/datadog-agent/pkg/security/metrics"
 	"github.com/DataDog/datadog-agent/pkg/security/probe"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
@@ -44,12 +52,11 @@ func TestNetworkCIDR(t *testing.T) {
 		}
 	}
 
-	// write the rules using the local resolv.conf file
-	resolvFile, err := resolvconf.GetSpecific("/etc/resolv.conf")
+	// read the local resolv.conf file and parse nameservers
+	nameserversCIDR, err := parseNameserversFromResolvConf("/etc/resolv.conf")
 	if err != nil {
 		t.Fatal(err)
 	}
-	nameserversCIDR := resolvconf.GetNameserversAsPrefix(resolvFile.Content)
 
 	rule := &rules.RuleDefinition{
 		ID:         "test_rule",
@@ -63,7 +70,7 @@ func TestNetworkCIDR(t *testing.T) {
 	defer test.Close()
 
 	t.Run("dns", func(t *testing.T) {
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			_, err = net.LookupIP("google.com")
 			if err != nil {
 				return err
@@ -74,14 +81,48 @@ func TestNetworkCIDR(t *testing.T) {
 			assert.Equal(t, "google.com", event.DNS.Question.Name, "wrong domain name")
 
 			test.validateDNSSchema(t, event)
-		})
+		}, "test_rule")
 	})
+}
+
+// parseNameserversFromResolvConf reads a resolv.conf file and returns the
+// nameservers as netip.Prefix values (each as a /32 or /128 prefix).
+func parseNameserversFromResolvConf(path string) ([]netip.Prefix, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var prefixes []netip.Prefix
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "nameserver") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		addr, err := netip.ParseAddr(fields[1])
+		if err != nil {
+			continue
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return prefixes, nil
 }
 
 func isRawPacketNotSupported(kv *kernel.Version) bool {
 	// OpenSUSE distributions are missing the dummy kernel module
 	return probe.IsRawPacketNotSupported(kv) || kv.IsSLESKernel() || kv.IsOpenSUSELeapKernel()
 }
+
+var _ = declare(TestRawPacket, testOpts{networkRawPacketEnabled: true})
 
 func TestRawPacket(t *testing.T) {
 	SkipIfNotAvailable(t)
@@ -118,20 +159,26 @@ func TestRawPacket(t *testing.T) {
 		}
 	}()
 
-	rule := &rules.RuleDefinition{
-		ID:         "test_rule_raw_packet_udp4",
-		Expression: fmt.Sprintf(`packet.filter == "ip dst %s and udp dst port %d" && process.file.name == "%s"`, testDestIP, testUDPDestPort, filepath.Base(executable)),
+	ruleDefs := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_raw_packet_udp4",
+			Expression: fmt.Sprintf(`packet.filter == "ip dst %s and udp dst port %d" && process.file.name == "%s"`, testDestIP, testUDPDestPort, filepath.Base(executable)),
+		},
+		{
+			ID:         "test_rule_raw_packet_icmp",
+			Expression: `packet.filter == "icmp and icmp[icmptype] == icmp-echo and ip dst 8.8.8.8"`,
+		},
 	}
 
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule}, withStaticOpts(testOpts{networkRawPacketEnabled: true}))
+	test, err := newTestModule(t, nil, ruleDefs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer test.Close()
 
 	t.Run("udp4", func(t *testing.T) {
-		test.WaitSignal(t, func() error {
-			conn, err := net.Dial("udp4", fmt.Sprintf("%s:%d", testDestIP, testUDPDestPort))
+		test.WaitSignalFromRule(t, func() error {
+			conn, err := net.Dial("udp4", net.JoinHostPort(testDestIP, strconv.Itoa(int(testUDPDestPort))))
 			if err != nil {
 				return err
 			}
@@ -150,8 +197,696 @@ func TestRawPacket(t *testing.T) {
 			assertFieldEqual(t, event, "packet.destination.ip", *expectedIPNet)
 			assertFieldEqual(t, event, "packet.l4_protocol", int(model.IPProtoUDP))
 			assertFieldEqual(t, event, "packet.destination.port", int(testUDPDestPort))
+		}, "test_rule_raw_packet_udp4")
+	})
+
+	t.Run("icmp", func(t *testing.T) {
+		if _, err := whichNonFatal("docker"); err != nil {
+			t.Skip("Skip test where docker is unavailable")
+		}
+
+		wrapper, err := newDockerCmdWrapper(test.Root(), test.Root(), "busybox", "")
+		if err != nil {
+			t.Fatalf("failed to start docker wrapper: %v", err)
+		}
+
+		waitSignal := test.WaitSignalWithoutProcessContext
+
+		kv, err := kernel.NewKernelVersion()
+		if err != nil {
+			t.Errorf("failed to get kernel version: %s", err)
+			return
+		}
+
+		if !kv.HasBpfGetSocketCookieForCgroupSocket() || kv.Code < kernel.Kernel5_15 {
+			waitSignal = test.WaitSignalWithoutProcessContext
+		}
+
+		wrapper.Run(t, "ping", func(t *testing.T, _ wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+			waitSignal(t, func() error {
+				cmd := cmdFunc("/bin/ping", []string{"-c", "1", "8.8.8.8"}, nil)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("%s: %w", out, err)
+				}
+				return nil
+			}, func(event *model.Event, rule *rules.Rule) {
+				assert.Equal(t, "test_rule_raw_packet_icmp", rule.ID, "wrong rule triggered")
+				assert.Equal(t, "8.8.8.8/32", event.NetworkContext.Destination.IPNet.String(), "wrong destination IP")
+				assert.Equal(t, uint16(model.IPProtoICMP), event.RawPacket.L4Protocol)
+				assert.Equal(t, uint32(model.ICMPTypeEchoRequest), event.RawPacket.NetworkContext.Type)
+			})
 		})
 	})
+}
+
+var _ = declare(TestRawPacketRouterSelFlipOnRulesetReload, testOpts{networkRawPacketEnabled: true})
+
+func TestRawPacketRouterSelFlipOnRulesetReload(t *testing.T) {
+	SkipIfNotAvailable(t)
+
+	checkKernelCompatibility(t, "network feature", isRawPacketNotSupported)
+
+	rule := &rules.RuleDefinition{
+		ID:         "test_rule_raw_packet_router_sel",
+		Expression: `dns.question.name == "never.match.raw.packet.router.sel.test"`,
+	}
+
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer test.Close()
+
+	p, ok := test.probe.PlatformProbe.(*probe.EBPFProbe)
+	if !ok {
+		t.Fatal("expected *probe.EBPFProbe")
+	}
+
+	selBefore, err := ebpfprobes.GetActiveRawPacketMapNumber(p.Manager.Get())
+	if err != nil {
+		t.Fatalf("raw_packet_router_sel (before reload): %v", err)
+	}
+	if selBefore != 0 && selBefore != 1 {
+		t.Fatalf("raw_packet_router_sel must be 0 or 1, got %d", selBefore)
+	}
+
+	if err := test.reloadPolicies(); err != nil {
+		t.Fatalf("reload policies: %v", err)
+	}
+
+	selAfter, err := ebpfprobes.GetActiveRawPacketMapNumber(p.Manager.Get())
+	if err != nil {
+		t.Fatalf("raw_packet_router_sel (after reload): %v", err)
+	}
+
+	assert.Equal(t, uint32(1)-selBefore, selAfter,
+		"raw_packet_router_sel must be flipped after ruleset reload")
+}
+
+var _ = declare(TestRawPacketAction, testOpts{networkRawPacketEnabled: true})
+
+func TestRawPacketAction(t *testing.T) {
+	if testEnvironment == DockerEnvironment {
+		t.Skip("skipping cgroup ID test in docker")
+	}
+
+	SkipIfNotAvailable(t)
+
+	checkKernelCompatibility(t, "network feature", isRawPacketNotSupported)
+
+	rule := &rules.RuleDefinition{
+		ID:         "test_rule_raw_packet_drop",
+		Expression: `exec.file.name == "free"`,
+		Actions: []*rules.ActionDefinition{
+			{
+				NetworkFilter: &rules.NetworkFilterDefinition{
+					BPFFilter: "port 53",
+					Scope:     "cgroup",
+					Policy:    rules.NetworkFilterPolicyDrop,
+				},
+			},
+		},
+	}
+
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer test.Close()
+
+	cmdWrapper, err := test.StartADocker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cmdWrapper.stop()
+
+	t.Run("drop", func(t *testing.T) {
+		cmd := cmdWrapper.Command("nslookup", []string{"google.com"}, []string{})
+		if err := cmd.Run(); err != nil {
+			t.Error(err)
+		}
+
+		test.WaitSignalFromRule(t, func() error {
+			cmd := cmdWrapper.Command("free", []string{}, []string{})
+			return cmd.Run()
+		}, func(_ *model.Event, rule *rules.Rule) {
+			assertTriggeredRule(t, rule, "test_rule_raw_packet_drop")
+		}, "test_rule_raw_packet_drop")
+
+		err = retry(t, func() error {
+			msg := test.msgSender.getMsg("test_rule_raw_packet_drop")
+			if msg == nil {
+				return errors.New("not found")
+			}
+			validateMessageSchema(t, string(msg.Data))
+
+			jsonPathValidation(test, msg.Data, func(_ *testModule, obj interface{}) {
+				if el, err := jsonpath.JsonPathLookup(obj, `$.agent.rule_actions[?(@.policy == 'drop')]`); err != nil || el == nil || len(el.([]interface{})) == 0 {
+					t.Errorf("element not found %s => %v", string(msg.Data), err)
+				}
+				if el, err := jsonpath.JsonPathLookup(obj, `$.agent.rule_actions[?(@.filter == 'port 53')]`); err != nil || el == nil || len(el.([]interface{})) == 0 {
+					t.Errorf("element not found %s => %v", string(msg.Data), err)
+				}
+				if el, err := jsonpath.JsonPathLookup(obj, `$.agent.rule_actions[?(@.status == 'performed')]`); err != nil || el == nil || len(el.([]interface{})) == 0 {
+					t.Errorf("element not found %s => %v", string(msg.Data), err)
+				}
+
+			})
+
+			return nil
+		}, backoff.WithBackOff(backoff.NewConstantBackOff(200*time.Millisecond)), backoff.WithMaxTries(60))
+		assert.NoError(t, err)
+
+		// wait for the action to be performed
+		time.Sleep(5 * time.Second)
+
+		cmd = cmdWrapper.Command("nslookup", []string{"microsoft.com"}, []string{})
+		if err = cmd.Run(); err == nil {
+			t.Error("should return an error")
+		}
+
+		err = retry(t, func() error {
+			msg := test.msgSender.getMsg("rawpacket_action")
+			if msg == nil {
+				return errors.New("not found")
+			}
+			validateRawPacketActionSchema(t, string(msg.Data))
+
+			return nil
+		}, backoff.WithBackOff(backoff.NewConstantBackOff(500*time.Millisecond)), backoff.WithMaxTries(30))
+		assert.NoError(t, err)
+	})
+}
+
+var _ = declare(TestRawPacketDropMetricAccuracyWithReload, testOpts{networkRawPacketEnabled: true})
+
+func TestRawPacketDropMetricAccuracyWithReload(t *testing.T) {
+	if testEnvironment == DockerEnvironment {
+		t.Skip("skipping cgroup ID test in docker")
+	}
+
+	SkipIfNotAvailable(t)
+
+	checkKernelCompatibility(t, "network feature", isRawPacketNotSupported)
+
+	const (
+		ruleID1       = "test_rule_raw_packet_drop_ping_metric"
+		ruleID2       = "test_rule_raw_packet_drop_ping_metric_2"
+		pingHost      = "8.8.8.8"
+		pingCount     = 3
+		totalExpected = 6
+	)
+
+	bootstrapRule := &rules.RuleDefinition{
+		ID:         "bootstrap_capture_container_id",
+		Expression: `exec.file.name == "id"`,
+	}
+
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{bootstrapRule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer test.Close()
+
+	test.statsdClient.Flush()
+
+	captureContainerID := func(wrapper *dockerCmdWrapper) string {
+		var containerID string
+		test.WaitSignalFromRule(t, func() error {
+			return wrapper.Command("id", []string{}, []string{}).Run()
+		}, func(event *model.Event, _ *rules.Rule) {
+			containerID = event.GetContainerID()
+			assert.NotEmpty(t, containerID)
+		}, bootstrapRule.ID)
+		t.Logf("captured container ID: %s", containerID)
+		return containerID
+	}
+
+	triggerIsolation := func(wrapper *dockerCmdWrapper, ruleID string) {
+		test.WaitSignalFromRule(t, func() error {
+			return wrapper.Command("free", []string{}, []string{}).Run()
+		}, func(_ *model.Event, rule *rules.Rule) {
+			assertTriggeredRule(t, rule, ruleID)
+		}, ruleID)
+	}
+
+	emitPackets := func(wrapper *dockerCmdWrapper, host string, count int) {
+		t.Helper()
+		cmd := wrapper.Command("sh", []string{
+			"-c",
+			fmt.Sprintf(`i=1; while [ $i -le %d ]; do echo test | nc -u -w1 %s 53; if [ $i -lt %d ]; then sleep 1; fi; i=$((i+1)); done`, count, host, count),
+		}, []string{})
+		_, _ = cmd.CombinedOutput()
+	}
+
+	waitForMetric := func(ruleID string, expected int64) {
+		t.Helper()
+		metricKey := metrics.MetricRawPacketDropped + ":rule_id:" + ruleID
+		err := retry(t, func() error {
+			test.sendStats()
+			count := test.statsdClient.Get(metricKey)
+			if count != expected {
+				return fmt.Errorf("expected %d dropped packets for %s, got %d (%+v)", expected, ruleID, count, test.statsdClient.GetByPrefix(metrics.MetricRawPacketDropped))
+			}
+			return nil
+		}, backoff.WithBackOff(backoff.NewConstantBackOff(500*time.Millisecond)), backoff.WithMaxTries(30))
+		assert.NoError(t, err)
+	}
+
+	reloadPolicy := func(ruleDefs []*rules.RuleDefinition) {
+		t.Helper()
+		if err := setTestPolicy(commonCfgDir, nil, ruleDefs); err != nil {
+			t.Fatalf("failed to set policy: %v", err)
+		}
+		if err := test.reloadPolicies(); err != nil {
+			t.Fatalf("failed to reload policies: %v", err)
+		}
+	}
+
+	// 1) start container
+	cmdWrapperA, err := test.StartADocker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cmdWrapperA.stop()
+
+	// 2) recover container ID
+	containerAID := captureContainerID(cmdWrapperA)
+
+	// 2bis) Create second container for later
+	cmdWrapperB, err := newDockerCmdWrapper(test.Root(), test.Root(), "alpine", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cmdWrapperB.start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmdWrapperB.stop()
+	time.Sleep(1 * time.Second)
+
+	containerBID := captureContainerID(cmdWrapperB)
+	rule2 := &rules.RuleDefinition{
+		ID:         ruleID2,
+		Expression: fmt.Sprintf(`exec.file.name == "free" && process.container.id == "%s"`, containerBID),
+		Actions: []*rules.ActionDefinition{
+			{
+				NetworkFilter: &rules.NetworkFilterDefinition{
+					BPFFilter: "host 1.1.1.1",
+					Scope:     "cgroup",
+					Policy:    rules.NetworkFilterPolicyDrop,
+				},
+			},
+		},
+	}
+
+	// 3) isolation rule on container A
+	rule1 := &rules.RuleDefinition{
+		ID:         ruleID1,
+		Expression: fmt.Sprintf(`exec.container.id == "%s"`, containerAID),
+		Actions: []*rules.ActionDefinition{
+			{
+				NetworkFilter: &rules.NetworkFilterDefinition{
+					BPFFilter: "host " + pingHost,
+					Scope:     "cgroup",
+					Policy:    rules.NetworkFilterPolicyDrop,
+				},
+			},
+		},
+	}
+	reloadPolicy([]*rules.RuleDefinition{bootstrapRule, rule1})
+	// trigger isolation by starting a first process on container A
+	cmdWrapperA.Command("free", []string{}, []string{}).Run()
+	time.Sleep(1 * time.Second)
+
+	// 4) 3 pings in container A async
+	go emitPackets(cmdWrapperA, pingHost, pingCount)
+
+	// 5) reload with a second rule on another container (free trigger, different filter)
+	reloadPolicy([]*rules.RuleDefinition{rule2, rule1})
+	triggerIsolation(cmdWrapperB, ruleID2)
+
+	// 6) add some pings in container B
+	go emitPackets(cmdWrapperB, "1.1.1.1", 2)
+
+	// 7) 3 more pings in container A
+	emitPackets(cmdWrapperA, pingHost, pingCount)
+	// wait until they have all been processed
+	time.Sleep(2 * time.Second)
+
+	// 8) rule1 counter should total 6 dropped packets across reload
+	waitForMetric(ruleID1, totalExpected)
+}
+
+var _ = declare(TestRawPacketActionWithSignature, testOpts{networkRawPacketEnabled: true})
+
+func TestRawPacketActionWithSignature(t *testing.T) {
+	if testEnvironment == DockerEnvironment {
+		t.Skip("skipping cgroup ID test in docker")
+	}
+
+	SkipIfNotAvailable(t)
+
+	checkKernelCompatibility(t, "network feature", isRawPacketNotSupported)
+
+	// Initial rule to capture the signature - no action yet
+	// Include a DNS rule to ensure network probes (including cgroup socket hooks) are attached from the start.
+	// This is necessary because without a network event type in the initial ruleset, the cgroup socket
+	// hooks (hook_sock_create, hook_sock_release) are not attached. These hooks populate the sock_cookie_pid
+	// map which is needed for PID resolution in the TC classifier on kernels < 6.1.
+	ruleDefs := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_capture_signature",
+			Expression: `exec.file.name == "free"`,
+		},
+		{
+			ID:         "test_dns_to_activate_network_probes",
+			Expression: `dns.question.name == "never.match.example.com"`,
+		},
+	}
+
+	test, err := newTestModule(t, nil, ruleDefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer test.Close()
+
+	cmdWrapper, err := test.StartADocker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cmdWrapper.stop()
+
+	var capturedSignature string
+
+	// First, run "free" to capture the signature
+	test.WaitSignalFromRule(t, func() error {
+		cmd := cmdWrapper.Command("free", []string{}, []string{})
+		return cmd.Run()
+	}, func(event *model.Event, rule *rules.Rule) {
+		assertTriggeredRule(t, rule, "test_rule_capture_signature")
+		capturedSignature = event.FieldHandlers.ResolveSignature(event)
+	}, "test_rule_capture_signature")
+
+	if capturedSignature == "" {
+		t.Fatal("captured signature is empty")
+	}
+
+	// Verify DNS works before applying the filter
+	cmd := cmdWrapper.Command("nslookup", []string{"google.com"}, []string{})
+	if err := cmd.Run(); err != nil {
+		t.Errorf("nslookup should work before filter: %v", err)
+	}
+
+	// Now create a new rule with the network filter action using the captured signature
+	newRuleDefs := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_capture_signature",
+			Expression: `exec.file.name == "free" && event.signature != "` + capturedSignature + `"`,
+		},
+		{
+			ID:         "test_rule_raw_packet_drop_with_signature",
+			Expression: `exec.file.name == "free" && event.signature == "` + capturedSignature + `"`,
+			Actions: []*rules.ActionDefinition{
+				{
+					NetworkFilter: &rules.NetworkFilterDefinition{
+						BPFFilter: "port 53",
+						Scope:     "cgroup",
+						Policy:    rules.NetworkFilterPolicyDrop,
+					},
+				},
+			},
+		},
+	}
+
+	// Set the new policy and reload
+	if err := setTestPolicy(commonCfgDir, nil, newRuleDefs); err != nil {
+		t.Fatalf("failed to set new policy: %v", err)
+	}
+	if err := test.reloadPolicies(); err != nil {
+		t.Fatalf("failed to reload policies: %v", err)
+	}
+	// Trigger a small event to force the replay of cached events.
+	// The replay only happens in handleEvent when a new eBPF event arrives.
+	exec.Command("true").Run()
+
+	// Run free again to trigger the rule with signature (free is not long-running, so we need to run it again)
+	err = test.GetEventSent(t, func() error {
+		cmd := cmdWrapper.Command("free", []string{}, []string{})
+		return cmd.Run()
+	}, func(rule *rules.Rule, event *model.Event) bool {
+		assertTriggeredRule(t, rule, "test_rule_raw_packet_drop_with_signature")
+
+		// Verify the network filter action was performed using the event's action reports
+		assert.Equal(t, 1, len(event.ActionReports), "expected one action report")
+		if len(event.ActionReports) == 1 {
+			report := event.ActionReports[0]
+			if rawPacketReport, ok := report.(*probe.RawPacketActionReport); ok {
+				assert.Equal(t, "port 53", rawPacketReport.Filter, "unexpected filter")
+				assert.Equal(t, "drop", rawPacketReport.Policy, "unexpected policy")
+			}
+		}
+		return true
+	}, 10*time.Second, "test_rule_raw_packet_drop_with_signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the action to be performed
+	time.Sleep(5 * time.Second)
+
+	// DNS should now be blocked for this container
+	cmd = cmdWrapper.Command("nslookup", []string{"microsoft.com"}, []string{})
+	_, nslookupErr := cmd.CombinedOutput()
+	if nslookupErr == nil {
+		t.Error("nslookup should return an error after filter is applied")
+	}
+
+	// Verify the raw packet action event was sent
+	err = retry(t, func() error {
+		msg := test.msgSender.getMsg("rawpacket_action")
+		if msg == nil {
+			return errors.New("not found")
+		}
+		validateRawPacketActionSchema(t, string(msg.Data))
+		return nil
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(500*time.Millisecond)), backoff.WithMaxTries(30))
+	assert.NoError(t, err)
+
+	// Now remove the network isolation rule and verify DNS works again
+	// Create a new policy without the network filter action
+	ruleDefsWithoutFilter := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_capture_signature",
+			Expression: `exec.file.name == "free"`,
+		},
+	}
+
+	// Set the new policy without network filter and reload
+	if err := setTestPolicy(commonCfgDir, nil, ruleDefsWithoutFilter); err != nil {
+		t.Fatalf("failed to set policy without filter: %v", err)
+	}
+	if err := test.reloadPolicies(); err != nil {
+		t.Fatalf("failed to reload policies: %v", err)
+	}
+
+	// Wait for the filter to be removed
+	time.Sleep(2 * time.Second)
+
+	// DNS should now work again in the container
+	cmd = cmdWrapper.Command("nslookup", []string{"example.com"}, []string{})
+	if err := cmd.Run(); err != nil {
+		t.Errorf("nslookup should work after removing network filter: %v", err)
+	}
+}
+
+var _ = declare(TestRawPacketActionProcessScopeWithSignature, testOpts{networkRawPacketEnabled: true})
+
+func TestRawPacketActionProcessScopeWithSignature(t *testing.T) {
+	SkipIfNotAvailable(t)
+
+	checkKernelCompatibility(t, "network feature", isRawPacketNotSupported)
+
+	// Use a local UDP port for testing - no external network dependency
+	const udpTestPort = "5555"
+
+	// Initial rule to capture signature when syscall_tester starts
+	ruleDefs := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_capture_signature",
+			Expression: `exec.file.name == "syscall_tester"`,
+		},
+	}
+
+	test, err := newTestModule(t, nil, ruleDefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer test.Close()
+
+	syscallTester, err := loadSyscallTester(t, test, "syscall_tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Channel for reading lines from stdout - single goroutine reads, avoids race
+	linesCh := make(chan string, 100)
+	linesErrCh := make(chan error, 1)
+
+	// Start a single reader goroutine (will be started after we have the stdout pipe)
+	startLineReader := func(reader *bufio.Reader) {
+		go func() {
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					linesErrCh <- err
+					return
+				}
+				linesCh <- line
+			}
+		}()
+	}
+
+	// Helper function to drain all buffered lines and return the last UDP status
+	drainAndReadUDPStatus := func(timeout time.Duration) (udpOK bool, err error) {
+		deadline := time.Now().Add(timeout)
+		foundAny := false
+
+		for time.Now().Before(deadline) {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			select {
+			case line := <-linesCh:
+				if strings.Contains(line, "UDP_OK") {
+					udpOK = true
+					foundAny = true
+				} else if strings.Contains(line, "UDP_FAIL") {
+					udpOK = false
+					foundAny = true
+				}
+			case <-linesErrCh:
+				if foundAny {
+					return udpOK, nil
+				}
+				return false, errors.New("reader error")
+			case <-time.After(remaining):
+				if foundAny {
+					return udpOK, nil
+				}
+				return false, errors.New("timeout reading UDP status")
+			}
+		}
+		if foundAny {
+			return udpOK, nil
+		}
+		return false, errors.New("timeout reading UDP status")
+	}
+
+	// Start udploop in background and capture the signature
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var udploopCmd *exec.Cmd
+	var stdout io.ReadCloser
+	var capturedSignature string
+
+	test.WaitSignalFromRule(t, func() error {
+		udploopCmd = exec.CommandContext(ctx, syscallTester, "udploop", udpTestPort)
+		var err error
+		stdout, err = udploopCmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
+		return udploopCmd.Start()
+	}, func(event *model.Event, rule *rules.Rule) {
+		assertTriggeredRule(t, rule, "test_rule_capture_signature")
+		capturedSignature = event.FieldHandlers.ResolveSignature(event)
+	}, "test_rule_capture_signature")
+
+	defer func() {
+		cancel()
+		if udploopCmd != nil {
+			udploopCmd.Wait()
+		}
+	}()
+
+	if capturedSignature == "" {
+		t.Fatal("captured signature is empty")
+	}
+
+	reader := bufio.NewReader(stdout)
+	startLineReader(reader)
+
+	// Step 1: Verify UDP works before isolation
+	udpOK, err := drainAndReadUDPStatus(10 * time.Second)
+	if err != nil || !udpOK {
+		t.Fatalf("UDP should work before isolation: udpOK=%v, err=%v", udpOK, err)
+	}
+
+	// Step 2: Apply network isolation rule with signature matching
+	newRuleDefs := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_capture_signature",
+			Expression: `exec.file.name == "syscall_tester" && event.signature != "` + capturedSignature + `"`,
+		},
+		{
+			ID:         "test_rule_syscall_tester_isolate",
+			Expression: `exec.file.name == "syscall_tester" && event.signature == "` + capturedSignature + `"`,
+			Actions: []*rules.ActionDefinition{
+				{
+					NetworkFilter: &rules.NetworkFilterDefinition{
+						BPFFilter: "port " + udpTestPort,
+						Scope:     "process",
+						Policy:    rules.NetworkFilterPolicyDrop,
+					},
+				},
+			},
+		},
+	}
+
+	if err := setTestPolicy(commonCfgDir, nil, newRuleDefs); err != nil {
+		t.Fatalf("failed to set policy with network filter: %v", err)
+	}
+	if err := test.reloadPolicies(); err != nil {
+		t.Fatalf("failed to reload policies: %v", err)
+	}
+	// Trigger a small event to force the replay of cached events.
+	// The replay only happens in handleEvent when a new eBPF event arrives.
+	exec.Command("true").Run()
+
+	// Wait for the filter to be applied
+	time.Sleep(3 * time.Second)
+
+	// Step 3: Verify UDP fails for the now-isolated process
+	udpOK, err = drainAndReadUDPStatus(10 * time.Second)
+	if err == nil && udpOK {
+		t.Error("Step 3: UDP should fail for isolated process")
+	}
+
+	// Step 4: Remove the network isolation rule
+	ruleDefsWithoutFilter := []*rules.RuleDefinition{
+		{
+			ID:         "test_rule_capture_signature",
+			Expression: `exec.file.name == "syscall_tester"`,
+		},
+	}
+
+	if err := setTestPolicy(commonCfgDir, nil, ruleDefsWithoutFilter); err != nil {
+		t.Fatalf("failed to set policy without filter: %v", err)
+	}
+	if err := test.reloadPolicies(); err != nil {
+		t.Fatalf("failed to reload policies: %v", err)
+	}
+
+	// Wait for the filter to be removed
+	time.Sleep(2 * time.Second)
+
+	// Step 5: Verify UDP works again on the same process
+	udpOK, err = drainAndReadUDPStatus(10 * time.Second)
+	if err != nil || !udpOK {
+		t.Errorf("Step 5: UDP should work after removing network filter: udpOK=%v, err=%v", udpOK, err)
+	}
 }
 
 func TestRawPacketFilter(t *testing.T) {
@@ -196,9 +931,13 @@ func TestRawPacketFilter(t *testing.T) {
 		},
 		{
 			BPFFilter: "tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x47455420",
+			CGroupPathKey: model.PathKey{
+				Inode: 1234,
+			},
 		},
 		{
 			BPFFilter: "icmp[icmptype] != icmp-echo and icmp[icmptype] != icmp-echoreply",
+			Pid:       123,
 		},
 		{
 			BPFFilter: "port ftp or ftp-data",
@@ -230,6 +969,11 @@ func TestRawPacketFilter(t *testing.T) {
 		progSpecs, err := rawpacket.FiltersToProgramSpecs(rawPacketEventMap.FD(), clsRouterMapFd.FD(), filters, opts)
 		assert.NoError(t, err)
 		assert.NotEmpty(t, progSpecs)
+
+		for _, prog := range progSpecs {
+			// check if len of proc insturctions is lower than the limit
+			assert.Less(t, len(prog.Instructions), opts.MaxProgSize)
+		}
 
 		colSpec := ebpf.CollectionSpec{
 			Programs: make(map[string]*ebpf.ProgramSpec),
@@ -263,10 +1007,16 @@ func TestRawPacketFilter(t *testing.T) {
 
 		opts := rawpacket.DefaultProgOpts()
 		opts.MaxProgSize = 4000
-		opts.NopInstLen = 3500
+		opts.NopInstLen = 1000
 		runTest(t, filters, opts)
 	})
 }
+
+var _ = declare(TestNetworkFlowSendUDP4,
+	testOpts{
+		networkFlowMonitorEnabled: true,
+	},
+)
 
 func TestNetworkFlowSendUDP4(t *testing.T) {
 	SkipIfNotAvailable(t)
@@ -291,11 +1041,7 @@ func TestNetworkFlowSendUDP4(t *testing.T) {
 		Expression: `network_flow_monitor.flows.length > 0 && process.file.name == "syscall_tester"`,
 	}
 
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule}, withStaticOpts(
-		testOpts{
-			networkFlowMonitorEnabled: true,
-		},
-	))
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{rule})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +1053,7 @@ func TestNetworkFlowSendUDP4(t *testing.T) {
 	}
 
 	t.Run("test_network_flow_send_udp4", func(t *testing.T) {
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			return runSyscallTesterFunc(context.Background(), t, syscallTester, "network_flow_send_udp4", testDestIP, strconv.Itoa(testUDPDestPort))
 		}, func(event *model.Event, _ *rules.Rule) {
 			assert.Equal(t, "network_flow_monitor", event.GetType(), "wrong event type")
@@ -323,6 +1069,6 @@ func TestNetworkFlowSendUDP4(t *testing.T) {
 				assert.Equal(t, uint64(0), event.NetworkFlowMonitor.Flows[0].Ingress.PacketCount, "wrong ingress packet count")
 				assert.Equal(t, uint64(0), event.NetworkFlowMonitor.Flows[0].Ingress.DataSize, "wrong ingress data size")
 			}
-		})
+		}, "test_rule_network_flow")
 	})
 }

@@ -11,13 +11,89 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	listv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	adtypes "github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/types"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
+	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 )
+
+func TestKubeEndpointServiceFilterTemplatesOverriddenChecks(t *testing.T) {
+	endpointID := "kube_endpoint_uid://default/myservice/10.0.0.1"
+	annotationRedis := integration.Config{
+		Name:          "redisdb",
+		Provider:      names.KubeEndpointSlices,
+		Source:        "kube_endpoints:kube_endpoint_uid://default/myservice/",
+		ADIdentifiers: []string{endpointID},
+		Instances:     []integration.Data{integration.Data(`{"host":"%%host%%"}`)},
+	}
+	legacyAnnotationRedis := annotationRedis
+	legacyAnnotationRedis.Provider = names.KubeEndpoints
+	crRedis := annotationRedis
+	crRedis.Provider = names.KubeEndpointSlicesCR
+	crRedis.Source = "datadoginstrumentation:default/redis"
+	crRedis.Instances = []integration.Data{integration.Data(`{"host":"%%host%%","source":"cr"}`)}
+	crHTTP := crRedis
+	crHTTP.Name = "http_check"
+
+	tests := []struct {
+		name    string
+		configs []integration.Config
+		want    []string
+	}{
+		{
+			name:    "CR check without annotation is preserved",
+			configs: []integration.Config{crRedis},
+			want:    []string{names.KubeEndpointSlicesCR + "/redisdb"},
+		},
+		{
+			name:    "EndpointSlice annotation overrides same CR integration",
+			configs: []integration.Config{crRedis, annotationRedis},
+			want:    []string{names.KubeEndpointSlices + "/redisdb"},
+		},
+		{
+			name:    "legacy Endpoints annotation overrides same CR integration",
+			configs: []integration.Config{crRedis, legacyAnnotationRedis},
+			want:    []string{names.KubeEndpoints + "/redisdb"},
+		},
+		{
+			name:    "different integrations coexist",
+			configs: []integration.Config{crHTTP, annotationRedis},
+			want: []string{
+				names.KubeEndpointSlicesCR + "/http_check",
+				names.KubeEndpointSlices + "/redisdb",
+			},
+		},
+	}
+
+	service := &KubeEndpointService{entity: endpointID}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			configs := make(map[string]integration.Config, len(tc.configs))
+			for _, config := range tc.configs {
+				configs[config.Digest()] = config
+			}
+
+			service.FilterTemplates(configs)
+
+			got := make([]string, 0, len(configs))
+			for _, config := range configs {
+				got = append(got, config.Provider+"/"+config.Name)
+			}
+			assert.ElementsMatch(t, tc.want, got)
+		})
+	}
+}
 
 func TestProcessEndpoints(t *testing.T) {
 	kep := &v1.Endpoints{
@@ -41,7 +117,7 @@ func TestProcessEndpoints(t *testing.T) {
 		},
 	}
 
-	eps := processEndpoints(kep, []string{"foo:bar"})
+	eps := processEndpoints(kep, []string{"foo:bar"}, workloadfilterfxmock.SetupMockFilter(t))
 
 	// Sort eps to impose the order
 	sort.Slice(eps, func(i, j int) bool {
@@ -60,7 +136,7 @@ func TestProcessEndpoints(t *testing.T) {
 	assert.Equal(t, "kube_endpoint_uid://default/myservice/10.0.0.1", eps[0].GetServiceID())
 
 	adID := eps[0].GetADIdentifiers()
-	assert.Equal(t, []string{"kube_endpoint_uid://default/myservice/10.0.0.1"}, adID)
+	assert.Equal(t, []string{"kube_endpoint_uid://default/myservice/10.0.0.1", string(adtypes.CelEndpointIdentifier)}, adID)
 
 	hosts, err := eps[0].GetHosts()
 	assert.NoError(t, err)
@@ -68,7 +144,7 @@ func TestProcessEndpoints(t *testing.T) {
 
 	ports, err := eps[0].GetPorts()
 	assert.NoError(t, err)
-	assert.Equal(t, []ContainerPort{{123, "port123"}, {126, "port126"}}, ports)
+	assert.Equal(t, []workloadmeta.ContainerPort{{Port: 123, Name: "port123"}, {Port: 126, Name: "port126"}}, ports)
 
 	tags, err := eps[0].GetTags()
 	assert.NoError(t, err)
@@ -76,9 +152,13 @@ func TestProcessEndpoints(t *testing.T) {
 
 	assert.Equal(t, "kube_endpoint_uid://default/myservice/10.0.0.2", eps[1].GetServiceID())
 
+	namespaceName, err := eps[0].GetExtraConfig("namespace")
+	assert.NoError(t, err)
+	assert.Equal(t, "default", namespaceName)
+
 	adID = eps[1].GetADIdentifiers()
 	assert.NoError(t, err)
-	assert.Equal(t, []string{"kube_endpoint_uid://default/myservice/10.0.0.2"}, adID)
+	assert.Equal(t, []string{"kube_endpoint_uid://default/myservice/10.0.0.2", string(adtypes.CelEndpointIdentifier)}, adID)
 
 	hosts, err = eps[1].GetHosts()
 	assert.NoError(t, err)
@@ -86,11 +166,15 @@ func TestProcessEndpoints(t *testing.T) {
 
 	ports, err = eps[1].GetPorts()
 	assert.NoError(t, err)
-	assert.Equal(t, []ContainerPort{{123, "port123"}, {126, "port126"}}, ports)
+	assert.Equal(t, []workloadmeta.ContainerPort{{Port: 123, Name: "port123"}, {Port: 126, Name: "port126"}}, ports)
 
 	tags, err = eps[1].GetTags()
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"kube_service:myservice", "kube_namespace:default", "kube_endpoint_ip:10.0.0.2", "foo:bar"}, tags)
+
+	namespaceName, err = eps[1].GetExtraConfig("namespace")
+	assert.NoError(t, err)
+	assert.Equal(t, "default", namespaceName)
 }
 
 func TestSubsetsDiffer(t *testing.T) {
@@ -399,7 +483,7 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 		metricsExcluded bool
 		globalExcluded  bool
 		want            bool
-		filter          containers.FilterType
+		filterScope     workloadfilter.Scope
 	}{
 		{
 			name: "metrics excluded is true",
@@ -428,7 +512,7 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 			},
 			metricsExcluded: true,
 			want:            true,
-			filter:          containers.MetricsFilter,
+			filterScope:     workloadfilter.MetricsFilter,
 		},
 		{
 			name: "metrics excluded is false",
@@ -458,7 +542,7 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 			metricsExcluded: false,
 			globalExcluded:  true,
 			want:            false,
-			filter:          containers.MetricsFilter,
+			filterScope:     workloadfilter.MetricsFilter,
 		},
 		{
 			name: "metrics excluded is true with logs filter",
@@ -488,7 +572,7 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 			metricsExcluded: true,
 			globalExcluded:  false,
 			want:            false,
-			filter:          containers.LogsFilter,
+			filterScope:     workloadfilter.LogsFilter,
 		},
 		{
 			name: "metrics excluded is false with logs filter",
@@ -518,7 +602,7 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 			metricsExcluded: false,
 			globalExcluded:  true,
 			want:            false,
-			filter:          containers.LogsFilter,
+			filterScope:     workloadfilter.LogsFilter,
 		},
 		{
 			name: "global excluded is true",
@@ -548,7 +632,7 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 			metricsExcluded: true,
 			globalExcluded:  true,
 			want:            true,
-			filter:          containers.GlobalFilter,
+			filterScope:     workloadfilter.GlobalFilter,
 		},
 		{
 			name: "metrics excluded is false",
@@ -578,16 +662,224 @@ func TestHasFilterKubeEndpoints(t *testing.T) {
 			metricsExcluded: false,
 			globalExcluded:  false,
 			want:            false,
-			filter:          containers.GlobalFilter,
+			filterScope:     workloadfilter.GlobalFilter,
 		},
 	}
+
+	filterStore := workloadfilterfxmock.SetupMockFilter(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := processService(tt.ksvc)
+			svc := processService(tt.ksvc, filterStore)
 			svc.metricsExcluded = tt.metricsExcluded
 			svc.globalExcluded = tt.globalExcluded
-			isFilter := svc.HasFilter(tt.filter)
+			isFilter := svc.HasFilter(tt.filterScope)
 			assert.Equal(t, isFilter, tt.want)
 		})
 	}
+}
+
+func TestKubeEndpointsFiltering(t *testing.T) {
+	mockConfig := configmock.New(t)
+	mockConfig.SetInTest("container_exclude_metrics", []string{"kube_namespace:excluded-namespace"})
+	mockConfig.SetInTest("container_exclude", []string{"name:global-excluded"})
+	mockFilterStore := workloadfilterfxmock.SetupMockFilter(t)
+
+	// Create test endpoints with different scenarios
+	testCases := []struct {
+		name                string
+		endpoint            *v1.Endpoints
+		expectedMetricsExcl bool
+		expectedGlobalExcl  bool
+	}{
+		{
+			name: "normal endpoint: not excluded",
+			endpoint: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "normal-service",
+					Namespace: "default",
+					UID:       types.UID("normal-uid"),
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{IP: "10.0.0.1"},
+						},
+						Ports: []v1.EndpointPort{
+							{Name: "http", Port: 80},
+						},
+					},
+				},
+			},
+			expectedMetricsExcl: false,
+			expectedGlobalExcl:  false,
+		},
+		{
+			name: "endpoint in excluded namespace: metrics excluded",
+			endpoint: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "service-in-excluded-ns",
+					Namespace: "excluded-namespace",
+					UID:       types.UID("excluded-ns-uid"),
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{IP: "10.0.0.2"},
+						},
+						Ports: []v1.EndpointPort{
+							{Name: "http", Port: 80},
+						},
+					},
+				},
+			},
+			expectedMetricsExcl: true,
+			expectedGlobalExcl:  false,
+		},
+		{
+			name: "globally excluded endpoint",
+			endpoint: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "global-excluded",
+					Namespace: "default",
+					UID:       types.UID("global-excluded-uid"),
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{IP: "10.0.0.3"},
+						},
+						Ports: []v1.EndpointPort{
+							{Name: "http", Port: 80},
+						},
+					},
+				},
+			},
+			expectedMetricsExcl: false,
+			expectedGlobalExcl:  true,
+		},
+		{
+			name: "endpoint with AD annotations: metrics excluded",
+			endpoint: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ad-excluded",
+					Namespace: "default",
+					UID:       types.UID("ad-excluded-uid"),
+					Annotations: map[string]string{
+						"ad.datadoghq.com/service.check_names": "[\"http_check\"]",
+						"ad.datadoghq.com/metrics_exclude":     "true",
+						"ad.datadoghq.com/exclude":             "false",
+					},
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{IP: "10.0.0.4"},
+						},
+						Ports: []v1.EndpointPort{
+							{Name: "http", Port: 80},
+						},
+					},
+				},
+			},
+			expectedMetricsExcl: true,
+			expectedGlobalExcl:  false,
+		},
+		{
+			name: "endpoint with AD annotations: metrics excluded",
+			endpoint: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "annotation-excluded",
+					Namespace: "default",
+					UID:       types.UID("annotation-excluded-uid"),
+					Annotations: map[string]string{
+						"ad.datadoghq.com/service.check_names": "[\"http_check\"]",
+						"ad.datadoghq.com/exclude":             "true",
+					},
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{IP: "10.0.0.4"},
+						},
+						Ports: []v1.EndpointPort{
+							{Name: "http", Port: 80},
+						},
+					},
+				},
+			},
+			expectedMetricsExcl: true,
+			expectedGlobalExcl:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			eps := processEndpoints(tc.endpoint, []string{}, mockFilterStore)
+			assert.NotEmpty(t, eps, "Should have at least one endpoint service")
+			for _, ep := range eps {
+				assert.Equal(t, tc.expectedMetricsExcl, ep.metricsExcluded,
+					"Expected metricsExcluded to be %v for endpoint %s/%s",
+					tc.expectedMetricsExcl, tc.endpoint.Namespace, tc.endpoint.Name)
+				assert.Equal(t, tc.expectedGlobalExcl, ep.globalExcluded,
+					"Expected globalExcluded to be %v for endpoint %s/%s",
+					tc.expectedGlobalExcl, tc.endpoint.Namespace, tc.endpoint.Name)
+			}
+		})
+	}
+}
+
+func newEndpointsTestListener(t *testing.T, svc *v1.Service, kep *v1.Endpoints) (*KubeEndpointsListener, cache.Indexer, chan Service, chan Service) {
+	svcIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	require.NoError(t, svcIndexer.Add(svc))
+	epIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	require.NoError(t, epIndexer.Add(kep))
+
+	newCh := make(chan Service, 10)
+	delCh := make(chan Service, 10)
+	l := &KubeEndpointsListener{
+		endpoints:       make(map[types.UID][]*KubeEndpointService),
+		endpointsLister: listv1.NewEndpointsLister(epIndexer),
+		serviceLister:   listv1.NewServiceLister(svcIndexer),
+		promInclAnnot:   getPrometheusIncludeAnnotations(),
+		filterStore:     workloadfilterfxmock.SetupMockFilter(t),
+		newService:      newCh,
+		delService:      delCh,
+	}
+	return l, svcIndexer, newCh, delCh
+}
+
+// TestEndpointsServiceUpdatedPrometheusAnnotations verifies that changes to prometheus
+// scrape annotations trigger endpoint service emission.
+func TestEndpointsServiceUpdatedPrometheusAnnotations(t *testing.T) {
+	kep := &v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx-svc", Namespace: "default", UID: types.UID("ep-uid")},
+		Subsets: []v1.EndpointSubset{{
+			Addresses: []v1.EndpointAddress{{IP: "10.0.0.1"}, {IP: "10.0.0.2"}},
+			Ports:     []v1.EndpointPort{{Name: "metrics", Port: 9113}},
+		}},
+	}
+
+	t.Run("annotation added", func(t *testing.T) {
+		svcOld := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "nginx-svc", Namespace: "default", UID: "svc-uid"}}
+		l, svcIndexer, newCh, _ := newEndpointsTestListener(t, svcOld, kep)
+
+		svcNew := svcOld.DeepCopy()
+		svcNew.Annotations = map[string]string{"prometheus.io/scrape": "true"}
+		require.NoError(t, svcIndexer.Update(svcNew))
+		l.serviceUpdated(svcOld, svcNew)
+
+		require.Len(t, newCh, 2, "endpoint services should be emitted when prometheus annotation is added")
+	})
+
+	t.Run("scrape annotation value changed", func(t *testing.T) {
+		svcOld := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "nginx-svc", Namespace: "default", UID: "svc-uid", Annotations: map[string]string{"prometheus.io/scrape": "false"}}}
+		l, svcIndexer, newCh, _ := newEndpointsTestListener(t, svcOld, kep)
+
+		svcNew := svcOld.DeepCopy()
+		svcNew.Annotations["prometheus.io/scrape"] = "true"
+		require.NoError(t, svcIndexer.Update(svcNew))
+		l.serviceUpdated(svcOld, svcNew)
+
+		require.Len(t, newCh, 2, "endpoint services should be emitted when scrape annotation value changes")
+	})
 }

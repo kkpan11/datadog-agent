@@ -14,9 +14,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 
+	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
+	secretsnoopimpl "github.com/DataDog/datadog-agent/comp/core/secrets/noop-impl"
 	logscompression "github.com/DataDog/datadog-agent/comp/serializer/logscompression/impl"
 	"github.com/DataDog/datadog-agent/pkg/eventmonitor"
 	secconfig "github.com/DataDog/datadog-agent/pkg/security/config"
@@ -52,6 +55,9 @@ event_monitoring_config:
 
 runtime_security_config:
   enabled: {{ .RuntimeSecurityEnabled }}
+  security_profile:
+    v2:
+      enabled: false
 {{ if gt .EventServerRetention 0 }}
   event_server:
     retention: {{ .EventServerRetention }}
@@ -113,6 +119,10 @@ func newTestModule(t testing.TB, macroDefs []*rules.MacroDefinition, ruleDefs []
 	for _, opt := range fopts {
 		opt(&opts)
 	}
+	// Windows always builds a fresh module, so the declared config only decides
+	// this test's own config here -- there is no grouping to get wrong. Resolve
+	// it anyway so that declarations behave identically on both platforms.
+	resolveStaticOpts(t, &opts)
 
 	if commonCfgDir == "" {
 		cd, err := os.MkdirTemp("", "test-cfgdir")
@@ -126,12 +136,12 @@ func newTestModule(t testing.TB, macroDefs []*rules.MacroDefinition, ruleDefs []
 	if err != nil {
 		return nil, err
 	}
-	if _, err = setTestPolicy(commonCfgDir, macroDefs, ruleDefs); err != nil {
+	if err := setTestPolicy(commonCfgDir, macroDefs, ruleDefs); err != nil {
 		return nil, err
 	}
 	statsdClient := statsdclient.NewStatsdClient()
 
-	emconfig, secconfig, err := genTestConfigs(commonCfgDir, opts.staticOpts)
+	emconfig, secconfig, err := genTestConfigs(t, commonCfgDir, opts.staticOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +174,9 @@ func newTestModule(t testing.TB, macroDefs []*rules.MacroDefinition, ruleDefs []
 		emopts.ProbeOpts.Tagger = NewFakeTaggerDifferentImageNames()
 	}
 
-	testMod.eventMonitor, err = eventmonitor.NewEventMonitor(emconfig, secconfig, emopts)
+	ipcComp := ipcmock.New(t)
+
+	testMod.eventMonitor, err = eventmonitor.NewEventMonitor(emconfig, secconfig, functionalTestsHostname, emopts)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +185,12 @@ func newTestModule(t testing.TB, macroDefs []*rules.MacroDefinition, ruleDefs []
 	var ruleSetloadedErr *multierror.Error
 	if !opts.staticOpts.disableRuntimeSecurity {
 		compression := logscompression.NewComponent()
-		cws, err := module.NewCWSConsumer(testMod.eventMonitor, secconfig.RuntimeSecurity, nil, module.Opts{EventSender: testMod}, compression)
+		cmdServer, err := module.NewCommandServer(secconfig.RuntimeSecurity)
+		if err != nil {
+			return nil, err
+		}
+
+		cws, err := module.NewCWSConsumer(cmdServer, testMod.eventMonitor, secconfig.RuntimeSecurity, nil, nil, module.Opts{EventSender: testMod}, compression, ipcComp, functionalTestsHostname, secretsnoopimpl.NewComponent().Comp)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create module: %w", err)
 		}
@@ -206,9 +223,9 @@ func newTestModule(t testing.TB, macroDefs []*rules.MacroDefinition, ruleDefs []
 		opts.staticOpts.preStartCallback(testMod)
 	}
 
-	if opts.staticOpts.snapshotRuleMatchHandler != nil {
+	if opts.staticOpts.ruleMatchHandler != nil {
 		testMod.RegisterRuleEventHandler(func(e *model.Event, r *rules.Rule) {
-			opts.staticOpts.snapshotRuleMatchHandler(testMod, e, r)
+			opts.staticOpts.ruleMatchHandler(testMod, e, r)
 		})
 		t.Cleanup(func() {
 			testMod.RegisterRuleEventHandler(nil)
@@ -230,6 +247,30 @@ func newTestModule(t testing.TB, macroDefs []*rules.MacroDefinition, ruleDefs []
 
 func (tm *testModule) Close() {
 	tm.eventMonitor.Close()
+}
+
+// etwReadyProvider is an interface for probes that support ETW ready signaling
+type etwReadyProvider interface {
+	ETWReady() <-chan struct{}
+}
+
+// WaitForETWReady waits for ETW to be ready (first event received) with a timeout.
+// Returns true if ETW is ready, false if timeout was reached.
+// This replaces the unreliable time.Sleep() approach for waiting on ETW startup.
+func (tm *testModule) WaitForETWReady(timeout time.Duration) bool {
+	provider, ok := tm.probe.PlatformProbe.(etwReadyProvider)
+	if !ok || provider == nil {
+		// Probe doesn't support ETW ready signaling, nothing to wait for
+		return true
+	}
+
+	select {
+	case <-provider.ETWReady():
+		return true
+	case <-time.After(timeout):
+		log.Warnf("Timeout waiting for ETW to be ready after %v", timeout)
+		return false
+	}
 }
 
 func (tm *testModule) writePlatformSpecificTimeoutError(b *strings.Builder) {

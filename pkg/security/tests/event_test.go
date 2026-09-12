@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/avast/retry-go/v4"
+	"github.com/cenkalti/backoff/v7"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/DataDog/datadog-agent/pkg/security/events"
@@ -107,12 +107,19 @@ func TestEventRaleLimiters(t *testing.T) {
 	ruleDefs := []*rules.RuleDefinition{
 		{
 			ID:         "test_unique_id",
-			Expression: `open.file.path == "{{.Root}}/test-unique-id"`,
-			Every: &rules.HumanReadableDuration{
-				Duration: 5 * time.Second,
-			},
-			RateLimiterToken: []string{"process.file.name"},
-		},
+			Expression: `open.file.path == "{{.Root}}/test-unique-id" && process.file.name not in ${test_unique_id_services}`,
+			Actions: []*rules.ActionDefinition{
+				{
+					Set: &rules.SetDefinition{
+						Name:  "test_unique_id_services",
+						Field: "process.file.name",
+						TTL: &rules.HumanReadableDuration{
+							Duration: 5 * time.Second,
+						},
+						Append: true,
+					},
+				},
+			}},
 		{
 			ID:         "test_std",
 			Expression: `open.file.path == "{{.Root}}/test-std"`,
@@ -234,7 +241,7 @@ func TestEventIteratorRegister(t *testing.T) {
 	ruleDefs := []*rules.RuleDefinition{
 		{
 			ID:         "test_register_1",
-			Expression: `open.file.path == "{{.Root}}/test-register" && process.ancestors[A].name == "syscall_tester" && process.ancestors[A].argv in ["span-exec"]`,
+			Expression: `open.file.path == "{{.Root}}/test-register" && process.ancestors[A].name == "syscall_tester" && process.ancestors[A].argv in ["self-exec"]`,
 		},
 		{
 			ID:         "test_register_2",
@@ -266,15 +273,15 @@ func TestEventIteratorRegister(t *testing.T) {
 	}
 
 	t.Run("std", func(t *testing.T) {
-		test.WaitSignal(t, func() error {
-			return runSyscallTesterFunc(context.Background(), t, syscallTester, "span-exec", "123", "456", "/usr/bin/touch", testFile)
+		test.WaitSignalFromRule(t, func() error {
+			return runSyscallTesterFunc(context.Background(), t, syscallTester, "self-exec", "self-exec", "open", testFile)
 		}, func(_ *model.Event, rule *rules.Rule) {
 			assertTriggeredRule(t, rule, "test_register_1")
-		})
+		}, "test_register_1")
 	})
 
 	t.Run("pid1", func(t *testing.T) {
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			f, err := os.Create(testFile2)
 			if err != nil {
 				return err
@@ -282,7 +289,7 @@ func TestEventIteratorRegister(t *testing.T) {
 			return f.Close()
 		}, func(_ *model.Event, rule *rules.Rule) {
 			assertTriggeredRule(t, rule, "test_register_2")
-		})
+		}, "test_register_2")
 	})
 }
 
@@ -334,7 +341,7 @@ func TestEventProductTags(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err = retry.Do(func() error {
+		err = retry(t, func() error {
 			msg := test.msgSender.getMsg("rule_tags_match")
 			if msg == nil {
 				return errors.New("not found")
@@ -343,7 +350,7 @@ func TestEventProductTags(t *testing.T) {
 			assert.Contains(t, msg.Tags, "tag:match")
 
 			return nil
-		}, retry.Delay(200*time.Millisecond), retry.Attempts(30), retry.DelayType(retry.FixedDelay))
+		}, backoff.WithBackOff(backoff.NewConstantBackOff(200*time.Millisecond)), backoff.WithMaxTries(30))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -370,10 +377,7 @@ func TestEventProductTags(t *testing.T) {
 }
 
 func truncatedParents(t *testing.T, staticOpts testOpts, dynamicOpts dynamicTestOpts) {
-	var truncatedParents string
-	for i := 0; i < model.MaxPathDepth; i++ {
-		truncatedParents += "a/"
-	}
+	truncatedParents := strings.Repeat("a/", model.MaxPathDepth)
 
 	rule := &rules.RuleDefinition{
 		ID: "path_test",
@@ -413,7 +417,7 @@ func truncatedParents(t *testing.T, staticOpts testOpts, dynamicOpts dynamicTest
 		t.Fatal(err)
 	}
 
-	test.WaitSignal(t, func() error {
+	test.WaitSignalFromRule(t, func() error {
 		f, err := os.OpenFile(truncatedParentsFile, os.O_CREATE, 0755)
 		if err != nil {
 			return err
@@ -433,7 +437,7 @@ func truncatedParents(t *testing.T, staticOpts testOpts, dynamicOpts dynamicTest
 			assert.Equal(t, "a", splittedFilepath[len(splittedFilepath)-1], "invalid path resolution at the right edge")
 			assert.Equal(t, model.MaxPathDepth, len(splittedFilepath), "invalid path depth")
 		}
-	})
+	}, "path_test")
 }
 
 func cleanupABottomUp(path string) {
@@ -442,6 +446,10 @@ func cleanupABottomUp(path string) {
 		path = filepath.Dir(path)
 	}
 }
+
+// The two subtests deliberately build different modules, one per dentry
+// resolution path, so this test cannot share one with anybody.
+var _ = declareInlineConfig(TestEventTruncatedParents)
 
 func TestEventTruncatedParents(t *testing.T) {
 	SkipIfNotAvailable(t)

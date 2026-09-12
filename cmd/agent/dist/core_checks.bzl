@@ -1,0 +1,95 @@
+"""
+Agent checks. This file is both cmd/agent/dist/core_checks.bzl and tasks/checks.py
+"""
+
+AGENT_CORECHECKS = [
+    "container",
+    "containerd",
+    "container_image",
+    "container_lifecycle",
+    "cpu",
+    "cri",
+    "datadog_csi_driver",
+    "snmp",
+    "docker",
+    "file_handle",
+    "go_expvar",
+    "io",
+    "jmx",
+    "kubernetes_apiserver",
+    "load",
+    "memory",
+    "ntp",
+    "oom_kill",
+    "oracle",
+    "oracle-dbm",
+    "sbom",
+    "systemd",
+    "tcp_queue_length",
+    "uptime",
+    "jetson",
+    "telemetry",
+    "orchestrator_pod",
+    "orchestrator_kubelet_config",
+    "orchestrator_ecs",
+    "cisco_sdwan",
+    "network_path",
+    "gpu",
+    "nccl",
+    "discovery",
+    "versa",
+    "network_config_management",
+    "cloud_hostinfo",
+]
+
+AIX_CORECHECKS = [
+    "cisco_sdwan",
+    "cloud_hostinfo",
+    "cpu",
+    "disk",
+    "discovery",
+    "io",
+    "load",
+    "memory",
+    "network",
+    "ntp",
+    "oracle",
+    "snmp",
+    "telemetry",
+    "uptime",
+    "versa",
+]
+
+WINDOWS_CORECHECKS = [
+    "agentcrashdetect",
+    "battery",
+    "powershell",
+    "sbom",
+    "thermal",
+    "windows_registry",
+    "winkmem",
+    "wincrashdetect",
+    "windows_certificate",
+    "winproc",
+    "win32_event_log",
+    "wlan",
+]
+
+MACOS_CORECHECKS = [
+    "battery",
+    "thermal",
+    "wlan",
+]
+
+IOT_AGENT_CORECHECKS = [
+    "cpu",
+    "disk",
+    "io",
+    "load",
+    "memory",
+    "network",
+    "ntp",
+    "uptime",
+    "systemd",
+    "jetson",
+]

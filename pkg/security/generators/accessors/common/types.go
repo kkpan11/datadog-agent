@@ -32,18 +32,26 @@ const (
 
 // Module represents everything needed to generate the accessors for a specific module (fields, build tags, ...)
 type Module struct {
-	Name            string
-	SourcePkgPrefix string
-	SourcePkg       string
-	TargetPkg       string
-	BuildTags       []string
-	Fields          map[string]*StructField // Fields only contains fields that are exposed in SECL
-	//GettersOnlyFields map[string]*StructField // GettersOnlyFields only contains fields that have generated getters but are not exposed in SECL
-	AllFields  map[string]*StructField
-	Iterators  map[string]*StructField
-	EventTypes map[string]*EventTypeMetadata
-	Mock       bool
-	Getters    []string
+	Name                string
+	SourcePkgPrefix     string
+	SourcePkg           string
+	TargetPkg           string
+	BuildTags           []string
+	Fields              map[string]*StructField // Fields only contains fields that are exposed in SECL
+	AllFields           map[string]*StructField
+	AllStructFields     interface{} // used for event deep copy generation
+	Iterators           map[string]*StructField
+	EventTypes          map[string]*EventTypeMetadata
+	FileFields          []FileField
+	Mock                bool
+	Getters             []string
+	FieldsOrderByChecks []string
+}
+
+// FileField represents a file field used for `{Get,Validate}FileField` generation
+type FileField struct {
+	Name        string
+	StructField string
 }
 
 // StructField represents a structure field for which an accessor will be generated
@@ -55,6 +63,7 @@ type StructField struct {
 	ReturnType       string
 	IsArray          bool
 	IsLength         bool
+	IsRootDomain     bool
 	Event            string
 	Handler          string
 	Helper           bool // specify the handler as just a helper and not a real resolver. It means that this handler won't be called by the ResolveFields function
@@ -64,7 +73,7 @@ type StructField struct {
 	Iterator         *StructField
 	Weight           int64
 	CommentText      string
-	OpOverrides      string
+	OpOverrides      []string
 	Check            string
 	SetHandler       string
 	Alias            string
@@ -75,6 +84,7 @@ type StructField struct {
 	RestrictedTo     []string
 	IsIterator       bool
 	ReadOnly         bool
+	DefaultValue     string
 }
 
 // GetEvaluatorType returns the evaluator type name
@@ -84,22 +94,22 @@ func (sf *StructField) GetEvaluatorType() string {
 		evaluatorType = "eval.IntEvaluator"
 	} else if sf.ReturnType == "int" {
 		evaluatorType = "eval.IntEvaluator"
-		if sf.Iterator != nil || sf.IsArray {
+		if sf.Iterator != nil || (sf.IsArray && !sf.IsLength) {
 			evaluatorType = "eval.IntArrayEvaluator"
 		}
 	} else if sf.ReturnType == "bool" {
 		evaluatorType = "eval.BoolEvaluator"
-		if sf.Iterator != nil || sf.IsArray {
+		if sf.Iterator != nil || (sf.IsArray && !sf.IsLength) {
 			evaluatorType = "eval.BoolArrayEvaluator"
 		}
 	} else if sf.ReturnType == "net.IPNet" {
 		evaluatorType = "eval.CIDREvaluator"
-		if sf.Iterator != nil || sf.IsArray {
+		if sf.Iterator != nil || (sf.IsArray && !sf.IsLength) {
 			evaluatorType = "eval.CIDRArrayEvaluator"
 		}
 	} else {
 		evaluatorType = "eval.StringEvaluator"
-		if sf.Iterator != nil || sf.IsArray {
+		if sf.Iterator != nil || (sf.IsArray && !sf.IsLength) {
 			evaluatorType = "eval.StringArrayEvaluator"
 		}
 	}
@@ -108,6 +118,10 @@ func (sf *StructField) GetEvaluatorType() string {
 
 // GetDefaultReturnValue returns default value for the given return type
 func (sf *StructField) GetDefaultReturnValue() string {
+	if sf.DefaultValue != "" {
+		return sf.DefaultValue
+	}
+
 	if sf.ReturnType == "int" {
 		if sf.Iterator != nil || sf.IsArray {
 			return "[]int{}"
@@ -120,7 +134,7 @@ func (sf *StructField) GetDefaultReturnValue() string {
 		return "false"
 	} else if sf.ReturnType == "net.IPNet" {
 		if sf.IsArray {
-			return "&eval.CIDRValues{}"
+			return "[]net.IPNet{}"
 		}
 		return "net.IPNet{}"
 	} else if sf.Iterator != nil || sf.IsArray {

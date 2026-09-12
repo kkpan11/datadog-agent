@@ -18,10 +18,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/quantile"
-
 	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
+	"github.com/DataDog/datadog-agent/pkg/util/quantile"
 )
 
 // AssertPointsEqual evaluate if two list of point are equal (order doesn't matters).
@@ -120,7 +119,6 @@ func assertSketchSeriesEqualWithComparator(t assert.TestingT, exp, act *SketchSe
 
 	assert.Equal(t, exp.Host, act.Host, "Host")
 	assert.Equal(t, exp.Interval, act.Interval, "Interval")
-	assert.Equal(t, exp.ContextKey, act.ContextKey, "ContextKey")
 
 	switch {
 	case len(exp.Points) != len(act.Points):
@@ -152,7 +150,6 @@ type tHelper interface {
 
 var _ SketchesSource = (*SketchesSourceTest)(nil)
 
-//nolint:revive // TODO(AML) Fix revive linter
 type SketchesSourceTest struct {
 	values       SketchSeriesList
 	currentIndex int
@@ -162,49 +159,43 @@ type SketchesSourceTest struct {
 func NewSketchesSourceTestWithSketch() *SketchesSourceTest {
 	return &SketchesSourceTest{
 		currentIndex: -1,
-		values:       SketchSeriesList{&SketchSeries{Name: "fakename", Host: "fakehost"}},
+		values: SketchSeriesList{
+			&SketchSeries{DistributionMetadata: DistributionMetadata{Name: "fakename", Host: "fakehost"}},
+		},
 	}
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func NewSketchesSourceTest() *SketchesSourceTest {
 	return &SketchesSourceTest{
 		currentIndex: -1,
 	}
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (s *SketchesSourceTest) MoveNext() bool {
 	s.currentIndex++
 	return s.currentIndex < len(s.values)
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
-func (s *SketchesSourceTest) Current() *SketchSeries {
+func (s *SketchesSourceTest) Current() Distribution {
 	return s.values[s.currentIndex]
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (s *SketchesSourceTest) Count() uint64 {
 	return uint64(len(s.values))
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (s *SketchesSourceTest) Append(sketches *SketchSeries) {
 	s.values = append(s.values, sketches)
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (s *SketchesSourceTest) Get(index int) *SketchSeries {
 	return s.values[index]
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (s *SketchesSourceTest) Reset() {
 	s.currentIndex = -1
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (s *SketchesSourceTest) WaitForValue() bool {
 	return true
 }

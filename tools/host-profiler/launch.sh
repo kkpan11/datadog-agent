@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+set -e
+
+DD_API_KEY="$(sudo cat /run/secrets/dd-api-key)"
+export DD_API_KEY
+
+sudo mountpoint -q /sys/kernel/tracing || sudo mount -t tracefs tracefs /sys/kernel/tracing
+
+cd /app
+
+# Run the profiler (uses localhost for agent connection via shared network namespace)
+# IPC artifacts (auth_token, ipc_cert.pem) are in /etc/datadog-agent from shared volume
+sudo -E ./bin/host-profiler/host-profiler run \
+  --core-config /etc/datadog-agent/datadog.yaml

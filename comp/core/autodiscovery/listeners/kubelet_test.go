@@ -12,9 +12,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
+	adtypes "github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/types"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
+	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
+	workloadmetamock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/mock"
 )
 
 const (
@@ -70,10 +77,10 @@ func TestKubeletCreatePodService(t *testing.T) {
 			},
 			expectedServices: map[string]wlmListenerSvc{
 				"kubernetes_pod://foobar": {
-					service: &service{
+					service: &WorkloadService{
 						entity:        pod,
 						adIdentifiers: []string{"kubernetes_pod://foobar"},
-						ports: []ContainerPort{
+						ports: []workloadmeta.ContainerPort{
 							{
 								Port: 22,
 								Name: "ssh",
@@ -136,12 +143,14 @@ func TestKubeletCreateContainerService(t *testing.T) {
 		IP: "127.0.0.1",
 	}
 
+	podWithTolerateUnreadyAnnotation := podWithAnnotations.DeepCopy().(*workloadmeta.KubernetesPod)
+	podWithTolerateUnreadyAnnotation.Annotations["ad.datadoghq.com/tolerate-unready"] = "true"
+
 	podWithExcludeAnnotation := podWithAnnotations.DeepCopy().(*workloadmeta.KubernetesPod)
 	podWithExcludeAnnotation.Annotations[fmt.Sprintf("ad.datadoghq.com/%s.exclude", containerName)] = `true`
 
 	podWithMetricsExcludeAnnotation := podWithAnnotations.DeepCopy().(*workloadmeta.KubernetesPod)
 	podWithMetricsExcludeAnnotation.Annotations[fmt.Sprintf("ad.datadoghq.com/%s.metrics_exclude", containerName)] = `true`
-	podWithMetricsExcludeAnnotation.Annotations[tolerateUnreadyAnnotation] = `true`
 
 	podWithLogsExcludeAnnotation := podWithAnnotations.DeepCopy().(*workloadmeta.KubernetesPod)
 	podWithLogsExcludeAnnotation.Annotations[fmt.Sprintf("ad.datadoghq.com/%s.logs_exclude", containerName)] = `true`
@@ -247,9 +256,10 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: basicContainer,
 						adIdentifiers: []string{
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"gcr.io/foobar:latest",
 							"foobar",
@@ -257,13 +267,14 @@ func TestKubeletCreateContainerService(t *testing.T) {
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports: []ContainerPort{},
+						ports: []workloadmeta.ContainerPort{},
 						extraConfig: map[string]string{
 							"namespace": podNamespace,
 							"pod_name":  podName,
 							"pod_uid":   podID,
 						},
-						tagger: taggerComponent,
+						tagger:    taggerComponent,
+						imageName: "foobar",
 					},
 				},
 			},
@@ -280,23 +291,25 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: recentlyStoppedContainer,
 						adIdentifiers: []string{
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"foobar",
 						},
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports:           []ContainerPort{},
+						ports:           []workloadmeta.ContainerPort{},
 						metricsExcluded: true,
 						extraConfig: map[string]string{
 							"namespace": podNamespace,
 							"pod_name":  podName,
 							"pod_uid":   podID,
 						},
-						tagger: taggerComponent,
+						tagger:    taggerComponent,
+						imageName: "foobar",
 					},
 				},
 			},
@@ -336,22 +349,24 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: runningContainerWithFinishedAtTime,
 						adIdentifiers: []string{
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"foobar",
 						},
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports: []ContainerPort{},
+						ports: []workloadmeta.ContainerPort{},
 						extraConfig: map[string]string{
 							"namespace": podNamespace,
 							"pod_name":  podName,
 							"pod_uid":   podID,
 						},
-						tagger: taggerComponent,
+						tagger:    taggerComponent,
+						imageName: "foobar",
 					},
 				},
 			},
@@ -368,16 +383,17 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: multiplePortsContainer,
 						adIdentifiers: []string{
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"foobar",
 						},
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports: []ContainerPort{
+						ports: []workloadmeta.ContainerPort{
 							{
 								Port: 22,
 								Name: "ssh",
@@ -392,7 +408,8 @@ func TestKubeletCreateContainerService(t *testing.T) {
 							"pod_name":  podName,
 							"pod_uid":   podID,
 						},
-						tagger: taggerComponent,
+						tagger:    taggerComponent,
+						imageName: "foobar",
 					},
 				},
 			},
@@ -409,24 +426,26 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: customIDsContainer,
 						adIdentifiers: []string{
 							"customid",
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"foobar",
 						},
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports:      []ContainerPort{},
+						ports:      []workloadmeta.ContainerPort{},
 						checkNames: []string{"customcheck"},
 						extraConfig: map[string]string{
 							"namespace": podNamespace,
 							"pod_name":  podName,
 							"pod_uid":   podID,
 						},
-						tagger: taggerComponent,
+						tagger:    taggerComponent,
+						imageName: "foobar",
 					},
 				},
 			},
@@ -454,17 +473,18 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: customIDsContainer,
 						adIdentifiers: []string{
 							"customid",
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"foobar",
 						},
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports:      []ContainerPort{},
+						ports:      []workloadmeta.ContainerPort{},
 						checkNames: []string{"customcheck"},
 						extraConfig: map[string]string{
 							"namespace": podNamespace,
@@ -473,7 +493,7 @@ func TestKubeletCreateContainerService(t *testing.T) {
 						},
 						metricsExcluded: true,
 						tagger:          taggerComponent,
-						ready:           true,
+						imageName:       "foobar",
 					},
 				},
 			},
@@ -490,17 +510,18 @@ func TestKubeletCreateContainerService(t *testing.T) {
 			expectedServices: map[string]wlmListenerSvc{
 				"container://foobarquux": {
 					parent: "kubernetes_pod://foobar",
-					service: &service{
+					service: &WorkloadService{
 						entity: customIDsContainer,
 						adIdentifiers: []string{
 							"customid",
+							adtypes.KubeContainerNameIdentifier(containerName),
 							"docker://foobarquux",
 							"foobar",
 						},
 						hosts: map[string]string{
 							"pod": "127.0.0.1",
 						},
-						ports:      []ContainerPort{},
+						ports:      []workloadmeta.ContainerPort{},
 						checkNames: []string{"customcheck"},
 						extraConfig: map[string]string{
 							"namespace": podNamespace,
@@ -509,6 +530,44 @@ func TestKubeletCreateContainerService(t *testing.T) {
 						},
 						logsExcluded: true,
 						tagger:       taggerComponent,
+						imageName:    "foobar",
+					},
+				},
+			},
+		},
+		{
+			name: "pod with tolerate-unready annotation",
+			pod:  podWithTolerateUnreadyAnnotation,
+			podContainer: &workloadmeta.OrchestratorContainer{
+				ID:    containerID,
+				Name:  containerName,
+				Image: basicImage,
+			},
+			container: customIDsContainer,
+			expectedServices: map[string]wlmListenerSvc{
+				"container://foobarquux": {
+					parent: "kubernetes_pod://foobar",
+					service: &WorkloadService{
+						entity: customIDsContainer,
+						adIdentifiers: []string{
+							"customid",
+							adtypes.KubeContainerNameIdentifier(containerName),
+							"docker://foobarquux",
+							"foobar",
+						},
+						hosts: map[string]string{
+							"pod": "127.0.0.1",
+						},
+						ports:      []workloadmeta.ContainerPort{},
+						checkNames: []string{"customcheck"},
+						extraConfig: map[string]string{
+							"namespace": podNamespace,
+							"pod_name":  podName,
+							"pod_uid":   podID,
+						},
+						tagger:    taggerComponent,
+						ready:     true, // // Because of the tolerate-unready annotation
+						imageName: "foobar",
 					},
 				},
 			},
@@ -526,8 +585,231 @@ func TestKubeletCreateContainerService(t *testing.T) {
 	}
 }
 
+func TestProcessPodWithEphemeralContainer(t *testing.T) {
+	taggerComponent := taggerfxmock.SetupFakeTagger(t)
+	listener, wlm := newKubeletListener(t, taggerComponent)
+
+	ephemeralContainerID := "ephemeral-container-id"
+	ephemeralContainerName := "debug-container"
+
+	pod := &workloadmeta.KubernetesPod{
+		EntityID: workloadmeta.EntityID{
+			Kind: workloadmeta.KindKubernetesPod,
+			ID:   podID,
+		},
+		EntityMeta: workloadmeta.EntityMeta{
+			Name:      podName,
+			Namespace: podNamespace,
+		},
+		EphemeralContainers: []workloadmeta.OrchestratorContainer{
+			{
+				ID:   ephemeralContainerID,
+				Name: ephemeralContainerName,
+				Image: workloadmeta.ContainerImage{
+					RawName:   "debug-image",
+					ShortName: "debug-image",
+				},
+			},
+		},
+		IP: "127.0.0.1",
+	}
+
+	container := &workloadmeta.Container{
+		EntityID: workloadmeta.EntityID{
+			Kind: workloadmeta.KindContainer,
+			ID:   ephemeralContainerID,
+		},
+		EntityMeta: workloadmeta.EntityMeta{
+			Name: ephemeralContainerName,
+		},
+		Image: workloadmeta.ContainerImage{
+			RawName:   "debug-image",
+			ShortName: "debug-image",
+		},
+		State: workloadmeta.ContainerState{
+			Running: true,
+		},
+		Runtime: workloadmeta.ContainerRuntimeDocker,
+	}
+
+	wlm.Store().(workloadmetamock.Mock).Set(container)
+
+	listener.processPod(pod)
+
+	expectedServices := map[string]wlmListenerSvc{
+		"container://ephemeral-container-id": {
+			parent: "kubernetes_pod://foobar",
+			service: &WorkloadService{
+				entity: container,
+				adIdentifiers: []string{
+					adtypes.KubeContainerNameIdentifier(ephemeralContainerName),
+					"docker://ephemeral-container-id",
+					"debug-image",
+				},
+				hosts: map[string]string{
+					"pod": "127.0.0.1",
+				},
+				ports: []workloadmeta.ContainerPort{},
+				extraConfig: map[string]string{
+					"namespace": podNamespace,
+					"pod_name":  podName,
+					"pod_uid":   podID,
+				},
+				tagger:    taggerComponent,
+				imageName: "debug-image",
+			},
+		},
+		"kubernetes_pod://foobar": {
+			service: &WorkloadService{
+				entity:        pod,
+				adIdentifiers: []string{"kubernetes_pod://foobar"},
+				hosts: map[string]string{
+					"pod": "127.0.0.1",
+				},
+				ready:     true,
+				tagger:    taggerComponent,
+				imageName: "",
+			},
+		},
+	}
+
+	wlm.assertServices(expectedServices)
+}
+
+func TestAreTagsComplete(t *testing.T) {
+	podEntityID := types.NewEntityID(types.KubernetesPodUID, podID)
+	containerEntityID := types.NewEntityID(types.ContainerID, containerID)
+
+	tests := []struct {
+		name     string
+		pod      *workloadmeta.KubernetesPod
+		tagInfos []*types.TagInfo
+		expected bool
+	}{
+		{
+			name: "pod and container complete",
+			pod: &workloadmeta.KubernetesPod{
+				EntityID: workloadmeta.EntityID{
+					Kind: workloadmeta.KindKubernetesPod,
+					ID:   podID,
+				},
+				Containers: []workloadmeta.OrchestratorContainer{
+					{
+						ID:   containerID,
+						Name: containerName,
+					},
+				},
+			},
+			tagInfos: []*types.TagInfo{
+				{
+					Source:      "source",
+					EntityID:    podEntityID,
+					LowCardTags: []string{"kube_namespace:default"},
+					IsComplete:  true,
+				},
+				{
+					Source:      "source",
+					EntityID:    containerEntityID,
+					LowCardTags: []string{"container_name:agent"},
+					IsComplete:  true,
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "pod incomplete",
+			pod: &workloadmeta.KubernetesPod{
+				EntityID: workloadmeta.EntityID{
+					Kind: workloadmeta.KindKubernetesPod,
+					ID:   podID,
+				},
+			},
+			tagInfos: []*types.TagInfo{
+				{
+					Source:      "source",
+					EntityID:    podEntityID,
+					LowCardTags: []string{"kube_namespace:default"},
+					IsComplete:  false,
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "container incomplete",
+			pod: &workloadmeta.KubernetesPod{
+				EntityID: workloadmeta.EntityID{
+					Kind: workloadmeta.KindKubernetesPod,
+					ID:   podID,
+				},
+				Containers: []workloadmeta.OrchestratorContainer{
+					{
+						ID:   containerID,
+						Name: containerName,
+					},
+				},
+			},
+			tagInfos: []*types.TagInfo{
+				{
+					Source:      "source",
+					EntityID:    podEntityID,
+					LowCardTags: []string{"kube_namespace:default"},
+					IsComplete:  true,
+				},
+				{
+					Source:      "source",
+					EntityID:    containerEntityID,
+					LowCardTags: []string{"container_name:agent"},
+					IsComplete:  false,
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "container not in tagger",
+			pod: &workloadmeta.KubernetesPod{
+				EntityID: workloadmeta.EntityID{
+					Kind: workloadmeta.KindKubernetesPod,
+					ID:   podID,
+				},
+				Containers: []workloadmeta.OrchestratorContainer{
+					{
+						ID:   "unknown-container",
+						Name: "unknown",
+					},
+				},
+			},
+			tagInfos: []*types.TagInfo{
+				{
+					Source:      "source",
+					EntityID:    podEntityID,
+					LowCardTags: []string{"kube_namespace:default"},
+					IsComplete:  true,
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			taggerMock := taggerfxmock.SetupFakeTagger(t)
+			taggerMock.GetTagStore().ProcessTagInfo(test.tagInfos)
+			listener, _ := newKubeletListener(t, taggerMock)
+
+			assert.Equal(t, test.expected, listener.areTagsComplete(test.pod))
+		})
+	}
+}
+
 func newKubeletListener(t *testing.T, tagger tagger.Component) (*KubeletListener, *testWorkloadmetaListener) {
 	wlm := newTestWorkloadmetaListener(t)
+	filterStore := workloadfilterfxmock.SetupMockFilter(t)
 
-	return &KubeletListener{workloadmetaListener: wlm, tagger: tagger}, wlm
+	return &KubeletListener{
+		workloadmetaListener: wlm,
+		globalFilter:         filterStore.GetContainerAutodiscoveryFilters(workloadfilter.GlobalFilter),
+		metricsFilter:        filterStore.GetContainerAutodiscoveryFilters(workloadfilter.MetricsFilter),
+		logsFilter:           filterStore.GetContainerAutodiscoveryFilters(workloadfilter.LogsFilter),
+		tagger:               tagger,
+	}, wlm
 }

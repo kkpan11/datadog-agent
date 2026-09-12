@@ -26,6 +26,12 @@ const (
 	HashTriggerTimeout = "timeout"
 	// HashTriggerProcessExit hash triggered on process exit
 	HashTriggerProcessExit = "process_exit"
+
+	// maxRetryForMsgWithHashAction is the maximum number of retries for a hash action.
+	// Hash reports are resolved after at most defaultHashActionFlushDelay (5s). This value
+	// must be large enough that maxRetryForMsgWithHashAction * retryDelay (200ms) > 5s with
+	// a comfortable margin. 50 × 200ms = 10s.
+	maxRetryForMsgWithHashAction = 50
 )
 
 // HashActionReport defines a hash action reports
@@ -39,13 +45,14 @@ type HashActionReport struct {
 	Trigger string `json:"trigger"`
 
 	// internal
-	resolved  bool
-	rule      *rules.Rule
-	pid       uint32
-	seenAt    time.Time
-	fileEvent model.FileEvent
-	crtID     containerutils.ContainerID
-	eventType model.EventType
+	resolved    bool
+	rule        *rules.Rule
+	pid         uint32
+	seenAt      time.Time
+	fileEvent   model.FileEvent
+	cgroupID    containerutils.CGroupID
+	eventType   model.EventType
+	maxFileSize int64
 }
 
 // IsResolved return if the action is resolved
@@ -58,6 +65,11 @@ func (k *HashActionReport) IsResolved() error {
 	}
 
 	return fmt.Errorf("hash action current state: %+v", k)
+}
+
+// MaxRetry implements the DelayabledEvent interface for hash actions
+func (k *HashActionReport) MaxRetry() int {
+	return maxRetryForMsgWithHashAction
 }
 
 // ToJSON marshal the action
@@ -93,4 +105,56 @@ func (k *HashActionReport) PatchEvent(ev *serializers.EventSerializer) {
 
 	ev.FileEventSerializer.HashState = k.fileEvent.HashState.String()
 	ev.FileEventSerializer.Hashes = k.fileEvent.Hashes
+}
+
+// RawPacketActionReport defines a raw packet action reports
+// easyjson:json
+type RawPacketActionReport struct {
+	sync.RWMutex
+
+	Filter string                `json:"filter"`
+	Policy string                `json:"policy"`
+	Status RawPacketActionStatus `json:"status"`
+	Scope  string                `json:"scope"`
+
+	// internal
+	rule *rules.Rule
+}
+
+type RawPacketActionStatus string
+
+const (
+	RawPacketActionStatusPerformed RawPacketActionStatus = "performed"
+	RawPacketActionStatusError     RawPacketActionStatus = "error"
+)
+
+// IsResolved return if the action is resolved
+func (k *RawPacketActionReport) IsResolved() error {
+	return nil
+}
+
+// MaxRetry implements the DelayabledEvent interface for raw packet actions
+func (k *RawPacketActionReport) MaxRetry() int {
+	return 0
+}
+
+// ToJSON marshal the action
+func (k *RawPacketActionReport) ToJSON() ([]byte, error) {
+	k.Lock()
+	defer k.Unlock()
+
+	data, err := utils.MarshalEasyJSON(k)
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// IsMatchingRule returns true if this action report is targeted at the given rule ID
+func (k *RawPacketActionReport) IsMatchingRule(ruleID eval.RuleID) bool {
+	k.RLock()
+	defer k.RUnlock()
+
+	return k.rule.ID == ruleID
 }

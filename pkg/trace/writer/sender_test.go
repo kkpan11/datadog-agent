@@ -15,13 +15,16 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
+
+	"github.com/DataDog/datadog-go/v5/statsd"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
-	"github.com/DataDog/datadog-go/v5/statsd"
 )
 
 const testAPIKey = "123"
@@ -65,9 +68,11 @@ func TestMaxConns(t *testing.T) {
 func TestIsRetriable(t *testing.T) {
 	for code, want := range map[int]bool{
 		400: false,
+		403: false, // 403 is only retried when API key refresh is available
 		404: false,
 		408: true,
 		409: false,
+		429: true,
 		500: true,
 		503: true,
 		505: true,
@@ -81,32 +86,16 @@ func TestIsRetriable(t *testing.T) {
 }
 
 func TestSender(t *testing.T) {
-	statsd := &statsd.NoOpClient{}
-	const climit = 100
-	testSenderConfig := func(serverURL string) *senderConfig {
-		url, err := url.Parse(serverURL + "/")
-		if err != nil {
-			t.Fatal(err)
-		}
-		cfg := config.New()
-		cfg.ConnectionResetInterval = 0
-		return &senderConfig{
-			client:     cfg.NewHTTPClient(),
-			url:        url,
-			maxConns:   climit,
-			maxQueued:  40,
-			maxRetries: 4,
-			apiKey:     testAPIKey,
-			userAgent:  "testUserAgent",
-		}
-	}
-
 	t.Run("accept", func(t *testing.T) {
 		assert := assert.New(t)
 		server := newTestServer()
 		defer server.Close()
 
-		s := newSender(testSenderConfig(server.URL), statsd)
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for i := 0; i < 20; i++ {
 			s.Push(expectResponses(200))
 		}
@@ -123,8 +112,9 @@ func TestSender(t *testing.T) {
 		server := newTestServerWithLatency(50 * time.Millisecond)
 		defer server.Close()
 
-		s := newSender(testSenderConfig(server.URL), statsd)
-		for i := 0; i < climit*2; i++ {
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+		for i := 0; i < s.cfg.maxConns*2; i++ {
 			// we have to sleep for a bit to yield to the receiver, otherwise
 			// the channel will get immediately full.
 			time.Sleep(time.Millisecond)
@@ -132,9 +122,9 @@ func TestSender(t *testing.T) {
 		}
 		s.Stop()
 
-		assert.True(server.Peak() <= climit)
-		assert.Equal(climit*2, server.Total(), "total")
-		assert.Equal(climit*2, server.Accepted(), "accepted")
+		assert.True(server.Peak() <= s.cfg.maxConns)
+		assert.Equal(s.cfg.maxConns*2, server.Total(), "total")
+		assert.Equal(s.cfg.maxConns*2, server.Accepted(), "accepted")
 		assert.Equal(0, server.Retried(), "retry")
 		assert.Equal(0, server.Failed(), "failed")
 	})
@@ -144,7 +134,8 @@ func TestSender(t *testing.T) {
 		server := newTestServer()
 		defer server.Close()
 
-		s := newSender(testSenderConfig(server.URL), statsd)
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
 		for i := 0; i < 20; i++ {
 			s.Push(expectResponses(404))
 		}
@@ -167,7 +158,8 @@ func TestSender(t *testing.T) {
 			return time.Nanosecond
 		}
 
-		s := newSender(testSenderConfig(server.URL), statsd)
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
 		s.Push(expectResponses(503, 408, 200))
 		s.Stop()
 
@@ -183,10 +175,11 @@ func TestSender(t *testing.T) {
 		defer server.Close()
 		defer useBackoffDuration(time.Millisecond)()
 
-		s := newSender(testSenderConfig(server.URL), statsd)
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
 		s.Push(expectResponses(503, 503, 200))
 		for i := 0; i < 20; i++ {
-			s.Push(expectResponses(403))
+			s.Push(expectResponses(404))
 		}
 
 		s.Stop()
@@ -207,7 +200,8 @@ func TestSender(t *testing.T) {
 			wg.Done()
 		}))
 		defer server.Close()
-		s := newSender(testSenderConfig(server.URL), statsd)
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
 		s.Push(expectResponses(http.StatusOK))
 		s.Stop()
 		wg.Wait()
@@ -220,9 +214,10 @@ func TestSender(t *testing.T) {
 		defer useBackoffDuration(0)()
 
 		var recorder mockRecorder
-		cfg := testSenderConfig(server.URL)
-		cfg.recorder = &recorder
-		s := newSender(cfg, statsd)
+
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+		s.cfg.recorder = &recorder
 
 		// push a couple of payloads
 		start := time.Now()
@@ -230,7 +225,7 @@ func TestSender(t *testing.T) {
 		s.Push(expectResponses(200))
 		s.Push(expectResponses(200))
 		for i := 0; i < 4; i++ {
-			s.Push(expectResponses(403))
+			s.Push(expectResponses(404))
 		}
 		s.Stop()
 
@@ -246,7 +241,7 @@ func TestSender(t *testing.T) {
 		sent := recorder.data(eventTypeSent)
 		assert.Equal(3, len(sent))
 		for i := 0; i < 3; i++ {
-			assert.True(sent[i].bytes > len("|403"))
+			assert.True(sent[i].bytes > len("|404"))
 			assert.NoError(sent[i].err)
 			assert.Equal(1, sent[i].count)
 			assert.True(time.Since(start)-sent[i].duration < time.Second)
@@ -255,8 +250,8 @@ func TestSender(t *testing.T) {
 		failed := recorder.data(eventTypeRejected)
 		assert.Equal(4, len(failed))
 		for i := 0; i < 4; i++ {
-			assert.True(failed[i].bytes > len("|403"))
-			assert.Equal("403 Forbidden", failed[i].err.Error())
+			assert.True(failed[i].bytes > len("|404"))
+			assert.Equal("404 Not Found", failed[i].err.Error())
 			assert.Equal(1, failed[i].count)
 			assert.True(time.Since(start)-failed[i].duration < time.Second)
 		}
@@ -273,10 +268,11 @@ func TestSender(t *testing.T) {
 			defer server.Close()
 		}
 
-		senders := []*sender{
-			newSender(testSenderConfig(servers[0].URL), statsd),
-			newSender(testSenderConfig(servers[1].URL), statsd),
-			newSender(testSenderConfig(servers[2].URL), statsd),
+		senders := make([]*sender, 3)
+		for i := range 3 {
+			s, err := newTestSender(servers[i].URL)
+			assert.NoError(err)
+			senders[i] = s
 		}
 		// Enable and failover MRF on s1, enable and not failover on s2, disabled on s3
 		senders[0].cfg.isMRF = true
@@ -313,6 +309,178 @@ func TestSender(t *testing.T) {
 		assert.Equal(0, servers[2].Retried(), "retry")
 		assert.Equal(20, servers[2].Failed(), "failed")
 	})
+
+	t.Run("403_secrets_refresh_fn", func(t *testing.T) {
+		assert := assert.New(t)
+		server := newTestServer()
+		defer server.Close()
+
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+
+		callbackInvoked := false
+		s.apiKeyManager.refreshFn = func() (string, error) {
+			callbackInvoked = true
+			return "secrets refreshed", nil
+		}
+		s.apiKeyManager.throttleInterval = 100 * time.Millisecond
+
+		s.Push(expectResponses(403))
+		s.Stop()
+
+		assert.True(callbackInvoked, "secrets refresh callback should have been invoked on 403")
+	})
+	t.Run("403_secrets_refresh_fn_nil", func(t *testing.T) {
+		assert := assert.New(t)
+		server := newTestServer()
+		defer server.Close()
+
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+
+		assert.NotPanics(func() {
+			s.Push(expectResponses(403))
+			s.Stop()
+		})
+	})
+
+	t.Run("403_refresh_disabled_not_retried", func(t *testing.T) {
+		assert := assert.New(t)
+		server := newTestServer()
+		defer server.Close()
+		defer useBackoffDuration(time.Nanosecond)()
+
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+
+		// Refresh wired but disabled (throttle == 0): a 403 must not be retried.
+		callbackInvoked := false
+		s.apiKeyManager.refreshFn = func() (string, error) {
+			callbackInvoked = true
+			return "secrets refreshed", nil
+		}
+		s.apiKeyManager.throttleInterval = 0
+
+		s.Push(expectResponses(403, 403, 403, 403, 200))
+		s.Stop()
+
+		assert.Equal(1, server.Total(), "403 must not be retried when refresh is disabled")
+		assert.False(callbackInvoked, "refresh must not run when disabled")
+	})
+
+	t.Run("403_not_retried_when_key_not_from_secret", func(t *testing.T) {
+		assert := assert.New(t)
+		server := newTestServer()
+		defer server.Close()
+		defer useBackoffDuration(time.Nanosecond)()
+
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+
+		// Refresh enabled, but the key isn't secret-backed: refresh can't change it, so no retry.
+		callbackInvoked := false
+		s.apiKeyManager.refreshFn = func() (string, error) { callbackInvoked = true; return "", nil }
+		s.apiKeyManager.throttleInterval = 100 * time.Millisecond
+		s.apiKeyManager.isFromSecret = func(string) bool { return false }
+
+		s.Push(expectResponses(403, 403, 403, 403, 200))
+		s.Stop()
+
+		assert.Equal(1, server.Total(), "403 must not be retried when key is not secret-backed")
+		assert.False(callbackInvoked, "refresh must not run when key is not secret-backed")
+	})
+
+	t.Run("403_retries_with_backoff", func(t *testing.T) {
+		assert := assert.New(t)
+		server := newTestServer()
+		defer server.Close()
+		defer useBackoffDuration(time.Nanosecond)()
+
+		s, err := newTestSender(server.URL)
+		assert.NoError(err)
+
+		callbackInvoked := false
+		s.apiKeyManager.refreshFn = func() (string, error) {
+			callbackInvoked = true
+			return "secrets refreshed", nil
+		}
+		s.apiKeyManager.throttleInterval = 100 * time.Millisecond
+
+		assert.NoError(err)
+		s.Push(expectResponses(403, 403, 200))
+		s.Stop()
+
+		assert.Equal(3, server.Total(), "should have made 3 requests")
+		assert.Equal(2, server.Retried(), "should have retried twice")
+		assert.Equal(1, server.Accepted(), "should have succeeded once")
+		assert.True(callbackInvoked, "secrets refresh callback should have been invoked on 403")
+	})
+
+	t.Run("403_throttles_refresh", func(t *testing.T) {
+		server := newTestServer() // outside the synctest bubble: its Accept loop never durably blocks
+		defer server.Close()
+		synctest.Test(t, syncTest403ThrottlesRefresh(server))
+	})
+}
+
+func syncTest403ThrottlesRefresh(server *testServer) func(*testing.T) {
+	return func(t *testing.T) {
+		assert := assert.New(t)
+		defer useBackoffDuration(time.Nanosecond)()
+
+		s, err := newInProcessTestSender(server)
+		assert.NoError(err)
+
+		callCount := 0
+		s.apiKeyManager.refreshFn = func() (string, error) {
+			callCount++
+			return "secrets refreshed", nil
+		}
+		s.apiKeyManager.throttleInterval = 100 * time.Millisecond
+
+		// First 403 should trigger refresh
+		s.Push(expectResponses(403))
+		s.WaitForInflight()
+		assert.Equal(1, callCount, "first 403 should trigger refresh")
+
+		s.Push(expectResponses(403))
+		s.WaitForInflight()
+		assert.Equal(1, callCount, "second 403 should be throttled")
+
+		// Wait for throttle interval to expire
+		time.Sleep(110 * time.Millisecond)
+
+		s.Push(expectResponses(403))
+		s.WaitForInflight()
+		assert.Equal(2, callCount, "third 403 after throttle should trigger refresh")
+
+		s.Stop()
+	}
+}
+
+// TestIsEnabledConcurrent verifies that concurrent calls to isEnabled on an MRF
+// sender don't race on the enabled field. isEnabled is invoked concurrently in
+// production from multiple producers calling sendPayloads on the same *sender.
+func TestIsEnabledConcurrent(t *testing.T) {
+	server := newTestServer()
+	defer server.Close()
+
+	s, err := newTestSender(server.URL)
+	assert.NoError(t, err)
+	defer s.Stop()
+
+	s.cfg.isMRF = true
+	failover := atomic.NewBool(false)
+	s.cfg.MRFFailoverAPM = failover.Load
+
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			failover.Store(i%2 == 0)
+			s.isEnabled()
+		})
+	}
+	wg.Wait()
 }
 
 func TestPayload(t *testing.T) {
@@ -403,4 +571,44 @@ func (r *mockRecorder) recordEvent(t eventType, data *eventData) {
 	case eventTypeRejected:
 		r.rejected = append(r.rejected, data)
 	}
+}
+
+func newTestSender(serverURL string) (*sender, error) {
+	cfg := config.New()
+	cfg.ConnectionResetInterval = 0
+	return newTestSenderWithClient(serverURL, cfg.NewHTTPClient())
+}
+
+func newTestSenderWithClient(serverURL string, client *config.ResetClient) (*sender, error) {
+	url, err := url.Parse(serverURL + "/")
+	if err != nil {
+		return nil, err
+	}
+	scfg := &senderConfig{
+		client:     client,
+		url:        url,
+		maxConns:   100,
+		maxQueued:  40,
+		maxRetries: 4,
+		userAgent:  "testUserAgent",
+	}
+	apiKeyManager := &apiKeyManager{
+		apiKey: testAPIKey,
+	}
+	statsd := &statsd.NoOpClient{}
+	return newSender(scfg, apiKeyManager, statsd), nil
+}
+
+func newInProcessTestSender(server *testServer) (*sender, error) {
+	return newTestSenderWithClient(server.URL, config.NewResetClient(0, func() *http.Client {
+		return &http.Client{Transport: handlerTransport(server.ServeHTTP)}
+	}))
+}
+
+type handlerTransport http.HandlerFunc
+
+func (tr handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	tr(rec, req)
+	return rec.Result(), nil
 }

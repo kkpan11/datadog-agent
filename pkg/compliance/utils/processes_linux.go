@@ -10,7 +10,8 @@ package utils
 import (
 	// We wrap pkg/security/utils here only for compat reason to be able to
 	// still compile pkg/compliance on !linux.
-	"fmt"
+
+	"errors"
 
 	secutils "github.com/DataDog/datadog-agent/pkg/security/utils"
 
@@ -23,7 +24,9 @@ type ContainerID string
 // GetProcessContainerID returns the container ID associated with the given
 // process ID. Returns an empty string if no container found.
 func GetProcessContainerID(pid int32) (ContainerID, bool) {
-	containerID, err := secutils.GetProcContainerID(uint32(pid), uint32(pid))
+	cfs := secutils.DefaultCGroupFS()
+
+	containerID, _, _, err := cfs.FindCGroupContext(uint32(pid), uint32(pid))
 	if containerID == "" || err != nil {
 		return "", false
 	}
@@ -62,5 +65,5 @@ func GetContainerOverlayPath(pid int32) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("could not find overlay mountpoint")
+	return "", errors.New("could not find overlay mountpoint")
 }

@@ -3,14 +3,15 @@
 
 #define LOAD_CONSTANT(param, var) asm("%0 = " param " ll" \
                                       : "=r"(var))
-#define IS_UNHANDLED_ERROR(retval) retval < 0 && retval != -EACCES && retval != -EPERM
+#define IS_UNHANDLED_ERROR(retval) !capture_all_errors_enabled() && retval < 0 && retval != -EACCES && retval != -EPERM
 #define IS_ERR(ptr) ((unsigned long)(ptr) > (unsigned long)(-1000))
-#define IS_KTHREAD(ppid, pid) ppid == 2 || pid == 2
+#define IS_KTHREADD(pid) (pid == 2)
+#define IS_KERNEL_THREAD(pid) (IS_KTHREADD(pid) || bpf_map_lookup_elem(&kernel_thread_pids, &pid)) // will be reported as kworker userspace side
 #define NS_TO_SEC(x) (x) / 1000000000
 #define SEC_TO_NS(x) (x) * 1000000000
 
 #define PARSE_FUNC(STRUCT)                                                                                \
-    __attribute__((always_inline)) struct STRUCT *parse_##STRUCT(struct __sk_buff *skb, struct cursor *c, struct STRUCT *dest) { \
+    static __attribute__((always_inline)) struct STRUCT *parse_##STRUCT(struct __sk_buff *skb, struct cursor *c, struct STRUCT *dest) { \
         if (bpf_skb_load_bytes(skb, ((u32)(long)c->pos - skb->data), dest, sizeof(*dest)) < 0) {   \
             return NULL;                                                                           \
         }                                                                                          \

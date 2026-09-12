@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/env"
@@ -19,7 +21,7 @@ import (
 )
 
 const (
-	defaultInjectorVersion = "0.35.0-1"
+	defaultInjectorVersion = "0"
 )
 
 var (
@@ -27,10 +29,11 @@ var (
 	defaultLibraryVersions = map[string]string{
 		common.DatadogAPMLibraryJavaPackage:   "1",
 		common.DatadogAPMLibraryRubyPackage:   "2",
-		common.DatadogAPMLibraryJSPackage:     "5",
+		common.DatadogAPMLibraryJSPackage:     "6",
 		common.DatadogAPMLibraryDotNetPackage: "3",
 		common.DatadogAPMLibraryPythonPackage: "3",
 		common.DatadogAPMLibraryPHPPackage:    "1",
+		common.DatadogAPMLibraryNginxPackage:  "1",
 	}
 
 	fullSemverRe = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+`)
@@ -49,6 +52,7 @@ var (
 	supportedEnvVars = []string{
 		"DD_ENV",
 		"DD_SITE",
+		"DD_LOG_LEVEL",
 		"DD_TAGS",
 		"DD_HOST_TAGS",
 		"DD_URL",
@@ -56,6 +60,8 @@ var (
 		"DD_FIPS_MODE",
 		"DD_SYSTEM_PROBE_ENSURE_CONFIG",
 		"DD_RUNTIME_SECURITY_CONFIG_ENABLED",
+		"DD_SBOM_CONTAINER_IMAGE_ENABLED",
+		"DD_SBOM_HOST_ENABLED",
 		"DD_COMPLIANCE_CONFIG_ENABLED",
 		"DD_APM_INSTRUMENTATION_ENABLED",
 		"DD_APM_LIBRARIES",
@@ -66,6 +72,16 @@ var (
 		"DD_PROXY_HTTP",
 		"DD_PROXY_HTTPS",
 		"DD_PROXY_NO_PROXY",
+		"DD_INFRASTRUCTURE_MODE",
+		"DD_LOGS_ENABLED",
+		"DD_PRIVATE_ACTION_RUNNER_ENABLED",
+		"DD_PRIVATE_ACTION_RUNNER_ACTIONS_ALLOWLIST",
+		"DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED",
+		"DD_PROCESS_AGENT_PROCESS_COLLECTION_ENABLED",
+		"DD_PROCESS_CONFIG_CONTAINER_COLLECTION_ENABLED",
+		"DD_PROCESS_AGENT_CONTAINER_COLLECTION_ENABLED",
+		"DD_PROCESS_CONFIG_PROCESS_DISCOVERY_ENABLED",
+		"DD_PROCESS_AGENT_PROCESS_DISCOVERY_ENABLED",
 	}
 )
 
@@ -84,15 +100,29 @@ func SetupDefaultScript(s *common.Setup) error {
 	// Config management
 	setConfigTags(s)
 	setConfigSecurityProducts(s)
+	if err := setConfigProcessAgent(s); err != nil {
+		return err
+	}
 
 	if url, ok := os.LookupEnv("DD_URL"); ok {
 		s.Config.DatadogYAML.DDURL = url
 	}
 
-	// Install packages
+	// Install agent package
 	installAgentPackage(s)
-	installAPMPackages(s)
 
+	// DDOT is now delivered as an agent extension and installed via
+	// postInstallDatadogAgent when DD_OTELCOLLECTOR_ENABLED=true.
+	// keep this for reference until code is fully cleaned up
+	// installDDOTPackage(s)
+
+	// Optionally setup SSI
+	err := SetupAPMSSIScript(s)
+	if err != nil {
+		return fmt.Errorf("failed to setup APM SSI script: %w", err)
+	}
+
+	s.NoConfig = false
 	return nil
 }
 
@@ -100,30 +130,88 @@ func SetupDefaultScript(s *common.Setup) error {
 func setConfigSecurityProducts(s *common.Setup) {
 	runtimeSecurityConfigEnabled, runtimeSecurityConfigEnabledOk := os.LookupEnv("DD_RUNTIME_SECURITY_CONFIG_ENABLED")
 	complianceConfigEnabled, complianceConfigEnabledOk := os.LookupEnv("DD_COMPLIANCE_CONFIG_ENABLED")
-	if runtimeSecurityConfigEnabledOk || complianceConfigEnabledOk {
+	sbomContainerImageEnabled, sbomContainerImageEnabledOk := os.LookupEnv("DD_SBOM_CONTAINER_IMAGE_ENABLED")
+	sbomHostEnabled, sbomHostEnabledOk := os.LookupEnv("DD_SBOM_HOST_ENABLED")
+	if runtimeSecurityConfigEnabledOk || complianceConfigEnabledOk || sbomContainerImageEnabledOk || sbomHostEnabledOk {
 		s.Config.SecurityAgentYAML = &config.SecurityAgentConfig{}
 		s.Config.SystemProbeYAML = &config.SystemProbeConfig{}
 	}
+
 	if complianceConfigEnabledOk && strings.ToLower(complianceConfigEnabled) != "false" {
-		s.Config.SecurityAgentYAML.ComplianceConfig = config.SecurityAgentComplianceConfig{
-			Enabled: true,
-		}
+		s.Config.SecurityAgentYAML.ComplianceConfig.Enabled = config.BoolToPtr(true)
 	}
 	if runtimeSecurityConfigEnabledOk && strings.ToLower(runtimeSecurityConfigEnabled) != "false" {
-		s.Config.SecurityAgentYAML.RuntimeSecurityConfig = config.RuntimeSecurityConfig{
-			Enabled: true,
-		}
-		s.Config.SystemProbeYAML.RuntimeSecurityConfig = config.RuntimeSecurityConfig{
-			Enabled: true,
+		s.Config.SecurityAgentYAML.RuntimeSecurityConfig.Enabled = config.BoolToPtr(true)
+		s.Config.SystemProbeYAML.RuntimeSecurityConfig.Enabled = config.BoolToPtr(true)
+	}
+	if sbomContainerImageEnabledOk && strings.ToLower(sbomContainerImageEnabled) != "false" {
+		s.Config.DatadogYAML.SBOM.Enabled = config.BoolToPtr(true)
+		s.Config.DatadogYAML.SBOM.ContainerImage.Enabled = config.BoolToPtr(true)
+		s.Config.SecurityAgentYAML.RuntimeSecurityConfig.SBOM.Enabled = config.BoolToPtr(true)
+		s.Config.SecurityAgentYAML.RuntimeSecurityConfig.SBOM.ContainerImage.Enabled = config.BoolToPtr(true)
+		s.Config.SystemProbeYAML.RuntimeSecurityConfig.SBOM.Enabled = config.BoolToPtr(true)
+		s.Config.SystemProbeYAML.RuntimeSecurityConfig.SBOM.ContainerImage.Enabled = config.BoolToPtr(true)
+	}
+	if sbomHostEnabledOk && strings.ToLower(sbomHostEnabled) != "false" {
+		s.Config.DatadogYAML.SBOM.Enabled = config.BoolToPtr(true)
+		s.Config.DatadogYAML.SBOM.Host.Enabled = config.BoolToPtr(true)
+		s.Config.SecurityAgentYAML.RuntimeSecurityConfig.SBOM.Enabled = config.BoolToPtr(true)
+		s.Config.SecurityAgentYAML.RuntimeSecurityConfig.SBOM.Host.Enabled = config.BoolToPtr(true)
+		s.Config.SystemProbeYAML.RuntimeSecurityConfig.SBOM.Enabled = config.BoolToPtr(true)
+		s.Config.SystemProbeYAML.RuntimeSecurityConfig.SBOM.Host.Enabled = config.BoolToPtr(true)
+	}
+}
+
+// setConfigProcessAgent sets the process_config collection toggles from environment variables.
+// Each toggle honors both the canonical DD_PROCESS_CONFIG_* name and the historical
+// DD_PROCESS_AGENT_* alias the agent itself accepts (see pkg/config/setup/process.go).
+// Values are parsed as explicit booleans (not presence-only) because container_collection
+// and process_discovery default to true at runtime, so a presence-only var could not disable them.
+func setConfigProcessAgent(s *common.Setup) error {
+	var err error
+	if s.Config.DatadogYAML.ProcessConfig.ProcessCollection.Enabled, err = processToggle("DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED", "DD_PROCESS_AGENT_PROCESS_COLLECTION_ENABLED"); err != nil {
+		return err
+	}
+	if s.Config.DatadogYAML.ProcessConfig.ContainerCollection.Enabled, err = processToggle("DD_PROCESS_CONFIG_CONTAINER_COLLECTION_ENABLED", "DD_PROCESS_AGENT_CONTAINER_COLLECTION_ENABLED"); err != nil {
+		return err
+	}
+	if s.Config.DatadogYAML.ProcessConfig.ProcessDiscovery.Enabled, err = processToggle("DD_PROCESS_CONFIG_PROCESS_DISCOVERY_ENABLED", "DD_PROCESS_AGENT_PROCESS_DISCOVERY_ENABLED"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// processToggle reads the first set environment variable in names and coerces it to a
+// boolean using strconv.ParseBool, so the same truthy/falsy values the agent accepts
+// (e.g. "1"/"0", "true"/"false") are honored. It returns nil when none are set, and an
+// error when the value is not a valid boolean rather than silently treating it as false.
+func processToggle(names ...string) (*bool, error) {
+	val, ok := lookupEnvAny(names...)
+	if !ok {
+		return nil, nil
+	}
+	enabled, err := strconv.ParseBool(val)
+	if err != nil {
+		return nil, fmt.Errorf("invalid boolean value %q for %s: %w", val, names[0], err)
+	}
+	return config.BoolToPtr(enabled), nil
+}
+
+// lookupEnvAny returns the value of the first environment variable in names that is set.
+// The canonical name should be listed first so it wins when multiple aliases are set.
+func lookupEnvAny(names ...string) (string, bool) {
+	for _, name := range names {
+		if val, ok := os.LookupEnv(name); ok {
+			return val, true
 		}
 	}
+	return "", false
 }
 
 // setConfigInstallerDaemon sets the daemon in the configuration
 func setConfigInstallerDaemon(s *common.Setup) {
-	s.Config.DatadogYAML.RemoteUpdates = true
-	if val, ok := os.LookupEnv("DD_REMOTE_UPDATES"); ok && strings.ToLower(val) == "false" {
-		s.Config.DatadogYAML.RemoteUpdates = false
+	if val, ok := os.LookupEnv("DD_REMOTE_UPDATES"); ok {
+		s.Config.DatadogYAML.RemoteUpdates = config.BoolToPtr(strings.ToLower(val) == "true")
 	}
 }
 
@@ -163,12 +251,32 @@ func installAgentPackage(s *common.Setup) {
 	}
 }
 
+// installDDOTPackage is no longer used. DDOT is now delivered as an agent
+// extension and installed via postInstallDatadogAgent when DD_OTELCOLLECTOR_ENABLED=true.
+// Kept for reference until full cleanup.
+// func installDDOTPackage(s *common.Setup) {
+// 	if otelEnabled, ok := os.LookupEnv("DD_OTELCOLLECTOR_ENABLED"); ok && strings.ToLower(otelEnabled) == "true" {
+// 		s.Packages.Install(common.DatadogAgentDDOTPackage, agentVersion())
+// 	}
+// }
+
 // installAPMPackages installs the APM packages
 func installAPMPackages(s *common.Setup) {
 	// Injector install
-	_, apmInstrumentationEnabled := os.LookupEnv("DD_APM_INSTRUMENTATION_ENABLED")
+	apmInstrumentationMethod, apmInstrumentationEnabled := os.LookupEnv("DD_APM_INSTRUMENTATION_ENABLED")
 	if apmInstrumentationEnabled {
-		s.Packages.Install(common.DatadogAPMInjectPackage, defaultInjectorVersion)
+		if runtime.GOOS == "windows" {
+			switch apmInstrumentationMethod {
+			case env.APMInstrumentationEnabledHost:
+				s.Packages.Install(common.DatadogAPMInjectPackage, defaultInjectorVersion)
+			case env.APMInstrumentationEnabledIIS:
+				// we don't need to install anything for IIS
+			default:
+				// we do nothing in unless it is host or IIS
+			}
+		} else {
+			s.Packages.Install(common.DatadogAPMInjectPackage, defaultInjectorVersion)
+		}
 	}
 
 	// Libraries install
@@ -177,6 +285,13 @@ func installAPMPackages(s *common.Setup) {
 		lang := packageToLanguage(library)
 		_, installLibrary := s.Env.ApmLibraries[lang]
 		if (installAllAPMLibraries || len(s.Env.ApmLibraries) == 0 && apmInstrumentationEnabled) || installLibrary {
+			s.Packages.Install(library, getLibraryVersion(s.Env, library))
+		}
+	}
+	// Explicit-only libraries: install only when named in ApmLibraries; never
+	// from "all" or the empty-libs fallback.
+	for _, library := range common.ExplicitOnlyApmLibraries {
+		if _, installLibrary := s.Env.ApmLibraries[packageToLanguage(library)]; installLibrary {
 			s.Packages.Install(library, getLibraryVersion(s.Env, library))
 		}
 	}
@@ -227,7 +342,7 @@ func exitOnUnsupportedEnvVars(envVars ...string) error {
 
 func telemetrySupportedEnvVars(s *common.Setup, envVars ...string) {
 	for _, envVar := range envVars {
-		s.Span.SetTag(fmt.Sprintf("env_var.%s", envVar), os.Getenv(envVar))
+		s.Span.SetTag("env_var."+envVar, os.Getenv(envVar))
 	}
 }
 

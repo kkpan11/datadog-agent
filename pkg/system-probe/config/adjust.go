@@ -11,7 +11,7 @@ import (
 	"sync"
 
 	"github.com/DataDog/datadog-agent/pkg/config/model"
-	"github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -21,19 +21,17 @@ var adjustMtx sync.Mutex
 func Adjust(cfg model.Config) {
 	adjustMtx.Lock()
 	defer adjustMtx.Unlock()
-	if cfg.GetBool(spNS("adjusted")) {
+	if k := spNS("adjusted"); cfg.GetBool(k) && cfg.GetSource(k) == model.SourceAgentRuntime {
 		return
 	}
 
 	deprecateString(cfg, spNS("log_level"), "log_level")
 	deprecateString(cfg, spNS("log_file"), "log_file")
 
-	usmEnabled := cfg.GetBool(smNS("enabled"))
-	npmEnabled := cfg.GetBool(netNS("enabled"))
 	// this check must come first, so we can accurately tell if system_probe was explicitly enabled
 	if cfg.GetBool(spNS("enabled")) &&
-		!cfg.IsSet(netNS("enabled")) &&
-		!usmEnabled {
+		!cfg.IsConfigured(netNS("enabled")) &&
+		!cfg.GetBool(smNS("enabled")) {
 		// This case exists to preserve backwards compatibility. If system_probe_config.enabled is explicitly set to true, and there is no network_config block,
 		// enable the connections/network check.
 		log.Warn(deprecationMessage(spNS("enabled"), netNS("enabled")))
@@ -41,18 +39,25 @@ func Adjust(cfg model.Config) {
 		cfg.Set(netNS("enabled"), true, model.SourceAgentRuntime)
 	}
 
-	validateString(cfg, spNS("sysprobe_socket"), setup.DefaultSystemProbeAddress, ValidateSocketAddress)
+	validateString(cfg, spNS("sysprobe_socket"), defaultpaths.GetDefaultSystemProbeAddress(), ValidateSocketAddress)
 
 	deprecateBool(cfg, spNS("allow_precompiled_fallback"), spNS("allow_prebuilt_fallback"))
 	allowPrebuiltEbpfFallback(cfg)
 
+	adjustDiscovery(cfg)
 	adjustNetwork(cfg)
 	adjustUSM(cfg)
 	adjustSecurity(cfg)
 
+	// Re-read the USM/NPM flags here: adjustDiscovery, adjustNetwork, and
+	// adjustUSM may all have flipped them since the locals at the top of
+	// this function were captured. In particular, discovery-only mode
+	// force-enables service_monitoring_config.enabled; without re-reading,
+	// this guard would silently undo the process inference that
+	// adjustDiscovery just turned on.
 	if cfg.GetBool(spNS("process_service_inference", "enabled")) &&
-		!usmEnabled &&
-		!npmEnabled {
+		!cfg.GetBool(smNS("enabled")) &&
+		!cfg.GetBool(netNS("enabled")) {
 		log.Warn("universal service monitoring and network monitoring are disabled, disabling process service inference")
 		cfg.Set(spNS("process_service_inference", "enabled"), false, model.SourceAgentRuntime)
 	}
@@ -63,7 +68,7 @@ func Adjust(cfg model.Config) {
 // validateString validates the string configuration value at `key` using a custom provided function `valFn`.
 // If `key` is not set or `valFn` returns an error, the `defaultVal` is used instead.
 func validateString(cfg model.Config, key string, defaultVal string, valFn func(string) error) {
-	if cfg.IsSet(key) {
+	if cfg.IsConfigured(key) {
 		if err := valFn(cfg.GetString(key)); err != nil {
 			log.Errorf("error validating `%s`: %s, using default value of `%s`", key, err, defaultVal)
 			cfg.Set(key, defaultVal, model.SourceAgentRuntime)
@@ -76,7 +81,7 @@ func validateString(cfg model.Config, key string, defaultVal string, valFn func(
 // validateInt validates the int configuration value at `key` using a custom provided function `valFn`.
 // If `key` is not set or `valFn` returns an error, the `defaultVal` is used instead.
 func validateInt(cfg model.Config, key string, defaultVal int, valFn func(int) error) {
-	if cfg.IsSet(key) {
+	if cfg.IsConfigured(key) {
 		if err := valFn(cfg.GetInt(key)); err != nil {
 			log.Errorf("error validating `%s`: %s, using default value of `%d`", key, err, defaultVal)
 			cfg.Set(key, defaultVal, model.SourceAgentRuntime)
@@ -89,7 +94,7 @@ func validateInt(cfg model.Config, key string, defaultVal int, valFn func(int) e
 // validateInt64 validates the int64 configuration value at `key` using a custom provided function `valFn`.
 // If `key` is not set or `valFn` returns an error, the `defaultVal` is used instead.
 func validateInt64(cfg model.Config, key string, defaultVal int64, valFn func(int64) error) {
-	if cfg.IsSet(key) {
+	if cfg.IsConfigured(key) {
 		if err := valFn(cfg.GetInt64(key)); err != nil {
 			log.Errorf("error validating `%s`: %s. using default value of `%d`", key, err, defaultVal)
 			cfg.Set(key, defaultVal, model.SourceAgentRuntime)
@@ -100,10 +105,14 @@ func validateInt64(cfg model.Config, key string, defaultVal int64, valFn func(in
 }
 
 // applyDefault sets configuration `key` to `defaultVal` only if not previously set.
-func applyDefault(cfg model.Config, key string, defaultVal interface{}) {
-	if !cfg.IsSet(key) {
+// Returns true if the default value was applied.
+func applyDefault(cfg model.Config, key string, defaultVal interface{}) bool {
+	if !cfg.IsConfigured(key) {
 		cfg.Set(key, defaultVal, model.SourceAgentRuntime)
+		return true
 	}
+
+	return false
 }
 
 // deprecateBool logs a deprecation message if `oldkey` is used.
@@ -149,9 +158,9 @@ func deprecateString(cfg model.Config, oldkey string, newkey string) {
 // deprecateCustom logs a deprecation message if `oldkey` is used.
 // It sets `newkey` to the value obtained from `getFn`, but only if `oldkey` is set and `newkey` is not set.
 func deprecateCustom(cfg model.Config, oldkey string, newkey string, getFn func(model.Config) interface{}) {
-	if cfg.IsSet(oldkey) {
+	if cfg.IsConfigured(oldkey) {
 		log.Warn(deprecationMessage(oldkey, newkey))
-		if !cfg.IsSet(newkey) {
+		if !cfg.IsConfigured(newkey) {
 			cfg.Set(newkey, getFn(cfg), model.SourceAgentRuntime)
 		}
 	}
@@ -177,5 +186,13 @@ func limitMaxInt64(cfg model.Config, key string, max int64) {
 	if val > max {
 		log.Warnf("configuration key `%s` was set to `%d`, using maximum value `%d` instead", key, val, max)
 		cfg.Set(key, max, model.SourceAgentRuntime)
+	}
+}
+
+// disableConfig sets `key` to false, if set to `true`, and logs a warning with the `reason`.
+func disableConfig(cfg model.Config, key string, reason string) {
+	if cfg.GetBool(key) {
+		log.Warnf("disabling %s: %s", key, reason)
+		cfg.Set(key, false, model.SourceAgentRuntime)
 	}
 }

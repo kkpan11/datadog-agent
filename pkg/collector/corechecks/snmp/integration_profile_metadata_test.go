@@ -19,9 +19,11 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	nooptagger "github.com/DataDog/datadog-agent/comp/core/tagger/impl-noop"
+	filterlistimpl "github.com/DataDog/datadog-agent/comp/filterlist/impl"
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/mocksender"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
+	"github.com/DataDog/datadog-agent/pkg/util/cache"
 	"github.com/DataDog/datadog-agent/pkg/version"
 
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/snmp/internal/checkconfig"
@@ -30,12 +32,19 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/snmp/gosnmplib"
 )
 
+func setupHostname(t *testing.T) {
+	mockConfig := configmock.New(t)
+	cache.Cache.Delete(cache.BuildAgentKey("hostname"))
+	mockConfig.SetInTest("hostname", "my-hostname")
+}
+
 func TestProfileMetadata_f5(t *testing.T) {
+	setupHostname(t)
 	cfg := configmock.New(t)
 	timeNow = common.MockTimeNow
-	aggregator.NewBufferedAggregator(nil, nil, nil, nooptagger.NewComponent(), "", 1*time.Hour)
+	aggregator.NewBufferedAggregator(nil, nil, nil, nooptagger.NewComponent(), "", 1*time.Hour, filterlistimpl.NewNoopFilterList())
 	invalidPath, _ := filepath.Abs(filepath.Join("internal", "test", "metadata.d"))
-	cfg.SetWithoutSource("confd_path", invalidPath)
+	cfg.SetInTest("confd_path", invalidPath)
 
 	sess := session.CreateMockSession()
 	sessionFactory := func(*checkconfig.CheckConfig) (session.Session, error) {
@@ -57,8 +66,8 @@ profiles:
   f5-big-ip:
     definition_file: f5-big-ip.yaml
 `)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	err := chk.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, rawInitConfig, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	err := chk.Configure(senderManager, integration.FakeConfigHash, rawInstanceConfig, rawInitConfig, "test", "provider")
 	assert.NoError(t, err)
 	sender := mocksender.NewMockSenderWithSenderManager(chk.ID(), senderManager)
 
@@ -349,6 +358,7 @@ profiles:
         "snmp_device:1.2.3.4"
       ],
       "tags": [
+		"agent_host:my-hostname",
         "agent_version:%s",
 		"device_id:profile-metadata:1.2.3.4",
 		"device_ip:1.2.3.4",

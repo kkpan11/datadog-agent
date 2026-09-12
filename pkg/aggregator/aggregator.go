@@ -14,9 +14,12 @@ import (
 	"sync"
 	"time"
 
+	observer "github.com/DataDog/datadog-agent/comp/anomalydetection/observer/def"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatform"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
+	filterlist "github.com/DataDog/datadog-agent/comp/filterlist/def"
+	eventplatform "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/def"
 	haagent "github.com/DataDog/datadog-agent/comp/haagent/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/internal/tags"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
@@ -27,12 +30,11 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
-	"github.com/DataDog/datadog-agent/pkg/serializer/split"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	"github.com/DataDog/datadog-agent/pkg/util/metricname"
 	"github.com/DataDog/datadog-agent/pkg/util/sort"
 	"github.com/DataDog/datadog-agent/pkg/version"
 )
@@ -146,26 +148,34 @@ var (
 	aggregatorEventPlatformEvents              = expvar.Map{}
 	aggregatorEventPlatformEventsErrors        = expvar.Map{}
 
-	tlmFlush = telemetry.NewCounter("aggregator", "flush",
+	tlmFlush = telemetryimpl.GetCompatComponent().NewCounter("aggregator", "flush",
 		[]string{"data_type", "state"}, "Number of metrics/service checks/events flushed")
 
-	tlmChannelSize = telemetry.NewGauge("aggregator", "channel_size",
+	tlmChannelSize = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "channel_size",
 		[]string{"shard"}, "Size of the aggregator channel")
-	tlmProcessed = telemetry.NewCounter("aggregator", "processed",
+	tlmProcessed = telemetryimpl.GetCompatComponent().NewCounter("aggregator", "processed",
 		[]string{"shard", "data_type"}, "Amount of metrics/services_checks/events processed by the aggregator")
-	tlmDogstatsdTimeBuckets = telemetry.NewGauge("aggregator", "dogstatsd_time_buckets",
+	tlmProcessedMetrics         = tlmProcessed.WithValues("", "metrics")
+	tlmProcessedHistogramBucket = tlmProcessed.WithValues("", "histogram_bucket")
+	tlmDogstatsdTimeBuckets     = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "dogstatsd_time_buckets",
 		[]string{"shard"}, "Number of time buckets in the dogstatsd sampler")
-	tlmDogstatsdContexts = telemetry.NewGauge("aggregator", "dogstatsd_contexts",
+	tlmDogstatsdContexts = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "dogstatsd_contexts",
 		[]string{"shard"}, "Count the number of dogstatsd contexts in the aggregator")
-	tlmDogstatsdContextsByMtype = telemetry.NewGauge("aggregator", "dogstatsd_contexts_by_mtype",
+	tlmDogstatsdContextsByMtype = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "dogstatsd_contexts_by_mtype",
 		[]string{"shard", "metric_type"}, "Count the number of dogstatsd contexts in the aggregator, by metric type")
-	tlmDogstatsdContextsBytesByMtype = telemetry.NewGauge("aggregator", "dogstatsd_contexts_bytes_by_mtype",
+	tlmDogstatsdContextsBytesByMtype = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "dogstatsd_contexts_bytes_by_mtype",
 		[]string{"shard", "metric_type", tags.BytesKindTelemetryKey}, "Estimated count of bytes taken by contexts in the aggregator, by metric type")
-	tlmChecksContexts = telemetry.NewGauge("aggregator", "checks_contexts",
+	tlmDogstatsdFilteredMetrics = telemetryimpl.GetCompatComponent().NewSimpleCounter("aggregator", "dogstatsd_filtered_metrics", "How many metrics were filtered in the time samplers")
+	tlmChecksFilteredMetrics    = telemetryimpl.GetCompatComponent().NewSimpleCounter("aggregator", "checks_filtered_metrics", "How many metrics were filtered in the check samplers")
+	tlmFilteredTags             = telemetryimpl.GetCompatComponent().NewSimpleCounter("aggregator", "filtered_tags", "How many tags were filtered from a metric sample")
+	tlmFilteredTagsCacheHit     = telemetryimpl.GetCompatComponent().NewSimpleCounter("aggregator", "filtered_tags_cache_hit", "How many times we hit the cache on filtering tags")
+	tlmFilteredTagsCacheMiss    = telemetryimpl.GetCompatComponent().NewSimpleCounter("aggregator", "filtered_tags_cache_miss", "How many times we missed the cache on filtering tags")
+	tlmFilteredTagsCacheEvict   = telemetryimpl.GetCompatComponent().NewSimpleCounter("aggregator", "filtered_tags_cache_evict", "How many times an entry was evicted from the tag filter cache")
+	tlmChecksContexts           = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "checks_contexts",
 		[]string{"shard"}, "Count the number of checks contexts in the check aggregator")
-	tlmChecksContextsByMtype = telemetry.NewGauge("aggregator", "checks_contexts_by_mtype",
+	tlmChecksContextsByMtype = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "checks_contexts_by_mtype",
 		[]string{"shard", "metric_type"}, "Count the number of checks contexts in the check aggregator, by metric type")
-	tlmChecksContextsBytesByMtype = telemetry.NewGauge("aggregator", "checks_contexts_bytes_by_mtype",
+	tlmChecksContextsBytesByMtype = telemetryimpl.GetCompatComponent().NewGauge("aggregator", "checks_contexts_bytes_by_mtype",
 		[]string{"shard", "metric_type", tags.BytesKindTelemetryKey}, "Estimated count of bytes taken by contexts in the check aggregator, by metric type")
 
 	// Hold series to be added to aggregated series on each flush
@@ -260,7 +270,7 @@ type BufferedAggregator struct {
 	hostnameUpdateDone     chan struct{} // signals that the hostname update is finished
 	flushChan              chan flushTrigger
 
-	stopChan  chan struct{}
+	stopChan  chan chan struct{}
 	health    *health.Handle
 	agentName string // Name of the agent for telemetry metrics
 
@@ -269,6 +279,16 @@ type BufferedAggregator struct {
 	globalTags                  func(types.TagCardinality) ([]string, error) // This function gets global tags from the tagger when host tags are not available
 	tagger                      tagger.Component
 	flushAndSerializeInParallel FlushAndSerializeInParallel
+
+	// observerHandle is set at startup and copied into newly created CheckSamplers.
+	observerHandle observer.Handle
+
+	// use this chan to trigger a filterList reconfiguration
+	filterListChan  chan metricname.Matcher
+	flushFilterList metricname.Matcher
+
+	tagFilterListChan chan filterlist.TagMatcher
+	tagFilterList     filterlist.TagMatcher
 }
 
 // FlushAndSerializeInParallel contains options for flushing metrics and serializing in parallel.
@@ -286,16 +306,10 @@ func NewFlushAndSerializeInParallel(config model.Config) FlushAndSerializeInPara
 }
 
 // NewBufferedAggregator instantiates a BufferedAggregator
-func NewBufferedAggregator(s serializer.MetricSerializer, eventPlatformForwarder eventplatform.Component, haAgent haagent.Component, tagger tagger.Component, hostname string, flushInterval time.Duration) *BufferedAggregator {
+func NewBufferedAggregator(s serializer.MetricSerializer, eventPlatformForwarder eventplatform.Component, haAgent haagent.Component, tagger tagger.Component, hostname string, flushInterval time.Duration, filterList filterlist.Component) *BufferedAggregator {
 	bufferSize := pkgconfigsetup.Datadog().GetInt("aggregator_buffer_size")
 
 	agentName := flavor.GetFlavor()
-	if agentName == flavor.IotAgent && !pkgconfigsetup.Datadog().GetBool("iot_host") {
-		agentName = flavor.DefaultAgent
-	} else if pkgconfigsetup.Datadog().GetBool("iot_host") {
-		// Override the agentName if this Agent is configured to report as IotAgent
-		agentName = flavor.IotAgent
-	}
 	if pkgconfigsetup.Datadog().GetBool("heroku_dyno") {
 		// Override the agentName if this Agent is configured to report as Heroku Dyno
 		agentName = flavor.HerokuAgent
@@ -338,7 +352,7 @@ func NewBufferedAggregator(s serializer.MetricSerializer, eventPlatformForwarder
 		hostnameUpdate:              make(chan string),
 		hostnameUpdateDone:          make(chan struct{}),
 		flushChan:                   make(chan flushTrigger),
-		stopChan:                    make(chan struct{}),
+		stopChan:                    make(chan chan struct{}),
 		health:                      health.RegisterLiveness("aggregator"),
 		agentName:                   agentName,
 		tlmContainerTagsEnabled:     pkgconfigsetup.Datadog().GetBool("basic_telemetry_add_container_tags"),
@@ -346,6 +360,11 @@ func NewBufferedAggregator(s serializer.MetricSerializer, eventPlatformForwarder
 		globalTags:                  tagger.GlobalTags,
 		tagger:                      tagger,
 		flushAndSerializeInParallel: NewFlushAndSerializeInParallel(pkgconfigsetup.Datadog()),
+
+		filterListChan:    make(chan metricname.Matcher),
+		flushFilterList:   filterList.GetMetricFilterList(),
+		tagFilterListChan: make(chan filterlist.TagMatcher),
+		tagFilterList:     filterList.GetTagFilterList(),
 	}
 
 	return aggregator
@@ -439,14 +458,14 @@ func (agg *BufferedAggregator) handleSenderSample(ss senderMetricSample) {
 	defer agg.mu.Unlock()
 
 	aggregatorChecksMetricSample.Add(1)
-	tlmProcessed.Inc("", "metrics")
+	tlmProcessedMetrics.Inc()
 
 	if checkSampler, ok := agg.checkSamplers[ss.id]; ok {
 		if ss.commit {
-			checkSampler.commit(timeNowNano())
+			checkSampler.commit(timeNowNano(), &agg.flushFilterList)
 		} else {
 			ss.metricSample.Tags = sort.UniqInPlace(ss.metricSample.Tags)
-			checkSampler.addSample(ss.metricSample)
+			checkSampler.addSample(ss.metricSample, agg.tagFilterList)
 		}
 	} else {
 		log.Debugf("CheckSampler with ID '%s' doesn't exist, can't handle senderMetricSample", ss.id)
@@ -458,11 +477,11 @@ func (agg *BufferedAggregator) handleSenderBucket(checkBucket senderHistogramBuc
 	defer agg.mu.Unlock()
 
 	aggregatorCheckHistogramBucketMetricSample.Add(1)
-	tlmProcessed.Inc("", "histogram_bucket")
+	tlmProcessedHistogramBucket.Inc()
 
 	if checkSampler, ok := agg.checkSamplers[checkBucket.id]; ok {
 		checkBucket.bucket.Tags = sort.UniqInPlace(checkBucket.bucket.Tags)
-		checkSampler.addBucket(checkBucket.bucket)
+		checkSampler.addBucket(checkBucket.bucket, agg.tagFilterList)
 	} else {
 		log.Debugf("CheckSampler with ID '%s' doesn't exist, can't handle histogram bucket", checkBucket.id)
 	}
@@ -504,6 +523,12 @@ func (agg *BufferedAggregator) addEvent(e event.Event) {
 	e.Tags = tb.Get()
 
 	agg.events = append(agg.events, &e)
+}
+
+// SetObserverHandle sets the observer handle for mirroring check metrics.
+// The handle is propagated to newly created CheckSamplers.
+func (agg *BufferedAggregator) SetObserverHandle(h observer.Handle) {
+	agg.observerHandle = h
 }
 
 // GetSeriesAndSketches grabs all the series & sketches from the queue and clears the queue
@@ -632,17 +657,6 @@ func (agg *BufferedAggregator) appendDefaultSeries(start time.Time, series metri
 			SourceTypeName: "System",
 		})
 	}
-
-	// Send along a metric that counts the number of times we dropped some payloads because we couldn't split them.
-	series.Append(&metrics.Serie{
-		Name:           fmt.Sprintf("n_o_i_n_d_e_x.datadog.%s.payload.dropped", agg.agentName),
-		Points:         []metrics.Point{{Value: float64(split.GetPayloadDrops()), Ts: float64(start.Unix())}},
-		Tags:           tagset.CompositeTagsFromSlice(agg.tags(false)),
-		Host:           agg.hostname,
-		MType:          metrics.APIGaugeType,
-		SourceTypeName: "System",
-		NoIndex:        true,
-	})
 }
 
 func (agg *BufferedAggregator) flushSeriesAndSketches(trigger flushTrigger) {
@@ -773,9 +787,11 @@ func (agg *BufferedAggregator) Flush(trigger flushTrigger) {
 	agg.updateChecksTelemetry()
 }
 
-// Stop stops the aggregator.
+// Stop stops the aggregator, blocking until the run() goroutine exits.
 func (agg *BufferedAggregator) Stop() {
-	agg.stopChan <- struct{}{}
+	stop := make(chan struct{})
+	agg.stopChan <- stop
+	<-stop
 }
 
 func (agg *BufferedAggregator) run() {
@@ -784,8 +800,10 @@ func (agg *BufferedAggregator) run() {
 
 	for {
 		select {
-		case <-agg.stopChan:
+		case stop := <-agg.stopChan:
 			log.Info("Stopping aggregator")
+			agg.health.Deregister() //nolint:errcheck
+			close(stop)
 			return
 		case trigger := <-agg.flushChan:
 			agg.Flush(trigger)
@@ -796,6 +814,11 @@ func (agg *BufferedAggregator) run() {
 			agg.tagsStore.Shrink()
 
 			aggregatorEventPlatformErrorLogged = false
+
+		case matcher := <-agg.filterListChan:
+			agg.flushFilterList = matcher
+		case matcher := <-agg.tagFilterListChan:
+			agg.setFilterList(matcher)
 		case <-agg.health.C:
 		case checkItem := <-agg.checkItems:
 			checkItem.handle(agg)
@@ -856,6 +879,15 @@ func (agg *BufferedAggregator) run() {
 			tlmFlush.Add(1, event.eventType, state)
 		}
 	}
+}
+
+// Set a new filterlist, ensuring we also clear the context resolver strip cache
+// for each check sampler.
+func (agg *BufferedAggregator) setFilterList(matcher filterlist.TagMatcher) {
+	for _, cs := range agg.checkSamplers {
+		cs.clearStripCache()
+	}
+	agg.tagFilterList = matcher
 }
 
 // tags returns the list of tags that should be added to the agent telemetry metrics
@@ -985,13 +1017,18 @@ func (agg *BufferedAggregator) handleRegisterSampler(id checkid.ID) {
 		log.Debugf("Sampler with ID '%s' has already been registered, will use existing sampler", id)
 		return
 	}
-	agg.checkSamplers[id] = newCheckSampler(
+	cs := newCheckSampler(
 		pkgconfigsetup.Datadog().GetInt("check_sampler_bucket_commits_count_expiry"),
 		pkgconfigsetup.Datadog().GetBool("check_sampler_expire_metrics"),
 		pkgconfigsetup.Datadog().GetBool("check_sampler_context_metrics"),
 		pkgconfigsetup.Datadog().GetDuration("check_sampler_stateful_metric_expiration_time"),
+		pkgconfigsetup.Datadog().GetBool("check_sampler_allow_sketch_bucket_reset"),
 		agg.tagsStore,
 		id,
 		agg.tagger,
 	)
+	if agg.observerHandle != nil {
+		cs.SetObserverHandle(agg.observerHandle)
+	}
+	agg.checkSamplers[id] = cs
 }

@@ -16,24 +16,22 @@ import (
 	serverlessTag "github.com/DataDog/datadog-agent/pkg/serverless/tags"
 )
 
-func TestGetBaseTagsArrayNoEnvNoMetadata(t *testing.T) {
-	assert.Equal(t, 2, len(GetBaseTagsMapWithMetadata(make(map[string]string, 0), "")))
+func TestGetBaseTagsArrayNoEnv(t *testing.T) {
+	assert.Equal(t, 0, len(GetBaseTagsMap()))
 }
 
-func TestGetBaseTagsArrayWithMetadataTagsNoMetadata(t *testing.T) {
+func TestGetBaseTagsArrayWithEnv(t *testing.T) {
 	t.Setenv("K_SERVICE", "myService")
 	t.Setenv("K_REVISION", "FDGF34")
 	t.Setenv("DD_ENV", "myEnv")
 	t.Setenv("DD_SERVICE", "superService")
 	t.Setenv("DD_VERSION", "123.4")
-	tags := serverlessTag.MapToArray(GetBaseTagsMapWithMetadata(make(map[string]string, 0), "_dd.datadog_init_version"))
+	tags := serverlessTag.MapToArray(GetBaseTagsMap())
 	sort.Strings(tags)
-	assert.Equal(t, 5, len(tags))
-	assert.Contains(t, tags[0], "_dd.compute_stats:1")
-	assert.Contains(t, tags[1], "_dd.datadog_init_version")
-	assert.Equal(t, "env:myenv", tags[2])
-	assert.Equal(t, "service:superservice", tags[3])
-	assert.Equal(t, "version:123.4", tags[4])
+	assert.Equal(t, 3, len(tags))
+	assert.Equal(t, "env:myenv", tags[0])
+	assert.Equal(t, "service:superservice", tags[1])
+	assert.Equal(t, "version:123.4", tags[2])
 }
 
 func TestGetTagFound(t *testing.T) {
@@ -47,48 +45,6 @@ func TestGetTagNotFound(t *testing.T) {
 	value, found := getTagFromEnv("XXX")
 	assert.Equal(t, false, found)
 	assert.Equal(t, "", value)
-}
-
-func TestGetBaseTagsMapNoEnvNoMetadata(t *testing.T) {
-	assert.Equal(t, 2, len(GetBaseTagsMapWithMetadata(make(map[string]string, 0), "")))
-}
-
-func TestGetBaseTagsMapNoMetadata(t *testing.T) {
-	t.Setenv("K_SERVICE", "myService")
-	t.Setenv("K_REVISION", "FDGF34")
-	t.Setenv("DD_ENV", "myEnv")
-	t.Setenv("DD_SERVICE", "superService")
-	t.Setenv("DD_VERSION", "123.4")
-	tags := GetBaseTagsMapWithMetadata(make(map[string]string, 0), "")
-	assert.Equal(t, 5, len(tags))
-	assert.Equal(t, "myenv", tags["env"])
-	assert.Equal(t, "superservice", tags["service"])
-	assert.Equal(t, "123.4", tags["version"])
-}
-
-func TestGetBaseTagsMapWithMetadata(t *testing.T) {
-	t.Setenv("K_SERVICE", "myService")
-	tags := GetBaseTagsMapWithMetadata(map[string]string{
-		"location":      "mysuperlocation",
-		"othermetadata": "mysuperothermetadatavalue",
-	}, "")
-	assert.Equal(t, 4, len(tags))
-	assert.Equal(t, "mysuperlocation", tags["location"])
-	assert.Equal(t, "mysuperothermetadatavalue", tags["othermetadata"])
-}
-
-func TestGetBaseTagsArrayWithMetadataTags(t *testing.T) {
-	t.Setenv("K_REVISION", "FDGF34")
-	tags := serverlessTag.MapToArray(GetBaseTagsMapWithMetadata(map[string]string{
-		"location":      "mysuperlocation",
-		"othermetadata": "mysuperothermetadatavalue",
-	}, "_dd.datadog_sidecar_version"))
-	sort.Strings(tags)
-	assert.Equal(t, 4, len(tags))
-	assert.Contains(t, tags[0], "_dd.compute_stats:1")
-	assert.Contains(t, tags[1], "_dd.datadog_sidecar_version")
-	assert.Equal(t, "location:mysuperlocation", tags[2])
-	assert.Equal(t, "othermetadata:mysuperothermetadatavalue", tags[3])
 }
 
 func TestDdTags(t *testing.T) {
@@ -106,8 +62,64 @@ func TestDdTags(t *testing.T) {
 	assert.Equal(t, "value6", mergedTags["key6"])
 }
 
-func TestWithoutHighCardinalityTags(t *testing.T) {
-	tags := map[string]string{"key1": "value1", "key2": "value2", "container_id": "abc", "replica_name": "abc"}
-	filteredTags := WithoutHighCardinalityTags(tags)
+func TestMakeMetricAgentTags(t *testing.T) {
+	tags := map[string]string{
+		"key1":                "value1",
+		"key2":                "value2",
+		"container_id":        "abc",
+		"replica_name":        "abc",
+		"gcrj.execution_name": "exec-123",
+		"gcrj.task_index":     "0",
+		"gcrj.task_attempt":   "1",
+		"gcrj.task_count":     "10",
+	}
+	filteredTags := MakeMetricAgentTags(tags)
 	assert.Equal(t, map[string]string{"key1": "value1", "key2": "value2"}, filteredTags)
+}
+
+func TestMakeTraceAgentTags(t *testing.T) {
+	tests := []struct {
+		name                  string
+		envValue              string
+		expectComputeStatsTag bool
+	}{
+		{
+			name:                  "disabled by default",
+			envValue:              "",
+			expectComputeStatsTag: false,
+		},
+		{
+			name:                  "enabled with true",
+			envValue:              "true",
+			expectComputeStatsTag: true,
+		},
+		{
+			name:                  "disabled with false",
+			envValue:              "false",
+			expectComputeStatsTag: false,
+		},
+		{
+			name:                  "disabled with other value",
+			envValue:              "yes",
+			expectComputeStatsTag: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envValue != "" {
+				t.Setenv(enableBackendTraceStatsEnvVar, tt.envValue)
+			}
+
+			tags := MakeTraceAgentTags(make(map[string]string, 0))
+
+			if tt.expectComputeStatsTag {
+				// compute_stats should be present in modified tags
+				assert.Equal(t, serverlessTag.ComputeStatsValue, tags[serverlessTag.ComputeStatsKey])
+			} else {
+				_, hasComputeStats := tags[serverlessTag.ComputeStatsKey]
+				assert.False(t, hasComputeStats, "compute_stats should not be present")
+			}
+		})
+	}
 }

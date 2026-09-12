@@ -7,6 +7,8 @@ package quantile
 
 import (
 	"sync"
+
+	"github.com/DataDog/sketches-go/ddsketch/store"
 )
 
 const (
@@ -65,3 +67,60 @@ func getOverflowList() []bin {
 func putOverflowList(a []bin) {
 	overflowListPool.Put(&a)
 }
+
+var floatKeyCountPool = sync.Pool{
+	New: func() interface{} {
+		a := make([]floatKeyCount, 0, defaultBinListSize)
+		return &a
+	},
+}
+
+func getFloatKeyCountList() []floatKeyCount {
+	a := *(floatKeyCountPool.Get().(*[]floatKeyCount))
+	return a[:0]
+}
+
+func putFloatKeyCountList(a []floatKeyCount) {
+	if cap(a) >= defaultBinListSize {
+		floatKeyCountPool.Put(&a)
+	}
+}
+
+var keyCountPool = sync.Pool{
+	New: func() interface{} {
+		a := make([]KeyCount, 0, defaultBinListSize)
+		return &a
+	},
+}
+
+func getKeyCountList() []KeyCount {
+	a := *(keyCountPool.Get().(*[]KeyCount))
+	return a[:0]
+}
+
+func putKeyCountList(a []KeyCount) {
+	if cap(a) >= defaultBinListSize {
+		keyCountPool.Put(&a)
+	}
+}
+
+var denseStorePool = sync.Pool{
+	New: func() interface{} {
+		return store.NewDenseStore()
+	},
+}
+
+// denseStoreGetFn and denseStorePutFn are indirections so tests can intercept
+// every borrow/return without relying on sync.Pool scheduling guarantees.
+var denseStoreGetFn = func() store.Store {
+	return denseStorePool.Get().(store.Store)
+}
+
+var denseStorePutFn = func(s store.Store) {
+	s.Clear()
+	denseStorePool.Put(s)
+}
+
+func getDenseStore() store.Store { return denseStoreGetFn() }
+
+func putDenseStore(s store.Store) { denseStorePutFn(s) }

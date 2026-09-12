@@ -10,13 +10,16 @@ package providers
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
+	adtypes "github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
@@ -24,6 +27,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+)
+
+const (
+	celEndpointID = "cel://endpoint"
 )
 
 type store struct {
@@ -37,27 +44,30 @@ func newStore() *store {
 
 type epConfig struct {
 	templates     []integration.Config
-	ep            *v1.Endpoints
+	eps           map[*v1.Endpoints]struct{}
 	shouldCollect bool
+	resolveMode   endpointResolveMode
 }
 
 func newEpConfig() *epConfig {
 	return &epConfig{
 		templates:     []integration.Config{},
 		shouldCollect: false,
+		resolveMode:   kubeEndpointResolveAuto, // default to auto mode
 	}
 }
 
 // KubeEndpointsFileConfigProvider generates endpoints checks from check configurations defined in files.
 type KubeEndpointsFileConfigProvider struct {
 	sync.RWMutex
-	epLister listersv1.EndpointsLister
-	upToDate bool
-	store    *store
+	epLister     listersv1.EndpointsLister
+	upToDate     bool
+	store        *store
+	configErrors map[string]types.ErrorMsgSet
 }
 
 // NewKubeEndpointsFileConfigProvider returns a new KubeEndpointsFileConfigProvider
-func NewKubeEndpointsFileConfigProvider(*pkgconfigsetup.ConfigurationProviders, *telemetry.Store) (ConfigProvider, error) {
+func NewKubeEndpointsFileConfigProvider(*constants.ConfigurationProviders, *telemetry.Store) (types.ConfigProvider, error) {
 	templates, _, err := ReadConfigFiles(WithAdvancedADOnly)
 	if err != nil {
 		return nil, err
@@ -113,9 +123,17 @@ func (p *KubeEndpointsFileConfigProvider) String() string {
 	return names.KubeEndpointsFile
 }
 
-// GetConfigErrors is not implemented for the KubeEndpointsFileConfigProvider.
-func (p *KubeEndpointsFileConfigProvider) GetConfigErrors() map[string]ErrorMsgSet {
-	return make(map[string]ErrorMsgSet)
+// GetConfigErrors returns a map of errors that occurred when building the config store,
+// indexed by the integration name that generated the error.
+func (p *KubeEndpointsFileConfigProvider) GetConfigErrors() map[string]types.ErrorMsgSet {
+	p.RLock()
+	defer p.RUnlock()
+
+	errors := make(map[string]types.ErrorMsgSet, len(p.configErrors))
+	for k, v := range p.configErrors {
+		errors[k] = v
+	}
+	return errors
 }
 
 func (p *KubeEndpointsFileConfigProvider) setUpToDate(v bool) {
@@ -160,6 +178,7 @@ func (p *KubeEndpointsFileConfigProvider) updateHandler(old, new interface{}) {
 	}
 
 	if !equality.Semantic.DeepEqual(newEp.Subsets, oldEp.Subsets) {
+		p.deleteHandler(oldEp)
 		shouldUpdate := p.store.insertEp(newEp)
 		if shouldUpdate {
 			p.setUpToDate(false)
@@ -180,15 +199,58 @@ func (p *KubeEndpointsFileConfigProvider) deleteHandler(obj interface{}) {
 // buildConfigStore initializes the config templates store.
 func (p *KubeEndpointsFileConfigProvider) buildConfigStore(templates []integration.Config) {
 	p.store = newStore()
+	p.configErrors = make(map[string]types.ErrorMsgSet)
 	for _, tpl := range templates {
 		for _, advancedAD := range tpl.AdvancedADIdentifiers {
 			if advancedAD.KubeEndpoints.IsEmpty() {
 				continue
 			}
 
-			p.store.insertTemplate(epID(advancedAD.KubeEndpoints.Namespace, advancedAD.KubeEndpoints.Name), tpl)
+			resolveMode := endpointResolveMode(advancedAD.KubeEndpoints.Resolve)
+			if resolveMode == "" {
+				resolveMode = kubeEndpointResolveAuto // default to auto mode
+			}
+
+			p.store.insertTemplate(epID(advancedAD.KubeEndpoints.Namespace, advancedAD.KubeEndpoints.Name), tpl, resolveMode)
+		}
+
+		// Configuration defined using only CEL selectors
+		if len(tpl.AdvancedADIdentifiers) == 0 && len(tpl.CELSelector.KubeEndpoints) > 0 {
+			// Create matching programs from CEL rules
+			programs, celADIDs, err := integration.CreateMatchingPrograms(tpl.CELSelector, true)
+			if !slices.Contains(celADIDs, adtypes.CelEndpointIdentifier) {
+				errMsg := fmt.Sprintf("CEL selector for template %s is not targeting endpoints", tpl.Name)
+				log.Error(errMsg)
+				p.configErrors[tpl.Name] = types.ErrorMsgSet{errMsg: struct{}{}}
+				continue
+			}
+			if err != nil {
+				errMsg := fmt.Sprintf("Failed to create CEL matching program for template %s: %v", tpl.Name, err)
+				log.Error(errMsg)
+				p.configErrors[tpl.Name] = types.ErrorMsgSet{errMsg: struct{}{}}
+				continue
+			}
+			tpl.SetMatchingPrograms(programs)
+
+			p.store.insertTemplate(celEndpointID, tpl, kubeEndpointResolveAuto)
 		}
 	}
+}
+
+// matchesAnyCELTemplate checks if an endpoint matches any CEL template.
+func (s *store) matchesAnyCELTemplate(ep *v1.Endpoints) bool {
+	celEpConfig, celFound := s.epConfigs[celEndpointID]
+	if !celFound || len(celEpConfig.templates) == 0 {
+		return false
+	}
+
+	filterableEp := workloadfilter.CreateKubeEndpoint(ep.Name, ep.Namespace, ep.GetAnnotations())
+	for _, tpl := range celEpConfig.templates {
+		if tpl.IsMatched(filterableEp) {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldHandle returns whether an endpoints object should be tracked.
@@ -196,12 +258,13 @@ func (s *store) shouldHandle(ep *v1.Endpoints) bool {
 	s.RLock()
 	defer s.RUnlock()
 
+	// Check for AdvancedADIdentifer OR CEL Selector based match
 	_, found := s.epConfigs[epID(ep.Namespace, ep.Name)]
-	return found
+	return found || s.matchesAnyCELTemplate(ep)
 }
 
-// insertTemplate caches config templates.
-func (s *store) insertTemplate(id string, tpl integration.Config) {
+// insertTemplate caches config templates with a specific resolve mode.
+func (s *store) insertTemplate(id string, tpl integration.Config, resolveMode endpointResolveMode) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -211,6 +274,7 @@ func (s *store) insertTemplate(id string, tpl integration.Config) {
 	}
 
 	s.epConfigs[id].templates = append(s.epConfigs[id].templates, tpl)
+	s.epConfigs[id].resolveMode = resolveMode
 }
 
 // insertEp caches the provided endpoints object if it matches one of the tracked configs
@@ -220,15 +284,28 @@ func (s *store) insertEp(ep *v1.Endpoints) bool {
 	s.Lock()
 	defer s.Unlock()
 
-	epConfig, found := s.epConfigs[epID(ep.Namespace, ep.Name)]
-	if !found {
-		return false
+	// Configuration defined using Advanced AD identifiers (exact namespace/name match)
+	epConfig, adFound := s.epConfigs[epID(ep.Namespace, ep.Name)]
+	if adFound {
+		if epConfig.eps == nil {
+			epConfig.eps = make(map[*v1.Endpoints]struct{})
+		}
+		epConfig.eps[ep] = struct{}{}
+		epConfig.shouldCollect = true
 	}
 
-	epConfig.ep = ep
-	epConfig.shouldCollect = true
+	// Endpoint matches any CEL template (CEL Selector based match)
+	celFound := s.matchesAnyCELTemplate(ep)
+	if celFound {
+		celEpConfig := s.epConfigs[celEndpointID]
+		if celEpConfig.eps == nil {
+			celEpConfig.eps = make(map[*v1.Endpoints]struct{})
+		}
+		celEpConfig.eps[ep] = struct{}{}
+		celEpConfig.shouldCollect = true
+	}
 
-	return true
+	return adFound || celFound
 }
 
 // deleteEp handles endpoint objects deletion.
@@ -237,13 +314,23 @@ func (s *store) deleteEp(ep *v1.Endpoints) {
 	s.Lock()
 	defer s.Unlock()
 
-	epConfig, found := s.epConfigs[epID(ep.Namespace, ep.Name)]
-	if !found {
-		return
+	celEpConfig, celFound := s.epConfigs[celEndpointID]
+	if celFound {
+		delete(celEpConfig.eps, ep)
+		if len(celEpConfig.eps) == 0 {
+			// No more endpoints object to monitor for this config, mark it as not collectable
+			celEpConfig.shouldCollect = false
+		}
 	}
 
-	epConfig.ep = nil
-	epConfig.shouldCollect = false
+	epConfig, found := s.epConfigs[epID(ep.Namespace, ep.Name)]
+	if found {
+		delete(epConfig.eps, ep)
+		if len(epConfig.eps) == 0 {
+			// No more endpoints object to monitor for this config, mark it as not collectable
+			epConfig.shouldCollect = false
+		}
+	}
 }
 
 func (s *store) isEmpty() bool {
@@ -262,20 +349,24 @@ func (s *store) generateConfigs() []integration.Config {
 	for _, epConfig := range s.epConfigs {
 		if epConfig.shouldCollect {
 			for _, tpl := range epConfig.templates {
-				configs = append(configs, endpointChecksFromTemplate(tpl, epConfig.ep)...)
+				for ep := range epConfig.eps {
+					configs = append(configs, endpointChecksFromTemplate(tpl, ep, epConfig.resolveMode)...)
+				}
 			}
 		}
 	}
-
 	return configs
 }
 
 // endpointChecksFromTemplate resolves an integration.Config template based on the provided Endpoints object.
-func endpointChecksFromTemplate(tpl integration.Config, ep *v1.Endpoints) []integration.Config {
+func endpointChecksFromTemplate(tpl integration.Config, ep *v1.Endpoints, resolveMode endpointResolveMode) []integration.Config {
 	configs := []integration.Config{}
 	if ep == nil {
 		return configs
 	}
+
+	// Check resolve mode to know how we should process this endpoint
+	resolveFunc := getEndpointResolveFunc(resolveMode, ep.Namespace, ep.Name)
 
 	for i := range ep.Subsets {
 		for j := range ep.Subsets[i].Addresses {
@@ -287,6 +378,7 @@ func endpointChecksFromTemplate(tpl integration.Config, ep *v1.Endpoints) []inte
 				InitConfig:              tpl.InitConfig,
 				MetricConfig:            tpl.MetricConfig,
 				LogsConfig:              tpl.LogsConfig,
+				CELSelector:             tpl.CELSelector,
 				ADIdentifiers:           []string{entity},
 				AdvancedADIdentifiers:   nil,
 				ClusterCheck:            true,
@@ -296,7 +388,9 @@ func endpointChecksFromTemplate(tpl integration.Config, ep *v1.Endpoints) []inte
 				CheckTagCardinality:     tpl.CheckTagCardinality,
 			}
 
-			utils.ResolveEndpointConfigAuto(config, ep.Subsets[i].Addresses[j])
+			if resolveFunc != nil {
+				resolveFunc(config, ep.Subsets[i].Addresses[j])
+			}
 			configs = append(configs, *config)
 		}
 	}

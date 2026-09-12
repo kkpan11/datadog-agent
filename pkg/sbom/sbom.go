@@ -7,23 +7,32 @@
 package sbom
 
 import (
+	"errors"
 	"time"
 
+	"github.com/DataDog/agent-payload/v5/cyclonedx_v1_4"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/sbom/types"
-
-	cyclonedxgo "github.com/CycloneDX/cyclonedx-go"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
-	ScanFilesystemType = "filesystem" // ScanFilesystemType defines the type for file-system scan
-	ScanDaemonType     = "daemon"     // ScanDaemonType defines the type for daemon scan
+	ScanFilesystemType = "filesystem"  // ScanFilesystemType defines the type for file-system scan
+	ScanDaemonType     = "daemon"      // ScanDaemonType defines the type for daemon scan
+	ScanMethodTagName  = "scan_method" // ScanMethodTagName defines the tag name for scan method
 )
+
+// ErrScanNotSupported reports that a scan can never succeed for the given image
+// and must not be retried. Exporting an image on a remote snapshotter such as
+// nydus to a tarball is such a case. Its layers live in the snapshotter rather
+// than the content store, so the export cannot read them however often the scan
+// is retried.
+var ErrScanNotSupported = errors.New("sbom scan not supported for this image")
 
 // Report defines the report interface
 type Report interface {
-	ToCycloneDX() (*cyclonedxgo.BOM, error)
+	ToCycloneDX() *cyclonedx_v1_4.Bom
 	ID() string
 }
 
@@ -37,13 +46,15 @@ func ScanOptionsFromConfigForContainers(cfg config.Component) ScanOptions {
 		Analyzers:        cfg.GetStringSlice("sbom.container_image.analyzers"),
 		UseMount:         cfg.GetBool("sbom.container_image.use_mount"),
 		OverlayFsScan:    cfg.GetBool("sbom.container_image.overlayfs_direct_scan"),
+		AdditionalDirs:   cfg.GetStringSlice("sbom.container_image.additional_directories"),
 	}
 }
 
 // ScanOptionsFromConfigForHosts loads the scanning options from the configuration
 func ScanOptionsFromConfigForHosts(cfg config.Component) ScanOptions {
 	return ScanOptions{
-		Analyzers: cfg.GetStringSlice("sbom.host.analyzers"),
+		Analyzers:      cfg.GetStringSlice("sbom.host.analyzers"),
+		AdditionalDirs: cfg.GetStringSlice("sbom.host.additional_directories"),
 	}
 }
 
@@ -55,10 +66,37 @@ type ScanOptions = types.ScanOptions
 
 // ScanResult defines the scan result
 type ScanResult struct {
-	Error     error
-	Report    Report
-	CreatedAt time.Time
-	Duration  time.Duration
-	ImgMeta   *workloadmeta.ContainerImageMetadata
-	RequestID string
+	Error            error
+	Report           Report
+	CreatedAt        time.Time
+	Duration         time.Duration
+	GenerationMethod string
+	ImgMeta          *workloadmeta.ContainerImageMetadata
+	RequestID        string
+}
+
+// ConvertScanResultToSBOM converts an SBOM scan result to a workloadmeta SBOM.
+func (result *ScanResult) ConvertScanResultToSBOM() *workloadmeta.SBOM {
+	status := workloadmeta.Success
+	reportedError := ""
+	var report *cyclonedx_v1_4.Bom
+
+	if result.Error != nil {
+		log.Errorf("SBOM generation failed for image: %v", result.Error)
+		status = workloadmeta.Failed
+		reportedError = result.Error.Error()
+	} else {
+		report = result.Report.ToCycloneDX()
+	}
+
+	sbom := &workloadmeta.SBOM{
+		CycloneDXBOM:       report,
+		GenerationTime:     result.CreatedAt,
+		GenerationDuration: result.Duration,
+		GenerationMethod:   result.GenerationMethod,
+		Status:             status,
+		Error:              reportedError,
+	}
+
+	return sbom
 }

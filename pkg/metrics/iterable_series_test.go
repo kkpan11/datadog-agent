@@ -6,7 +6,6 @@
 package metrics
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -50,7 +49,6 @@ func TestIterableSeriesCallback(t *testing.T) {
 	r.Equal("serie2", series[1].Name)
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func TestIterableSeriesReceiverStopped(_ *testing.T) {
 	iterableSeries := NewIterableSeries(func(*Serie) {}, 1, 1)
 	iterableSeries.Append(&Serie{Name: "serie1"})
@@ -63,7 +61,7 @@ func TestIterableSeriesReceiverStopped(_ *testing.T) {
 
 func BenchmarkIterableSeries(b *testing.B) {
 	for bufferSize := 1000; bufferSize <= 8000; bufferSize *= 2 {
-		b.Run(fmt.Sprintf("%v", bufferSize), func(b *testing.B) {
+		b.Run(strconv.Itoa(bufferSize), func(b *testing.B) {
 			Serialize(
 				NewIterableSeries(func(*Serie) {}, 100, bufferSize),
 				NewIterableSketches(func(*SketchSeries) {}, 10, 2),

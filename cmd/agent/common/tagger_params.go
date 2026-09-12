@@ -12,7 +12,8 @@ import (
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
 	"github.com/DataDog/datadog-agent/pkg/api/security"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	pkgapiutil "github.com/DataDog/datadog-agent/pkg/api/util"
+	"github.com/DataDog/datadog-agent/pkg/config/helper"
 	"github.com/DataDog/datadog-agent/pkg/config/utils"
 )
 
@@ -20,21 +21,19 @@ import (
 func DualTaggerParams() (tagger.DualParams, tagger.RemoteParams) {
 	return tagger.DualParams{
 			UseRemote: func(c config.Component) bool {
-				return pkgconfigsetup.IsCLCRunner(c) && c.GetBool("clc_runner_remote_tagger_enabled")
+				return helper.IsCLCRunner(c) && c.GetBool("clc_runner_remote_tagger_enabled")
 			},
-		}, tagger.RemoteParams{
-			RemoteTarget: func(config.Component) (string, error) {
+		}, tagger.NewRemoteParams(
+			tagger.WithRemoteTarget(func(config.Component) (string, error) {
 				target, err := utils.GetClusterAgentEndpoint()
 				if err != nil {
 					return "", err
 				}
 				return strings.TrimPrefix(target, "https://"), nil
-			},
-			RemoteTokenFetcher: func(c config.Component) func() (string, error) {
-				return func() (string, error) {
-					return security.GetClusterAgentAuthToken(c)
-				}
-			},
-			RemoteFilter: types.NewFilterBuilder().Exclude(types.KubernetesPodUID).Build(types.HighCardinality),
-		}
+			}),
+			tagger.WithRemoteFilter(types.NewFilterBuilder().Exclude(types.KubernetesPodUID).Build(types.HighCardinality)),
+
+			tagger.WithOverrideTLSConfigGetter(pkgapiutil.GetCrossNodeClientTLSConfig),
+			tagger.WithOverrideAuthTokenGetter(security.GetClusterAgentAuthToken),
+		)
 }

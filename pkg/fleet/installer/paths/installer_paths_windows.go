@@ -11,6 +11,7 @@ package paths
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,10 +20,10 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/registry"
 
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/env"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	"github.com/DataDog/datadog-agent/pkg/util/winutil"
 )
 
 var (
@@ -43,8 +44,14 @@ var (
 	PackagesPath string
 	// ConfigsPath is the path to the Fleet-managed configuration directory
 	ConfigsPath string
+	// AgentConfigDir is the path to the agent configuration directory.
+	AgentConfigDir string
+	// AgentConfigDirExp is the path to the agent configuration directory for experiments.
+	AgentConfigDirExp string
 	// RootTmpDir is the temporary path where the bootstrapper will be extracted to.
 	RootTmpDir string
+	// ProtectedDir is the path to the protected directory for persistent data across upgrades.
+	ProtectedDir string
 	// DefaultUserConfigsDir is the default Agent configuration directory
 	DefaultUserConfigsDir string
 	// StableInstallerPath is the path to the stable installer binary.
@@ -53,7 +60,36 @@ var (
 	RunPath string
 )
 
+const (
+	// installerDataSecurityDescriptor is the security descriptor for DatadogInstallerData (C:\ProgramData\Datadog\Installer)
+	//
+	// Desired permissions:
+	//   - OWNER: Administrators
+	//   - GROUP: Administrators
+	//   - SYSTEM: Full Control (propagates to children)
+	//   - Administrators: Full Control (propagates to children)
+	//   - Everyone: 0x1200a9 List folder contents (propagates to container children only, so no access to file content)
+	//   - PROTECTED: does not inherit permissions from parent
+	installerDataSecurityDescriptor = "O:BAG:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;0x1200a9;;;WD)"
+)
+
+// securityInfo holds the security information extracted from a security
+// descriptor for use in Windows API calls such as SetNamedSecurityInfo.
+type securityInfo struct {
+	Flags windows.SECURITY_INFORMATION
+	Owner *windows.SID
+	Group *windows.SID
+	DACL  *windows.ACL
+	SACL  *windows.ACL
+}
+
 func init() {
+	initPaths()
+}
+
+// initPaths computes the paths from the environment. Split out of init so that tests can recompute
+// them after redirecting DD_APPLICATIONDATADIRECTORY, see ReloadPaths.
+func initPaths() {
 	// Fetch environment variables, the paths are configurable.
 	// setup and experiment subcommands will respect the paths configured in the environment.
 	// This is important for experiments, as running the MSI may remove the registry keys.
@@ -68,47 +104,183 @@ func init() {
 	if env.MsiParams.ApplicationDataDirectory != "" {
 		DatadogDataDir = env.MsiParams.ApplicationDataDirectory
 	} else {
-		DatadogDataDir, _ = getProgramDataDirForProduct("Datadog Agent")
+		DatadogDataDir, _ = winutil.GetProgramDataDirForProduct("Datadog Agent")
 	}
+	AgentConfigDir = DatadogDataDir
+	AgentConfigDirExp = filepath.Clean(DatadogDataDir) + "-exp"
 	DatadogInstallerData = filepath.Join(DatadogDataDir, "Installer")
 	PackagesPath = filepath.Join(DatadogInstallerData, "packages")
-	ConfigsPath = filepath.Join(DatadogInstallerData, "configs")
+	ConfigsPath = filepath.Join(DatadogInstallerData, "managed")
 	RootTmpDir = filepath.Join(DatadogInstallerData, "tmp")
+	ProtectedDir = filepath.Join(DatadogDataDir, "protected")
 	RunPath = filepath.Join(PackagesPath, "run")
 
 	// Install directory
 	if env.MsiParams.ProjectLocation != "" {
 		DatadogProgramFilesDir = env.MsiParams.ProjectLocation
 	} else {
-		DatadogProgramFilesDir, _ = getProgramFilesDirForProduct("Datadog Agent")
+		DatadogProgramFilesDir, _ = winutil.GetProgramFilesDirForProduct("Datadog Agent")
 	}
 	StableInstallerPath = filepath.Join(DatadogProgramFilesDir, "bin", "datadog-installer.exe")
 }
 
-// EnsureInstallerDataDir creates/updates the root directory for the installer data and sets permissions
+// ResolveDatadogProgramFilesDir returns the MSI install root, preferring live env and registry
+// over the process-init snapshot. Fleet/OCI installs can run postinst before registry keys exist
+// in the parent process; MSI hooks pass DD_PROJECTLOCATION for the same reason.
+func ResolveDatadogProgramFilesDir() string {
+	if dir := env.FromEnv().MsiParams.ProjectLocation; dir != "" {
+		return filepath.Clean(dir)
+	}
+	if dir, err := winutil.GetProgramFilesDirForProduct("Datadog Agent"); err == nil && dir != "" {
+		return filepath.Clean(dir)
+	}
+	if DatadogProgramFilesDir != "" {
+		return filepath.Clean(DatadogProgramFilesDir)
+	}
+	return ""
+}
+
+// createDirIfNotExists creates a directory if it doesn't exist.
+// Returns an error if the path exists but is not a directory, or if creation fails.
+//
+// Function behaves similarly to os.MkdirAll, but does not create parent directories.
+func createDirIfNotExists(path string) error {
+	// Check if directory exists first
+	info, err := os.Stat(path)
+	if err == nil {
+		// Path exists, verify it's a directory
+		if !info.IsDir() {
+			return &fs.PathError{
+				Op:   "mkdir",
+				Path: path,
+				Err:  syscall.ENOTDIR,
+			}
+		}
+		return nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		// Some other error occurred while checking
+		return fmt.Errorf("failed to check if directory %s exists: %w", path, err)
+	}
+
+	// Directory doesn't exist, try to create it
+	err = os.Mkdir(path, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", path, err)
+	}
+	return nil
+}
+
+// SetupInstallerDataDir creates/updates the root directory for the installer data and sets permissions
 // to ensure that only Administrators have write access to the directory tree.
 //
-// bootstrap runs before the MSI, so it must create the directory with the correct permissions.
-func EnsureInstallerDataDir() error {
-	targetDir := DatadogInstallerData
-
-	// Desired permissions:
-	// - OWNER: Administrators
-	// - GROUP: Administrators
-	// - SYSTEM: Full Control (propagates to children)
-	// - Administrators: Full Control (propagates to children)
-	// - Everyone: 0x1200a9 List folder contents (propagates to container children only, so no access to file content)
-	// - PROTECTED: does not inherit permissions from parent
-	sddl := "O:BAG:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;0x1200a9;;;WD)"
+// bootstrap/setup run before the MSI, so must create the directory with the correct permissions.
+//
+// This function is intended to be called only during initial setup, it requires special privileges and
+// recursively applies permissions to some subdirectories which can be expensive, see EnsureInstallerDataDir for an alternative.
+func SetupInstallerDataDir() error {
+	sddl := installerDataSecurityDescriptor
 
 	// The following privileges are required to modify the security descriptor,
 	// and are granted to Administrators by default:
 	//  - SeTakeOwnershipPrivilege - Required to set the owner
 	privilegesRequired := []string{"SeTakeOwnershipPrivilege"}
 
-	// check if DatadogDataDir exists
+	err := ensureDatadogDataDir(sddl)
+	if err != nil {
+		return err
+	}
+
+	return winio.RunWithPrivileges(privilegesRequired, func() error {
+		// Create root path: `C:\ProgramData\Datadog\Installer`
+		err := SecureCreateDirectory(DatadogInstallerData, sddl)
+		if err != nil {
+			return fmt.Errorf("failed to create DatadogInstallerData: %w", err)
+		}
+
+		// The root directory now exists with the correct permissions
+		// we still need to ensure the subdirectories have the correct permissions.
+
+		// Create subdirectories that inherit permissions from the parent
+		if err := createDirIfNotExists(RootTmpDir); err != nil {
+			return err
+		}
+		err = resetPermissionsForTree(RootTmpDir)
+		if err != nil {
+			return fmt.Errorf("failed to reset permissions for RootTmpDir: %w", err)
+		}
+
+		// Create protected directory under DatadogDataDir for persistent data across upgrades.
+		// It inherits permissions from DatadogDataDir (managed by MSI).
+		if err := createDirIfNotExists(ProtectedDir); err != nil {
+			return fmt.Errorf("failed to create ProtectedDir: %w", err)
+		}
+
+		// Create subdirectories that have different permissions (global read)
+		// PackagesPath should only contain files from public OCI packages
+		if err := createDirIfNotExists(PackagesPath); err != nil {
+			return err
+		}
+		err = SetRepositoryPermissions(PackagesPath)
+		if err != nil {
+			return fmt.Errorf("failed to create PackagesPath: %w", err)
+		}
+		// ConfigsPath has generated configuration files but will not contain secrets.
+		// To support options that are secrets, we will need to fetch them from a secret store.
+		if err := createDirIfNotExists(ConfigsPath); err != nil {
+			return err
+		}
+		err = SetRepositoryPermissions(ConfigsPath)
+		if err != nil {
+			return fmt.Errorf("failed to create ConfigsPath: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// EnsureInstallerDataDir is a minimal version of SetupInstallerDataDir, ensuring only the root directory is securely created.
+// subdirectories will inherit the secure permissions, but they may be overly restrictive until setup is run.
+//
+// It is meant to be safe to call frequently and outside of initial setup.
+func EnsureInstallerDataDir() error {
+	sddl := installerDataSecurityDescriptor
+
+	// fast path: both directories exist and are secure
+	if IsDirSecure(DatadogDataDir) == nil && IsDirSecure(DatadogInstallerData) == nil {
+		return nil
+	}
+	// A directory does not exist or is not secure, we need to create it
+
+	err := ensureDatadogDataDir(sddl)
+	if err != nil {
+		return err
+	}
+
+	// Enabling privileges can be audited/noisy and this function may be called frequently,
+	// so try to avoid enabling privileges if possible.
+	err = SecureCreateDirectory(DatadogInstallerData, sddl)
+	if err != nil {
+		// try again with privileges
+		privilegesRequired := []string{"SeTakeOwnershipPrivilege"}
+		return winio.RunWithPrivileges(privilegesRequired, func() error {
+			return SecureCreateDirectory(DatadogInstallerData, sddl)
+		})
+	}
+
+	return nil
+}
+
+// ensureDatadogDataDir creates the Agent configuration directory (C:\ProgramData\Datadog) if it
+// does not exist, and returns an error if it exists but is not owned by Administrators or SYSTEM.
+// The MSI checks the same thing, see the EnsureSecureConfigRoot and DDCreateFolders custom actions.
+//
+// It creates or checks, it never resets permissions, unlike SecureCreateDirectory:
+//   - the MSI owns this DACL, it carries the ACEs the Agent user inherits
+//   - so no privileges are needed here, unlike SetupInstallerDataDir's RunWithPrivileges block
+func ensureDatadogDataDir(sddl string) error {
 	_, err := os.Stat(DatadogDataDir)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, fs.ErrNotExist) {
 		// DatadogDataDir does not exist, so we need to create it
 		// probably means the MSI has yet to run
 		// we'll create the directory with the restricted permissions
@@ -117,14 +289,20 @@ func EnsureInstallerDataDir() error {
 		if err != nil {
 			return fmt.Errorf("failed to create DatadogDataDir: %w", err)
 		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check if %s exists: %w", DatadogDataDir, err)
 	}
 
-	return winio.RunWithPrivileges(privilegesRequired, func() error {
-		return secureCreateDirectory(targetDir, sddl)
-	})
+	return IsDirSecure(DatadogDataDir)
 }
 
-func secureCreateDirectory(path string, sddl string) error {
+// SecureCreateDirectory creates a directory with the specified SDDL string.
+//
+// If the directory already exists and it is owned by Administrators or SYSTEM, the permissions
+// are set to the expected state. If the directory is owned by an unknown party, an error is returned.
+func SecureCreateDirectory(path string, sddl string) error {
 	// Try to create the directory with the desired permissions.
 	// We avoid TOCTOU issues because CreateDirectory fails if the directory already exists.
 	// This is of concern because Windows by default grants Users write access to ProgramData.
@@ -155,11 +333,13 @@ func secureCreateDirectory(path string, sddl string) error {
 		return err
 	}
 
-	// The owner is Administrators or SYSTEM, so we can be resonably sure the directory and its
+	// The owner is Administrators or SYSTEM, so we can be reasonably sure the directory and its
 	// original permissions were created by an Administrator. If the Administrator created
 	// the directory insecurely, we'll reset the permissions here, but we can't account
-	// for damage that might have already been done.
-	err = treeResetNamedSecurityInfoWithSDDL(path, sddl)
+	// for created/changed files in the tree during that time. The caller may opt to reset the
+	// permissions recursively, but this is not done here as we have paths that have children
+	// with different permissions.
+	err = setNamedSecurityInfoWithSDDL(path, sddl)
 	if err != nil {
 		return err
 	}
@@ -170,7 +350,7 @@ func secureCreateDirectory(path string, sddl string) error {
 // IsInstallerDataDirSecure return nil if the Datadog Installer data directory is owned by Administrators or SYSTEM,
 // otherwise an error is returned.
 //
-// CreateInstallerDataDir sets the owner to Administrators and is called during bootstrap.
+// SetupInstallerDataDir sets the owner to Administrators and is called during bootstrap.
 // Unprivileged users (users without SeTakeOwnershipPrivilege/SeRestorePrivilege) cannot set the owner to Administrators.
 func IsInstallerDataDirSecure() error {
 	targetDir := DatadogInstallerData
@@ -178,8 +358,13 @@ func IsInstallerDataDirSecure() error {
 	return IsDirSecure(targetDir)
 }
 
-// IsDirSecure returns nil if the directory is owned by Administrators or SYSTEM,
-// otherwise an error is returned.
+// containerAdministratorSID is the SID of the ContainerAdministrator account used in Windows
+// containers. It is not part of the WELL_KNOWN_SID_TYPE enum, so it cannot be created with
+// windows.CreateWellKnownSid like the other allowed owners.
+const containerAdministratorSID = "S-1-5-93-2-1"
+
+// IsDirSecure returns nil if the directory is owned by Administrators, SYSTEM, or
+// ContainerAdministrator, otherwise an error is returned.
 func IsDirSecure(targetDir string) error {
 	allowedWellKnownSids := []windows.WELL_KNOWN_SID_TYPE{
 		windows.WinBuiltinAdministratorsSid,
@@ -187,6 +372,7 @@ func IsDirSecure(targetDir string) error {
 	}
 
 	// get security info
+	// Reads the owner of a junction or symlink itself, not of its target.
 	sd, err := windows.GetNamedSecurityInfo(targetDir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return fmt.Errorf("failed to get security info for dir \"%s\": %w", targetDir, err)
@@ -197,7 +383,7 @@ func IsDirSecure(targetDir string) error {
 		return fmt.Errorf("failed to get owner: %w", err)
 	}
 	if owner == nil {
-		return fmt.Errorf("owner is nil")
+		return errors.New("owner is nil")
 	}
 	var allowedSids []*windows.SID
 	for _, id := range allowedWellKnownSids {
@@ -207,13 +393,37 @@ func IsDirSecure(targetDir string) error {
 		}
 		allowedSids = append(allowedSids, sid)
 	}
+	containerAdminSid, err := windows.StringToSid(containerAdministratorSID)
+	if err != nil {
+		return fmt.Errorf("failed to create container administrator sid: %w", err)
+	}
+	allowedSids = append(allowedSids, containerAdminSid)
 	ownerInAllowedList := slices.ContainsFunc(allowedSids, func(sid *windows.SID) bool {
 		return windows.EqualSid(owner, sid)
 	})
 	if !ownerInAllowedList {
-		return fmt.Errorf("installer data directory has unexpected owner: %v", owner.String())
+		// This message is shown to the user, so it explains how to resolve the problem.
+		return fmt.Errorf("directory %s has unexpected owner %v, it must be owned by Administrators "+
+			"or SYSTEM. The installer will not use a directory that a user without administrator "+
+			"rights may have created. Remove it, or make Administrators its owner by running "+
+			"takeown.exe /A /F \"%s\" after reviewing its contents, then retry",
+			targetDir, describeSID(owner), filepath.Clean(targetDir))
 	}
 	return nil
+}
+
+// describeSID returns the account name for sid, falling back to its string form when it cannot be
+// resolved, for example because the account has been deleted. The MSI reports the owner the same
+// way, see SecureDirectory.Describe.
+func describeSID(sid *windows.SID) string {
+	account, domain, _, err := sid.LookupAccount("")
+	if err != nil {
+		return sid.String()
+	}
+	if domain == "" {
+		return fmt.Sprintf("%s (%s)", account, sid)
+	}
+	return fmt.Sprintf("%s\\%s (%s)", domain, account, sid)
 }
 
 // createDirectoryWithSDDL creates a directory with the specified SDDL string, returns
@@ -237,7 +447,23 @@ func createDirectoryWithSDDL(path string, sddl string) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
+	// CreateDirectory creates the directory with the Owner,Group,DACL,
+	// but does not apply the AI (SeDaclAutoInherit) flag, so we reapply the SDDL
+	// here to ensure the AI flag is set.
+	err = setNamedSecurityInfoFromSecurityDescriptor(path, sd)
+	if err != nil {
+		return fmt.Errorf("failed to set named security info: %w", err)
+	}
+
 	return nil
+}
+
+func setNamedSecurityInfoWithSDDL(root string, sddl string) error {
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return err
+	}
+	return setNamedSecurityInfoFromSecurityDescriptor(root, sd)
 }
 
 func treeResetNamedSecurityInfoWithSDDL(root string, sddl string) error {
@@ -248,24 +474,24 @@ func treeResetNamedSecurityInfoWithSDDL(root string, sddl string) error {
 	return treeResetNamedSecurityInfoFromSecurityDescriptor(root, sd)
 }
 
-func treeResetNamedSecurityInfoFromSecurityDescriptor(root string, sd *windows.SECURITY_DESCRIPTOR) error {
+func getSecurityInfoFromSecurityDescriptor(sd *windows.SECURITY_DESCRIPTOR) (*securityInfo, error) {
 	var flags windows.SECURITY_INFORMATION
 	control, _, err := sd.Control()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	flags |= securityInformationFromControlFlags(control)
 
 	owner, _, err := sd.Owner()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if owner != nil {
 		flags |= windows.OWNER_SECURITY_INFORMATION
 	}
 	group, _, err := sd.Group()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if group != nil {
 		flags |= windows.GROUP_SECURITY_INFORMATION
@@ -273,7 +499,7 @@ func treeResetNamedSecurityInfoFromSecurityDescriptor(root string, sd *windows.S
 	dacl, _, err := sd.DACL()
 	if err != nil {
 		if err != windows.ERROR_OBJECT_NOT_FOUND {
-			return err
+			return nil, err
 		}
 	} else {
 		flags |= windows.DACL_SECURITY_INFORMATION
@@ -281,19 +507,41 @@ func treeResetNamedSecurityInfoFromSecurityDescriptor(root string, sd *windows.S
 	sacl, _, err := sd.SACL()
 	if err != nil {
 		if err != windows.ERROR_OBJECT_NOT_FOUND {
-			return err
+			return nil, err
 		}
 	} else {
 		flags |= windows.SACL_SECURITY_INFORMATION
 	}
+	return &securityInfo{
+		Flags: flags,
+		Owner: owner,
+		Group: group,
+		DACL:  dacl,
+		SACL:  sacl,
+	}, nil
+}
+
+func setNamedSecurityInfoFromSecurityDescriptor(root string, sd *windows.SECURITY_DESCRIPTOR) error {
+	info, err := getSecurityInfoFromSecurityDescriptor(sd)
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(root, windows.SE_FILE_OBJECT, info.Flags, info.Owner, info.Group, info.DACL, info.SACL)
+}
+
+func treeResetNamedSecurityInfoFromSecurityDescriptor(root string, sd *windows.SECURITY_DESCRIPTOR) error {
+	info, err := getSecurityInfoFromSecurityDescriptor(sd)
+	if err != nil {
+		return err
+	}
 	err = TreeResetNamedSecurityInfo(
 		root,
 		windows.SE_FILE_OBJECT,
-		flags,
-		owner,
-		group,
-		dacl,
-		sacl,
+		info.Flags,
+		info.Owner,
+		info.Group,
+		info.DACL,
+		info.SACL,
 		// Set to false to remove explicit ACEs from the subtree
 		false)
 	if err != nil {
@@ -357,58 +605,14 @@ func TreeResetNamedSecurityInfo(
 	return nil
 }
 
-// getProgramDataDirForProduct returns the current programdatadir, usually
-// c:\programdata\Datadog given a product key name
-func getProgramDataDirForProduct(product string) (path string, err error) {
-	res, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
-	if err != nil {
-		// Something is terribly wrong on the system if %PROGRAMDATA% is missing
-		return "", err
+// FleetPoliciesDirForManagedProcess returns the fleet policies directory for DD_FLEET_POLICIES_DIR
+// when the installer wires managed processes (e.g. DDOT under dd-procmgr). It uses the registry
+// value when present; otherwise the stable managed fleet policies directory under ConfigsPath.
+func FleetPoliciesDirForManagedProcess() string {
+	if v := winutil.ReadFleetPoliciesDirFromRegistry(); v != "" {
+		return v
 	}
-	keyname := "SOFTWARE\\Datadog\\" + product
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
-		keyname,
-		registry.ALL_ACCESS)
-	if err != nil {
-		// if the key isn't there, we might be running a standalone binary that wasn't installed through MSI
-		log.Debugf("Windows installation key root (%s) not found, using default program data dir", keyname)
-		return filepath.Join(res, "Datadog"), nil
-	}
-	defer k.Close()
-	val, _, err := k.GetStringValue("ConfigRoot")
-	if err != nil {
-		log.Warnf("Windows installation key config not found, using default program data dir")
-		return filepath.Join(res, "Datadog"), nil
-	}
-	path = val
-	return
-}
-
-// getProgramFilesDirForProduct returns the root of the installatoin directory,
-// usually c:\program files\datadog\datadog agent
-func getProgramFilesDirForProduct(product string) (path string, err error) {
-	res, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, 0)
-	if err != nil {
-		// Something is terribly wrong on the system if %PROGRAMFILES% is missing
-		return "", err
-	}
-	keyname := "SOFTWARE\\Datadog\\" + product
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
-		keyname,
-		registry.ALL_ACCESS)
-	if err != nil {
-		// if the key isn't there, we might be running a standalone binary that wasn't installed through MSI
-		log.Debugf("Windows installation key root (%s) not found, using default program data dir", keyname)
-		return filepath.Join(res, "Datadog", product), nil
-	}
-	defer k.Close()
-	val, _, err := k.GetStringValue("InstallPath")
-	if err != nil {
-		log.Warnf("Windows installation key config not found, using default program data dir")
-		return filepath.Join(res, "Datadog", product), nil
-	}
-	path = val
-	return
+	return filepath.Join(ConfigsPath, "datadog-agent", "stable")
 }
 
 // SetRepositoryPermissions sets the permissions on the repository directory
@@ -426,10 +630,85 @@ func SetRepositoryPermissions(path string) error {
 	return treeResetNamedSecurityInfoWithSDDL(path, sddl)
 }
 
+// SetFileReadableByEveryone grants the Everyone group (S-1-1-0) read access on a file while
+// preserving the owner/group and the rest of the DACL (SYSTEM, Administrators, and ddagentuser
+// keep their access). This is the Windows equivalent of a world-readable (0644) file on Linux
+// and lets non-admin identities (e.g. an IIS App Pool identity) read fleet config such as
+// application_monitoring.yaml.
+func SetFileReadableByEveryone(path string) error {
+	everyone, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		return fmt.Errorf("failed to create Everyone SID: %w", err)
+	}
+
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("failed to get security info: %w", err)
+	}
+
+	control, _, err := sd.Control()
+	if err != nil {
+		return fmt.Errorf("failed to get security descriptor control flags: %w", err)
+	}
+	var flags windows.SECURITY_INFORMATION = windows.DACL_SECURITY_INFORMATION
+	if control&windows.SE_DACL_PROTECTED != 0 {
+		flags |= windows.PROTECTED_DACL_SECURITY_INFORMATION
+	} else {
+		flags |= windows.UNPROTECTED_DACL_SECURITY_INFORMATION
+	}
+
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return fmt.Errorf("failed to get DACL: %w", err)
+	}
+
+	// Merge a Generic Read grant for Everyone into the existing DACL, preserving all other ACEs.
+	newDACL, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		{
+			AccessPermissions: windows.ACCESS_MASK(windows.GENERIC_READ),
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.NO_INHERITANCE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_GROUP,
+				TrusteeValue: windows.TrusteeValueFromSID(everyone),
+			},
+		},
+	}, dacl)
+	if err != nil {
+		return fmt.Errorf("failed to update DACL: %w", err)
+	}
+
+	return windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		flags,
+		nil,     // owner - leave unchanged
+		nil,     // group - leave unchanged
+		newDACL, // DACL - set this
+		nil,     // SACL - leave unchanged
+	)
+}
+
 // GetAdminInstallerBinaryPath returns the path to the datadog-installer executable
 // inside an MSI administrative install extracted directory tree.
 //
 // https://learn.microsoft.com/en-us/windows/win32/msi/administrative-installation
 func GetAdminInstallerBinaryPath(path string) string {
 	return filepath.Join(path, "ProgramFiles64Folder", "Datadog", "Datadog Agent", "bin", "datadog-installer.exe")
+}
+
+// resetPermissionsForTree sets the owner/group to Administrators, enables inheritance, and removes all explicit ACEs.
+func resetPermissionsForTree(path string) error {
+	// set owner/group to Administrators
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return err
+	}
+	// set owner, group, and disable protection (enable inheritance) on the DACL
+	var flags windows.SECURITY_INFORMATION
+	flags |= windows.OWNER_SECURITY_INFORMATION
+	flags |= windows.GROUP_SECURITY_INFORMATION
+	flags |= windows.UNPROTECTED_DACL_SECURITY_INFORMATION
+	return TreeResetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, flags, admins, admins, nil, nil, false)
 }

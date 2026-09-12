@@ -3,6 +3,10 @@
 set -e
 
 install_systemd_unit() {
+  # Must be reset per call: it is only assigned when --workdir is passed, so
+  # without this it would leak into every subsequent unit.
+  local workdir=""
+
   while [[ $# -ge 2 ]]; do
     case $1 in
       --workdir)
@@ -21,11 +25,32 @@ install_systemd_unit() {
   port=$3
   extraenv=$4
 
+  # Build environment variables section
+  env_section="Environment=\"PORT=${port}\"\nEnvironment=\"NODE_VERSION=20\""
+
+  # Split extraenv and add each variable as a separate Environment line
+  if [[ -n "${extraenv}" ]]; then
+    while IFS= read -r -d ' ' env_var; do
+      if [[ -n "${env_var}" ]]; then
+        env_section="${env_section}\nEnvironment=\"${env_var}\""
+      fi
+    done <<< "${extraenv} "
+  fi
+
+  # The start limit is left enabled on purpose. These services are
+  # Restart=always with RestartSec=1, so one which fails immediately restarts
+  # forever: it stays in "activating (auto-restart)" and never reaches "failed",
+  # which makes a broken fixture look like a service the Agent failed to
+  # discover rather than a service that is not running. Letting the limit stop
+  # it turns that into a failed unit instead. The counter is reset by an
+  # explicit systemctl stop, so the start/stop cycles the tests do between
+  # subtests never accumulate towards it.
   cat > "/etc/systemd/system/${name}.service" <<- EOM
 [Unit]
 Description=${name}
 After=network.target
-StartLimitIntervalSec=0
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -33,9 +58,7 @@ Restart=always
 RestartSec=1
 User=root
 ExecStart=${command}
-Environment="PORT=${port}"
-Environment="NODE_VERSION=20"
-Environment="${extraenv}"
+$(echo -e "${env_section}")
 ${workdir}
 
 [Install]
@@ -53,7 +76,7 @@ apt-get install -y \
 
 
 # Install Python deps
-pip install ddtrace
+pip install ddtrace==4.7.1
 
 # Install Node
 if [ ! -d "${HOME}/.nvm" ]; then
@@ -64,9 +87,9 @@ export NVM_DIR="$HOME/.nvm"
 # shellcheck source=/dev/null
 source "${NVM_DIR}/nvm.sh"
 # Retry a few times since occasional failures have been seen
-nvm install 20 || nvm install 20 || nvm install 20
+nvm install 20.20.1 || nvm install 20.20.1 || nvm install 20.20.1
 
-npm install json-server || npm install json-server
+npm install json-server@1.0.0-beta.15 || npm install json-server@1.0.0-beta.15
 npm install /home/ubuntu/e2e-test/node/instrumented
 
 # Install Ruby
@@ -87,12 +110,18 @@ popd
 
 # Install our own services
 ## Node
-install_systemd_unit "node-json-server" "$NVM_DIR/nvm-exec npx json-server --port 8084 /home/ubuntu/e2e-test/node/json-server/db.json" "8084" ""
+# Run from the directory json-server was installed into above. npx resolves the
+# package relative to the working directory, and systemd units default to /,
+# where it is not found; npx then stages a fresh download from the npm registry
+# on every start of the unit, which is slow, network-dependent, and fails
+# outright if the registry is unreachable.
+install_systemd_unit --workdir "/home/ubuntu" "node-json-server" "$NVM_DIR/nvm-exec npx json-server --port 8084 /home/ubuntu/e2e-test/node/json-server/db.json" "8084" ""
 install_systemd_unit "node-instrumented" "$NVM_DIR/nvm-exec node /home/ubuntu/e2e-test/node/instrumented/server.js" "8085" ""
 
 ## Python
-install_systemd_unit "python-svc" "/usr/bin/python3 /home/ubuntu/e2e-test/python/server.py" "8082" "DD_SERVICE=python-svc-dd"
+install_systemd_unit "python-svc" "/usr/bin/python3 /home/ubuntu/e2e-test/python/server.py" "8082" "DD_SERVICE=python-svc-dd DD_VERSION=2.1 DD_ENV=prod"
 install_systemd_unit "python-instrumented" "/usr/bin/python3 /home/ubuntu/e2e-test/python/instrumented.py" "8083" "DD_SERVICE=python-instrumented-dd"
+install_systemd_unit "python-restricted" "/usr/bin/python3 /home/ubuntu/e2e-test/python/server.py" "8086" "DD_SERVICE=python-restricted-dd"
 
 ## Ruby
 install_systemd_unit --workdir "/home/ubuntu/rails-hello" "rails-svc" "rails server" "7777" ""

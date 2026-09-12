@@ -6,6 +6,8 @@
 package ec2
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -29,23 +31,23 @@ func isBoardVendorEC2() bool {
 // On AWS Nitro instances dmi information contains the instanceID for the host. We check that the board vendor is
 // EC2 and that the board_asset_tag match an instanceID format before using it
 func getInstanceIDFromDMI() (string, error) {
-	// we don't want to collect anything on Fargate
-	if fargate.IsFargateInstance() {
-		return "", fmt.Errorf("host alias detection through DMI is disabled on Fargate")
+	// we don't want to collect anything in sidecar mode
+	if fargate.IsSidecar() {
+		return "", errors.New("host alias detection through DMI is disabled in sidecar mode")
 	}
 
 	if !pkgconfigsetup.Datadog().GetBool("ec2_use_dmi") {
-		return "", fmt.Errorf("'ec2_use_dmi' is disabled")
+		return "", errors.New("'ec2_use_dmi' is disabled")
 	}
 
 	if !isBoardVendorEC2() {
-		isEC2UUID()
-		return "", fmt.Errorf("board vendor is not AWS")
+		isEC2UUID() // called for side effect: sets MetadataSourceUUID if UUID identifies this host as EC2
+		return "", errors.New("board vendor is not AWS")
 	}
 
 	boardAssetTag := dmi.GetBoardAssetTag()
 	if !strings.HasPrefix(boardAssetTag, "i-") {
-		isEC2UUID()
+		isEC2UUID() // called for side effect: sets MetadataSourceUUID if UUID identifies this host as EC2
 		return "", fmt.Errorf("invalid board_asset_tag: '%s'", boardAssetTag)
 	}
 	ec2internal.SetCloudProviderSource(ec2internal.MetadataSourceDMI)
@@ -95,7 +97,7 @@ func isEC2UUID() bool {
 	b[0] = byte(IDPart)
 	b[1] = byte(IDPart >> 8)
 
-	swapID := fmt.Sprintf("%x", b)
+	swapID := hex.EncodeToString(b)
 	if strings.HasPrefix(strings.ToLower(swapID), "ec2") {
 		ec2internal.SetCloudProviderSource(ec2internal.MetadataSourceUUID)
 		return true

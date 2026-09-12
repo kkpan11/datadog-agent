@@ -10,7 +10,6 @@ package probe
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -18,7 +17,7 @@ import (
 	"github.com/DataDog/datadog-go/v5/statsd"
 	"go.uber.org/atomic"
 
-	"github.com/DataDog/datadog-agent/pkg/process/procutil"
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	"github.com/DataDog/datadog-agent/pkg/security/config"
 	"github.com/DataDog/datadog-agent/pkg/security/events"
 	"github.com/DataDog/datadog-agent/pkg/security/metrics"
@@ -29,13 +28,14 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
 	"github.com/DataDog/datadog-agent/pkg/security/seclog"
 	"github.com/DataDog/datadog-agent/pkg/security/serializers"
+	"github.com/DataDog/datadog-agent/pkg/security/utils"
 )
 
 const (
 	defaultConsumerChanSize = 50
 )
 
-// PlatformProbe defines a platform dependant probe
+// PlatformProbe defines a platform dependent probe
 type PlatformProbe interface {
 	Init() error
 	Start() error
@@ -47,17 +47,29 @@ type PlatformProbe interface {
 	NewModel() *model.Model
 	DumpDiscarders() (string, error)
 	FlushDiscarders() error
-	ApplyRuleSet(_ *rules.RuleSet) (*kfilters.FilterReport, error)
+	ApplyRuleSet(_ *rules.RuleSet) (*kfilters.FilterReport, bool, error)
 	OnNewRuleSetLoaded(_ *rules.RuleSet)
+	ShouldEvaluateDiscarders(_ *model.Event) bool
 	OnNewDiscarder(_ *rules.RuleSet, _ *model.Event, _ eval.Field, _ eval.EventType)
 	HandleActions(_ *eval.Context, _ *rules.Rule)
+	EnrichRuleEvent(_ *model.Event)
 	NewEvent() *model.Event
 	GetFieldHandlers() model.FieldHandlers
 	DumpProcessCache(_ bool) (string, error)
 	AddDiscarderPushedCallback(_ DiscarderPushedCallback)
 	GetEventTags(_ containerutils.ContainerID) []string
 	EnableEnforcement(bool)
+	ReplayEvents()
+	SendCustomEventKillAction(_ model.ActionReport, _ []string)
 }
+
+var probeTelemetry = struct {
+	totalVariables telemetry.Gauge
+}{
+	totalVariables: metrics.NewITGauge(metrics.MetricSECLTotalVariables, []string{"type", "scope"}, "Number of instantiated variables"),
+}
+
+var probeEventZeroer = model.NewEventZeroer()
 
 // EventConsumer defines a probe event consumer
 type EventConsumer struct {
@@ -107,27 +119,32 @@ type Probe struct {
 	cancelFnc func()
 	wg        sync.WaitGroup
 	startTime time.Time
-	scrubber  *procutil.DataScrubber
+	scrubber  *utils.Scrubber
 
 	// Events section
 	consumers           []*EventConsumer
-	eventHandlers       [model.MaxAllEventType][]EventHandler
-	eventConsumers      [model.MaxAllEventType][]*EventConsumer
-	customEventHandlers [model.MaxAllEventType][]CustomEventHandler
+	eventHandlers       []EventHandler                              // listen all the regular events
+	customEventHandlers []CustomEventHandler                        // listen all the custom events
+	eventConsumers      [model.MaxAllEventType + 1][]*EventConsumer // listen specific regular event
 
 	// stats
 	ruleActionStatsLock sync.RWMutex
 	ruleActionStats     map[actionStatsTags]*atomic.Int64
 }
 
-func newProbe(config *config.Config, opts Opts) *Probe {
+func newProbe(config *config.Config, opts Opts) (*Probe, error) {
+	scrubber, err := utils.NewScrubber(config.Probe.CustomSensitiveWords, config.Probe.CustomSensitiveRegexps)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create event scrubber: %w", err)
+	}
+
 	return &Probe{
 		Opts:            opts,
 		Config:          config,
 		StatsdClient:    opts.StatsdClient,
-		scrubber:        newProcScrubber(config.Probe.CustomSensitiveWords),
+		scrubber:        scrubber,
 		ruleActionStats: make(map[actionStatsTags]*atomic.Int64),
-	}
+	}, nil
 }
 
 // Init initializes the probe
@@ -152,7 +169,7 @@ func (p *Probe) sendConsumerStats() error {
 		dropped := consumer.eventDropped.Swap(0)
 		if dropped > 0 {
 			tags := []string{
-				fmt.Sprintf("consumer_id:%s", consumer.consumer.ID()),
+				"consumer_id:" + consumer.consumer.ID(),
 			}
 			if err := p.StatsdClient.Count(metrics.MetricEventMonitoringEventsDropped, dropped, tags, 1.0); err != nil {
 				return err
@@ -174,8 +191,8 @@ func (p *Probe) SendStats() error {
 		count := counter.Swap(0)
 		if count > 0 {
 			tags := []string{
-				fmt.Sprintf("rule_id:%s", tags.ruleID),
-				fmt.Sprintf("action_name:%s", tags.actionName),
+				"rule_id:" + tags.ruleID,
+				"action_name:" + tags.actionName,
 			}
 			_ = p.StatsdClient.Count(metrics.MetricRuleActionPerformed, count, tags, 1.0)
 		}
@@ -192,7 +209,9 @@ func (p *Probe) Close() error {
 
 // Stop the probe
 func (p *Probe) Stop() {
-	p.cancelFnc()
+	if p.cancelFnc != nil {
+		p.cancelFnc()
+	}
 	p.wg.Wait()
 
 	p.PlatformProbe.Stop()
@@ -205,7 +224,7 @@ func (p *Probe) FlushDiscarders() error {
 }
 
 // ApplyRuleSet setup the probes for the provided set of rules and returns the policy report.
-func (p *Probe) ApplyRuleSet(rs *rules.RuleSet) (*kfilters.FilterReport, error) {
+func (p *Probe) ApplyRuleSet(rs *rules.RuleSet) (*kfilters.FilterReport, bool, error) {
 	return p.PlatformProbe.ApplyRuleSet(rs)
 }
 
@@ -226,6 +245,14 @@ func (p *Probe) Snapshot() error {
 // Walk iterates through the entire tree and call the provided callback on each entry
 func (p *Probe) Walk(cb func(entry *model.ProcessCacheEntry)) {
 	p.PlatformProbe.Walk(cb)
+}
+
+// ShouldEvaluateDiscarders returns whether discarder evaluation should proceed for the given event
+func (p *Probe) ShouldEvaluateDiscarders(ev *model.Event) bool {
+	if p.PlatformProbe == nil {
+		return true
+	}
+	return p.PlatformProbe.ShouldEvaluateDiscarders(ev)
 }
 
 // OnNewDiscarder is called when a new discarder is found
@@ -260,6 +287,19 @@ func (p *Probe) HandleActions(rule *rules.Rule, event eval.Event) {
 	p.PlatformProbe.HandleActions(ctx, rule)
 }
 
+// EnrichRuleEvent gives the platform probe an opportunity to enrich an event
+// just before it is serialized and sent as a security signal. It is only
+// called for non-silent rule matches, so any work done here pays a cost
+// proportional to alert volume rather than total event volume.
+//
+// Today this is used to backfill the untruncated argv/envp of the matched
+// process from procfs (Linux/eBPF), so that investigators see the full
+// command line in the alert payload even though the on-stream values are
+// length-capped for performance reasons.
+func (p *Probe) EnrichRuleEvent(event *model.Event) {
+	p.PlatformProbe.EnrichRuleEvent(event)
+}
+
 // AddEventConsumer sets a probe event consumer
 func (p *Probe) AddEventConsumer(consumer EventConsumerHandler) error {
 	chanSize := consumer.ChanSize()
@@ -288,29 +328,30 @@ func (p *Probe) AddEventConsumer(consumer EventConsumerHandler) error {
 
 // AddEventHandler sets a probe event handler for the UnknownEventType which requires access to all the struct fields
 func (p *Probe) AddEventHandler(handler EventHandler) error {
-	p.eventHandlers[model.UnknownEventType] = append(p.eventHandlers[model.UnknownEventType], handler)
+	p.eventHandlers = append(p.eventHandlers, handler)
 
 	return nil
 }
 
 // AddCustomEventHandler set the probe event handler
-func (p *Probe) AddCustomEventHandler(eventType model.EventType, handler CustomEventHandler) error {
-	if eventType >= model.MaxAllEventType {
-		return errors.New("unsupported event type")
-	}
-
-	p.customEventHandlers[eventType] = append(p.customEventHandlers[eventType], handler)
+func (p *Probe) AddCustomEventHandler(handler CustomEventHandler) error {
+	p.customEventHandlers = append(p.customEventHandlers, handler)
 
 	return nil
 }
 
 func (p *Probe) sendEventToHandlers(event *model.Event) {
-	for _, handler := range p.eventHandlers[model.UnknownEventType] {
+	for _, handler := range p.eventHandlers {
 		handler.HandleEvent(event)
 	}
 }
 
 func (p *Probe) sendEventToConsumers(event *model.Event) {
+	if t := event.GetEventType(); int(t) >= len(p.eventConsumers) {
+		seclog.Errorf("event type (%d) not allowed", t)
+		return
+	}
+
 	for _, pc := range p.eventConsumers[event.GetEventType()] {
 		if copied := pc.consumer.Copy(event); copied != nil {
 			select {
@@ -322,12 +363,17 @@ func (p *Probe) sendEventToConsumers(event *model.Event) {
 	}
 }
 
-func logTraceEvent(eventType model.EventType, event interface{}) {
+func (p *Probe) logTraceEvent(eventType model.EventType, event interface{}) {
 	if !seclog.DefaultLogger.IsTracing() {
 		return
 	}
 
-	seclog.DefaultLogger.TraceTagf(eventType, "Dispatching event %s", serializers.EventStringerWrapper{Event: event})
+	seclog.DefaultLogger.TraceTagf(eventType, "Dispatching event %s", serializers.EventStringerWrapper{Event: event, Scrubber: p.scrubber})
+}
+
+// GetScrubber returns the event scrubber
+func (p *Probe) GetScrubber() *utils.Scrubber {
+	return p.scrubber
 }
 
 // AddDiscarderPushedCallback add a callback to the list of func that have to be called when a discarder is pushed to kernel
@@ -335,20 +381,17 @@ func (p *Probe) AddDiscarderPushedCallback(cb DiscarderPushedCallback) {
 	p.PlatformProbe.AddDiscarderPushedCallback(cb)
 }
 
+// SendCustomEventKillAction sends a custom remediation-style event for a resolved kill action report.
+func (p *Probe) SendCustomEventKillAction(report model.ActionReport, tags []string) {
+	p.PlatformProbe.SendCustomEventKillAction(report, tags)
+}
+
 // DispatchCustomEvent sends a custom event to the probe event handler
 func (p *Probe) DispatchCustomEvent(rule *rules.Rule, event *events.CustomEvent) {
-	logTraceEvent(event.GetEventType(), event)
+	p.logTraceEvent(event.GetEventType(), event)
 
-	// send wildcard first
-	for _, handler := range p.customEventHandlers[model.UnknownEventType] {
+	for _, handler := range p.customEventHandlers {
 		handler.HandleCustomEvent(rule, event)
-	}
-
-	// send specific event
-	if event.GetEventType() != model.UnknownEventType {
-		for _, handler := range p.customEventHandlers[event.GetEventType()] {
-			handler.HandleCustomEvent(rule, event)
-		}
 	}
 }
 
@@ -388,6 +431,11 @@ func (p *Probe) onRuleActionPerformed(rule *rules.Rule, action *rules.ActionDefi
 	}
 }
 
+// ReplayEvents replays the events from the rule set
+func (p *Probe) ReplayEvents() {
+	p.PlatformProbe.ReplayEvents()
+}
+
 // NewRuleSet returns a new ruleset
 func (p *Probe) NewRuleSet(eventTypeEnabled map[eval.EventType]bool) *rules.RuleSet {
 	ruleOpts, evalOpts := rules.NewBothOpts(eventTypeEnabled)
@@ -396,6 +444,8 @@ func (p *Probe) NewRuleSet(eventTypeEnabled map[eval.EventType]bool) *rules.Rule
 	ruleOpts.WithSupportedDiscarders(SupportedDiscarders)
 	ruleOpts.WithSupportedMultiDiscarder(SupportedMultiDiscarder)
 	ruleOpts.WithRuleActionPerformedCb(p.onRuleActionPerformed)
+	ruleOpts.WithRuleCacheEnabled(p.Config.RuntimeSecurity.RuleCacheEnabled)
+	evalOpts.WithTelemetry(&eval.Telemetry{TotalVariables: probeTelemetry.totalVariables})
 
 	eventCtor := func() eval.Event {
 		return p.PlatformProbe.NewEvent()
@@ -419,9 +469,9 @@ func (p *Probe) IsNetworkFlowMonitorEnabled() bool {
 	return p.IsNetworkEnabled() && p.Config.Probe.NetworkFlowMonitorEnabled
 }
 
-// IsSysctlEventEnabled returns whether the sysctl event is enabled
-func (p *Probe) IsSysctlEventEnabled() bool {
-	return p.Config.RuntimeSecurity.SysCtlEnabled
+// IsCapabilitiesMonitoringEnabled returns whether capabilities monitoring is enabled
+func (p *Probe) IsCapabilitiesMonitoringEnabled() bool {
+	return p.Config.Probe.CapabilitiesMonitoringEnabled
 }
 
 // IsActivityDumpEnabled returns whether activity dump is enabled

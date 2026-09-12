@@ -12,10 +12,13 @@ import (
 	"sort"
 	"time"
 
+	adtypes "github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/common"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmetafilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/util/workloadmeta"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/containers"
@@ -27,15 +30,25 @@ import (
 // to the workloadmeta store.
 type KubeletListener struct {
 	workloadmetaListener
-	tagger tagger.Component
+	globalFilter      workloadfilter.FilterBundle
+	metricsFilter     workloadfilter.FilterBundle
+	logsFilter        workloadfilter.FilterBundle
+	tagger            tagger.Component
+	staticConfigIndex *StaticConfigIndex
 }
 
 // NewKubeletListener returns a new KubeletListener.
 func NewKubeletListener(options ServiceListernerDeps) (ServiceListener, error) {
 	const name = "ad-kubeletlistener"
 
-	l := &KubeletListener{}
-	filter := workloadmeta.NewFilterBuilder().
+	l := &KubeletListener{
+		globalFilter:      options.Filter.GetContainerAutodiscoveryFilters(workloadfilter.GlobalFilter),
+		metricsFilter:     options.Filter.GetContainerAutodiscoveryFilters(workloadfilter.MetricsFilter),
+		logsFilter:        options.Filter.GetContainerAutodiscoveryFilters(workloadfilter.LogsFilter),
+		tagger:            options.Tagger,
+		staticConfigIndex: options.StaticConfigIndex,
+	}
+	wmetaFilter := workloadmeta.NewFilterBuilder().
 		SetSource(workloadmeta.SourceAll).
 		AddKind(workloadmeta.KindKubernetesPod).
 		Build()
@@ -45,17 +58,26 @@ func NewKubeletListener(options ServiceListernerDeps) (ServiceListener, error) {
 		return nil, errors.New("workloadmeta store is not initialized")
 	}
 	var err error
-	l.workloadmetaListener, err = newWorkloadmetaListener(name, filter, l.processPod, wmetaInstance, options.Telemetry)
+	maxWait := time.Duration(pkgconfigsetup.Datadog().GetInt("ad_tag_completeness_max_wait")) * time.Second
+	l.workloadmetaListener, err = newWorkloadmetaListenerWithTagWait(name, wmetaFilter, l.processPod, wmetaInstance, options.Telemetry, l.areTagsComplete, maxWait)
 	if err != nil {
 		return nil, err
 	}
-	l.tagger = options.Tagger
 
 	return l, nil
 }
 
 func (l *KubeletListener) processPod(entity workloadmeta.Entity) {
-	pod := entity.(*workloadmeta.KubernetesPod)
+	// Fetch the pod from the workloadmeta store to get the most up-to-date state.
+	// Handling cases where a pod deletion is reported as a 'Set' event due to
+	// delayed updates from multiple workloadmeta sources. If the pod has been deleted,
+	// its containers will be missing from the store, preventing stale container services
+	// from being created.
+	pod, err := l.Store().GetKubernetesPod(entity.GetID().ID)
+	if err != nil || pod == nil {
+		log.Debugf("Failed to get kubernetes pod from workloadmeta store, using pod from event")
+		pod = entity.(*workloadmeta.KubernetesPod)
+	}
 
 	wlmContainers := pod.GetAllContainers()
 	containers := make([]*workloadmeta.Container, 0, len(wlmContainers))
@@ -78,10 +100,10 @@ func (l *KubeletListener) createPodService(
 	pod *workloadmeta.KubernetesPod,
 	containers []*workloadmeta.Container,
 ) {
-	var ports []ContainerPort
+	var ports []workloadmeta.ContainerPort
 	for _, container := range containers {
 		for _, port := range container.Ports {
-			ports = append(ports, ContainerPort{
+			ports = append(ports, workloadmeta.ContainerPort{
 				Port: port.Port,
 				Name: port.Name,
 			})
@@ -94,14 +116,16 @@ func (l *KubeletListener) createPodService(
 
 	entity := kubelet.PodUIDToEntityName(pod.ID)
 	taggerEntityID := common.BuildTaggerEntityID(pod.GetID())
-	svc := &service{
-		entity:        pod,
-		tagsHash:      l.tagger.GetEntityHash(taggerEntityID, types.ChecksConfigCardinality),
-		adIdentifiers: []string{entity},
-		hosts:         map[string]string{"pod": pod.IP},
-		ports:         ports,
-		ready:         true,
-		tagger:        l.tagger,
+	svc := &WorkloadService{
+		entity:            pod,
+		tagsHash:          l.tagger.GetEntityHash(taggerEntityID, types.ChecksConfigCardinality),
+		adIdentifiers:     []string{entity},
+		hosts:             map[string]string{"pod": pod.IP},
+		ports:             ports,
+		ready:             true,
+		tagger:            l.tagger,
+		wmeta:             l.Store(),
+		staticConfigIndex: l.staticConfigIndex,
 	}
 
 	svcID := buildSvcID(pod.GetID())
@@ -120,13 +144,9 @@ func (l *KubeletListener) createContainerService(
 	containerName := podContainer.Name
 	containerImg := podContainer.Image
 
-	if l.IsExcluded(
-		containers.GlobalFilter,
-		pod.Annotations,
-		containerName,
-		containerImg.RawName,
-		pod.Namespace,
-	) {
+	filterableContainer := workloadmetafilter.CreateContainerFromOrch(podContainer, workloadmetafilter.CreatePod(pod))
+
+	if l.globalFilter.IsExcluded(filterableContainer) {
 		log.Debugf("container %s filtered out: name %q image %q namespace %q", container.ID, containerName, containerImg.RawName, pod.Namespace)
 		return
 	}
@@ -144,9 +164,9 @@ func (l *KubeletListener) createContainerService(
 		}
 	}
 
-	ports := make([]ContainerPort, 0, len(container.Ports))
+	ports := make([]workloadmeta.ContainerPort, 0, len(container.Ports))
 	for _, port := range container.Ports {
-		ports = append(ports, ContainerPort{
+		ports = append(ports, workloadmeta.ContainerPort{
 			Port: port.Port,
 			Name: port.Name,
 		})
@@ -157,7 +177,7 @@ func (l *KubeletListener) createContainerService(
 	})
 
 	entity := containers.BuildEntityName(string(container.Runtime), container.ID)
-	svc := &service{
+	svc := &WorkloadService{
 		entity:   container,
 		tagsHash: l.tagger.GetEntityHash(types.NewEntityID(types.ContainerID, container.ID), types.ChecksConfigCardinality),
 		ready:    pod.Ready || shouldSkipPodReadiness(pod),
@@ -171,21 +191,12 @@ func (l *KubeletListener) createContainerService(
 
 		// Exclude non-running containers (including init containers)
 		// from metrics collection but keep them for collecting logs.
-		metricsExcluded: l.IsExcluded(
-			containers.MetricsFilter,
-			pod.Annotations,
-			containerName,
-			containerImg.RawName,
-			pod.Namespace,
-		) || !container.State.Running,
-		logsExcluded: l.IsExcluded(
-			containers.LogsFilter,
-			pod.Annotations,
-			containerName,
-			containerImg.RawName,
-			pod.Namespace,
-		),
-		tagger: l.tagger,
+		metricsExcluded:   l.metricsFilter.IsExcluded(filterableContainer) || !container.State.Running,
+		logsExcluded:      l.logsFilter.IsExcluded(filterableContainer),
+		tagger:            l.tagger,
+		imageName:         containerImg.ShortName,
+		wmeta:             l.Store(),
+		staticConfigIndex: l.staticConfigIndex,
 	}
 
 	adIdentifier := containerName
@@ -194,7 +205,7 @@ func (l *KubeletListener) createContainerService(
 		svc.adIdentifiers = append(svc.adIdentifiers, customADID)
 	}
 
-	svc.adIdentifiers = append(svc.adIdentifiers, entity, containerImg.RawName)
+	svc.adIdentifiers = append(svc.adIdentifiers, adtypes.KubeContainerNameIdentifier(containerName), entity, containerImg.RawName)
 
 	if len(containerImg.ShortName) > 0 && containerImg.ShortName != containerImg.RawName {
 		svc.adIdentifiers = append(svc.adIdentifiers, containerImg.ShortName)
@@ -209,4 +220,36 @@ func (l *KubeletListener) createContainerService(
 	svcID := buildSvcID(container.GetID())
 	podSvcID := buildSvcID(pod.GetID())
 	l.AddService(svcID, svc, podSvcID)
+}
+
+func (l *KubeletListener) areTagsComplete(entity workloadmeta.Entity) bool {
+	pod, ok := entity.(*workloadmeta.KubernetesPod)
+	if !ok {
+		log.Errorf("expected KubernetesPod entity, got %T", entity)
+		return true
+	}
+
+	podTaggerID := common.BuildTaggerEntityID(pod.GetID())
+	_, podComplete, err := l.tagger.TagWithCompleteness(podTaggerID, types.ChecksConfigCardinality)
+	if err != nil {
+		log.Debugf("error checking tag completeness for pod %s: %s", pod.ID, err)
+		return false
+	}
+	if !podComplete {
+		return false
+	}
+
+	for _, podContainer := range pod.GetAllContainers() {
+		containerTaggerID := types.NewEntityID(types.ContainerID, podContainer.ID)
+		_, containerComplete, err := l.tagger.TagWithCompleteness(containerTaggerID, types.ChecksConfigCardinality)
+		if err != nil {
+			log.Debugf("error checking tag completeness for container %s: %s", podContainer.ID, err)
+			return false
+		}
+		if !containerComplete {
+			return false
+		}
+	}
+
+	return true
 }

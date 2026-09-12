@@ -3,21 +3,22 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package verifier
 
 import (
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
-	"golang.org/x/exp/maps"
 
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/util/filesystem"
@@ -82,7 +83,7 @@ func TestGetSourceMap(t *testing.T) {
 				// On one hand we have file-line from DWARF, on the other we have the line contents
 				// from BTF data. We compare the two and make sure they match for most of the lines
 				// We accept some divergence as sometimes there will be differences with macros, etc.
-				insList := maps.Keys(progSourceMap)
+				insList := slices.Collect(maps.Keys(progSourceMap))
 				sort.Ints(insList)
 				for _, ins := range insList {
 					sl := progSourceMap[ins]

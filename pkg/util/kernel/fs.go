@@ -35,7 +35,9 @@ func ParseMountInfoFile(pid int32) ([]*mountinfo.Info, error) {
 }
 
 // ProcFSRoot retrieves the current procfs dir we should use
-var ProcFSRoot = funcs.MemoizeNoError(func() string {
+var ProcFSRoot = funcs.MemoizeNoError(procFsRoot)
+
+func procFsRoot() string {
 	if v := os.Getenv("HOST_PROC"); v != "" {
 		return v
 	}
@@ -45,10 +47,9 @@ var ProcFSRoot = funcs.MemoizeNoError(func() string {
 		}
 	}
 	return "/proc"
-})
+}
 
-// SysFSRoot retrieves the current sysfs dir we should use
-var SysFSRoot = funcs.MemoizeNoError(func() string {
+func sysFsRoot() string {
 	if v := os.Getenv("HOST_SYS"); v != "" {
 		return v
 	}
@@ -58,7 +59,10 @@ var SysFSRoot = funcs.MemoizeNoError(func() string {
 		}
 	}
 	return "/sys"
-})
+}
+
+// SysFSRoot retrieves the current sysfs dir we should use
+var SysFSRoot = funcs.MemoizeNoError(sysFsRoot)
 
 // BootRoot retrieves the current boot dir we should use
 var BootRoot = funcs.MemoizeNoError(func() string {

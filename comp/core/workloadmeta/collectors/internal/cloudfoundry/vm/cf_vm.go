@@ -14,9 +14,9 @@ import (
 
 	"go.uber.org/fx"
 
+	config "github.com/DataDog/datadog-agent/comp/core/config"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/util/cloudproviders/cloudfoundry"
 	"github.com/DataDog/datadog-agent/pkg/util/clusteragent"
@@ -29,8 +29,15 @@ const (
 	componentName = "workloadmeta-cloudfoundry-vm"
 )
 
+type dependencies struct {
+	fx.In
+
+	Config config.Component
+}
+
 type collector struct {
 	id      string
+	cfg     config.Component
 	store   workloadmeta.Component
 	seen    map[workloadmeta.EntityID]struct{}
 	catalog workloadmeta.AgentType
@@ -43,12 +50,13 @@ type collector struct {
 }
 
 // NewCollector instantiates a CollectorProvider which can provide a CF container collector
-func NewCollector() (workloadmeta.CollectorProvider, error) {
+func NewCollector(deps dependencies) (workloadmeta.CollectorProvider, error) {
 	return workloadmeta.CollectorProvider{
 		Collector: &collector{
 			id:      collectorID,
+			cfg:     deps.Config,
 			seen:    make(map[workloadmeta.EntityID]struct{}),
-			catalog: workloadmeta.NodeAgent | workloadmeta.ProcessAgent,
+			catalog: workloadmeta.NodeAgent,
 		},
 	}, nil
 }
@@ -72,10 +80,10 @@ func (c *collector) Start(_ context.Context, store workloadmeta.Component) error
 		return err
 	}
 
-	c.nodeName = pkgconfigsetup.Datadog().GetString("bosh_id")
+	c.nodeName = c.cfg.GetString("bosh_id")
 
 	// Check for Cluster Agent availability (will be retried at each pull)
-	c.dcaEnabled = pkgconfigsetup.Datadog().GetBool("cluster_agent.enabled")
+	c.dcaEnabled = c.cfg.GetBool("cluster_agent.enabled")
 	c.dcaClient = c.getDCAClient()
 
 	return nil
@@ -100,7 +108,7 @@ func (c *collector) Pull(_ context.Context) error {
 
 	var allContainersTags map[string][]string
 	if dcaClient := c.getDCAClient(); dcaClient != nil {
-		allContainersTags, err = c.dcaClient.GetCFAppsMetadataForNode(c.nodeName)
+		allContainersTags, err = dcaClient.GetCFAppsMetadataForNode(c.nodeName)
 		if err != nil {
 			log.Debugf("Unable to fetch CF tags from cluster agent, CF tags will be missing, err: %v", err)
 		}
@@ -223,13 +231,18 @@ func (c *collector) getDCAClient() clusteragent.DCAClientInterface {
 		return c.dcaClient
 	}
 
-	var err error
-	c.dcaClient, err = clusteragent.GetClusterAgentClient()
+	// Assign to a local *DCAClient first and only store it into the interface
+	// field on success. GetClusterAgentClient returns (*DCAClient, error); on
+	// failure that nil pointer would otherwise be boxed into the c.dcaClient
+	// interface field, producing a non-nil "typed nil" that passes the
+	// `c.dcaClient != nil` check above and panics when a method is called on it.
+	client, err := clusteragent.GetClusterAgentClient()
 	if err != nil {
 		log.Debugf("Could not initialise the communication with the cluster agent, PCF tags may be missing, err: %v", err)
 		return nil
 	}
 
+	c.dcaClient = client
 	return c.dcaClient
 }
 

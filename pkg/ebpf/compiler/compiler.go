@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // Package compiler is the runtime compiler for eBPF
 package compiler
@@ -19,13 +19,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 var (
-	datadogAgentEmbeddedPath = filepath.Join(setup.InstallPath, "embedded")
+	datadogAgentEmbeddedPath = filepath.Join(defaultpaths.GetInstallPath(), "embedded")
 	clangBinPath             = filepath.Join(datadogAgentEmbeddedPath, "bin/clang-bpf")
 	llcBinPath               = filepath.Join(datadogAgentEmbeddedPath, "bin/llc-bpf")
 
@@ -52,13 +52,13 @@ func kernelHeaderPaths(headerDirs []string) []string {
 	var paths []string
 	for _, d := range headerDirs {
 		paths = append(paths,
-			fmt.Sprintf("%s/arch/%s/include", d, arch),
-			fmt.Sprintf("%s/arch/%s/include/generated", d, arch),
-			fmt.Sprintf("%s/include", d),
-			fmt.Sprintf("%s/arch/%s/include/uapi", d, arch),
-			fmt.Sprintf("%s/arch/%s/include/generated/uapi", d, arch),
-			fmt.Sprintf("%s/include/uapi", d),
-			fmt.Sprintf("%s/include/generated/uapi", d),
+			d+"/arch/"+arch+"/include",
+			d+"/arch/"+arch+"/include/generated",
+			d+"/include",
+			d+"/arch/"+arch+"/include/uapi",
+			d+"/arch/"+arch+"/include/generated/uapi",
+			d+"/include/uapi",
+			d+"/include/generated/uapi",
 		)
 	}
 	return paths
@@ -71,11 +71,11 @@ func CompileToObjectFile(inFile, outputFile string, cflags []string, headerDirs 
 		return err
 	}
 	defer os.RemoveAll(tmpIncludeDir)
-	cflags = append(cflags, fmt.Sprintf("-isystem%s", tmpIncludeDir))
+	cflags = append(cflags, "-isystem"+tmpIncludeDir)
 
 	kps := kernelHeaderPaths(headerDirs)
 	for _, p := range kps {
-		cflags = append(cflags, fmt.Sprintf("-isystem%s", p))
+		cflags = append(cflags, "-isystem"+p)
 	}
 
 	cflags = append(cflags, "-c", "-x", "c", "-o", "-", inFile)
@@ -174,11 +174,11 @@ func Preprocess(in io.Reader, out io.Writer, cflags []string, headerDirs []strin
 		return err
 	}
 	defer os.RemoveAll(tmpIncludeDir)
-	cflags = append(cflags, fmt.Sprintf("-isystem%s", tmpIncludeDir))
+	cflags = append(cflags, "-isystem"+tmpIncludeDir)
 
 	kps := kernelHeaderPaths(headerDirs)
 	for _, p := range kps {
-		cflags = append(cflags, fmt.Sprintf("-isystem%s", p))
+		cflags = append(cflags, "-isystem"+p)
 	}
 
 	cflags = append(cflags, "-E", "-x", "c", "-o", "-", "-")

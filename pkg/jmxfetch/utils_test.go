@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 )
@@ -32,7 +32,7 @@ func TestJSONConverter(t *testing.T) {
 		var cf integration.RawMap
 
 		// Read file contents
-		yamlFile, err := os.ReadFile(fmt.Sprintf("./fixtures/%s.yaml", c))
+		yamlFile, err := os.ReadFile(fmt.Sprintf("./testdata/%s.yaml", c))
 		assert.NoError(t, err)
 
 		// Parse configuration
@@ -48,7 +48,7 @@ func TestJSONConverter(t *testing.T) {
 	for name, config := range cache {
 		c[name] = GetJSONSerializableMap(config)
 	}
-	j["configurations"] = c
+	j["configs"] = c
 
 	//json encode
 	_, err := json.Marshal(GetJSONSerializableMap(j))

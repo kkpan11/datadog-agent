@@ -13,6 +13,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/secl/containerutils"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
+	"github.com/DataDog/datadog-agent/pkg/security/utils"
 )
 
 const (
@@ -28,6 +29,11 @@ const (
 	HeartbeatRuleID = "heartbeat"
 	// HeartbeatRuleDesc is the rule description for the heartbeat events
 	HeartbeatRuleDesc = "Heartbeat"
+
+	// RemediationStatusRuleID is the rule ID for the remediation_status events
+	RemediationStatusRuleID = "remediation_status"
+	// RemediationStatusRuleDesc is the rule description for the remediation_status events
+	RemediationStatusRuleDesc = "Remediation status"
 
 	// AbnormalPathRuleID is the rule ID for the abnormal_path events
 	AbnormalPathRuleID = "abnormal_path"
@@ -68,12 +74,22 @@ const (
 	SysCtlSnapshotRuleID = "sysctl_snapshot"
 	// SysCtlSnapshotRuleDesc is the description of the sysctl snapshot rule
 	SysCtlSnapshotRuleDesc = "A new sysctl snapshot was generated"
+
+	// RawPacketActionRuleID is the rule ID for raw packet action events
+	RawPacketActionRuleID = "rawpacket_action"
+	// RawPacketActionRuleDesc is the rule description for raw packet action events
+	RawPacketActionRuleDesc = "RawPacket Action"
+
+	// FailedDNSRuleID is the rule ID for an event about a DNS packet that failed to get decoded
+	FailedDNSRuleID = "failed_dns"
+	// FailedDNSRuleDesc is the rule description for raw packet action events
+	FailedDNSRuleDesc = "Failed DNS"
 )
 
 // AgentContainerContext is like model.ContainerContext, but without event based resolvers
 type AgentContainerContext struct {
 	ContainerID containerutils.ContainerID `json:"id,omitempty"`
-	CreatedAt   uint64                     `json:"created_at"`
+	CreatedAt   *utils.EasyjsonTime        `json:"created_at,omitempty"`
 }
 
 // CustomEventCommonFields represents the fields common to all custom events
@@ -91,9 +107,9 @@ func (commonFields *CustomEventCommonFields) FillCustomEventCommonFields(acc *Ag
 }
 
 // NewCustomRule returns a new custom rule
-func NewCustomRule(id eval.RuleID, description string) *rules.Rule {
+func NewCustomRule(id eval.RuleID, description string, opts *eval.Opts) *rules.Rule {
 	return &rules.Rule{
-		Rule: &eval.Rule{ID: id},
+		Rule: &eval.Rule{ID: id, Opts: opts},
 		PolicyRule: &rules.PolicyRule{
 			Def: &rules.RuleDefinition{ID: id, Description: description},
 		},
@@ -111,6 +127,14 @@ func AllCustomRuleIDs() []string {
 		BrokenProcessLineageErrorRuleID,
 		InternalCoreDumpRuleID,
 		SysCtlSnapshotRuleID,
+		FailedDNSRuleID,
+		RemediationStatusRuleID,
+	}
+}
+
+func AllSecInfoRuleIDs() []string {
+	return []string{
+		RemediationStatusRuleID,
 	}
 }
 

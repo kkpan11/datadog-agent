@@ -6,95 +6,54 @@
 package discovery
 
 import (
-	_ "embed"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/util/testutil/flake"
-	"github.com/DataDog/datadog-agent/test/fakeintake/aggregator"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awsdocker "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/docker"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client/agentclient"
-	"github.com/DataDog/test-infra-definitions/components/datadog/dockeragentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/dockeragentparams"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+
+	scendocker "github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2docker"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awsdocker "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/docker"
 )
 
-const (
-	pythonImage = "public.ecr.aws/docker/library/python:3"
-)
-
-type dockerDiscoveryTestSuite struct {
+type dockerTestSuite struct {
 	e2e.BaseSuite[environments.DockerHost]
 }
 
-func TestDiscoveryDocker(t *testing.T) {
+func TestDockerTestSuite(t *testing.T) {
+	t.Parallel()
+
 	agentOpts := []dockeragentparams.Option{
 		dockeragentparams.WithAgentServiceEnvVariable("DD_DISCOVERY_ENABLED", pulumi.StringPtr("true")),
+		dockeragentparams.WithAgentServiceEnvVariable("DD_DISCOVERY_USE_SYSTEM_PROBE_LITE", pulumi.StringPtr("true")),
+		// Setting any DD_SYSTEM_PROBE_* env var triggers privileged mode in the
+		// Docker compose. This var sets the socket path to its default (no-op)
+		// and is not in system-probe-lite's NON_DISCOVERY_ENV_VARS list, so it
+		// won't cause fallback to full system-probe.
+		dockeragentparams.WithAgentServiceEnvVariable("DD_SYSTEM_PROBE_CONFIG_SYSPROBE_SOCKET", pulumi.StringPtr("/opt/datadog-agent/run/sysprobe.sock")),
 	}
 
-	e2e.Run(t,
-		&dockerDiscoveryTestSuite{},
-		e2e.WithProvisioner(
-			awsdocker.Provisioner(
-				awsdocker.WithAgentOptions(agentOpts...),
-			)))
-}
-
-func (s *dockerDiscoveryTestSuite) TestServiceDiscoveryContainerID() {
-	t := s.T()
-
-	flake.Mark(t)
-
-	client := s.Env().FakeIntake.Client()
-	err := client.FlushServerAndResetAggregators()
-	require.NoError(t, err)
-
-	s.assertDockerAgentDiscoveryRunning()
-
-	_, err = s.Env().RemoteHost.Execute("docker pull " + pythonImage)
-	if err != nil {
-		s.T().Skipf("could not pull docker image for service discovery E2E test: %s", err)
+	options := []e2e.SuiteOption{
+		e2e.WithProvisioner(awsdocker.Provisioner(
+			awsdocker.WithRunOptions(
+				scendocker.WithAgentOptions(agentOpts...),
+			),
+		)),
 	}
 
-	containerID := s.Env().RemoteHost.MustExecute("docker run -d --name e2e-test-python-server --publish 8090:8090 " + pythonImage + " python -m http.server 8090")
-	t.Cleanup(func() {
-		s.Env().RemoteHost.MustExecute("docker stop e2e-test-python-server && docker rm e2e-test-python-server")
-	})
-	containerID = strings.TrimSuffix(containerID, "\n")
-	t.Logf("service container ID: %v", containerID)
-
-	services := s.Env().Docker.Client.ExecuteCommand(s.Env().Agent.ContainerName, "curl", "-s", "--unix-socket", "/opt/datadog-agent/run/sysprobe.sock", "http://unix/discovery/check")
-	t.Logf("system-probe services: %v", services)
-
-	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		payloads, err := client.GetServiceDiscoveries()
-		require.NoError(t, err)
-
-		foundMap := make(map[string]*aggregator.ServiceDiscoveryPayload)
-		for _, p := range payloads {
-			name := p.Payload.GeneratedServiceName
-			t.Log("RequestType", p.RequestType, "GeneratedServiceName", name)
-
-			if p.RequestType == "start-service" {
-				foundMap[name] = p
-			}
-		}
-
-		require.NotEmpty(c, foundMap)
-		require.Contains(c, foundMap, "http.server")
-		require.Equal(c, containerID, foundMap["http.server"].Payload.ContainerID)
-	}, 3*time.Minute, 10*time.Second)
+	e2e.Run(t, &dockerTestSuite{}, options...)
 }
 
-func (s *dockerDiscoveryTestSuite) assertDockerAgentDiscoveryRunning() {
+func (s *dockerTestSuite) TestSystemProbeLiteRunning() {
 	t := s.T()
 
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		statusOutput := s.Env().Agent.Client.Status(agentclient.WithArgs([]string{"collector", "--json"})).Content
-		assertCollectorStatusFromJSON(c, statusOutput, "service_discovery")
+		ps := s.Env().Docker.Client.ExecuteCommand(s.Env().Agent.ContainerName, "ps", "aux")
+		assert.True(c, strings.Contains(ps, "system-probe-lite"),
+			"system-probe-lite should be running in the container, got:\n%s", ps)
 	}, 2*time.Minute, 10*time.Second)
 }

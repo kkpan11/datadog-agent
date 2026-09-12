@@ -12,19 +12,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/network"
+	dockerclient "github.com/moby/moby/client"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.uber.org/fx"
 
+	config "github.com/DataDog/datadog-agent/comp/core/config"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	"github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/sbomutil"
 	"github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/util"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
@@ -42,6 +46,13 @@ import (
 const (
 	collectorID   = "docker"
 	componentName = "workloadmeta-docker"
+
+	// nvidiaVisibleDevicesEnvVar is the environment variable set by NVIDIA container runtime
+	// to specify which GPUs are visible to the container. Values can be:
+	// - GPU UUIDs: "GPU-uuid" or "GPU-uuid1,GPU-uuid2" (ECS, some K8s setups)
+	// - Device indices: "0", "1", "0,1" (local Docker)
+	// - Special values: "all", "none", "void"
+	nvidiaVisibleDevicesEnvVar = "NVIDIA_VISIBLE_DEVICES"
 )
 
 // imageEventActionSbom is an event that we set to create a fake docker event.
@@ -49,8 +60,16 @@ const imageEventActionSbom = events.Action("sbom")
 
 type resolveHook func(ctx context.Context, co container.InspectResponse) (string, error)
 
+type dependencies struct {
+	fx.In
+
+	Config      config.Component
+	FilterStore workloadfilter.Component
+}
+
 type collector struct {
 	id      string
+	cfg     config.Component
 	store   workloadmeta.Component
 	catalog workloadmeta.AgentType
 
@@ -67,14 +86,20 @@ type collector struct {
 
 	// SBOM Scanning
 	sbomScanner *scanner.Scanner //nolint: unused
+
+	filterPausedContainers workloadfilter.FilterBundle
+	filterSBOMContainers   workloadfilter.FilterBundle
 }
 
 // NewCollector returns a new docker collector provider and an error
-func NewCollector() (workloadmeta.CollectorProvider, error) {
+func NewCollector(deps dependencies) (workloadmeta.CollectorProvider, error) {
 	return workloadmeta.CollectorProvider{
 		Collector: &collector{
-			id:      collectorID,
-			catalog: workloadmeta.NodeAgent | workloadmeta.ProcessAgent,
+			id:                     collectorID,
+			cfg:                    deps.Config,
+			catalog:                workloadmeta.NodeAgent,
+			filterPausedContainers: deps.FilterStore.GetContainerPausedFilters(),
+			filterSBOMContainers:   deps.FilterStore.GetContainerSBOMFilters(),
 		},
 	}, nil
 }
@@ -101,12 +126,7 @@ func (c *collector) Start(ctx context.Context, store workloadmeta.Component) err
 		return err
 	}
 
-	filter, err := containers.GetPauseContainerFilter()
-	if err != nil {
-		log.Warnf("Can't get pause container filter, no filtering will be applied: %v", err)
-	}
-
-	c.containerEventsCh, c.imageEventsCh, err = c.dockerUtil.SubscribeToEvents(componentName, filter)
+	c.containerEventsCh, c.imageEventsCh, err = c.dockerUtil.SubscribeToEvents(componentName, c.filterPausedContainers)
 	if err != nil {
 		return err
 	}
@@ -116,7 +136,7 @@ func (c *collector) Start(ctx context.Context, store workloadmeta.Component) err
 		return err
 	}
 
-	err = c.generateEventsFromContainerList(ctx, filter)
+	err = c.generateEventsFromContainerList(ctx, c.filterPausedContainers)
 	if err != nil {
 		return err
 	}
@@ -178,12 +198,12 @@ func (c *collector) stream(ctx context.Context) {
 	}
 }
 
-func (c *collector) generateEventsFromContainerList(ctx context.Context, filter *containers.Filter) error {
+func (c *collector) generateEventsFromContainerList(ctx context.Context, filter workloadfilter.FilterBundle) error {
 	if c.store == nil {
 		return errors.New("Start was not called")
 	}
 
-	containers, err := c.dockerUtil.RawContainerListWithFilter(ctx, container.ListOptions{}, filter, c.store)
+	containers, err := c.dockerUtil.RawContainerListWithFilter(ctx, dockerclient.ContainerListOptions{}, filter, c.store)
 	if err != nil {
 		return err
 	}
@@ -319,6 +339,8 @@ func (c *collector) buildCollectorEvent(ctx context.Context, ev *docker.Containe
 			Hostname:     container.Config.Hostname,
 			PID:          container.State.Pid,
 			RestartCount: container.RestartCount,
+			Resources:    extractResources(container),
+			GPUDeviceIDs: extractGPUDeviceIDsForECS(container.Config.Env),
 		}
 
 	case events.ActionDie, docker.ActionDied:
@@ -441,35 +463,32 @@ func extractPorts(container container.InspectResponse) []workloadmeta.ContainerP
 	return ports
 }
 
-func extractPort(port nat.Port) []workloadmeta.ContainerPort {
+func extractPort(port network.Port) []workloadmeta.ContainerPort {
 	var output []workloadmeta.ContainerPort
 
-	// Try to parse a port range, eg. 22-25
-	first, last, err := port.Range()
-	if err != nil {
-		log.Debugf("cannot get port range from nat.Port: %s", err)
-		return output
-	}
+	pr := port.Range()
+	first := int(pr.Start())
+	last := int(pr.End())
 
 	if last > first {
 		output = make([]workloadmeta.ContainerPort, 0, last-first+1)
 		for p := first; p <= last; p++ {
 			output = append(output, workloadmeta.ContainerPort{
 				Port:     p,
-				Protocol: port.Proto(),
+				Protocol: string(port.Proto()),
 			})
 		}
 
 		return output
 	}
 
-	// Try to parse a single port (most common case)
-	p := port.Int()
+	// Single port (most common case)
+	p := int(port.Num())
 	if p > 0 {
 		output = []workloadmeta.ContainerPort{
 			{
 				Port:     p,
-				Protocol: port.Proto(),
+				Protocol: string(port.Proto()),
 			},
 		}
 	}
@@ -481,8 +500,8 @@ func extractNetworkIPs(networks map[string]*network.EndpointSettings) map[string
 	networkIPs := make(map[string]string)
 
 	for net, settings := range networks {
-		if len(settings.IPAddress) > 0 {
-			networkIPs[net] = settings.IPAddress
+		if settings.IPAddress.IsValid() {
+			networkIPs[net] = settings.IPAddress.String()
 		}
 	}
 
@@ -613,7 +632,12 @@ func (c *collector) getImageMetadata(ctx context.Context, imageID string, newSBO
 		}
 
 		if sbom == nil && existingImg.SBOM.Status != workloadmeta.Pending {
-			sbom = existingImg.SBOM
+			oldSBOM, err := sbomutil.UncompressSBOM(existingImg.SBOM)
+			if err != nil {
+				log.Errorf("Failed to uncompress SBOM for image %s: %v", existingImg.ID, err)
+			} else {
+				sbom = oldSBOM
+			}
 		}
 	}
 
@@ -627,7 +651,12 @@ func (c *collector) getImageMetadata(ctx context.Context, imageID string, newSBO
 	// not be able to inject them. For example, if we use the scanner from filesystem or
 	// if the `imgMeta` object does not contain all the metadata when it is sent.
 	// We add them here to make sure they are present.
-	sbom = util.UpdateSBOMRepoMetadata(sbom, imgInspect.RepoTags, imgInspect.RepoDigests)
+	sbom = sbomutil.UpdateSBOMRepoMetadata(sbom, imgInspect.RepoTags, imgInspect.RepoDigests)
+	csbom, err := sbomutil.CompressSBOM(sbom)
+	if err != nil {
+		log.Errorf("Failed to compress SBOM for image %s: %v", imgInspect.ID, err)
+		return nil, err
+	}
 
 	return &workloadmeta.ContainerImageMetadata{
 		EntityID: workloadmeta.EntityID{
@@ -646,7 +675,7 @@ func (c *collector) getImageMetadata(ctx context.Context, imageID string, newSBO
 		Architecture: imgInspect.Architecture,
 		Variant:      imgInspect.Variant,
 		Layers:       layersFromDockerHistoryAndInspect(imageHistory, imgInspect),
-		SBOM:         sbom,
+		SBOM:         csbom,
 	}, nil
 }
 
@@ -680,8 +709,8 @@ func layersFromDockerHistoryAndInspect(history []image.HistoryResponseItem, insp
 		shouldAssignDigests = false
 	}
 
-	// inspectIdx tracks the current RootFS layer ID index (in Docker, this corresponds to the Diff ID of a layer)
-	// NOTE: Docker returns the RootFS layers in chronological order
+	// inspectIdx tracks the current RootFS layer index (in Docker, RootFS.Layers
+	// holds diff_ids in chronological order).
 	inspectIdx := 0
 
 	// Docker returns the history layers in reverse-chronological order
@@ -690,20 +719,20 @@ func layersFromDockerHistoryAndInspect(history []image.HistoryResponseItem, insp
 		isEmptyLayer := history[i].Size == 0
 		isInheritedLayer := isInheritedLayer(history[i])
 
-		digest := ""
+		diffID := ""
 		if shouldAssignDigests && (isInheritedLayer || !isEmptyLayer) {
 			if isInheritedLayer {
-				log.Debugf("detected an inherited layer for image ID: \"%s\", assigning it digest: \"%s\"", inspect.ID, inspect.RootFS.Layers[inspectIdx])
+				log.Debugf("detected an inherited layer for image ID: \"%s\", assigning it diff_id: \"%s\"", inspect.ID, inspect.RootFS.Layers[inspectIdx])
 			}
-			digest = inspect.RootFS.Layers[inspectIdx]
+			diffID = inspect.RootFS.Layers[inspectIdx]
 			inspectIdx++
 		} else {
 			// Fallback to previous behavior
-			digest = history[i].ID
+			diffID = history[i].ID
 		}
 
 		layer := workloadmeta.ContainerImageLayer{
-			Digest:    digest,
+			DiffID:    diffID,
 			SizeBytes: history[i].Size,
 			History: &v1.History{
 				Created:    &created,
@@ -717,4 +746,67 @@ func layersFromDockerHistoryAndInspect(history []image.HistoryResponseItem, insp
 	}
 
 	return layers
+}
+
+// extractGPUDeviceIDsForECS extracts GPU device identifiers from NVIDIA_VISIBLE_DEVICES environment variable,
+// but ONLY when running in ECS. For regular Docker containers, the NVIDIA container toolkit adds
+// NVIDIA_VISIBLE_DEVICES in a way that's not visible in container.Config.Env (it's added by the
+// runtime, not the container config), so we must rely on reading from procfs at metric collection time.
+// In ECS, the env var IS visible in container.Config.Env because ECS sets it directly.
+// ECS typically sets GPU UUIDs (e.g., "GPU-uuid1,GPU-uuid2"), but users can also set "all" for GPU sharing.
+func extractGPUDeviceIDsForECS(envVars []string) []string {
+	// Only extract from container config in ECS.
+	// For regular Docker, NVIDIA_VISIBLE_DEVICES is added by the container runtime
+	// and won't be visible here - the GPU probe will read it from procfs instead.
+	if !env.IsECS() {
+		return nil
+	}
+	return extractGPUDeviceIDs(envVars)
+}
+
+// extractGPUDeviceIDs parses GPU device identifiers from NVIDIA_VISIBLE_DEVICES environment variable.
+// ECS typically sets GPU UUIDs (e.g., "GPU-uuid1,GPU-uuid2"), but users can also set "all" for GPU sharing.
+// Special values "all", "none", "void" are preserved and handled in matchByGPUDeviceIDs().
+// Empty value returns nil (env var set but empty).
+func extractGPUDeviceIDs(envVars []string) []string {
+	prefix := nvidiaVisibleDevicesEnvVar + "="
+	for _, e := range envVars {
+		if value, found := strings.CutPrefix(e, prefix); found {
+			if value == "" {
+				return nil
+			}
+			return strings.Split(value, ",")
+		}
+	}
+	return nil
+}
+
+func extractResources(container container.InspectResponse) workloadmeta.ContainerResources {
+	var resources workloadmeta.ContainerResources
+
+	if container.HostConfig == nil {
+		return resources
+	}
+
+	numRequestedGPUs := 0
+	for _, deviceRequest := range container.HostConfig.Resources.DeviceRequests {
+		for _, capabilityGroup := range deviceRequest.Capabilities {
+			if slices.Contains(capabilityGroup, "gpu") {
+				if deviceRequest.Count == workloadmeta.RequestAllGPUs {
+					numRequestedGPUs = workloadmeta.RequestAllGPUs
+				} else if numRequestedGPUs != workloadmeta.RequestAllGPUs {
+					numRequestedGPUs += deviceRequest.Count
+				}
+
+				if deviceRequest.Driver != "" && !slices.Contains(resources.GPUVendorList, deviceRequest.Driver) {
+					resources.GPUVendorList = append(resources.GPUVendorList, deviceRequest.Driver)
+				}
+			}
+		}
+	}
+
+	resources.GPURequest = pointer.Ptr(int64(numRequestedGPUs))
+	resources.GPULimit = pointer.Ptr(int64(numRequestedGPUs))
+
+	return resources
 }

@@ -9,8 +9,28 @@ package config
 
 import "github.com/DataDog/datadog-agent/pkg/config/model"
 
+// eBPFMapPreallocationSupported returns false on non bpf systems.
+func eBPFMapPreallocationSupported() bool {
+	return false
+}
+
 // ProcessEventDataStreamSupported returns true if process event data stream is supported
 func ProcessEventDataStreamSupported() bool {
+	return false
+}
+
+// DirectSendSupported returns true if sending data CNM/USM directly from system-probe is supported
+func DirectSendSupported() bool {
+	return false
+}
+
+// RedisMonitoringSupported returns false on darwin as eBPF is not supported
+func RedisMonitoringSupported() bool {
+	return false
+}
+
+// HTTP2MonitoringSupported returns false on darwin as eBPF is not supported
+func HTTP2MonitoringSupported() bool {
 	return false
 }
 

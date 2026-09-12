@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/comp/dogstatsd/packets"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap"
+	pidmap "github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap/def"
 	replay "github.com/DataDog/datadog-agent/comp/dogstatsd/replay/def"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -102,7 +102,7 @@ func (l *UDSStreamListener) listen() {
 		}
 		go func() {
 			l.connTracker.Track(conn)
-			_ = l.handleConnection(conn, func(c netUnixConn) error {
+			err = l.handleConnection(conn, func(c netUnixConn) error {
 				l.connTracker.Close(c)
 				return nil
 			})

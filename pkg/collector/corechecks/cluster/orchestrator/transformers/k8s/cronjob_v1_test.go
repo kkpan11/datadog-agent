@@ -29,10 +29,8 @@ func TestExtractCronJobV1(t *testing.T) {
 	lastSuccessfulTime := metav1.NewTime(time.Date(2021, time.April, 16, 14, 30, 0, 0, time.UTC))
 
 	tests := map[string]struct {
-		input             batchv1.CronJob
-		labelsAsTags      map[string]string
-		annotationsAsTags map[string]string
-		expected          model.CronJob
+		input    batchv1.CronJob
+		expected model.CronJob
 	}{
 		"full cron job (active)": {
 			input: batchv1.CronJob{
@@ -56,6 +54,7 @@ func TestExtractCronJobV1(t *testing.T) {
 					StartingDeadlineSeconds:    pointer.Ptr(int64(120)),
 					SuccessfulJobsHistoryLimit: pointer.Ptr(int32(2)),
 					Suspend:                    pointer.Ptr(false),
+					TimeZone:                   pointer.Ptr("Europe/London"),
 				},
 				Status: batchv1.CronJobStatus{
 					Active: []corev1.ObjectReference{
@@ -71,12 +70,6 @@ func TestExtractCronJobV1(t *testing.T) {
 					LastScheduleTime:   &lastScheduleTime,
 					LastSuccessfulTime: &lastSuccessfulTime,
 				},
-			},
-			labelsAsTags: map[string]string{
-				"app": "application",
-			},
-			annotationsAsTags: map[string]string{
-				"annotation": "annotation_key",
 			},
 			expected: model.CronJob{
 				Metadata: &model.Metadata{
@@ -95,6 +88,7 @@ func TestExtractCronJobV1(t *testing.T) {
 					StartingDeadlineSeconds:    120,
 					SuccessfulJobsHistoryLimit: 2,
 					Suspend:                    false,
+					TimeZone:                   "Europe/London",
 				},
 				Status: &model.CronJobStatus{
 					Active: []*model.ObjectReference{
@@ -110,19 +104,12 @@ func TestExtractCronJobV1(t *testing.T) {
 					LastScheduleTime:   lastScheduleTime.Unix(),
 					LastSuccessfulTime: lastSuccessfulTime.Unix(),
 				},
-				Tags: []string{
-					"application:my-app",
-					"annotation_key:my-annotation",
-				},
 			},
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			pctx := &processors.K8sProcessorContext{
-				LabelsAsTags:      tc.labelsAsTags,
-				AnnotationsAsTags: tc.annotationsAsTags,
-			}
+			pctx := &processors.K8sProcessorContext{}
 			actual := ExtractCronJobV1(pctx, &tc.input)
 			sort.Strings(actual.Tags)
 			sort.Strings(tc.expected.Tags)

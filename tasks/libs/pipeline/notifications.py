@@ -11,7 +11,11 @@ from tasks.libs.owners.parsing import read_owners
 
 
 def load_and_validate(
-    file_name: str, default_placeholder: str, default_value: str, relpath: bool = True
+    file_name: str,
+    default_placeholder: str,
+    default_value: str,
+    relpath: bool = True,
+    channel_type: str = 'notification',
 ) -> dict[str, str]:
     if relpath:
         p = pathlib.Path(os.path.realpath(__file__)).parent.joinpath(file_name)
@@ -21,8 +25,20 @@ def load_and_validate(
     result: dict[str, str] = {}
     with p.open(encoding='utf-8') as file_stream:
         for key, value in yaml.safe_load(file_stream).items():
-            if not (isinstance(key, str) and isinstance(value, str)):
-                raise ValueError(f"File {file_name} contains a non-string key or value. Key: {key}, Value: {value}")
+            if not isinstance(key, str):
+                raise ValueError(f"File {file_name} contains a non-string key. Key: {key}")
+            # Support merged format with notification/review sub-keys
+            if isinstance(value, dict) and channel_type in value:
+                value = value[channel_type]
+            # Support dict values with a 'name' field (e.g. {name: '#channel'})
+            if isinstance(value, dict):
+                if 'name' not in value:
+                    raise ValueError(
+                        f"File {file_name} has a dict value without 'name' key. Key: {key}, Value: {value}"
+                    )
+                value = value['name']
+            if not isinstance(value, str):
+                raise ValueError(f"File {file_name} contains a non-string value. Key: {key}, Value: {value}")
             result[key] = default_value if value == default_placeholder else value
     return result
 
@@ -35,24 +51,24 @@ DEFAULT_JIRA_PROJECT = "AGNTR"
 GITHUB_SLACK_MAP = load_and_validate("github_slack_map.yaml", "DEFAULT_SLACK_CHANNEL", DEFAULT_SLACK_CHANNEL)
 GITHUB_JIRA_MAP = load_and_validate("github_jira_map.yaml", "DEFAULT_JIRA_PROJECT", DEFAULT_JIRA_PROJECT)
 GITHUB_SLACK_REVIEW_MAP = load_and_validate(
-    "github_slack_review_map.yaml", "DEFAULT_SLACK_CHANNEL", DEFAULT_SLACK_CHANNEL
+    "github_slack_map.yaml", "DEFAULT_SLACK_CHANNEL", DEFAULT_SLACK_CHANNEL, channel_type='review'
 )
 
 
 def check_for_missing_owners_slack_and_jira(print_missing_teams=True, owners_file=".github/CODEOWNERS"):
     owners = read_owners(owners_file)
     error = False
-    for path in owners.paths:
-        if not path[2] or path[2][0][0] != "TEAM":
-            continue
-        if path[2][0][1].lower() not in GITHUB_SLACK_MAP:
-            error = True
-            if print_missing_teams:
-                print(f"The team {path[2][0][1]} doesn't have a slack team assigned !!")
-        if path[2][0][1].lower() not in GITHUB_JIRA_MAP:
-            error = True
-            if print_missing_teams:
-                print(f"The team {path[2][0][1]} doesn't have a jira project assigned !!")
+    teams = {p[2][0][1].lower() for p in owners.paths if p[2] and p[2][0][0] == "TEAM"}
+    for team in teams:
+        for gh_map, map_name in [
+            (GITHUB_SLACK_MAP, 'slack'),
+            (GITHUB_JIRA_MAP, 'jira'),
+            (GITHUB_SLACK_REVIEW_MAP, 'slack review'),
+        ]:
+            if team not in gh_map:
+                error = True
+                if print_missing_teams:
+                    print(f"The team {team} is missing from the Github {map_name} map. Please update!!")
     return error
 
 
@@ -74,7 +90,7 @@ def get_pr_from_commit(commit_title: str, project_name: str) -> tuple[str, str] 
     return parsed_pr_id, f"{GITHUB_BASE_URL}/{project_name}/pull/{parsed_pr_id}"
 
 
-def warn_new_commits(release_managers, team, branch, next_rc):
+def warn_new_commits(team, branch, next_rc):
     from slack_sdk import WebClient
 
     today = datetime.today()
@@ -83,8 +99,7 @@ def warn_new_commits(release_managers, team, branch, next_rc):
     message = "Hello :wave:\n"
     message += f":announcement: We detected new commits on the {branch} release branch of `integrations-core`.\n"
     message += f"Could you please release and tag your repo to prepare the {next_rc} `datadog-agent` release candidate planned <{rc_schedule_link}|{rc_date.strftime('%Y-%m-%d %H:%M')}> UTC?\n"
-    message += "Thanks in advance!\n"
-    message += f"cc {' '.join(release_managers)}"
+    message += "Thanks in advance!"
     client = WebClient(os.environ["SLACK_DATADOG_AGENT_BOT_TOKEN"])
     client.chat_postMessage(channel=f"#{team}", text=message)
 

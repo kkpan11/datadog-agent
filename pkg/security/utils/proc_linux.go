@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,14 +20,15 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/shirou/gopsutil/v4/process"
+
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model/sharedconsts"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
-	"github.com/shirou/gopsutil/v4/process"
 )
 
-// Getpid returns the current process ID in the host namespace
-func Getpid() uint32 {
-	p, err := os.Readlink(kernel.HostProc("/self"))
+// GetpidFrom returns the current process ID from the given proc root
+func GetpidFrom(procRoot string) uint32 {
+	p, err := os.Readlink(filepath.Join(procRoot, "self"))
 	if err == nil {
 		if pid, err := strconv.ParseInt(p, 10, 32); err == nil {
 			return uint32(pid)
@@ -35,44 +37,84 @@ func Getpid() uint32 {
 	return uint32(os.Getpid())
 }
 
-var networkNamespacePattern = regexp.MustCompile(`net:\[(\d+)\]`)
+// Getpid returns the current process ID in the host namespace
+func Getpid() uint32 {
+	return GetpidFrom(kernel.ProcFSRoot())
+}
 
-// NetNSPath represents a network namespace path
-type NetNSPath struct {
+var namespacePattern = regexp.MustCompile(`[a-z]+:\[(\d+)\]`)
+
+// ErrNoNSPid is returned when no NSpid field is found in the status file, useful to distinguish between
+// errors reading the file and the case where the field is not present, common for non-containerized processes.
+var ErrNoNSPid = errors.New("no NSpid field found")
+
+type NsType string
+
+const (
+	// cgroup
+	CGroupNsType NsType = "cgroup"
+	// ipc
+	IpcNsType NsType = "ipc"
+	// mnt
+	MntNsType NsType = "mnt"
+	// net
+	NetNsType NsType = "net"
+	// pid
+	PidNsType NsType = "pid"
+	// pid_for_children
+	PidForChildrenNsType NsType = "pid_for_children"
+	// time
+	TimeNsType NsType = "time"
+	// time_for_children
+	TimeForChildrenNsType NsType = "time_for_children"
+	// user
+	UserNsType NsType = "user"
+	// uts
+	UtsNsType NsType = "uts"
+)
+
+// NSPath represents a network namespace path
+type NSPath struct {
 	mu         sync.Mutex
 	pid        uint32
 	cachedPath string
+	nsType     NsType
 }
 
-// NetNSPathFromPid returns a new NetNSPath from the given Pid
-func NetNSPathFromPid(pid uint32) *NetNSPath {
-	return &NetNSPath{
-		pid: pid,
+// NewNSPathFromPid returns a new NSPath from the given Pid
+func NewNSPathFromPid(pid uint32, nsType NsType) *NSPath {
+	return &NSPath{
+		pid:    pid,
+		nsType: nsType,
 	}
 }
 
-// NetNSPathFromPath returns a new NetNSPath from the given path
-func NetNSPathFromPath(path string) *NetNSPath {
-	return &NetNSPath{
+// NSPathFromPath returns a new NSPath from the given path
+func NewNSPathFromPath(path string, nsType NsType) *NSPath {
+	return &NSPath{
 		cachedPath: path,
+		nsType:     nsType,
 	}
 }
 
 // GetPath returns the path for the given network namespace
-func (path *NetNSPath) GetPath() string {
+func (path *NSPath) GetPath() string {
 	path.mu.Lock()
 	defer path.mu.Unlock()
 
 	if path.cachedPath == "" {
-		path.cachedPath = procPidPath(path.pid, "ns/net")
+		path.cachedPath = procPidPath(path.pid, "ns/"+string(path.nsType))
 	}
 	return path.cachedPath
 }
 
-// GetProcessNetworkNamespace returns the network namespace of a pid after parsing /proc/[pid]/ns/net
-func (path *NetNSPath) GetProcessNetworkNamespace() (uint32, error) {
-	// open netns
-	f, err := os.Open(path.GetPath())
+// GetNSID returns the namespace ID of the given process
+func (path *NSPath) GetNSID() (uint32, error) {
+	return getNSIDFromPath(path.GetPath())
+}
+
+func getNSIDFromPath(path string) (uint32, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
@@ -83,16 +125,16 @@ func (path *NetNSPath) GetProcessNetworkNamespace() (uint32, error) {
 		return 0, err
 	}
 
-	matches := networkNamespacePattern.FindSubmatch([]byte(l))
+	matches := namespacePattern.FindSubmatch([]byte(l))
 	if len(matches) <= 1 {
-		return 0, fmt.Errorf("couldn't parse network namespace ID: %s", l)
+		return 0, fmt.Errorf("couldn't parse namespace ID for path %s: %s", path, l)
 	}
 
-	netns, err := strconv.ParseUint(string(matches[1]), 10, 32)
+	ns, err := strconv.ParseUint(string(matches[1]), 10, 32)
 	if err != nil {
 		return 0, err
 	}
-	return uint32(netns), nil
+	return uint32(ns), nil
 }
 
 // CgroupTaskPath returns the path to the cgroup file of a pid in /proc
@@ -173,7 +215,7 @@ func GetLoginUID(pid uint32) (uint32, error) {
 	// parse login uid
 	auid, err := strconv.ParseUint(data, 10, 32)
 	if err != nil {
-		return sharedconsts.AuditUIDUnset, fmt.Errorf("coudln't parse loginuid: %v", err)
+		return sharedconsts.AuditUIDUnset, fmt.Errorf("couldn't parse loginuid: %v", err)
 	}
 	return uint32(auid), nil
 }
@@ -185,8 +227,8 @@ func CapEffCapEprm(pid uint32) (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	lines := strings.Split(string(contents), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(contents), "\n")
+	for line := range lines {
 		capKind, value, found := strings.Cut(line, "\t")
 		if !found {
 			continue
@@ -232,6 +274,31 @@ func PidTTY(pid uint32) string {
 	return ""
 }
 
+// PidSID returns the session ID of the given pid from /proc/[pid]/stat
+func PidSID(pid uint32) uint32 {
+	statPath := procPidPath(pid, "stat")
+	content, err := os.ReadFile(statPath)
+	if err != nil {
+		return 0
+	}
+	// The comm field (field 2) can contain spaces and parens, so find the last ')' first
+	s := string(content)
+	idx := strings.LastIndex(s, ")")
+	if idx < 0 || idx+2 >= len(s) {
+		return 0
+	}
+	// Fields after comm: state(3), ppid(4), pgrp(5), session(6)
+	fields := strings.Fields(s[idx+2:])
+	if len(fields) < 4 {
+		return 0
+	}
+	sid, err := strconv.ParseUint(fields[3], 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(sid)
+}
+
 func zeroSplitter(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	for i := 0; i < len(data); i++ {
 		if data[i] == '\x00' {
@@ -265,7 +332,7 @@ func matchesOnePrefix(text string, prefixes []string) bool {
 	return false
 }
 
-// EnvVars returns a array with the environment variables of the given pid
+// EnvVars returns an array with the environment variables of the given pid.
 func EnvVars(priorityEnvsPrefixes []string, pid uint32, maxEnvVars int) ([]string, bool, error) {
 	filename := procPidPath(pid, "environ")
 
@@ -306,7 +373,7 @@ func EnvVars(priorityEnvsPrefixes []string, pid uint32, maxEnvVars int) ([]strin
 	envs = append(envs, priorityEnvs...)
 
 	for scanner.Scan() {
-		if len(envs) >= sharedconsts.MaxArgsEnvsSize {
+		if len(envs) >= maxEnvVars {
 			return envs, true, nil
 		}
 
@@ -348,8 +415,8 @@ func FetchLoadedModules() (map[string]ProcFSModule, error) {
 	}
 
 	output := make(map[string]ProcFSModule)
-	lines := strings.Split(string(procModules), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(procModules), "\n")
+	for line := range lines {
 		split := strings.Split(line, " ")
 		if len(split) < 6 {
 			continue
@@ -396,6 +463,76 @@ func FetchLoadedModules() (map[string]ProcFSModule, error) {
 	return output, nil
 }
 
+// ScanKernelModulePaths walks /lib/modules/$(uname -r)/ once and returns a map
+// of module name (normalised to /proc/modules form) to on-disk path. Returns
+// nil when the modules tree cannot be located or read.
+func ScanKernelModulePaths() map[string]string {
+	release, err := kernel.Release()
+	if err != nil {
+		return nil
+	}
+	return scanKernelModulePathsIn(filepath.Join("/lib/modules", release))
+}
+
+// scanKernelModulePathsIn is the testable core of ScanKernelModulePaths.
+func scanKernelModulePathsIn(root string) map[string]string {
+	if _, err := os.Stat(root); err != nil {
+		return nil
+	}
+	// /lib/modules/<release> is itself a symlink on some distros
+	// so resolve it before walking.
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+
+	paths := make(map[string]string)
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// keep walking siblings on permission / stat errors
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		// Recognised module file extensions, matching what the kernel build
+		// system produces via MODULES_COMPRESS (xz, zstd, gzip) plus the
+		// uncompressed default. Longest suffixes must come first so that
+		// e.g. ".ko.zst" is matched before ".ko".
+		name := d.Name()
+		var trimmed bool
+		for _, suffix := range []string{".ko.zst", ".ko.xz", ".ko.gz", ".ko"} {
+			if strings.HasSuffix(name, suffix) {
+				name = strings.TrimSuffix(name, suffix)
+				trimmed = true
+				break
+			}
+		}
+		if !trimmed {
+			return nil
+		}
+		// Normalise to the /proc/modules form (underscores). The kernel
+		// transparently accepts both dashes and underscores in module file
+		// names but reports the normalised name through /proc/modules.
+		name = strings.ReplaceAll(name, "-", "_")
+
+		resolved := p
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			resolved = r
+		}
+
+		// First match wins: in the rare case where two file names normalise to
+		// the same key (e.g. nf-nat.ko and nf_nat.ko coexist), we keep the
+		// first hit rather than oscillating with WalkDir's traversal order.
+		if _, exists := paths[name]; !exists {
+			paths[name] = resolved
+		}
+		return nil
+	})
+
+	return paths
+}
+
 // GetProcessPidNamespace returns the PID namespace of the given PID
 func GetProcessPidNamespace(pid uint32) (uint64, error) {
 	nspidPath := procPidPath(pid, "ns/pid")
@@ -405,7 +542,7 @@ func GetProcessPidNamespace(pid uint32) (uint64, error) {
 	}
 	// link should be in for of: pid:[4026532294]
 	if !strings.HasPrefix(link, "pid:[") {
-		return 0, fmt.Errorf("Failed to retrieve PID NS, pid ns malformated: (%s) err: %v", link, err)
+		return 0, fmt.Errorf("Failed to retrieve PID NS, pid ns malformed: (%s) err: %v", link, err)
 	}
 
 	link = strings.TrimPrefix(link, "pid:[")
@@ -413,12 +550,12 @@ func GetProcessPidNamespace(pid uint32) (uint64, error) {
 
 	ns, err := strconv.ParseUint(link, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to retrieve PID NS, pid ns malformated: (%s) err: %v", link, err)
+		return 0, fmt.Errorf("Failed to retrieve PID NS, pid ns malformed: (%s) err: %v", link, err)
 	}
 	return ns, nil
 }
 
-// GetNsPids returns the namespaced pids of the the givent root pid
+// GetNsPids returns the namespaced pids of the given root pid
 func GetNsPids(pid uint32, task string) ([]uint32, error) {
 	statusFile := TaskStatusPath(pid, task)
 	content, err := os.ReadFile(statusFile)
@@ -426,11 +563,11 @@ func GetNsPids(pid uint32, task string) ([]uint32, error) {
 		return nil, fmt.Errorf("failed to read status file: %w", err)
 	}
 
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "NSpid:") {
+	lines := strings.SplitSeq(string(content), "\n")
+	for line := range lines {
+		if after, ok := strings.CutPrefix(line, "NSpid:"); ok {
 			// Remove "NSpid:" prefix and trim spaces
-			values := strings.TrimPrefix(line, "NSpid:")
+			values := after
 			values = strings.TrimSpace(values)
 
 			// Split the remaining string into fields
@@ -439,7 +576,7 @@ func GetNsPids(pid uint32, task string) ([]uint32, error) {
 			// Convert string values to integers
 			nspids := make([]uint32, 0, len(fields))
 			for _, field := range fields {
-				val, err := strconv.ParseUint(field, 10, 64)
+				val, err := strconv.ParseUint(field, 10, 32)
 				if err != nil {
 					return nil, fmt.Errorf("failed to parse NSpid value: %w", err)
 				}
@@ -448,7 +585,7 @@ func GetNsPids(pid uint32, task string) ([]uint32, error) {
 			return nspids, nil
 		}
 	}
-	return nil, fmt.Errorf("NSpid field not found")
+	return nil, ErrNoNSPid
 }
 
 // GetPidTasks returns the task IDs of a process
@@ -507,7 +644,7 @@ func FindPidNamespace(nspid uint32, ns uint64) (uint32, error) {
 	return 0, errors.New("PID not found")
 }
 
-// GetTracerPid returns the tracer pid of the the givent root pid
+// GetTracerPid returns the tracer pid of the given root pid
 func GetTracerPid(pid uint32) (uint32, error) {
 	statusFile := StatusPath(pid)
 	content, err := os.ReadFile(statusFile)
@@ -515,21 +652,21 @@ func GetTracerPid(pid uint32) (uint32, error) {
 		return 0, fmt.Errorf("failed to read status file: %w", err)
 	}
 
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "TracerPid:") {
+	lines := strings.SplitSeq(string(content), "\n")
+	for line := range lines {
+		if after, ok := strings.CutPrefix(line, "TracerPid:"); ok {
 			// Remove "NSpid:" prefix and trim spaces
-			line = strings.TrimPrefix(line, "TracerPid:")
+			line = after
 			line = strings.TrimSpace(line)
 
-			tracerPid, err := strconv.ParseUint(line, 10, 64)
+			tracerPid, err := strconv.ParseUint(line, 10, 32)
 			if err != nil {
 				return 0, fmt.Errorf("failed to parse TracerPid value: %w", err)
 			}
 			return uint32(tracerPid), nil
 		}
 	}
-	return 0, fmt.Errorf("TracerPid field not found")
+	return 0, errors.New("TracerPid field not found")
 }
 
 // FindTraceesByTracerPid returns the process list being trced by the given tracer host PID
@@ -557,8 +694,8 @@ var isNsPidAvailable = sync.OnceValue(func() bool {
 	if err != nil {
 		return false
 	}
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(content), "\n")
+	for line := range lines {
 		if strings.HasPrefix(line, "NSpid:") {
 			return true
 		}

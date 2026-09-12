@@ -13,16 +13,18 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
 
+	"github.com/DataDog/datadog-agent/pkg/security/metrics"
 	"github.com/DataDog/datadog-agent/pkg/security/probe/config"
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers/cgroup"
-	"github.com/DataDog/datadog-agent/pkg/security/resolvers/container"
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers/path"
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers/usergroup"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
@@ -96,6 +98,8 @@ func newFakeForkEvent(ppid, pid int, inode uint64, resolver *EBPFResolver) *mode
 	e.ProcessCacheEntry.PPid = uint32(ppid)
 	e.ProcessCacheEntry.Pid = uint32(pid)
 	e.ProcessCacheEntry.FileEvent.Inode = inode
+	e.ProcessCacheEntry.CGroup.CGroupID = "FakeCgroupID"
+	e.ProcessCacheEntry.CGroup.CGroupPathKey.Inode = 4242
 	return e
 }
 
@@ -109,6 +113,8 @@ func newFakeExecEvent(ppid, pid int, inode uint64, resolver *EBPFResolver) *mode
 	e.ProcessCacheEntry.PPid = uint32(ppid)
 	e.ProcessCacheEntry.Pid = uint32(pid)
 	e.ProcessCacheEntry.FileEvent.Inode = inode
+	e.ProcessCacheEntry.CGroup.CGroupID = "FakeCgroupID"
+	e.ProcessCacheEntry.CGroup.CGroupPathKey.Inode = 4242
 	return e
 }
 
@@ -122,7 +128,7 @@ func newResolver() (*EBPFResolver, error) {
 		return nil, err
 	}
 
-	cgroupsResolver, err := cgroup.NewResolver(nil)
+	cgroupsResolver, err := cgroup.NewResolver(nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -132,14 +138,37 @@ func newResolver() (*EBPFResolver, error) {
 		return nil, err
 	}
 
-	containerResolver := container.New()
-
-	resolver, err := NewEBPFResolver(nil, &config.Config{}, &statsd.NoOpClient{}, nil, containerResolver, nil, cgroupsResolver, userGroupResolver, timeResolver, &path.NoOpResolver{}, nil, NewResolverOpts())
+	resolver, err := NewEBPFResolver(nil, &config.Config{}, &statsd.NoOpClient{}, nil, nil, nil, userGroupResolver, timeResolver, &path.NoOpResolver{}, nil, nil, NewResolverOpts())
 	if err != nil {
 		return nil, err
 	}
 
 	return resolver, nil
+}
+
+// assertChildrenConsistency verifies that ancestor chains are well-formed.
+// ProcessCacheEntry no longer keeps reverse Children references; lineage is
+// represented solely through Ancestor/Parent pointers.
+func assertChildrenConsistency(t *testing.T, resolver *EBPFResolver) {
+	t.Helper()
+
+	for _, entry := range resolver.entryCache {
+		seen := make(map[*model.ProcessCacheEntry]struct{})
+		for pc := entry; pc != nil; pc = pc.Ancestor {
+			if _, exists := seen[pc]; exists {
+				assert.Failf(t, "cycle in process lineage", "entry %d has a cycle at pid %d", entry.Pid, pc.Pid)
+				break
+			}
+			seen[pc] = struct{}{}
+
+			if pc.Ancestor == nil {
+				assert.Nil(t, pc.Parent, "entry %d has no Ancestor but Parent is set", pc.Pid)
+				continue
+			}
+			assert.Same(t, &pc.Ancestor.Process, pc.Parent,
+				"entry %d Parent should point to Ancestor %d Process", pc.Pid, pc.Ancestor.Pid)
+		}
+	}
 }
 
 func TestFork1st(t *testing.T) {
@@ -153,19 +182,19 @@ func TestFork1st(t *testing.T) {
 	child := newFakeForkEvent(3, 4, 123, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	exit(child)
@@ -174,7 +203,7 @@ func TestFork1st(t *testing.T) {
 
 	assert.Nil(t, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(parent)
@@ -182,7 +211,7 @@ func TestFork1st(t *testing.T) {
 	resolver.DeleteEntry(parent.ProcessCacheEntry.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 0, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestFork2nd(t *testing.T) {
@@ -196,30 +225,33 @@ func TestFork2nd(t *testing.T) {
 	child := newFakeForkEvent(3, 4, 123, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4)
+	// Note: we use DeleteEntry directly (skipping ApplyExitEntry) because this
+	// test uses fake PIDs that may collide with real kernel threads. ApplyExitEntry
+	// calls reparentOrphanChildren which reads /proc and would corrupt the cache.
+	// Subreaper reparenting is tested separately in TestSubreaperReparenting.
 	exit(parent)
-	resolver.ApplyExitEntry(parent, nil)
 	resolver.DeleteEntry(parent.ProcessContext.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(child)
@@ -227,7 +259,7 @@ func TestFork2nd(t *testing.T) {
 	resolver.DeleteEntry(child.ProcessContext.Pid, child.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 0, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestForkExec(t *testing.T) {
@@ -241,48 +273,47 @@ func TestForkExec(t *testing.T) {
 	exec := newFakeExecEvent(3, 4, 456, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)
-	resolver.AddExecEntry(exec)
+	resolver.AddExecEntry(exec, model.CGroupContext{})
 	assert.Equal(t, exec.ProcessCacheEntry, resolver.entryCache[exec.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, exec.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, exec.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4) -- Y(pid:4)
 	exit(parent)
-	resolver.ApplyExitEntry(parent, nil)
 	resolver.DeleteEntry(parent.ProcessContext.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, exec.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, exec.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(child)
 	resolver.ApplyExitEntry(child, nil)
 	resolver.DeleteEntry(child.ProcessContext.Pid, child.ResolveEventTime())
 	assert.Zero(t, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestResolveFromProcfs(t *testing.T) {
@@ -294,8 +325,15 @@ func TestResolveFromProcfs(t *testing.T) {
 	resolver.pidCacheMap = newFakeEBPMap()
 	resolver.inodeFileMap = newFakeEBPMap()
 
-	// use self pid so that the procfs entry exists and we have the permissions to read it
-	pid := os.Getpid()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	pid := cmd.Process.Pid
 
 	t.Run("sanitize-inode", func(t *testing.T) {
 		entry := resolver.resolveFromProcfs(uint32(pid), 222, 1, func(pce *model.ProcessCacheEntry, _ error) {
@@ -304,6 +342,47 @@ func TestResolveFromProcfs(t *testing.T) {
 		})
 		assert.NotNil(t, entry)
 	})
+}
+
+func TestResolveFromKernelMapsUsesEventPPid(t *testing.T) {
+	resolver, err := newResolver()
+	require.NoError(t, err)
+
+	resolver.procCacheMap = newFakeEBPMap()
+	resolver.pidCacheMap = newFakeEBPMap()
+
+	const (
+		parentPID = uint32(5_000_000)
+		childPID  = uint32(5_000_001)
+		inode     = uint64(123)
+	)
+
+	parent := resolver.NewProcessCacheEntry(model.PIDContext{Pid: parentPID, Tid: parentPID})
+	parent.FileEvent.Inode = inode
+	resolver.entryCache[parentPID] = parent
+
+	kernelEntry := resolver.NewProcessCacheEntry(model.PIDContext{Pid: childPID, Tid: childPID})
+	kernelEntry.FileEvent.Inode = inode
+	bootTime := resolver.timeResolver.GetBootTime()
+	kernelEntry.ForkTime = bootTime
+	kernelEntry.ExecTime = bootTime
+	kernelEntry.ExitTime = bootTime
+
+	procCache := make([]byte, 176) // sizeof(struct proc_cache_t)
+	_, err = kernelEntry.Process.MarshalProcCache(procCache, bootTime)
+	require.NoError(t, err)
+
+	pidCache := make([]byte, model.PidCacheEntrySize)
+	_, err = kernelEntry.Process.MarshalPidCache(pidCache, bootTime)
+	require.NoError(t, err)
+	require.NoError(t, resolver.procCacheMap.Put(kernelEntry.Cookie, procCache))
+	require.NoError(t, resolver.pidCacheMap.Put(childPID, pidCache))
+
+	entry := resolver.ResolveFromKernelMaps(childPID, childPID, parentPID, inode, nil)
+	require.NotNil(t, entry)
+	assert.Equal(t, parentPID, entry.PPid)
+	assert.Same(t, parent, entry.Ancestor)
+	assert.False(t, entry.IsParentMissing)
 }
 
 func TestOrphanExec(t *testing.T) {
@@ -317,47 +396,46 @@ func TestOrphanExec(t *testing.T) {
 	exec := newFakeExecEvent(3, 4, 456, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	//  X(pid:4)
 	exit(parent)
-	resolver.ApplyExitEntry(parent, nil)
 	resolver.DeleteEntry(parent.ProcessContext.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	//  X(pid:4) --> Y(pid:4)
-	resolver.AddExecEntry(exec)
+	resolver.AddExecEntry(exec, model.CGroupContext{})
 	assert.Equal(t, exec.ProcessCacheEntry, resolver.entryCache[exec.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, exec.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, exec.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(exec)
 	resolver.ApplyExitEntry(exec, nil)
 	resolver.DeleteEntry(exec.ProcessCacheEntry.Pid, time.Now())
 	assert.Zero(t, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestForkExecExec(t *testing.T) {
@@ -372,58 +450,57 @@ func TestForkExecExec(t *testing.T) {
 	exec2 := newFakeExecEvent(3, 4, 789, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	//  X(pid:4)
 	exit(parent)
-	resolver.ApplyExitEntry(parent, nil)
 	resolver.DeleteEntry(parent.ProcessContext.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4) -- Y(pid:4)
-	resolver.AddExecEntry(exec1)
+	resolver.AddExecEntry(exec1, model.CGroupContext{})
 	assert.Equal(t, exec1.ProcessCacheEntry, resolver.entryCache[exec1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	//  X(pid:4) -- Y(pid:4) -- Z(pid:4)
-	resolver.AddExecEntry(exec2)
+	resolver.AddExecEntry(exec2, model.CGroupContext{})
 	assert.Equal(t, exec2.ProcessCacheEntry, resolver.entryCache[exec2.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, exec1.ProcessCacheEntry, exec2.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, child.ProcessCacheEntry, exec2.ProcessCacheEntry.Ancestor.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, exec2.ProcessCacheEntry.Ancestor.Ancestor.Ancestor)
-	assert.EqualValues(t, 4, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache in the entryCache
 	exit(exec2)
 	resolver.ApplyExitEntry(exec2, nil)
 	resolver.DeleteEntry(exec1.ProcessCacheEntry.Pid, time.Now())
 	assert.Zero(t, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestForkReuse(t *testing.T) {
@@ -439,50 +516,49 @@ func TestForkReuse(t *testing.T) {
 	child2 := newFakeForkEvent(3, 5, 123, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent1, nil)
+	resolver.AddForkEntry(parent1, model.CGroupContext{}, nil)
 	assert.Equal(t, parent1.ProcessCacheEntry, resolver.entryCache[parent1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child1, nil)
+	resolver.AddForkEntry(child1, model.CGroupContext{}, nil)
 	assert.Equal(t, child1.ProcessCacheEntry, resolver.entryCache[child1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent1.ProcessCacheEntry, child1.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	//  X(pid:4)
 	exit(parent1)
-	resolver.ApplyExitEntry(parent1, nil)
 	resolver.DeleteEntry(parent1.ProcessContext.Pid, parent1.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, parent1.ProcessCacheEntry, child1.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4) -- Y(pid:4)
-	resolver.AddExecEntry(exec1)
+	resolver.AddExecEntry(exec1, model.CGroupContext{})
 	assert.Equal(t, exec1.ProcessCacheEntry, resolver.entryCache[exec1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, child1.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent1.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	//  X(pid:4) -- Y(pid:4)
 	//
 	// Z(pid:3)
-	resolver.AddForkEntry(parent2, nil)
+	resolver.AddForkEntry(parent2, model.CGroupContext{}, nil)
 	assert.Equal(t, parent2.ProcessCacheEntry, resolver.entryCache[parent2.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
-	assert.EqualValues(t, 4, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
@@ -491,11 +567,11 @@ func TestForkReuse(t *testing.T) {
 	// Z(pid:3)
 	//    |
 	// T(pid:5)
-	resolver.AddForkEntry(child2, nil)
+	resolver.AddForkEntry(child2, model.CGroupContext{}, nil)
 	assert.Equal(t, child2.ProcessCacheEntry, resolver.entryCache[child2.ProcessCacheEntry.Pid])
 	assert.Equal(t, 3, len(resolver.entryCache))
 	assert.Equal(t, parent2.ProcessCacheEntry, child2.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 5, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// Z(pid:3)
 	//    |
@@ -505,25 +581,24 @@ func TestForkReuse(t *testing.T) {
 	resolver.DeleteEntry(exec1.ProcessContext.Pid, exec1.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[exec1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [Z(pid:3)]
 	//    |
 	// T(pid:5)
 	exit(parent2)
-	resolver.ApplyExitEntry(parent2, nil)
 	resolver.DeleteEntry(parent2.ProcessContext.Pid, parent2.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent2.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, parent2.ProcessCacheEntry, child2.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(child2)
 	resolver.ApplyExitEntry(child2, nil)
 	resolver.DeleteEntry(child2.ProcessCacheEntry.Pid, child2.ResolveEventTime())
 	assert.Zero(t, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestForkForkExec(t *testing.T) {
@@ -538,45 +613,45 @@ func TestForkForkExec(t *testing.T) {
 	childExec := newFakeExecEvent(3, 4, 456, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
 	//    |
 	// X(pid:5)
-	resolver.AddForkEntry(grandChild, nil)
+	resolver.AddForkEntry(grandChild, model.CGroupContext{}, nil)
 	assert.Equal(t, grandChild.ProcessCacheEntry, resolver.entryCache[grandChild.ProcessCacheEntry.Pid])
 	assert.Equal(t, 3, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, grandChild.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, grandChild.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)
 	//    |
 	// X(pid:5)
-	resolver.AddExecEntry(childExec)
+	resolver.AddExecEntry(childExec, model.CGroupContext{})
 	assert.Equal(t, childExec.ProcessCacheEntry, resolver.entryCache[childExec.ProcessCacheEntry.Pid])
 	assert.Equal(t, 3, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, childExec.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, childExec.ProcessCacheEntry.Ancestor.Ancestor)
 	assert.Equal(t, child.ProcessCacheEntry, grandChild.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, grandChild.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 4, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [parent]
 	//     \ [child] -> childExec
@@ -588,12 +663,10 @@ func TestForkForkExec(t *testing.T) {
 	//    |
 	// X(pid:5)
 	exit(parent)
-	resolver.ApplyExitEntry(parent, nil)
 	resolver.DeleteEntry(parent.ProcessContext.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
-	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
-	assert.EqualValues(t, 4, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
@@ -601,18 +674,17 @@ func TestForkForkExec(t *testing.T) {
 	//    |
 	// X(pid:5)
 	exit(childExec)
-	resolver.ApplyExitEntry(childExec, nil)
 	resolver.DeleteEntry(childExec.ProcessContext.Pid, childExec.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[childExec.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(grandChild)
 	resolver.ApplyExitEntry(grandChild, nil)
 	resolver.DeleteEntry(grandChild.ProcessContext.Pid, grandChild.ResolveEventTime())
 	assert.Zero(t, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestExecBomb(t *testing.T) {
@@ -628,57 +700,56 @@ func TestExecBomb(t *testing.T) {
 	exec2 := newFakeExecEvent(3, 4, 456, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 1, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4)
 	exit(parent)
-	resolver.ApplyExitEntry(parent, nil)
 	resolver.DeleteEntry(parent.ProcessContext.Pid, parent.ResolveEventTime())
 	assert.Nil(t, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
-	assert.EqualValues(t, 2, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4) -- Y(pid:4)
-	resolver.AddExecEntry(exec1)
+	resolver.AddExecEntry(exec1, model.CGroupContext{})
 	assert.Equal(t, exec1.ProcessCacheEntry, resolver.entryCache[exec1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
 	assert.Equal(t, child.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, parent.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor.Ancestor)
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// [X(pid:3)]
 	//    |
 	// X(pid:4) -- Y(pid:4) -- Y(pid:4)
 	exec2Pid := exec2.ProcessCacheEntry.Pid
 
-	resolver.AddExecEntry(exec2)
+	resolver.AddExecEntry(exec2, model.CGroupContext{})
 	assert.Equal(t, exec1.ProcessCacheEntry, resolver.entryCache[exec2Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
-	assert.EqualValues(t, 3, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 
 	// nothing in the entryCache
 	exit(exec1)
 	resolver.ApplyExitEntry(exec1, nil)
 	resolver.DeleteEntry(exec1.ProcessContext.Pid, exec1.ResolveEventTime())
 	assert.Zero(t, len(resolver.entryCache))
-	assert.Zero(t, resolver.processCacheEntryCount.Load())
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestExecLostFork(t *testing.T) {
@@ -697,28 +768,31 @@ func TestExecLostFork(t *testing.T) {
 	child1.PIDContext.ExecInode = 456 // ExecInode != Inode parent
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, "agent", child.ProcessCacheEntry.FileEvent.BasenameStr)
 	assert.False(t, child.ProcessCacheEntry.IsParentMissing)
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
 	//   {|}
 	// X(pid:5)
-	resolver.AddForkEntry(child1, nil)
+	resolver.AddForkEntry(child1, model.CGroupContext{}, nil)
 	assert.Equal(t, "agent", child1.ProcessCacheEntry.FileEvent.BasenameStr)
 	assert.True(t, child1.ProcessCacheEntry.IsParentMissing)
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestExecLostExec(t *testing.T) {
@@ -737,26 +811,29 @@ func TestExecLostExec(t *testing.T) {
 	child2.PIDContext.ExecInode = 456 // ExecInode != Inode Ancestor
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child1, nil)
+	resolver.AddForkEntry(child1, model.CGroupContext{}, nil)
 	assert.Equal(t, child1.ProcessCacheEntry, resolver.entryCache[child1.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child1.ProcessCacheEntry.Ancestor)
 	assert.Equal(t, "agent", child1.ProcessCacheEntry.FileEvent.BasenameStr)
 	assert.False(t, child1.ProcessCacheEntry.IsParentMissing)
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4) -**- Y(pid:4)
-	resolver.AddExecEntry(child2)
+	resolver.AddExecEntry(child2, model.CGroupContext{})
 	assert.NotEqual(t, "agent", child2.ProcessCacheEntry.FileEvent.BasenameStr)
 	assert.True(t, child2.ProcessCacheEntry.IsParentMissing)
+	assertChildrenConsistency(t, resolver)
 }
 
 func TestIsExecExecRuntime(t *testing.T) {
@@ -772,32 +849,37 @@ func TestIsExecExecRuntime(t *testing.T) {
 	child4 := newFakeExecEvent(3, 4, 101112, resolver)
 
 	// X(pid:3)
-	resolver.AddForkEntry(parent, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.AddForkEntry(child, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)
-	resolver.AddExecEntry(child2)
+	resolver.AddExecEntry(child2, model.CGroupContext{})
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)  -- Z(pid:4)
-	resolver.AddExecEntry(child3)
+	resolver.AddExecEntry(child3, model.CGroupContext{})
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)  -- Z(pid:4) -- T(pid:4)
-	resolver.AddExecEntry(child4)
+	resolver.AddExecEntry(child4, model.CGroupContext{})
+	assertChildrenConsistency(t, resolver)
 
 	assert.False(t, parent.ProcessCacheEntry.IsExecExec)
 	assert.False(t, parent.ProcessCacheEntry.IsExec)
@@ -829,18 +911,20 @@ func TestIsExecExecSnapshot(t *testing.T) {
 	child3 := newFakeExecEvent(3, 4, 769, resolver)
 
 	// X(pid:3)
-	resolver.insertEntry(parent.ProcessCacheEntry, model.ProcessCacheEntryFromSnapshot)
+	resolver.insertEntry(parent.ProcessCacheEntry, model.CGroupContext{}, model.ProcessCacheEntryFromSnapshot)
 	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
 	assert.Equal(t, 1, len(resolver.entryCache))
+	assertChildrenConsistency(t, resolver)
 
 	// X(pid:3)
 	//    |
 	// X(pid:4)
-	resolver.setAncestor(child.ProcessCacheEntry)
-	resolver.insertEntry(child.ProcessCacheEntry, model.ProcessCacheEntryFromSnapshot)
+	child.ProcessCacheEntry.SetForkParent(parent.ProcessCacheEntry)
+	resolver.insertEntry(child.ProcessCacheEntry, model.CGroupContext{}, model.ProcessCacheEntryFromSnapshot)
 	assert.Equal(t, child.ProcessCacheEntry, resolver.entryCache[child.ProcessCacheEntry.Pid])
 	assert.Equal(t, 2, len(resolver.entryCache))
 	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+	assertChildrenConsistency(t, resolver)
 
 	assert.False(t, parent.ProcessCacheEntry.IsExecExec)
 	assert.False(t, parent.ProcessCacheEntry.IsExec)
@@ -851,7 +935,8 @@ func TestIsExecExecSnapshot(t *testing.T) {
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)
-	resolver.AddExecEntry(child2)
+	resolver.AddExecEntry(child2, model.CGroupContext{})
+	assertChildrenConsistency(t, resolver)
 
 	assert.False(t, child2.ProcessCacheEntry.IsExecExec)
 	assert.True(t, child2.ProcessCacheEntry.IsExec)
@@ -859,8 +944,657 @@ func TestIsExecExecSnapshot(t *testing.T) {
 	// X(pid:3)
 	//    |
 	// X(pid:4) -- Y(pid:4)  -- Z(pid:4)
-	resolver.AddExecEntry(child3)
+	resolver.AddExecEntry(child3, model.CGroupContext{})
+	assertChildrenConsistency(t, resolver)
 
 	assert.True(t, child3.ProcessCacheEntry.IsExecExec)
 	assert.True(t, child3.ProcessCacheEntry.IsExec)
+}
+
+func TestTryResolveMissingAncestor(t *testing.T) {
+	t.Run("ppid-known-parent-in-cache", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		// Build: init(pid:1) -> parent(pid:3), child(pid:4, ppid:3)
+		// Insert child directly into the cache without linking its Ancestor,
+		// simulating a broken lineage (e.g. the parent wasn't in cache when
+		// the child was first inserted).
+		//
+		// init(pid:1)
+		//     |
+		// parent(pid:3)    child(pid:4, ppid:3)  [Ancestor=nil]
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		parent := newFakeForkEvent(1, 3, 100, resolver)
+		child := newFakeForkEvent(3, 4, 100, resolver)
+
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+
+		resolver.Lock()
+		resolver.entryCache[child.ProcessCacheEntry.Pid] = child.ProcessCacheEntry
+		resolver.Unlock()
+
+		assert.Nil(t, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, uint32(3), child.ProcessCacheEntry.PPid)
+
+		resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathSetProcessContext, nil)
+
+		// init(pid:1)
+		//     |
+		// parent(pid:3)
+		//     |
+		// child(pid:4)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(1), resolver.reparentSuccessStats[metrics.ReparentCallpathSetProcessContext].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("ppid-zero-resolved-from-procfs", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		// Use real PIDs so that procfs can reveal the actual ppid.
+		realPid := uint32(os.Getpid())
+		realPPid := uint32(os.Getppid())
+
+		// Build: init(pid:1) -> parent(pid:realPPid)
+		// Insert child(pid:realPid, ppid:0) with no Ancestor.
+		// TryReparentFromProcfs should read /proc/<realPid>/status to discover
+		// realPPid, find parent in the cache, and link the Ancestor.
+		//
+		// init(pid:1)
+		//     |
+		// parent(pid:realPPid)    child(pid:realPid, ppid:0)  [Ancestor=nil]
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		parent := newFakeForkEvent(1, int(realPPid), 100, resolver)
+		child := newFakeForkEvent(0, int(realPid), 100, resolver)
+
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+
+		resolver.Lock()
+		resolver.entryCache[child.ProcessCacheEntry.Pid] = child.ProcessCacheEntry
+		resolver.Unlock()
+
+		assert.Nil(t, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, uint32(0), child.ProcessCacheEntry.PPid)
+
+		resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathSetProcessContext, nil)
+
+		// init(pid:1)
+		//     |
+		// parent(pid:realPPid)
+		//     |
+		// child(pid:realPid)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(1), resolver.reparentSuccessStats[metrics.ReparentCallpathSetProcessContext].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("ppid-zero-procfs-fails", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		// Use a PID above pid_max (4,194,304) so it can never exist in procfs
+		// regardless of host state. With ppid=0 the resolver tries to read
+		// /proc/<pid>/status which will fail, so the Ancestor should remain
+		// nil and reparentFailed should be incremented.
+		child := newFakeForkEvent(0, 5_000_099, 100, resolver)
+
+		resolver.Lock()
+		resolver.entryCache[child.ProcessCacheEntry.Pid] = child.ProcessCacheEntry
+		resolver.Unlock()
+
+		assert.Nil(t, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, uint32(0), child.ProcessCacheEntry.PPid)
+
+		resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathSetProcessContext, nil)
+
+		assert.Nil(t, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(1), resolver.reparentFailedStats[metrics.ReparentCallpathSetProcessContext].Load())
+	})
+}
+
+func TestTryReparentMaxForkDepth(t *testing.T) {
+	resolver, err := newResolver()
+	if err != nil {
+		t.Fatal()
+	}
+
+	// Build a chain that exceeds tryReparentMaxForkDepth. The chain alternates
+	// alive/exited entries so that each (alive child → exited parent) pair
+	// walking up from the entry increments forkDepth by 1.
+	//
+	// entry(alive) → exited → alive → exited → ... → init(1)
+	//
+	// We create tryReparentMaxForkDepth+5 such pairs and break the Ancestor
+	// link of an entry well beyond the limit. TryReparentFromProcfs should
+	// stop before reaching it.
+	numPairs := tryReparentMaxForkDepth + 5
+	chainLen := 2*numPairs + 1
+
+	// Use PIDs well above pid_max to avoid collisions with real processes.
+	basePid := 5_000_000
+
+	init1 := newFakeForkEvent(0, 1, 100, resolver)
+	resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+
+	first := newFakeForkEvent(1, basePid, 100, resolver)
+	resolver.AddForkEntry(first, model.CGroupContext{}, nil)
+
+	allEntries := []*model.ProcessCacheEntry{first.ProcessCacheEntry}
+	prevPid := basePid
+	for i := 1; i < chainLen; i++ {
+		pid := basePid + i
+		e := newFakeForkEvent(prevPid, pid, 100, resolver)
+		resolver.AddForkEntry(e, model.CGroupContext{}, nil)
+		allEntries = append(allEntries, e.ProcessCacheEntry)
+		prevPid = pid
+	}
+
+	entryIdx := len(allEntries) - 1
+	entry := allEntries[entryIdx]
+
+	// Mark entries at odd distance from entry as exited so the walk from
+	// entry encounters the pattern: alive, exited, alive, exited, ...
+	for i := 0; i < len(allEntries); i++ {
+		dist := entryIdx - i
+		if dist > 0 && dist%2 == 1 {
+			allEntries[i].ExitTime = time.Now()
+		}
+	}
+
+	// Break the Ancestor link of an entry beyond the depth limit.
+	// forkDepth reaches tryReparentMaxForkDepth+1 at distance 2*(tryReparentMaxForkDepth+1)-1
+	// from entry, so an entry at distance 2*(tryReparentMaxForkDepth+3)+2 is
+	// guaranteed to be unreachable.
+	beyondDist := 2*(tryReparentMaxForkDepth+3) + 2
+	beyondIdx := entryIdx - beyondDist
+	assert.True(t, beyondIdx >= 0, "chain not long enough")
+
+	allEntries[beyondIdx].Ancestor = nil
+
+	resolver.TryReparentFromProcfs(entry, metrics.ReparentCallpathSetProcessContext, nil)
+
+	// The broken ancestor link beyond the depth limit should NOT be resolved
+	// because the walk stops before reaching it.
+	assert.Nil(t, allEntries[beyondIdx].Ancestor,
+		"ancestor link beyond tryReparentMaxForkDepth should not be resolved")
+	assert.Equal(t, int64(0),
+		resolver.reparentSuccessStats[metrics.ReparentCallpathSetProcessContext].Load(),
+		"no missing-ancestor resolution should have occurred")
+}
+
+func TestSubreaperReparenting(t *testing.T) {
+	resolver, err := newResolver()
+	if err != nil {
+		t.Fatal()
+	}
+
+	// Use real PIDs so that procfs lookups succeed during reparenting.
+	// The test process has a real PID and a real PPID that exist in /proc.
+	realPid := uint32(os.Getpid())
+	realPPid := uint32(os.Getppid())
+	fakeParentPid := uint32(99999)
+
+	// Build tree: init(1) -> grandparent(realPPid) -> fakeParent(99999) -> child(realPid)
+	//
+	// init(pid:1)
+	//        |
+	// grandparent(pid:realPPid)
+	//        |
+	// fakeParent(pid:99999)
+	//        |
+	// child(pid:realPid)
+	var init1 *model.Event
+	if realPPid != 1 {
+		init1 = newFakeForkEvent(0, 1, 100, resolver)
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+	}
+	grandparentPPid := 0
+	if init1 != nil {
+		grandparentPPid = 1
+	}
+	grandparent := newFakeForkEvent(grandparentPPid, int(realPPid), 100, resolver)
+	fakeParent := newFakeForkEvent(int(realPPid), int(fakeParentPid), 100, resolver)
+	child := newFakeForkEvent(int(fakeParentPid), int(realPid), 100, resolver)
+
+	resolver.AddForkEntry(grandparent, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(fakeParent, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+
+	// Verify initial tree structure
+	expectedEntries := 3
+	if init1 != nil {
+		expectedEntries = 4
+	}
+	assert.Equal(t, expectedEntries, len(resolver.entryCache))
+	assert.Equal(t, fakeParentPid, child.ProcessCacheEntry.PPid)
+	assert.Equal(t, fakeParent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+	assert.Equal(t, grandparent.ProcessCacheEntry, fakeParent.ProcessCacheEntry.Ancestor)
+	assertChildrenConsistency(t, resolver)
+
+	// Simulate fakeParent exiting with subreaper reparenting.
+	// The kernel has already reparented child(realPid) to grandparent(realPPid).
+	// With no reverse Children references, reparenting is repaired lazily from
+	// the child's next observation by reading /proc/realPid/status.
+	resolver.DeleteEntry(fakeParentPid, time.Now())
+	resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathDoExit, nil)
+
+	// child should now be reparented to grandparent
+	//
+	// grandparent(pid:realPPid)
+	//        |
+	// child(pid:realPid)
+	assert.Equal(t, expectedEntries-1, len(resolver.entryCache))
+	assert.Equal(t, realPPid, child.ProcessCacheEntry.PPid)
+	assert.Equal(t, grandparent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+	assertChildrenConsistency(t, resolver)
+
+	// Clean up remaining entries
+	resolver.DeleteEntry(realPid, time.Now())
+	assertChildrenConsistency(t, resolver)
+
+	resolver.DeleteEntry(realPPid, time.Now())
+	if init1 != nil {
+		resolver.DeleteEntry(1, time.Now())
+	}
+	assert.Zero(t, len(resolver.entryCache))
+	assertChildrenConsistency(t, resolver)
+}
+
+func TestTryReparentFromProcfsIgnoresStoppedExecEntries(t *testing.T) {
+	t.Run("old-exec-entry", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		realPid := uint32(os.Getpid())
+		realPPid := uint32(os.Getppid())
+		fakeParentPid := uint32(5000300)
+
+		if realPPid != 1 {
+			resolver.AddForkEntry(newFakeForkEvent(0, 1, 100, resolver), model.CGroupContext{}, nil)
+		}
+		grandparentPPid := 0
+		if realPPid != 1 {
+			grandparentPPid = 1
+		}
+		grandparent := newFakeForkEvent(grandparentPPid, int(realPPid), 100, resolver)
+		parentFork := newFakeForkEvent(int(realPPid), int(fakeParentPid), 100, resolver)
+		oldExec := newFakeExecEvent(int(realPPid), int(fakeParentPid), 200, resolver)
+		child := newFakeForkEvent(int(fakeParentPid), int(realPid), 100, resolver)
+		currentExec := newFakeExecEvent(int(realPPid), int(fakeParentPid), 300, resolver)
+
+		resolver.AddForkEntry(grandparent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parentFork, model.CGroupContext{}, nil)
+		resolver.AddExecEntry(oldExec, model.CGroupContext{})
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+		resolver.AddExecEntry(currentExec, model.CGroupContext{})
+
+		requireOldAncestor := child.ProcessCacheEntry.Ancestor
+		assert.Equal(t, oldExec.ProcessCacheEntry, requireOldAncestor)
+		assert.True(t, oldExec.ProcessCacheEntry.IsExec)
+		assert.True(t, oldExec.ProcessCacheEntry.ExitTime.IsZero())
+		assert.False(t, oldExec.ProcessCacheEntry.StopExecutionTime.IsZero())
+		assert.Equal(t, currentExec.ProcessCacheEntry, resolver.entryCache[fakeParentPid])
+
+		// /proc/<realPid> would report realPPid, but the child is below an older
+		// exec generation of a still-live process. That entry only has
+		// StopExecutionTime set by Exec(), not ExitTime from do_exit, so lazy
+		// subreaper repair must not reparent the child.
+		resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathSetProcessContext, nil)
+
+		assert.Equal(t, fakeParentPid, child.ProcessCacheEntry.PPid)
+		assert.Equal(t, oldExec.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(0), resolver.reparentSuccessStats[metrics.ReparentCallpathSetProcessContext].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("final-exit-marks-exec-chain", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		realPid := uint32(os.Getpid())
+		realPPid := uint32(os.Getppid())
+		fakeParentPid := uint32(5000350)
+
+		if realPPid != 1 {
+			resolver.AddForkEntry(newFakeForkEvent(0, 1, 100, resolver), model.CGroupContext{}, nil)
+		}
+		grandparentPPid := 0
+		if realPPid != 1 {
+			grandparentPPid = 1
+		}
+		grandparent := newFakeForkEvent(grandparentPPid, int(realPPid), 100, resolver)
+		parentFork := newFakeForkEvent(int(realPPid), int(fakeParentPid), 100, resolver)
+		oldExec := newFakeExecEvent(int(realPPid), int(fakeParentPid), 200, resolver)
+		child := newFakeForkEvent(int(fakeParentPid), int(realPid), 100, resolver)
+		currentExec := newFakeExecEvent(int(realPPid), int(fakeParentPid), 300, resolver)
+
+		resolver.AddForkEntry(grandparent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parentFork, model.CGroupContext{}, nil)
+		resolver.AddExecEntry(oldExec, model.CGroupContext{})
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+		resolver.AddExecEntry(currentExec, model.CGroupContext{})
+
+		assert.Equal(t, oldExec.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.True(t, oldExec.ProcessCacheEntry.ExitTime.IsZero())
+		assert.True(t, parentFork.ProcessCacheEntry.ExitTime.IsZero())
+
+		exitTime := time.Now()
+		resolver.DeleteEntry(fakeParentPid, exitTime)
+
+		assert.Equal(t, exitTime, currentExec.ProcessCacheEntry.ExitTime)
+		assert.Equal(t, exitTime, oldExec.ProcessCacheEntry.ExitTime)
+		assert.Equal(t, exitTime, parentFork.ProcessCacheEntry.ExitTime)
+		assert.NotEqual(t, exitTime, oldExec.ProcessCacheEntry.StopExecutionTime)
+
+		resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathSetProcessContext, nil)
+
+		assert.Equal(t, realPPid, child.ProcessCacheEntry.PPid)
+		assert.Equal(t, grandparent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(1), resolver.reparentSuccessStats[metrics.ReparentCallpathSetProcessContext].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("initial-fork-entry-before-first-exec", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		realPid := uint32(os.Getpid())
+		realPPid := uint32(os.Getppid())
+		fakeParentPid := uint32(5000400)
+
+		if realPPid != 1 {
+			resolver.AddForkEntry(newFakeForkEvent(0, 1, 100, resolver), model.CGroupContext{}, nil)
+		}
+		grandparentPPid := 0
+		if realPPid != 1 {
+			grandparentPPid = 1
+		}
+		grandparent := newFakeForkEvent(grandparentPPid, int(realPPid), 100, resolver)
+		parentFork := newFakeForkEvent(int(realPPid), int(fakeParentPid), 100, resolver)
+		child := newFakeForkEvent(int(fakeParentPid), int(realPid), 100, resolver)
+		currentExec := newFakeExecEvent(int(realPPid), int(fakeParentPid), 200, resolver)
+
+		resolver.AddForkEntry(grandparent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parentFork, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+		resolver.AddExecEntry(currentExec, model.CGroupContext{})
+
+		assert.Equal(t, parentFork.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.False(t, parentFork.ProcessCacheEntry.IsExec)
+		assert.True(t, currentExec.ProcessCacheEntry.IsExec)
+		assert.True(t, parentFork.ProcessCacheEntry.ExitTime.IsZero())
+		assert.False(t, parentFork.ProcessCacheEntry.StopExecutionTime.IsZero())
+		assert.Equal(t, currentExec.ProcessCacheEntry, resolver.entryCache[fakeParentPid])
+
+		resolver.TryReparentFromProcfs(child.ProcessCacheEntry, metrics.ReparentCallpathSetProcessContext, nil)
+
+		assert.Equal(t, fakeParentPid, child.ProcessCacheEntry.PPid)
+		assert.Equal(t, parentFork.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(0), resolver.reparentSuccessStats[metrics.ReparentCallpathSetProcessContext].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+}
+
+func TestReparentExecChainPreservesExecAncestors(t *testing.T) {
+	resolver, err := newResolver()
+	if err != nil {
+		t.Fatal()
+	}
+
+	init1 := newFakeForkEvent(0, 1, 100, resolver)
+	grandparent := newFakeForkEvent(1, 5000100, 100, resolver)
+	parent := newFakeForkEvent(5000100, 5000101, 100, resolver)
+	childFork := newFakeForkEvent(5000101, 5000102, 100, resolver)
+	exec1 := newFakeExecEvent(5000101, 5000102, 200, resolver)
+	exec2 := newFakeExecEvent(5000101, 5000102, 300, resolver)
+
+	resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(grandparent, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(childFork, model.CGroupContext{}, nil)
+	resolver.AddExecEntry(exec1, model.CGroupContext{})
+	resolver.AddExecEntry(exec2, model.CGroupContext{})
+
+	assert.Equal(t, exec1.ProcessCacheEntry, exec2.ProcessCacheEntry.Ancestor)
+	assert.Equal(t, childFork.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor)
+	assert.Equal(t, parent.ProcessCacheEntry, childFork.ProcessCacheEntry.Ancestor)
+	assertChildrenConsistency(t, resolver)
+
+	resolver.TryReparentFromKernelPPid(exec2.ProcessCacheEntry, grandparent.ProcessCacheEntry.Pid, nil)
+
+	// Reparenting a process that has execed must move the fork-root edge and
+	// preserve the same-PID exec chain.
+	assert.Equal(t, exec1.ProcessCacheEntry, exec2.ProcessCacheEntry.Ancestor)
+	assert.Equal(t, childFork.ProcessCacheEntry, exec1.ProcessCacheEntry.Ancestor)
+	assert.Equal(t, grandparent.ProcessCacheEntry, childFork.ProcessCacheEntry.Ancestor)
+	assert.Equal(t, grandparent.ProcessCacheEntry.Pid, exec2.ProcessCacheEntry.PPid)
+	assert.Equal(t, grandparent.ProcessCacheEntry.Pid, exec1.ProcessCacheEntry.PPid)
+	assert.Equal(t, grandparent.ProcessCacheEntry.Pid, childFork.ProcessCacheEntry.PPid)
+	assertChildrenConsistency(t, resolver)
+}
+
+func TestDequeueExitedDeletesCurrentExecEntry(t *testing.T) {
+	resolver, err := newResolver()
+	if err != nil {
+		t.Fatal()
+	}
+
+	parent := newFakeForkEvent(0, 5000200, 100, resolver)
+	childFork := newFakeForkEvent(5000200, 5000201, 100, resolver)
+	exec1 := newFakeExecEvent(5000200, 5000201, 200, resolver)
+	exec2 := newFakeExecEvent(5000200, 5000201, 300, resolver)
+
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(childFork, model.CGroupContext{}, nil)
+	resolver.AddExecEntry(exec1, model.CGroupContext{})
+	resolver.AddExecEntry(exec2, model.CGroupContext{})
+
+	exec2.ProcessCacheEntry.ExecTime = time.Now().Add(-2 * time.Minute)
+	resolver.exitedQueue = append(resolver.exitedQueue, exec2.ProcessCacheEntry.Pid)
+	resolver.DequeueExited()
+
+	assert.Nil(t, resolver.entryCache[exec2.ProcessCacheEntry.Pid])
+	assert.Equal(t, 1, len(resolver.entryCache))
+	assert.Equal(t, parent.ProcessCacheEntry, resolver.entryCache[parent.ProcessCacheEntry.Pid])
+	assertChildrenConsistency(t, resolver)
+}
+
+func TestTryReparentFromKernelPPid(t *testing.T) {
+	t.Run("same-ppid-noop", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		parent := newFakeForkEvent(1, 5000001, 100, resolver)
+		child := newFakeForkEvent(5000001, 5000002, 100, resolver)
+
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+
+		assert.Equal(t, uint32(5000001), child.ProcessCacheEntry.PPid)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+
+		resolver.TryReparentFromKernelPPid(child.ProcessCacheEntry, 5000001, nil)
+
+		assert.Equal(t, uint32(5000001), child.ProcessCacheEntry.PPid)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(0), resolver.reparentSuccessStats[metrics.ReparentCallpathKernelPPid].Load())
+		assert.Equal(t, int64(0), resolver.reparentFailedStats[metrics.ReparentCallpathKernelPPid].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("different-ppid-parent-in-cache", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		// Use high PIDs to avoid collisions with real system processes
+		// init(1) -> grandparent(5000010) -> parent(5000011) -> child(5000012)
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		grandparent := newFakeForkEvent(1, 5000010, 100, resolver)
+		parent := newFakeForkEvent(5000010, 5000011, 100, resolver)
+		child := newFakeForkEvent(5000011, 5000012, 100, resolver)
+
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(grandparent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+
+		assert.Equal(t, uint32(5000011), child.ProcessCacheEntry.PPid)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+
+		// Kernel reports ppid=5000010 (grandparent) — subreaper reparenting
+		resolver.TryReparentFromKernelPPid(child.ProcessCacheEntry, 5000010, nil)
+
+		assert.Equal(t, uint32(5000010), child.ProcessCacheEntry.PPid)
+		assert.Equal(t, grandparent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(1), resolver.reparentSuccessStats[metrics.ReparentCallpathKernelPPid].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("different-ppid-parent-not-in-cache", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		parent := newFakeForkEvent(1, 5000020, 100, resolver)
+		child := newFakeForkEvent(5000020, 5000021, 100, resolver)
+
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+
+		// Kernel reports a ppid above pid_max (4194304) so it can never exist in
+		// procfs and is guaranteed to be unresolvable regardless of host state.
+		resolver.TryReparentFromKernelPPid(child.ProcessCacheEntry, 5_000_099, nil)
+
+		assert.Equal(t, uint32(5000020), child.ProcessCacheEntry.PPid)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(1), resolver.reparentFailedStats[metrics.ReparentCallpathKernelPPid].Load())
+		assertChildrenConsistency(t, resolver)
+	})
+
+	t.Run("kernel-ppid-zero-skip", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		parent := newFakeForkEvent(1, 5000030, 100, resolver)
+		child := newFakeForkEvent(5000030, 5000031, 100, resolver)
+
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+		resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+
+		resolver.TryReparentFromKernelPPid(child.ProcessCacheEntry, 0, nil)
+
+		assert.Equal(t, uint32(5000030), child.ProcessCacheEntry.PPid)
+		assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+		assert.Equal(t, int64(0), resolver.reparentSuccessStats[metrics.ReparentCallpathKernelPPid].Load())
+		assert.Equal(t, int64(0), resolver.reparentFailedStats[metrics.ReparentCallpathKernelPPid].Load())
+	})
+
+	t.Run("pid1-skip", func(t *testing.T) {
+		resolver, err := newResolver()
+		if err != nil {
+			t.Fatal()
+		}
+
+		init1 := newFakeForkEvent(0, 1, 100, resolver)
+		resolver.AddForkEntry(init1, model.CGroupContext{}, nil)
+
+		resolver.TryReparentFromKernelPPid(init1.ProcessCacheEntry, 999, nil)
+
+		assert.Equal(t, int64(0), resolver.reparentSuccessStats[metrics.ReparentCallpathKernelPPid].Load())
+		assert.Equal(t, int64(0), resolver.reparentFailedStats[metrics.ReparentCallpathKernelPPid].Load())
+	})
+}
+
+// TestAWSSecurityCredentialsScopedToProcess ensures AWS security credentials
+// obtained from an IMDS request are attributed only to the process that made
+// the request, and never leak onto its ancestors. This is a regression test
+// for a serialization bug where FetchAWSSecurityCredentials ignored the
+// process being serialized and always returned the triggering process's
+// credentials, causing them to be reported for every ancestor.
+func TestAWSSecurityCredentialsScopedToProcess(t *testing.T) {
+	resolver, err := newResolver()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// parent(pid:3) -> child(pid:4); the child performs the IMDS request
+	parent := newFakeForkEvent(0, 3, 123, resolver)
+	child := newFakeForkEvent(3, 4, 123, resolver)
+
+	resolver.AddForkEntry(parent, model.CGroupContext{}, nil)
+	resolver.AddForkEntry(child, model.CGroupContext{}, nil)
+	assert.Equal(t, parent.ProcessCacheEntry, child.ProcessCacheEntry.Ancestor)
+
+	// the child receives credentials from an IMDS v2 response
+	child.IMDS.AWS.SecurityCredentials = model.AWSSecurityCredentials{
+		Code:        "Success",
+		Type:        "AWS-HMAC",
+		AccessKeyID: "AKIAIOSFODNN7EXAMPLE",
+		Expiration:  time.Now().Add(time.Hour),
+	}
+	resolver.UpdateAWSSecurityCredentials(child.ProcessCacheEntry.Pid, child)
+
+	// the requesting process reports the credentials
+	childCreds := resolver.FetchAWSSecurityCredentials(child, &child.ProcessCacheEntry.Process)
+	assert.Len(t, childCreds, 1, "the requesting process should report its credentials")
+	if len(childCreds) == 1 {
+		assert.Equal(t, "AKIAIOSFODNN7EXAMPLE", childCreds[0].AccessKeyID)
+	}
+
+	// the ancestor must NOT report the child's credentials, even though the
+	// event's process context still points to the child
+	parentCreds := resolver.FetchAWSSecurityCredentials(child, &parent.ProcessCacheEntry.Process)
+	assert.Empty(t, parentCreds, "ancestors must not report the requesting process's credentials")
+}
+
+// TestAWSSecurityCredentialsExpiration ensures expired credentials are pruned
+// from the owning process on fetch.
+func TestAWSSecurityCredentialsExpiration(t *testing.T) {
+	resolver, err := newResolver()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proc := newFakeForkEvent(0, 3, 123, resolver)
+	resolver.AddForkEntry(proc, model.CGroupContext{}, nil)
+
+	proc.IMDS.AWS.SecurityCredentials = model.AWSSecurityCredentials{
+		Code:        "Success",
+		Type:        "AWS-HMAC",
+		AccessKeyID: "AKIAIOSFODNN7EXAMPLE",
+		Expiration:  proc.ResolveEventTime().Add(-time.Hour),
+	}
+	resolver.UpdateAWSSecurityCredentials(proc.ProcessCacheEntry.Pid, proc)
+
+	creds := resolver.FetchAWSSecurityCredentials(proc, &proc.ProcessCacheEntry.Process)
+	assert.Empty(t, creds, "expired credentials should be pruned on fetch")
 }

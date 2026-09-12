@@ -1,0 +1,25 @@
+"""toolchain to wrap the patchelf binary.
+
+Type: @@//bazel/toolchains/patchelf:patchelf_toolchain_type
+
+Toolchains:
+- patchelf_built_toolchain: uses the hermetic @patchelf//:patchelf binary.
+"""
+
+load("@@//bazel/toolchains/patchelf:patchelf.bzl", "patchelf_toolchain")
+
+toolchain_type(
+    name = "patchelf_toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
+patchelf_toolchain(
+    name = "patchelf_built",
+    label = "@patchelf//:patchelf",
+)
+
+toolchain(
+    name = "patchelf_built_toolchain",
+    toolchain = ":patchelf_built",
+    toolchain_type = ":patchelf_toolchain_type",
+)

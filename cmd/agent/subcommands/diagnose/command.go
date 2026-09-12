@@ -9,10 +9,12 @@ package diagnose
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.uber.org/fx"
@@ -22,29 +24,35 @@ import (
 
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
 	"github.com/DataDog/datadog-agent/cmd/agent/common"
-	"github.com/DataDog/datadog-agent/comp/aggregator/diagnosesendermanager"
-	"github.com/DataDog/datadog-agent/comp/aggregator/diagnosesendermanager/diagnosesendermanagerimpl"
-	"github.com/DataDog/datadog-agent/comp/collector/collector"
+	collector "github.com/DataDog/datadog-agent/comp/collector/collector/def"
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/autodiscoveryimpl"
+	autodiscovery "github.com/DataDog/datadog-agent/comp/core/autodiscovery/def"
+	adfx "github.com/DataDog/datadog-agent/comp/core/autodiscovery/fx"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	diagnose "github.com/DataDog/datadog-agent/comp/core/diagnose/def"
 	"github.com/DataDog/datadog-agent/comp/core/diagnose/format"
 	diagnosefx "github.com/DataDog/datadog-agent/comp/core/diagnose/fx"
 	diagnoseLocal "github.com/DataDog/datadog-agent/comp/core/diagnose/local"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	dualTaggerfx "github.com/DataDog/datadog-agent/comp/core/tagger/fx-dual"
-	wmcatalog "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/catalog"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadfilterfx "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx"
+	wmcatalog "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/catalog-core"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafx "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx"
+	workloadmetainit "github.com/DataDog/datadog-agent/comp/core/workloadmeta/init"
 	haagentfx "github.com/DataDog/datadog-agent/comp/haagent/fx"
+	healthplatform "github.com/DataDog/datadog-agent/comp/healthplatform"
 	logscompressorfx "github.com/DataDog/datadog-agent/comp/serializer/logscompression/fx"
 	metricscompressorfx "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/fx"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
@@ -108,16 +116,22 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 				wmcatalog.GetCatalog(),
 				workloadmetafx.Module(workloadmeta.Params{
 					AgentType:  workloadmeta.NodeAgent,
-					InitHelper: common.GetWorkloadmetaInit(),
+					InitHelper: workloadmetainit.GetWorkloadmetaInit(),
 				}),
 				fx.Supply(option.None[collector.Component]()),
 				dualTaggerfx.Module(common.DualTaggerParams()),
-				autodiscoveryimpl.Module(),
-				diagnosesendermanagerimpl.Module(),
+				workloadfilterfx.Module(),
+				fx.Invoke(func(wmeta workloadmeta.Component, tagger tagger.Component, filterStore workloadfilter.Component) {
+					proccontainers.InitSharedContainerProvider(wmeta, tagger, filterStore)
+				}),
+				adfx.Module(),
 				haagentfx.Module(),
+				healthplatform.Bundle(),
+				hostnameimpl.Module(),
 				logscompressorfx.Module(),
 				metricscompressorfx.Module(),
 				diagnosefx.Module(),
+				ipcfx.ModuleInsecure(),
 			)
 		},
 	}
@@ -165,6 +179,7 @@ This command print the V5 metadata payload for the Agent. This payload is used t
 				fx.Supply(payloadName("v5")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -179,6 +194,7 @@ This command prints the gohai data sent by the Agent, including current processe
 				fx.Supply(payloadName("gohai")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -193,6 +209,7 @@ This command print the inventory-agent metadata payload. This payload is used by
 				fx.Supply(payloadName("inventory-agent")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -207,6 +224,7 @@ This command print the host-gpu metadata payload. This payload is used by the 'h
 				fx.Supply(payloadName("host-gpu")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -221,20 +239,7 @@ This command print the inventory-host metadata payload. This payload is used by 
 				fx.Supply(payloadName("inventory-host")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
-			)
-		},
-	}
-
-	payloadInventoriesOtelCmd := &cobra.Command{
-		Use:   "inventory-otel",
-		Short: "Print the Inventory otel metadata payload.",
-		Long: `
-This command print the inventory-otel metadata payload. This payload is used by the 'OTel Agent' product.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return fxutil.OneShot(printPayload,
-				fx.Supply(payloadName("inventory-otel")),
-				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
-				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -249,6 +254,7 @@ This command print the ha-agent metadata payload. This payload is used by the 'H
 				fx.Supply(payloadName("ha-agent")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -263,6 +269,7 @@ This command print the inventory-checks metadata payload. This payload is used b
 				fx.Supply(payloadName("inventory-checks")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -277,6 +284,7 @@ This command print the package-signing metadata payload. This payload is used by
 				fx.Supply(payloadName("package-signing")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -291,6 +299,7 @@ This command print the system-probe metadata payload. This payload is used by th
 				fx.Supply(payloadName("system-probe")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -305,6 +314,7 @@ This command print the security-agent metadata payload. This payload is used by 
 				fx.Supply(payloadName("security-agent")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -318,6 +328,7 @@ This command print the security-agent metadata payload. This payload is used by 
 				fx.Supply(payloadName("agent-telemetry")),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -330,6 +341,37 @@ This command print the security-agent metadata payload. This payload is used by 
 			return fxutil.OneShot(printAgentFullTelemetry,
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
+			)
+		},
+	}
+
+	payloadHostSystemInfoCmd := &cobra.Command{
+		Use:   "host-system-info",
+		Short: "[internal] Print the host system info metadata payload.",
+		Long: `
+This command print the host system info metadata payload.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return fxutil.OneShot(printPayload,
+				fx.Supply(payloadName("host-system-info")),
+				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
+				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
+			)
+		},
+	}
+
+	payloadHealthPlatformIssuesCmd := &cobra.Command{
+		Use:   "health-issues",
+		Short: "[internal] Print health issues detected by the agent.",
+		Long: `
+This command prints health issues detected by the agent.
+Health platform must be enabled for issues to be reported.`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return fxutil.OneShot(printHealthPlatformIssues,
+				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
+				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -339,7 +381,6 @@ This command print the security-agent metadata payload. This payload is used by 
 	showPayloadCommand.AddCommand(payloadInventoriesAgentCmd)
 	showPayloadCommand.AddCommand(payloadInventoriesHostCmd)
 	showPayloadCommand.AddCommand(payloadHostGpuCmd)
-	showPayloadCommand.AddCommand(payloadInventoriesOtelCmd)
 	showPayloadCommand.AddCommand(payloadInventoriesHaAgentCmd)
 	showPayloadCommand.AddCommand(payloadInventoriesChecksCmd)
 	showPayloadCommand.AddCommand(payloadInventoriesPkgSigningCmd)
@@ -347,20 +388,22 @@ This command print the security-agent metadata payload. This payload is used by 
 	showPayloadCommand.AddCommand(payloadSecurityAgentCmd)
 	showPayloadCommand.AddCommand(agentTelemetryCmd)
 	showPayloadCommand.AddCommand(agentFullTelemetryCmd)
+	showPayloadCommand.AddCommand(payloadHostSystemInfoCmd)
+	showPayloadCommand.AddCommand(payloadHealthPlatformIssuesCmd)
 	diagnoseCommand.AddCommand(showPayloadCommand)
 
 	return []*cobra.Command{diagnoseCommand}
 }
 
 func cmdDiagnose(cliParams *cliParams,
-	senderManager diagnosesendermanager.Component,
-	wmeta option.Option[workloadmeta.Component],
+	filterStore workloadfilter.Component,
 	ac autodiscovery.Component,
-	secretResolver secrets.Component,
 	log log.Component,
 	tagger tagger.Component,
 	diagnoseComponent diagnose.Component,
-	config config.Component) error {
+	config config.Component,
+	client ipc.HTTPClient,
+) error {
 
 	diagCfg := diagnose.Config{
 		Verbose: cliParams.verbose,
@@ -383,24 +426,29 @@ func cmdDiagnose(cliParams *cliParams,
 		return nil
 	}
 
+	// API key is required to run diagnose; without it no checks can run and the command would exit successfully with no useful output
+	if !config.IsConfigured("api_key") {
+		return errors.New("no API key configured: diagnose requires an API key to run checks. Set the API key in datadog.yaml or use the DD_API_KEY environment variable")
+	}
+
 	// Run command
 	var err error
 	var result *diagnose.Result
 	if !cliParams.runLocal {
-		result, err = requestDiagnosesFromAgentProcess(diagCfg)
+		result, err = requestDiagnosesFromAgentProcess(diagCfg, client)
 
 		if err != nil {
 			if !cliParams.JSONOutput { // If JSON output is requested, the output should stay a valid JSON
 				fmt.Fprintln(w, color.YellowString(fmt.Sprintf("Error running diagnose in Agent process: %s", err)))
 				fmt.Fprintln(w, "Running diagnose command locally (may take extra time to run checks locally) ...")
 			}
-			result, err = diagnoseLocal.Run(diagnoseComponent, diagCfg, log, senderManager, wmeta, ac, secretResolver, tagger, config)
+			result, err = diagnoseLocal.Run(diagnoseComponent, diagCfg, log, filterStore, ac, tagger, config)
 		}
 	} else {
 		if !cliParams.JSONOutput { // If JSON output is requested, the output should stay a valid JSON
 			fmt.Fprintln(w, "Running diagnose command locally (may take extra time to run checks locally) ...")
 		}
-		result, err = diagnoseLocal.Run(diagnoseComponent, diagCfg, log, senderManager, wmeta, ac, secretResolver, tagger, config)
+		result, err = diagnoseLocal.Run(diagnoseComponent, diagCfg, log, filterStore, ac, tagger, config)
 	}
 
 	if err != nil {
@@ -415,21 +463,15 @@ func cmdDiagnose(cliParams *cliParams,
 }
 
 // NOTE: This and related will be moved to separate "agent telemetry" command in future
-func printPayload(name payloadName, _ log.Component, config config.Component) error {
-	if err := util.SetAuthToken(config); err != nil {
-		fmt.Println(err)
-		return nil
-	}
-
-	c := util.GetClient()
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+func printPayload(name payloadName, _ log.Component, config config.Component, client ipc.HTTPClient) error {
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return err
 	}
-	apiConfigURL := fmt.Sprintf("https://%v:%d%s%s",
-		ipcAddress, config.GetInt("cmd_port"), metadataEndpoint, name)
+	addr := net.JoinHostPort(ipcAddress, strconv.Itoa(config.GetInt("cmd_port")))
+	apiConfigURL := fmt.Sprintf("https://%s%s%s", addr, metadataEndpoint, name)
 
-	r, err := util.DoGet(c, apiConfigURL, util.CloseConnection)
+	r, err := client.Get(apiConfigURL, ipchttp.WithCloseConnection)
 	if err != nil {
 		return fmt.Errorf("Could not fetch metadata payload: %s", err)
 	}
@@ -438,22 +480,34 @@ func printPayload(name payloadName, _ log.Component, config config.Component) er
 	return nil
 }
 
-func requestDiagnosesFromAgentProcess(diagCfg diagnose.Config) (*diagnose.Result, error) {
+func printHealthPlatformIssues(_ log.Component, config config.Component, client ipc.HTTPClient) error {
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
+	if err != nil {
+		return err
+	}
+	addr := net.JoinHostPort(ipcAddress, strconv.Itoa(config.GetInt("cmd_port")))
+	apiConfigURL := fmt.Sprintf("https://%s/health-platform/issues", addr)
+
+	r, err := client.Get(apiConfigURL, ipchttp.WithCloseConnection)
+	if err != nil {
+		return fmt.Errorf("Could not fetch health platform issues: %s", err)
+	}
+
+	fmt.Println(string(r))
+	return nil
+}
+
+func requestDiagnosesFromAgentProcess(diagCfg diagnose.Config, client ipc.HTTPClient) (*diagnose.Result, error) {
 	// Get client to Agent's RPC call
-	c := util.GetClient()
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return nil, fmt.Errorf("error getting IPC address for the agent: %w", err)
 	}
 
-	// Make sure we have a session token (for privileged information)
-	if err = util.SetAuthToken(pkgconfigsetup.Datadog()); err != nil {
-		return nil, fmt.Errorf("auth error: %w", err)
-	}
-
 	// Form call end-point
 	//nolint:revive // TODO(CINT) Fix revive linter
-	diagnoseURL := fmt.Sprintf("https://%v:%v/agent/diagnose", ipcAddress, pkgconfigsetup.Datadog().GetInt("cmd_port"))
+	addr := net.JoinHostPort(ipcAddress, strconv.Itoa(pkgconfigsetup.Datadog().GetInt("cmd_port")))
+	diagnoseURL := fmt.Sprintf("https://%s/agent/diagnose", addr)
 
 	// Serialized diag config to pass it to Agent execution context
 	var cfgSer []byte
@@ -463,7 +517,7 @@ func requestDiagnosesFromAgentProcess(diagCfg diagnose.Config) (*diagnose.Result
 
 	// Run diagnose code inside Agent process
 	var response []byte
-	response, err = util.DoPost(c, diagnoseURL, "application/json", bytes.NewBuffer(cfgSer))
+	response, err = client.Post(diagnoseURL, "application/json", bytes.NewBuffer(cfgSer))
 	if err != nil {
 		if response != nil && string(response) != "" {
 			return nil, fmt.Errorf("error getting diagnoses from running agent: %s", strings.TrimSpace(string(response)))
@@ -482,21 +536,16 @@ func requestDiagnosesFromAgentProcess(diagCfg diagnose.Config) (*diagnose.Result
 }
 
 // printAgentFullTelemetry gets the full telemetry payload exposed by the agent
-func printAgentFullTelemetry(config config.Component) error {
-	c := util.GetClient()
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(config)
+func printAgentFullTelemetry(config config.Component, client ipc.HTTPClient) error {
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(config)
 	if err != nil {
 		return err
 	}
-	r, err := c.Get(fmt.Sprintf("http://%s:%s/telemetry", ipcAddress, config.GetString("expvar_port")))
+	addr := net.JoinHostPort(ipcAddress, config.GetString("expvar_port"))
+	r, err := client.Get(fmt.Sprintf("http://%s/telemetry", addr), ipchttp.WithoutAuthToken)
 	if err != nil {
-		return err
+		return fmt.Errorf("error getting full telemetry payload: %w", err)
 	}
-	defer r.Body.Close()
-	result, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(result))
+	fmt.Println(string(r))
 	return nil
 }

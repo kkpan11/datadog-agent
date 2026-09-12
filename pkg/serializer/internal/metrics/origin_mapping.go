@@ -22,9 +22,6 @@ func metricSourceToOriginProduct(ms metrics.MetricSource) int32 {
 	}
 	switch ms {
 	case metrics.MetricSourceServerless,
-		metrics.MetricSourceAwsLambdaCustom,
-		metrics.MetricSourceAwsLambdaEnhanced,
-		metrics.MetricSourceAwsLambdaRuntime,
 		metrics.MetricSourceAzureContainerAppCustom,
 		metrics.MetricSourceAzureContainerAppEnhanced,
 		metrics.MetricSourceAzureContainerAppRuntime,
@@ -33,7 +30,10 @@ func metricSourceToOriginProduct(ms metrics.MetricSource) int32 {
 		metrics.MetricSourceAzureAppServiceRuntime,
 		metrics.MetricSourceGoogleCloudRunCustom,
 		metrics.MetricSourceGoogleCloudRunEnhanced,
-		metrics.MetricSourceGoogleCloudRunRuntime:
+		metrics.MetricSourceGoogleCloudRunRuntime,
+		metrics.MetricSourceAWSMicroVMCustom,
+		metrics.MetricSourceAWSMicroVMEnhanced,
+		metrics.MetricSourceAWSMicroVMRuntime:
 		return serieMetadataOriginOriginProductServerlessType
 	}
 	return serieMetadataOriginOriginProductAgentType
@@ -94,8 +94,12 @@ func metricSourceToOriginCategory(ms metrics.MetricSource) int32 {
 		metrics.MetricSourceDisk,
 		metrics.MetricSourceNetwork,
 		metrics.MetricSourceSnmp,
+		metrics.MetricSourceCiscoSdwan,
+		metrics.MetricSourceCiscoCatalystCenter,
+		metrics.MetricSourceVersa,
 		metrics.MetricSourceWlan,
 		metrics.MetricSourceWindowsCertificateStore,
+		metrics.MetricSourceThermal,
 		// Plugins and non-checks
 		metrics.MetricSourceCloudFoundry,
 		metrics.MetricSourceJenkins,
@@ -218,6 +222,7 @@ func metricSourceToOriginCategory(ms metrics.MetricSource) int32 {
 		metrics.MetricSourceCloudFoundryAPI,
 		metrics.MetricSourceCockroachdb,
 		metrics.MetricSourceConsul,
+		metrics.MetricSourceControlM,
 		metrics.MetricSourceCoredns,
 		metrics.MetricSourceCouch,
 		metrics.MetricSourceCouchbase,
@@ -279,6 +284,10 @@ func metricSourceToOriginCategory(ms metrics.MetricSource) int32 {
 		metrics.MetricSourceMesosSlave,
 		metrics.MetricSourceMongo,
 		metrics.MetricSourceMysql,
+		metrics.MetricSourceN8N,
+		metrics.MetricSourceNutanix,
+		metrics.MetricSourcePaloAltoPanorama,
+		metrics.MetricSourcePrefect,
 		metrics.MetricSourceNagios,
 		metrics.MetricSourceNfsstat,
 		metrics.MetricSourceNginx,
@@ -355,7 +364,21 @@ func metricSourceToOriginCategory(ms metrics.MetricSource) int32 {
 		metrics.MetricSourceLiteLLM,
 		metrics.MetricSourceLustre,
 		metrics.MetricSourceProxmox,
-		metrics.MetricSourceResilience4j:
+		metrics.MetricSourceSupabase,
+		metrics.MetricSourceKeda,
+		metrics.MetricSourceDuckdb,
+		metrics.MetricSourceResilience4j,
+		metrics.MetricSourceBentoMl,
+		metrics.MetricSourceHuggingFaceTgi,
+		metrics.MetricSourceIbmSpectrumLsf,
+		metrics.MetricSourceDatadogOperator,
+		metrics.MetricSourceBattery,
+		metrics.MetricSourcePinot,
+		metrics.MetricSourceDellPowerFlex,
+		metrics.MetricSourceHPEArubaEdgeConnect,
+		metrics.MetricSourceNiFi,
+		metrics.MetricSourceKueue,
+		metrics.MetricSourceExternalSecrets:
 		return 11 // integrationMetrics
 	case metrics.MetricSourceGPU:
 		return 72 // ref: https://github.com/DataDog/dd-source/blob/276882b71d84785ec89c31973046ab66d5a01807/domains/metrics/shared/libs/proto/origin/origin.proto#L427
@@ -371,10 +394,10 @@ func metricSourceToOriginCategory(ms metrics.MetricSource) int32 {
 		metrics.MetricSourceAzureContainerAppEnhanced,
 		metrics.MetricSourceAzureContainerAppRuntime:
 		return 37
-	case metrics.MetricSourceAwsLambdaCustom,
-		metrics.MetricSourceAwsLambdaEnhanced,
-		metrics.MetricSourceAwsLambdaRuntime:
-		return 38
+	case metrics.MetricSourceAWSMicroVMCustom,
+		metrics.MetricSourceAWSMicroVMEnhanced,
+		metrics.MetricSourceAWSMicroVMRuntime:
+		return 90
 	default:
 		return 0
 	}
@@ -1059,32 +1082,40 @@ func metricSourceToOriginService(ms metrics.MetricSource) int32 {
 		return 418
 	case metrics.MetricSourceTibcoEMS:
 		return 419
+	case metrics.MetricSourceDuckdb:
+		return 423
+	case metrics.MetricSourceKeda:
+		return 424
 	case metrics.MetricSourceMilvus:
 		return 425
 	case metrics.MetricSourceNvidiaNim:
 		return 426
 	case metrics.MetricSourceQuarkus:
 		return 427
+	case metrics.MetricSourceSupabase:
+		return 428
+	case metrics.MetricSourceDatadogOperator:
+		return 456
 	case metrics.MetricSourceVelero:
 		return 458
 	case metrics.MetricSourceCelery:
 		return 464
 	case metrics.MetricSourceInfiniband:
 		return 465
-	case metrics.MetricSourceAwsLambdaCustom,
-		metrics.MetricSourceAzureContainerAppCustom,
+	case metrics.MetricSourceAzureContainerAppCustom,
 		metrics.MetricSourceAzureAppServiceCustom,
-		metrics.MetricSourceGoogleCloudRunCustom:
+		metrics.MetricSourceGoogleCloudRunCustom,
+		metrics.MetricSourceAWSMicroVMCustom:
 		return 472
-	case metrics.MetricSourceAwsLambdaEnhanced,
-		metrics.MetricSourceAzureContainerAppEnhanced,
+	case metrics.MetricSourceAzureContainerAppEnhanced,
 		metrics.MetricSourceAzureAppServiceEnhanced,
-		metrics.MetricSourceGoogleCloudRunEnhanced:
+		metrics.MetricSourceGoogleCloudRunEnhanced,
+		metrics.MetricSourceAWSMicroVMEnhanced:
 		return 473
-	case metrics.MetricSourceAwsLambdaRuntime,
-		metrics.MetricSourceAzureContainerAppRuntime,
+	case metrics.MetricSourceAzureContainerAppRuntime,
 		metrics.MetricSourceAzureAppServiceRuntime,
-		metrics.MetricSourceGoogleCloudRunRuntime:
+		metrics.MetricSourceGoogleCloudRunRuntime,
+		metrics.MetricSourceAWSMicroVMRuntime:
 		return 474
 	case metrics.MetricSourceWlan:
 		return 475
@@ -1106,6 +1137,46 @@ func metricSourceToOriginService(ms metrics.MetricSource) int32 {
 		return 483
 	case metrics.MetricSourceWindowsCertificateStore:
 		return 484
+	case metrics.MetricSourceBentoMl:
+		return 494
+	case metrics.MetricSourceHuggingFaceTgi:
+		return 495
+	case metrics.MetricSourceIbmSpectrumLsf:
+		return 496
+	case metrics.MetricSourceControlM:
+		return 500
+	case metrics.MetricSourceN8N:
+		return 501
+	case metrics.MetricSourceNutanix:
+		return 502
+	case metrics.MetricSourcePaloAltoPanorama:
+		return 503
+	case metrics.MetricSourcePrefect:
+		return 504
+	case metrics.MetricSourceBattery:
+		return 511
+	case metrics.MetricSourcePinot:
+		return 512
+	case metrics.MetricSourceDellPowerFlex:
+		return 514
+	case metrics.MetricSourceHPEArubaEdgeConnect:
+		return 515
+	case metrics.MetricSourceNiFi:
+		return 516
+	case metrics.MetricSourceCiscoSdwan:
+		return 517
+	case metrics.MetricSourceVersa:
+		return 519
+	case metrics.MetricSourceOpenTelemetryCollectorPodmanReceiver:
+		return 521
+	case metrics.MetricSourceExternalSecrets:
+		return 525
+	case metrics.MetricSourceKueue:
+		return 526
+	case metrics.MetricSourceThermal:
+		return 527
+	case metrics.MetricSourceCiscoCatalystCenter:
+		return 528
 	default:
 		return 0
 	}

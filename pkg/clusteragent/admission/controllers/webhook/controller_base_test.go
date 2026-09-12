@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build kubeapiserver && !darwin
+//go:build kubeapiserver
 
 package webhook
 
@@ -24,17 +24,32 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
 	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
+	noopTelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/fx-noop"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
+	workloadfiltermock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
 	workloadmetamock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/mock"
+	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/mutate/autoinstrumentation"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
+// newFilterStoreFromConfig creates a workloadfilter mock initialized with the given config.
+// This is needed for test cases that enable CWS instrumentation, which reads include/exclude from the filter store.
+func newFilterStoreFromConfig(t testing.TB, cfg config.Component) workloadfiltermock.Mock {
+	return fxutil.Test[workloadfiltermock.Mock](t, fx.Options(
+		fx.Provide(func() config.Component { return cfg }),
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		noopTelemetry.Module(),
+		workloadfilterfxmock.MockModule(),
+	))
+}
+
 func TestNewController(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	wmeta := fxutil.Test[workloadmeta.Component](t, core.MockBundle(), workloadmetafxmock.MockModule(workloadmeta.NewParams()))
-	datadogConfig := fxutil.Test[config.Component](t, core.MockBundle())
+	datadogConfig := config.NewMock(t)
 	factory := informers.NewSharedInformerFactory(client, time.Duration(0))
 
 	// V1
@@ -48,7 +63,13 @@ func TestNewController(t *testing.T) {
 		getV1Cfg(t),
 		wmeta,
 		nil,
+		nil,
 		datadogConfig,
+		nil,
+		nil,
+		newFilterStoreFromConfig(t, datadogConfig),
+		nil,
+		nil,
 		nil,
 	)
 
@@ -65,7 +86,13 @@ func TestNewController(t *testing.T) {
 		getV1beta1Cfg(t),
 		wmeta,
 		nil,
+		nil,
 		datadogConfig,
+		nil,
+		nil,
+		newFilterStoreFromConfig(t, datadogConfig),
+		nil,
+		nil,
 		nil,
 	)
 
@@ -133,12 +160,11 @@ func TestAutoInstrumentation(t *testing.T) {
 			wmeta := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
 				fx.Supply(config.Params{}),
 				fx.Provide(func() log.Component { return logmock.New(t) }),
-				config.MockModule(),
+				fx.Provide(func() config.Component { return config.NewMock(t) }),
 				workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 			))
 
-			// Create APM webhook.
-			apm, err := generateAutoInstrumentationWebhook(wmeta, mockConfig)
+			apm, err := autoinstrumentation.NewAutoInstrumentation(mockConfig, wmeta, nil, nil, nil)
 			assert.NoError(t, err)
 
 			// Create request.

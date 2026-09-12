@@ -22,20 +22,14 @@ import (
 	"github.com/xeipuuv/gojsonschema"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/runner/parameters"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
 	"github.com/DataDog/datadog-agent/test/new-e2e/tests/cws/api"
 )
 
 const (
-	// securityStartLog is the log corresponding to a successful start of the security-agent
-	securityStartLog = "Successfully connected to the runtime security module"
-
-	// systemProbeStartLog is the log corresponding to a successful start of the system-probe
-	systemProbeStartLog = "runtime security started"
-
 	// systemProbePath is the path of the system-probe binary
 	systemProbePath = "/opt/datadog-agent/embedded/bin/system-probe"
 
@@ -64,6 +58,10 @@ func (a *agentSuite) Hostname() string {
 	return a.Env().Agent.Client.Hostname()
 }
 
+func (a *agentSuite) InstanceID() string {
+	return ""
+}
+
 func (a *agentSuite) Client() *api.Client {
 	return a.apiClient
 }
@@ -76,7 +74,7 @@ func (a *agentSuite) Test00RulesetLoadedDefaultFile() {
 
 func (a *agentSuite) Test01RulesetLoadedDefaultRC() {
 	assert.EventuallyWithT(a.T(), func(c *assert.CollectT) {
-		testRulesetLoaded(c, a, "remote-config", "default.policy")
+		testRulesetLoaded(c, a, "remote-config", "threat-detection.policy")
 	}, 4*time.Minute, 10*time.Second)
 }
 
@@ -104,16 +102,16 @@ func (a *agentSuite) Test03OpenSignal() {
 			assert.NoErrorf(a.T(), err, "failed to delete agent rule %s", agentRuleID)
 		}
 		if dirname != "" {
-			a.Env().RemoteHost.MustExecute(fmt.Sprintf("rm -r %s", dirname))
+			a.Env().RemoteHost.MustExecute("rm -r " + dirname)
 		}
 	}()
 
 	// Create temporary directory
 	tempDir := a.Env().RemoteHost.MustExecute("mktemp -d")
 	dirname = strings.TrimSuffix(tempDir, "\n")
-	filepath := fmt.Sprintf("%s/secret", dirname)
-	desc := fmt.Sprintf("e2e test rule %s", a.testID)
-	agentRuleName := fmt.Sprintf("new_e2e_agent_rule_%s", a.testID)
+	filepath := dirname + "/secret"
+	desc := "e2e test rule " + a.testID
+	agentRuleName := "new_e2e_agent_rule_" + a.testID
 
 	// Create CWS Agent rule
 	rule := fmt.Sprintf("open.file.path == \"%s\"", filepath)
@@ -129,24 +127,6 @@ func (a *agentSuite) Test03OpenSignal() {
 	// Check if the agent is ready
 	isReady := a.Env().Agent.Client.IsReady()
 	assert.Equal(a.T(), isReady, true, "Agent should be ready")
-
-	// Check if system-probe has started
-	assert.EventuallyWithT(a.T(), func(c *assert.CollectT) {
-		output, err := a.Env().RemoteHost.Execute("cat /var/log/datadog/system-probe.log")
-		if !assert.NoError(c, err) {
-			return
-		}
-		assert.Contains(c, output, systemProbeStartLog, "system-probe could not start")
-	}, 30*time.Second, 1*time.Second)
-
-	// Check if security-agent has started
-	assert.EventuallyWithT(a.T(), func(c *assert.CollectT) {
-		output, err := a.Env().RemoteHost.Execute("cat /var/log/datadog/security-agent.log")
-		if !assert.NoError(c, err) {
-			return
-		}
-		assert.Contains(c, output, securityStartLog, "security-agent could not start")
-	}, 30*time.Second, 1*time.Second)
 
 	// Download policies
 	apiKey, err := runner.GetProfile().SecretStore().Get(parameters.APIKey)
@@ -166,7 +146,7 @@ func (a *agentSuite) Test03OpenSignal() {
 
 	// Push policies
 	a.Env().RemoteHost.MustExecute(fmt.Sprintf("sudo cp temp.txt %s && rm temp.txt", policiesPath))
-	policiesFile := a.Env().RemoteHost.MustExecute(fmt.Sprintf("cat %s", policiesPath))
+	policiesFile := a.Env().RemoteHost.MustExecute("cat " + policiesPath)
 	require.Contains(a.T(), policiesFile, desc, "The policies file should contain the created rule")
 
 	// Reload policies
@@ -186,7 +166,7 @@ func (a *agentSuite) Test03OpenSignal() {
 	// Check app event
 	assert.EventuallyWithT(a.T(), func(c *assert.CollectT) {
 		// Trigger agent event
-		a.Env().RemoteHost.MustExecute(fmt.Sprintf("touch %s", filepath))
+		a.Env().RemoteHost.MustExecute("touch " + filepath)
 		testRuleEvent(c, a, agentRuleName, func(e *api.RuleEvent) {
 			assert.Equal(c, "open", e.Evt.Name, "event name should be open")
 			assert.Equal(c, filepath, e.File.Path, "file path does not match")
@@ -204,7 +184,7 @@ func (a *agentSuite) Test03OpenSignal() {
 		if !assert.NotNil(c, signal) {
 			return
 		}
-		assert.Contains(c, signal.Tags, fmt.Sprintf("rule_id:%s", strings.ToLower(agentRuleName)), "unable to find rule_id tag")
+		assert.Contains(c, signal.Tags, "rule_id:"+strings.ToLower(agentRuleName), "unable to find rule_id tag")
 		if !assert.Contains(c, signal.AdditionalProperties, "attributes", "unable to find 'attributes' field in signal") {
 			return
 		}
@@ -264,12 +244,19 @@ func (a *agentSuite) Test99CWSEnabled() {
 type testSuite interface {
 	Hostname() string
 	Client() *api.Client
+	InstanceID() string
 }
 
 type eventValidationCb[T any] func(e T)
 
 func testRulesetLoaded(t assert.TestingT, ts testSuite, policySource string, policyName string, extraValidations ...eventValidationCb[*api.RulesetLoadedEvent]) {
-	query := fmt.Sprintf("rule_id:ruleset_loaded host:%s @policies.source:%s @policies.name:%s", ts.Hostname(), policySource, policyName)
+	query := fmt.Sprintf("rule_id:ruleset_loaded @policies.source:%s @policies.name:%s", policySource, policyName)
+	if hostname := ts.Hostname(); hostname != "" {
+		query = fmt.Sprintf("%s host:%s", query, hostname)
+	}
+	if instanceID := ts.InstanceID(); instanceID != "" {
+		query = fmt.Sprintf("%s instance_id:%s", query, instanceID)
+	}
 	rulesetLoaded, err := api.GetAppEvent[api.RulesetLoadedEvent](ts.Client(), query)
 	if !assert.NoErrorf(t, err, "could not get %s/%s ruleset_loaded event for host %s", policySource, policyName, ts.Hostname()) {
 		return
@@ -285,7 +272,13 @@ func testRulesetLoaded(t assert.TestingT, ts testSuite, policySource string, pol
 }
 
 func testRuleEvent(t assert.TestingT, ts testSuite, ruleID string, extraValidations ...eventValidationCb[*api.RuleEvent]) {
-	query := fmt.Sprintf("rule_id:%s host:%s", ruleID, ts.Hostname())
+	query := "rule_id:" + ruleID
+	if hostname := ts.Hostname(); hostname != "" {
+		query = fmt.Sprintf("%s host:%s", query, hostname)
+	}
+	if instanceID := ts.InstanceID(); instanceID != "" {
+		query = fmt.Sprintf("%s instance_id:%s", query, instanceID)
+	}
 	ruleEvent, err := api.GetAppEvent[api.RuleEvent](ts.Client(), query)
 	if !assert.NoErrorf(t, err, "could not get %s event for host %s", ruleID, ts.Hostname()) {
 		return
@@ -300,54 +293,21 @@ func testRuleEvent(t assert.TestingT, ts testSuite, ruleID string, extraValidati
 }
 
 func testCwsEnabled(t assert.TestingT, ts testSuite) {
-	query := fmt.Sprintf("SELECT h.hostname, a.feature_cws_enabled FROM host h JOIN datadog_agent a USING (datadog_agent_key) WHERE h.hostname = '%s'", ts.Hostname())
-	resp, err := ts.Client().TableQuery(query)
-	if !assert.NoErrorf(t, err, "ddsql query failed") {
+	enabled, err := ts.Client().IsProductEnabled(ts.Hostname(), "cws")
+	if !assert.NoErrorf(t, err, "fleet automation API request failed for host %s", ts.Hostname()) {
 		return
 	}
-	if !assert.Len(t, resp.Data, 1, "ddsql query didn't returned a single row") {
-		return
-	}
-	if !assert.Len(t, resp.Data[0].Attributes.Columns, 2, "ddsql query didn't returned two columns") {
-		return
-	}
-
-	columnChecks := []struct {
-		name          string
-		expectedValue interface{}
-	}{
-		{
-			name:          "hostname",
-			expectedValue: ts.Hostname(),
-		},
-		{
-			name:          "feature_cws_enabled",
-			expectedValue: true,
-		},
-	}
-
-	for _, columnCheck := range columnChecks {
-		result := false
-		for _, column := range resp.Data[0].Attributes.Columns {
-			if column.Name == columnCheck.name {
-				if !assert.Len(t, column.Values, 1, "column %s should have a single value", columnCheck.name) {
-					return
-				}
-				if !assert.Equal(t, columnCheck.expectedValue, column.Values[0], "column %s should be equal", columnCheck.name) {
-					return
-				}
-				result = true
-				break
-			}
-		}
-		if !assert.Truef(t, result, "column %s isn't present or has an unexpected value", columnCheck.name) {
-			return
-		}
-	}
+	assert.Truef(t, enabled, "cws should be enabled for host %s", ts.Hostname())
 }
 
 func testSelftestsEvent(t assert.TestingT, ts testSuite, extraValidations ...eventValidationCb[*api.SelftestsEvent]) {
-	query := fmt.Sprintf("rule_id:self_test host:%s", ts.Hostname())
+	query := "rule_id:self_test"
+	if hostname := ts.Hostname(); hostname != "" {
+		query = fmt.Sprintf("%s host:%s", query, hostname)
+	}
+	if instanceID := ts.InstanceID(); instanceID != "" {
+		query = fmt.Sprintf("%s instance_id:%s", query, instanceID)
+	}
 	selftestsEvent, err := api.GetAppEvent[api.SelftestsEvent](ts.Client(), query)
 	if !assert.NoErrorf(t, err, "could not get selftests event for host %s", ts.Hostname()) {
 		return

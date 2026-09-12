@@ -1,0 +1,149 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-present Datadog, Inc.
+
+package privateactionrunner
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
+	scenec2 "github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-platform/common"
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-platform/common/process"
+)
+
+const (
+	privateActionRunnerStartedLogLine     = "Private action runner starting"
+	privateActionRunnerKeysManagerLogLine = "Keys manager ready"
+)
+
+func generateTestPrivateActionRunnerConfig(t *testing.T) string {
+	return GenerateTestPrivateActionRunnerConfig(t)
+}
+
+type linuxPrivateActionRunnerEnabledSuite struct {
+	e2e.BaseSuite[environments.Host]
+}
+
+func TestLinuxPrivateActionRunnerEnabledSuite(t *testing.T) {
+	t.Parallel()
+	config := generateTestPrivateActionRunnerConfig(t)
+	e2e.Run(t, &linuxPrivateActionRunnerEnabledSuite{}, e2e.WithProvisioner(
+		awshost.Provisioner(
+			awshost.WithRunOptions(
+				scenec2.WithAgentOptions(agentparams.WithAgentConfig(config)),
+			),
+		),
+	))
+}
+
+func (s *linuxPrivateActionRunnerEnabledSuite) TestPrivateActionRunnerStartsWhenEnabled() {
+	host := s.Env().RemoteHost
+	svcManager := common.GetServiceManager(host)
+	s.Require().NotNil(svcManager)
+
+	// Start the private action runner service
+	_, err := svcManager.Start(privateActionRunnerServiceName)
+	s.Require().NoError(err)
+
+	// Verify the service is running
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		status, statusErr := svcManager.Status(privateActionRunnerServiceName)
+		assert.NoError(c, statusErr)
+		assert.Contains(c, status, "active")
+	}, 2*time.Minute, 5*time.Second, "private action runner service should be active when enabled")
+
+	// Verify the process is running
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		pids, pidErr := process.FindPID(host, "privateactionrunner")
+		assert.NoError(c, pidErr)
+		assert.NotEmpty(c, pids, "privateactionrunner process should be running")
+	}, 2*time.Minute, 5*time.Second, "privateactionrunner process should be running when enabled")
+
+	// Verify the log file exists
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		host.MustExecuteOn(c, "sudo test -f "+privateActionRunnerLogFile)
+	}, 2*time.Minute, 5*time.Second, "private action runner log file should exist")
+
+	// Verify log contains startup message
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		host.MustExecuteOn(c, fmt.Sprintf("sudo grep -i %q %s", privateActionRunnerStartedLogLine, privateActionRunnerLogFile))
+	}, 2*time.Minute, 5*time.Second, "private action runner log should contain the started message")
+
+	// Wait for the Core Agent to report the AP_RUNNER_KEYS client in its backend requests.
+	client := s.Env().FakeIntake.Client()
+	stats, err := client.RCStats()
+	s.Require().NoError(err)
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		current, statsErr := client.RCStats()
+		assert.NoError(c, statsErr)
+		if statsErr == nil {
+			assert.GreaterOrEqual(c, current.Polls, stats.Polls+2)
+		}
+	}, 45*time.Second, time.Second, "Core Agent should poll after PAR subscribes")
+	PushFakeRunnerKeysConfig(s.T(), client)
+
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		host.MustExecuteOn(c, fmt.Sprintf("sudo grep -F %q %s", privateActionRunnerKeysManagerLogLine, privateActionRunnerLogFile))
+	}, 30*time.Second, time.Second, "private action runner log should report the keys manager ready")
+}
+
+func (s *linuxPrivateActionRunnerEnabledSuite) TestPrivateActionRunnerServiceRestart() {
+	host := s.Env().RemoteHost
+	svcManager := common.GetServiceManager(host)
+	s.Require().NotNil(svcManager)
+
+	PushFakeRunnerKeysConfig(s.T(), s.Env().FakeIntake.Client())
+
+	// Ensure service is started
+	_, err := svcManager.Start(privateActionRunnerServiceName)
+	s.Require().NoError(err)
+
+	// Wait for service to be running
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		status, statusErr := svcManager.Status(privateActionRunnerServiceName)
+		assert.NoError(c, statusErr)
+		assert.Contains(c, status, "active")
+	}, 2*time.Minute, 5*time.Second)
+
+	// Get the original PID
+	var originalPID int
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		pids, pidErr := process.FindPID(host, "privateactionrunner")
+		assert.NoError(c, pidErr)
+		assert.NotEmpty(c, pids)
+		if len(pids) > 0 {
+			originalPID = pids[0]
+		}
+	}, 2*time.Minute, 5*time.Second)
+
+	// Restart the service
+	_, err = svcManager.Restart(privateActionRunnerServiceName)
+	s.Require().NoError(err)
+
+	// Verify service is running again
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		status, statusErr := svcManager.Status(privateActionRunnerServiceName)
+		assert.NoError(c, statusErr)
+		assert.Contains(c, status, "active")
+	}, 2*time.Minute, 5*time.Second, "private action runner should be active after restart")
+
+	// Verify we have a new PID (service actually restarted)
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		pids, pidErr := process.FindPID(host, "privateactionrunner")
+		assert.NoError(c, pidErr)
+		assert.NotEmpty(c, pids)
+		if len(pids) > 0 {
+			assert.NotEqual(c, originalPID, pids[0], "PID should change after restart")
+		}
+	}, 2*time.Minute, 5*time.Second, "privateactionrunner should have a new PID after restart")
+}

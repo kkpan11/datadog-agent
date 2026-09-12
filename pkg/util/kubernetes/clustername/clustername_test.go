@@ -18,48 +18,64 @@ import (
 func TestGetClusterName(t *testing.T) {
 	ctx := context.Background()
 	mockConfig := configmock.New(t)
+	// Disable cloud provider metadata detection to avoid real HTTP calls to
+	// EC2/GCE/Azure metadata endpoints.
+	mockConfig.SetInTest("cloud_provider_metadata", []string{})
 	env.SetFeatures(t, env.Kubernetes)
 	data := newClusterNameData()
 
 	testClusterName := "laika"
-	mockConfig.SetWithoutSource("cluster_name", testClusterName)
-	defer mockConfig.SetWithoutSource("cluster_name", nil)
+	mockConfig.SetInTest("cluster_name", testClusterName)
+	defer mockConfig.SetInTest("cluster_name", nil)
 
 	assert.Equal(t, testClusterName, getClusterName(ctx, data, "hostname"))
 
 	// Test caching and reset
 	newClusterName := "youri"
-	mockConfig.SetWithoutSource("cluster_name", newClusterName)
+	mockConfig.SetInTest("cluster_name", newClusterName)
 	assert.Equal(t, testClusterName, getClusterName(ctx, data, "hostname"))
 	freshData := newClusterNameData()
 	assert.Equal(t, newClusterName, getClusterName(ctx, freshData, "hostname"))
 
 	dotClusterName := "aclusternamewitha.dot"
-	mockConfig.SetWithoutSource("cluster_name", dotClusterName)
+	mockConfig.SetInTest("cluster_name", dotClusterName)
 	data = newClusterNameData()
 	assert.Equal(t, dotClusterName, getClusterName(ctx, data, "hostname"))
 
 	dotsClusterName := "a.cluster.name.with.dots"
-	mockConfig.SetWithoutSource("cluster_name", dotsClusterName)
+	mockConfig.SetInTest("cluster_name", dotsClusterName)
 	data = newClusterNameData()
 	assert.Equal(t, dotsClusterName, getClusterName(ctx, data, "hostname"))
+
+	startsWithNumberName := "1cluster"
+	mockConfig.SetInTest("cluster_name", startsWithNumberName)
+	data = newClusterNameData()
+	assert.Equal(t, startsWithNumberName, getClusterName(ctx, data, "hostname"))
+
+	underscoreClusterName := "cluster_with_underscore"
+	mockConfig.SetInTest("cluster_name", underscoreClusterName)
+	data = newClusterNameData()
+	assert.Equal(t, MakeClusterNameRFC1123Compliant(underscoreClusterName), getClusterName(ctx, data, "hostname"))
+
+	digitLeadingDottedClusterName := "1a.cluster.name"
+	mockConfig.SetInTest("cluster_name", digitLeadingDottedClusterName)
+	data = newClusterNameData()
+	assert.Equal(t, digitLeadingDottedClusterName, getClusterName(ctx, data, "hostname"))
 
 	// Test invalid cluster names
 	for _, invalidClusterName := range []string{
 		"Capital",
-		"with_underscore",
 		"with_dot._underscore",
 		"toolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoolongtoo",
 		"a..a",
-		"a.1.a",
 		"mx.gmail.com.",
 	} {
-		mockConfig.SetWithoutSource("cluster_name", invalidClusterName)
+		mockConfig.SetInTest("cluster_name", invalidClusterName)
 		freshData = newClusterNameData()
 		assert.Equal(t, "", getClusterName(ctx, freshData, "hostname"))
 	}
 
-	mockConfig.SetWithoutSource("cluster_name", "")
+	mockConfig.SetInTest("cluster_name", "")
 
 	// Test lowercase
 	wantedClustername := "foo"
@@ -67,6 +83,23 @@ func TestGetClusterName(t *testing.T) {
 	dummyFunc := func(context.Context) (string, error) { return discoveredClustername, nil }
 	setProviderCatalog(map[string]Provider{"dummyProvider": dummyFunc})
 	assert.Equal(t, wantedClustername, getClusterName(ctx, newClusterNameData(), "hostname"))
+}
+
+// TestGetClusterNameCLCRunner ensures that a Cluster Checks Runner (which
+// never has a locally-reachable kubelet) still honors a cluster name provided
+// via config, without needing the node-label based auto discovery.
+func TestGetClusterNameCLCRunner(t *testing.T) {
+	ctx := context.Background()
+	mockConfig := configmock.New(t)
+	env.SetFeatures(t, env.Kubernetes)
+
+	mockConfig.SetInTest("clc_runner_enabled", true)
+	mockConfig.SetInTest("config_providers", []map[string]interface{}{{"name": "clusterchecks"}})
+
+	testClusterName := "laika"
+	mockConfig.SetInTest("cluster_name", testClusterName)
+
+	assert.Equal(t, testClusterName, getClusterName(ctx, newClusterNameData(), "hostname"))
 }
 
 func TestGetClusterID(t *testing.T) {

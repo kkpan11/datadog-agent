@@ -20,8 +20,8 @@ func TestHostAliasDisable(t *testing.T) {
 	ctx := context.Background()
 	mockConfig := configmock.New(t)
 
-	mockConfig.SetWithoutSource("cloud_foundry", false)
-	mockConfig.SetWithoutSource("bosh_id", "ID_CF")
+	mockConfig.SetInTest("cloud_foundry", false)
+	mockConfig.SetInTest("bosh_id", "ID_CF")
 
 	aliases, err := GetHostAliases(ctx)
 	assert.Nil(t, err)
@@ -33,15 +33,15 @@ func TestHostAlias(t *testing.T) {
 	defer func() { getFqdn = netutil.Fqdn }()
 	mockConfig := configmock.New(t)
 
-	mockConfig.SetWithoutSource("cloud_foundry", true)
-	mockConfig.SetWithoutSource("bosh_id", "ID_CF")
-	mockConfig.SetWithoutSource("cf_os_hostname_aliasing", false)
+	mockConfig.SetInTest("cloud_foundry", true)
+	mockConfig.SetInTest("bosh_id", "ID_CF")
+	mockConfig.SetInTest("cf_os_hostname_aliasing", false)
 
 	aliases, err := GetHostAliases(ctx)
 	assert.Nil(t, err)
 	assert.Equal(t, []string{"ID_CF"}, aliases)
 
-	mockConfig.SetWithoutSource("cf_os_hostname_aliasing", true)
+	mockConfig.SetInTest("cf_os_hostname_aliasing", true)
 	// mock Fqdn returning hostname unchanged
 	getFqdn = func(hostname string) string {
 		return hostname
@@ -74,13 +74,14 @@ func TestHostAliasDefault(t *testing.T) {
 	mockHostname := "hostname"
 
 	// mock getFqdn to avoid flakes in CI runners
+	defer func() { getFqdn = netutil.Fqdn }()
 	getFqdn = func(string) string {
 		return mockHostname
 	}
 
-	mockConfig.SetWithoutSource("cloud_foundry", true)
-	mockConfig.SetWithoutSource("bosh_id", nil)
-	mockConfig.SetWithoutSource("cf_os_hostname_aliasing", nil)
+	mockConfig.SetInTest("cloud_foundry", true)
+	mockConfig.SetInTest("bosh_id", nil)
+	mockConfig.SetInTest("cf_os_hostname_aliasing", nil)
 
 	aliases, err := GetHostAliases(ctx)
 	assert.Nil(t, err)

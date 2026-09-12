@@ -17,14 +17,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DataDog/datadog-agent/pkg/trace/api/apiutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 	"github.com/DataDog/datadog-go/v5/statsd"
 )
 
 const (
-	openlineageURLTemplate = "https://data-obs-intake.%s/api/v1/lineage"
-	openlineageURLDefault  = "https://data-obs-intake.datadoghq.com/api/v1/lineage"
+	openlineageURLTemplate = config.OpenLineageEndpointPrefix + "%s" + config.OpenLineageEndpointPath
+	openlineageURLDefault  = config.OpenLineageEndpointPrefix + "datadoghq.com" + config.OpenLineageEndpointPath
 )
 
 // openLineageEndpoint returns the openlineage intake url and the corresponding API key.
@@ -87,7 +88,7 @@ func addOpenLineageAPIVersion(u *url.URL, version int) {
 
 func openLineageErrorHandler(message string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		msg := fmt.Sprintf("OpenLineage forwarder is OFF: %s", message)
+		msg := "OpenLineage forwarder is OFF: " + message
 		http.Error(w, msg, http.StatusInternalServerError)
 	})
 }
@@ -111,31 +112,26 @@ func (r *HTTPReceiver) openLineageProxyHandler() http.Handler {
 // The tags will be added as a header to all proxied requests.
 func newOpenLineageProxy(conf *config.AgentConfig, urls []*url.URL, keys []string, tags string, statsd statsd.ClientInterface) *httputil.ReverseProxy {
 	log.Debug("[openlineage] Creating reverse proxy")
-	cidProvider := NewIDProvider(conf.ContainerProcRoot, conf.ContainerIDFromOriginInfo)
-	director := func(req *http.Request) {
-		req.Header.Set("Via", fmt.Sprintf("trace-agent %s", conf.AgentVersion))
-		if _, ok := req.Header["User-Agent"]; !ok {
-			// explicitly disable User-Agent so it's not set to the default value
-			// that net/http gives it: Go-http-client/1.1
-			// See https://codereview.appspot.com/7532043
-			req.Header.Set("User-Agent", "")
-		}
-		containerID := cidProvider.GetContainerID(req.Context(), req.Header)
+	cidProvider := NewContainerIDProviderFromConfig(conf)
+	rewrite := func(req *httputil.ProxyRequest) {
+		req.SetXForwarded()
+		req.Out.Header.Set("Via", "trace-agent "+conf.AgentVersion)
+		containerID := cidProvider.GetContainerID(req.In.Context(), req.In.Header)
 		if ctags := getContainerTags(conf.ContainerTags, containerID); ctags != "" {
 			ctagsHeader := normalizeHTTPHeader(ctags)
-			req.Header.Set("X-Datadog-Container-Tags", ctagsHeader)
+			req.Out.Header.Set("X-Datadog-Container-Tags", ctagsHeader)
 			log.Debugf("Setting header X-Datadog-Container-Tags=%s for openlineage proxy", ctagsHeader)
 		}
-		req.Header.Set("X-Datadog-Additional-Tags", tags)
+		req.Out.Header.Set("X-Datadog-Additional-Tags", tags)
 		log.Debugf("Setting header X-Datadog-Additional-Tags=%s for openlineage proxy", tags)
 		_ = statsd.Count("datadog.trace_agent.openlineage", 1, nil, 1)
 
 	}
 	logger := log.NewThrottled(5, 10*time.Second) // limit to 5 messages every 10 seconds
 	return &httputil.ReverseProxy{
-		Director:  director,
+		Rewrite:   rewrite,
 		ErrorLog:  stdlog.New(logger, "openlineage.Proxy: ", 0),
-		Transport: &openLineageTransport{rt: conf.NewHTTPTransport(), urls: urls, keys: keys},
+		Transport: &openLineageTransport{rt: conf.NewHTTPTransport(), urls: urls, keys: keys, maxRequestBytes: conf.MaxRequestBytes},
 	}
 }
 
@@ -146,9 +142,10 @@ func newOpenLineageProxy(conf *config.AgentConfig, urls []*url.URL, keys []strin
 // response is discarded. There is no de-duplication done between endpoint
 // hosts or api keys.
 type openLineageTransport struct {
-	rt   http.RoundTripper
-	urls []*url.URL
-	keys []string
+	rt              http.RoundTripper
+	urls            []*url.URL
+	keys            []string
+	maxRequestBytes int64
 }
 
 func (m *openLineageTransport) RoundTrip(req *http.Request) (rresp *http.Response, rerr error) {
@@ -169,6 +166,7 @@ func (m *openLineageTransport) RoundTrip(req *http.Request) (rresp *http.Respons
 
 		return rresp, rerr
 	}
+	req.Body = apiutil.NewLimitedReader(req.Body, m.maxRequestBytes)
 	slurp, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err

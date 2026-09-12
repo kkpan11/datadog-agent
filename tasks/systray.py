@@ -7,6 +7,8 @@ import sys
 
 from invoke import task
 
+from tasks.libs.build.bazel import build_binary_with_bazel
+from tasks.libs.common.go import go_build
 from tasks.libs.common.utils import REPO_PATH, bin_name, get_version_ldflags
 from tasks.libs.releasing.version import get_version_numeric_only
 
@@ -16,7 +18,7 @@ AGENT_TAG = "datadog/agent:master"
 
 
 @task
-def build(ctx, debug=False, console=False, rebuild=False, race=False, major_version='7', go_mod="readonly"):
+def build(ctx, debug=False, console=False, rebuild=False, race=False, go_mod="readonly", enable_bazel=False):
     """
     Build the agent. If the bits to include in the build are not specified,
     the values from `invoke.yaml` will be used.
@@ -29,10 +31,24 @@ def build(ctx, debug=False, console=False, rebuild=False, race=False, major_vers
         print("Systray only available on Windows")
         return
 
+    if enable_bazel:
+        if console:
+            raise NotImplementedError(
+                "--enable-bazel does not support --console (the Bazel target hardcodes the windows subsystem)."
+            )
+        if debug:
+            raise NotImplementedError(
+                "--enable-bazel does not support --debug (stripping is tied to Bazel's release mode, not this flag)."
+            )
+        if race:
+            raise NotImplementedError("--enable-bazel does not support --race.")
+        build_binary_with_bazel("//cmd/systray:systray", bin_path=os.path.join(BIN_PATH, bin_name("ddtray")))
+        return
+
     # This generates the manifest resource. The manifest resource is necessary for
     # being able to load the ancient C-runtime that comes along with Python 2.7
     # command = "rsrc -arch amd64 -manifest cmd/agent/agent.exe.manifest -o cmd/agent/rsrc.syso"
-    ver = get_version_numeric_only(ctx, major_version=major_version)
+    ver = get_version_numeric_only(ctx)
     build_maj, build_min, build_patch = ver.split(".")
     env = {}
     windres_target = "pe-x86-64"
@@ -40,7 +56,7 @@ def build(ctx, debug=False, console=False, rebuild=False, race=False, major_vers
     command = f"windres -v  --target {windres_target} --define MAJ_VER={build_maj} --define MIN_VER={build_min} --define PATCH_VER={build_patch} "
     command += "-i cmd/systray/systray.rc -O coff -o cmd/systray/rsrc.syso"
     ctx.run(command)
-    ldflags = get_version_ldflags(ctx, major_version=major_version)
+    ldflags = get_version_ldflags(ctx)
     if not debug:
         ldflags += "-s -w "
     if console:
@@ -48,17 +64,19 @@ def build(ctx, debug=False, console=False, rebuild=False, race=False, major_vers
     else:
         subsystem = 'windows'
     ldflags += f"-X {REPO_PATH}/cmd/systray/command/command.subsystem={subsystem} "
-    ldflags += f"-linkmode external -extldflags '-Wl,--subsystem,{subsystem}' "
-    cmd = "go build -mod={go_mod} {race_opt} {build_type} -o {agent_bin} -ldflags=\"{ldflags}\" {REPO_PATH}/cmd/systray"
-    args = {
-        "go_mod": go_mod,
-        "race_opt": "-race" if race else "",
-        "build_type": "-a" if rebuild else "",
-        "agent_bin": os.path.join(BIN_PATH, bin_name("ddtray")),
-        "ldflags": ldflags,
-        "REPO_PATH": REPO_PATH,
-    }
-    ctx.run(cmd.format(**args), env=env)
+    ldflags += f"-linkmode external '-extldflags=-Wl,--subsystem,{subsystem}' "
+    go_build(
+        ctx,
+        f"{REPO_PATH}/cmd/systray",
+        mod=go_mod,
+        race=race,
+        rebuild=rebuild,
+        bin_path=os.path.join(BIN_PATH, bin_name("ddtray")),
+        ldflags=ldflags,
+        env=env,
+        check_deadcode=os.getenv("DEPLOY_AGENT") == "true",
+        build_tags=["grpcnotrace"],
+    )
 
 
 @task

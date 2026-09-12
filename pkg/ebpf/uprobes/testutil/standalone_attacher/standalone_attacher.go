@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2025-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // Package standalone_attacher is a standalone attacher that can be used to attach probes to a process in a standalone
 // process (usually inside of a container). The attacher will listen for HTTP requests and will reply with the status of
@@ -24,6 +24,7 @@ import (
 )
 
 var configName = flag.String("config", "", "config name")
+var useEventStream = flag.Bool("use-event-stream", false, "use event stream")
 
 func main() {
 	// use testing.Main so that we have a testing.T to pass to the runners.
@@ -38,7 +39,7 @@ func main() {
 }
 
 func run(t *testing.T) {
-	runner := uprobes.NewSameProcessAttacherRunner()
+	runner := uprobes.NewSameProcessAttacherRunner(*useEventStream)
 
 	if *configName == "" {
 		t.Fatal("config name is required")

@@ -8,20 +8,17 @@ package statusimpl
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	"github.com/DataDog/datadog-agent/comp/core/status"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	"github.com/DataDog/datadog-agent/pkg/version"
 )
 
@@ -36,13 +33,11 @@ func TestCommonHeaderProviderIndex(t *testing.T) {
 func TestCommonHeaderProviderJSON(t *testing.T) {
 	nowFunc = func() time.Time { return time.Unix(1515151515, 0) }
 	startTimeProvider = time.Unix(1515151515, 0)
-	originalTZ := os.Getenv("TZ")
-	os.Setenv("TZ", "UTC")
+	forceUTC(t)
 
 	defer func() {
 		nowFunc = time.Now
 		startTimeProvider = pkgconfigsetup.StartTime
-		os.Setenv("TZ", originalTZ)
 	}()
 
 	config := config.NewMock(t)
@@ -69,6 +64,7 @@ func TestCommonHeaderProviderJSON(t *testing.T) {
 func TestCommonHeaderProviderText(t *testing.T) {
 	nowFunc = func() time.Time { return time.Unix(1515151515, 0) }
 	startTimeProvider = time.Unix(1515151515, 0)
+	forceUTC(t)
 
 	defer func() {
 		nowFunc = time.Now
@@ -82,22 +78,7 @@ func TestCommonHeaderProviderText(t *testing.T) {
 	buffer := new(bytes.Buffer)
 	provider.Text(false, buffer)
 
-	expectedTextOutput := fmt.Sprintf(`  Status date: 2018-01-05 11:25:15 UTC (1515151515000)
-  Agent start: 2018-01-05 11:25:15 UTC (1515151515000)
-  Pid: %d
-  Go Version: %s
-  Python Version: n/a
-  Build arch: %s
-  Agent flavor: %s
-  FIPS Mode: not available
-  Log Level: info
-
-  Paths
-  =====
-    Config File: There is no config file
-    conf.d: %s
-    checks.d: %s
-`, pid, goVersion, arch, agentFlavor, config.GetString("confd_path"), config.GetString("additional_checksd"))
+	expectedTextOutput := getTextStatusOutput(pid, goVersion, arch, agentFlavor, config)
 
 	// We replace windows line break by linux so the tests pass on every OS
 	expectedResult := strings.ReplaceAll(expectedTextOutput, "\r\n", "\n")
@@ -162,6 +143,7 @@ func TestCommonHeaderProviderConfig(t *testing.T) {
 func TestCommonHeaderProviderTextWithFipsInformation(t *testing.T) {
 	nowFunc = func() time.Time { return time.Unix(1515151515, 0) }
 	startTimeProvider = time.Unix(1515151515, 0)
+	forceUTC(t)
 
 	defer func() {
 		nowFunc = time.Now
@@ -172,38 +154,13 @@ func TestCommonHeaderProviderTextWithFipsInformation(t *testing.T) {
 		"fips.enabled": true,
 	}
 
-	config := fxutil.Test[config.Component](t, fx.Options(
-		config.MockModule(),
-		fx.Replace(config.MockParams{Overrides: overrides}),
-	))
-
+	config := config.NewMockWithOverrides(t, overrides)
 	provider := newCommonHeaderProvider(agentParams, config)
 
 	buffer := new(bytes.Buffer)
 	provider.Text(false, buffer)
 
-	expectedTextOutput := fmt.Sprintf(`  Status date: 2018-01-05 11:25:15 UTC (1515151515000)
-  Agent start: 2018-01-05 11:25:15 UTC (1515151515000)
-  Pid: %d
-  Go Version: %s
-  Python Version: n/a
-  Build arch: %s
-  Agent flavor: %s
-  FIPS Mode: proxy
-  Log Level: info
-
-  Paths
-  =====
-    Config File: There is no config file
-    conf.d: %s
-    checks.d: %s
-
-  FIPS proxy
-  ==========
-    FIPS proxy is enabled. All communication to Datadog is routed to a local FIPS proxy:
-      - Local address: localhost
-      - Starting port: 9803
-`, pid, goVersion, arch, agentFlavor, config.GetString("confd_path"), config.GetString("additional_checksd"))
+	expectedTextOutput := getTextStatusOutput(pid, goVersion, arch, agentFlavor, config)
 
 	// We replace windows line break by linux so the tests pass on every OS
 	expectedResult := strings.ReplaceAll(expectedTextOutput, "\r\n", "\n")
@@ -215,13 +172,11 @@ func TestCommonHeaderProviderTextWithFipsInformation(t *testing.T) {
 func TestCommonHeaderProviderHTML(t *testing.T) {
 	nowFunc = func() time.Time { return time.Unix(1515151515, 0) }
 	startTimeProvider = time.Unix(1515151515, 0)
-	originalTZ := os.Getenv("TZ")
-	os.Setenv("TZ", "UTC")
+	forceUTC(t)
 
 	defer func() {
 		nowFunc = time.Now
 		startTimeProvider = pkgconfigsetup.StartTime
-		os.Setenv("TZ", originalTZ)
 	}()
 
 	config := config.NewMock(t)
@@ -243,7 +198,8 @@ func TestCommonHeaderProviderHTML(t *testing.T) {
     Flavor: %s<br>
     PID: %d<br>
     Agent start: 2018-01-05 11:25:15 UTC (1515151515000)<br>
-    FIPS Mode: not available<br>
+    FIPS Mode: %s<br>
+    Log File: %s<br>
     Log Level: info<br>
     Config File: There is no config file<br>
     Conf.d Path: %s<br>
@@ -260,7 +216,7 @@ func TestCommonHeaderProviderHTML(t *testing.T) {
     <br>Build arch: %s
   </span>
 </div>
-`, version.AgentVersion, agentFlavor, pid, config.GetString("confd_path"), config.GetString("additional_checksd"), goVersion, arch)
+`, version.AgentVersion, agentFlavor, pid, populateFIPSStatus(config), config.GetString("log_file"), config.GetString("confd_path"), config.GetString("additional_checksd"), goVersion, arch)
 
 	// We replace windows line break by linux so the tests pass on every OS
 	expectedResult := strings.ReplaceAll(expectedHTMLOutput, "\r\n", "\n")
@@ -272,24 +228,18 @@ func TestCommonHeaderProviderHTML(t *testing.T) {
 func TestCommonHeaderProviderHTMLWithFipsInformation(t *testing.T) {
 	nowFunc = func() time.Time { return time.Unix(1515151515, 0) }
 	startTimeProvider = time.Unix(1515151515, 0)
-	originalTZ := os.Getenv("TZ")
-	os.Setenv("TZ", "UTC")
+	forceUTC(t)
 
 	defer func() {
 		nowFunc = time.Now
 		startTimeProvider = pkgconfigsetup.StartTime
-		os.Setenv("TZ", originalTZ)
 	}()
 
 	overrides := map[string]interface{}{
 		"fips.enabled": true,
 	}
 
-	config := fxutil.Test[config.Component](t, fx.Options(
-		config.MockModule(),
-		fx.Replace(config.MockParams{Overrides: overrides}),
-	))
-
+	config := config.NewMockWithOverrides(t, overrides)
 	provider := newCommonHeaderProvider(agentParams, config)
 
 	buffer := new(bytes.Buffer)
@@ -307,7 +257,8 @@ func TestCommonHeaderProviderHTMLWithFipsInformation(t *testing.T) {
     Flavor: %s<br>
     PID: %d<br>
     Agent start: 2018-01-05 11:25:15 UTC (1515151515000)<br>
-    FIPS Mode: proxy<br>
+    FIPS Mode: %s<br>
+    Log File: %s<br>
     Log Level: info<br>
     Config File: There is no config file<br>
     Conf.d Path: %s<br>
@@ -332,7 +283,7 @@ func TestCommonHeaderProviderHTMLWithFipsInformation(t *testing.T) {
       - Starting port range: 9803<br>
   </span>
 </div>
-`, version.AgentVersion, agentFlavor, pid, config.GetString("confd_path"), config.GetString("additional_checksd"), goVersion, arch)
+`, version.AgentVersion, agentFlavor, pid, populateFIPSStatus(config), config.GetString("log_file"), config.GetString("confd_path"), config.GetString("additional_checksd"), goVersion, arch)
 
 	// We replace windows line break by linux so the tests pass on every OS
 	expectedResult := strings.ReplaceAll(expectedHTMLOutput, "\r\n", "\n")

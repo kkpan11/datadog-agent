@@ -1,0 +1,302 @@
+# Global build settings
+# gazelle:dd_agent_go_test on
+# gazelle:go_canonical_test_tag_set cel clusterchecks kubeapiserver kubelet orchestrator
+# gazelle:go_canonical_test_tag_set bpf
+# gazelle:go_canonical_test_tag_set containerd cel
+# gazelle:go_canonical_test_tag_set docker kubelet cel
+
+load("@bazel_lib//lib:write_source_files.bzl", "write_source_file", "write_source_files")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@dd_release_json//:release_json.bzl", "release_json")
+load("@gazelle//:def.bzl", "DEFAULT_LANGUAGES", "gazelle", "gazelle_binary")
+load("@package_metadata//rules:package_metadata.bzl", "package_metadata")
+load("@rules_license//rules:license.bzl", "license")
+load("//bazel/rules/go_shim:defs.bzl", "go_shim")
+load("//compliance/rules:purl.bzl", "purl_for_generic")
+load("//tasks:build_tags.bzl", "GAZELLE_BUILD_TAGS")
+
+package(
+    default_package_metadata = [":package_metadata"],
+    default_visibility = ["//visibility:public"],
+)
+
+package_metadata(
+    name = "package_metadata",
+    attributes = [
+        ":license",
+    ],
+    purl = purl_for_generic(
+        download_url = "https://github.com/DataDog/datadog-agent/releases/tag/{version}",
+        package = "datadog-agent",
+        version = release_json.get("current_milestone"),
+    ),
+)
+
+license(
+    name = "license",
+    license_kinds = ["@rules_license//licenses/spdx:Apache-2.0"],
+    license_text = "LICENSE",
+    visibility = ["//visibility:public"],
+)
+
+# Temporary export for hybrid omnibus/bazel build.
+# This glob is empty running bazel alone in a pipeline job.
+# It covers real files in the omnibus build after dda commands have run.
+exports_files(glob(
+    ["bin/**"],
+    allow_empty = True,
+))
+
+exports_files(["go.mod"])
+
+# TODO(ABLD-519): remove below `gazelle:exclude` directives
+# rc_tester_v1 imports gopkg.in/DataDog/dd-trace-go.v1, which is not part of the
+# Bazel go_deps graph (progs is a separate module outside go.work). Keep this
+# binary out of Bazel, consistent with testprogs binaries relying on the
+# ninja-built Go toolchain matrix (see PR #50629).
+# gazelle:exclude pkg/dyninst/testprogs/progs/busyloop
+# gazelle:exclude pkg/dyninst/testprogs/progs/drop_tester
+# gazelle:exclude pkg/dyninst/testprogs/progs/fault
+# gazelle:exclude pkg/dyninst/testprogs/progs/panic_recover
+# gazelle:exclude pkg/dyninst/testprogs/progs/rc_tester
+# gazelle:exclude pkg/dyninst/testprogs/progs/rc_tester_v1
+# gazelle:exclude pkg/dyninst/testprogs/progs/simple
+# gazelle:exclude pkg/ebpf/_obj
+# It is a generated via genrule src that shouldn't be added to the runtime
+# library.
+# gazelle:exclude pkg/ebpf/ebpftest/cgo_align.go
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/ebpf/ebpftest //pkg/ebpf/ebpftest
+# gazelle:exclude internal/qbranch/anomalydetection-testbench
+# gazelle:exclude vendor
+
+# ======= TESTDATA EXCLUDES =======
+# gazelle:exclude **/testdata/**/*.go
+# ======= END TESTDATA EXCLUDES =======
+
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/proto/pbgo/privateactionrunner/actionsclient //pkg/proto/pbgo/privateactionrunner/actionsclient
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/proto/pbgo/privateactionrunner/errorcode //pkg/proto/pbgo/privateactionrunner/errorcode
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/proto/pbgo/privateactionrunner/executor //pkg/proto/pbgo/privateactionrunner/executor
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/proto/pbgo/privateactionrunner/privateactions //pkg/proto/pbgo/privateactionrunner/privateactions
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/proto/pbgo/procmgr //pkg/proto/pbgo/procmgr
+# gazelle:resolve go github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace/idx //pkg/proto/pbgo/trace/idx
+# gazelle:resolve proto datadog/healthplatform/healthplatform.proto @com_github_datadog_agent_payload_v5//proto/healthplatform:healthplatform_proto
+# gazelle:resolve proto go datadog/healthplatform/healthplatform.proto @com_github_datadog_agent_payload_v5//healthplatform
+# GAZELLE_BUILD_TAGS is the source-of-truth tag list from
+# tasks/build_tags.bzl, shared with the dda inv build-tag code.
+gazelle(
+    name = "gazelle",
+    build_tags = GAZELLE_BUILD_TAGS,
+    external = "static",  # don't use the network: https://github.com/bazel-contrib/bazel-gazelle/issues/1385
+    extra_args = [
+        "-build_file_name=BUILD.bazel",  # avoid BUILD/build mess: https://github.com/docker/desktop-feedback/issues/251
+        "-remove_noop_keep_comments",  # drop dead `# keep` directives
+        "-strict",  # don't swallow syntax errors or unknown directives
+    ],
+    gazelle = ":gazelle_binary",
+    prefix = "github.com/DataDog/datadog-agent",
+)
+
+# Our dd_agent_go_test extension wraps the built-in Go extension and must replace it,
+# not extend it, to avoid duplicate rule generation.
+_LANGUAGES_WITHOUT_GO = [
+    lang
+    for lang in DEFAULT_LANGUAGES
+    if "//language/go" not in str(lang)
+]
+
+gazelle_binary(
+    name = "gazelle_binary",
+    languages = _LANGUAGES_WITHOUT_GO + [
+        "//bazel/rules/cws_codegen:gazelle_extension",
+        "//bazel/rules/go:gazelle_extension",
+        "//bazel/rules/go_msgp:gazelle_extension",
+        "//bazel/rules/go_stringer:gazelle_extension",
+        "//bazel/rules/write_pb_go:gazelle_extension",
+    ],
+)
+
+# bazel run //:go -- ...
+alias(
+    name = "go",
+    actual = "@go_fast",  #TODO(agent-build): move back to "@rules_go//go" when golang/go#77889 is addressed
+)
+
+# bazel run //:go_mod_tidy_all -- -x
+go_shim(
+    name = "go_mod_tidy_all",
+    tool = "//bazel/rules/go_mod_tidy_all",
+)
+
+run_binary(
+    name = "gen_go_work",
+    srcs = [
+        ":go.work",
+        ":modules.yml",
+    ],
+    outs = ["go.work.new"],
+    args = [
+        "--path",
+        "$(location go.work)",
+        "--modules-file",
+        "$(location modules.yml)",
+        "--output",
+        "$(location go.work.new)",
+    ],
+    tool = "//internal/tools/worksynchronizer",
+)
+
+# bazel run //:write_go_work
+write_source_file(
+    name = "write_go_work",
+    in_file = ":gen_go_work",
+    out_file = "go.work",
+)
+
+filegroup(
+    name = "python_version",
+    srcs = [".python-version"],
+)
+
+config_setting(
+    name = "macos_arm64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+)
+
+config_setting(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_arm64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:arm64",
+    ],
+)
+
+config_setting(
+    name = "windows_x86_64",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+# The location that the bulk of the agent gets installed to. Like most *nix tools, this
+# is in /opt. That will hold shared libraries, and python packages.  It is not the
+# complete installation, becuase some things go to /etc or /usr.
+#
+# Migration to bazel warning:
+# The goal we are aiming for is that output base is always passed to build
+# scripts and we install artifacts to output_base + install_dir. Unfortunately,
+# many existing scripts only use install_dir, without regard to a a base. They
+# put etc files under opt/datadog, then move them to /etc in the final part of the
+# build.
+# TODO: We need to learn how people expect to use install dir to create custom
+# builds for local testing that do not wipe out their local installation.
+string_flag(
+    name = "install_dir",
+    build_setting_default = "/opt/datadog-agent",
+    make_variable = "INSTALL_DIR",
+)
+
+# Configuration value to determine if we are using the standard install path.
+# This can be used to detect custom builds, where we might not to create some pieces.
+# Currently this is used only for installer symlinks. It is likely that we should not
+# continue to do that. My hunch is that it was only done to prevent disk stomping in
+# developer builds.
+config_setting(
+    name = "is_standard_install",
+    flag_values = {
+        "//:install_dir": "/opt/datadog-agent",
+    },
+)
+
+# This seems to be the base of where to write config files during
+# the build. That is, if we were creating /etc/foo, it would be
+# the path prepended to /etc to get a safe place to write.
+# We can set this from the omnibus variable OUTPUT_CONFIG_DIR.
+# But, it seems to be empty in CI runs, so we end up writing to /.
+# The default is /tmp so we don't shoot our feet off in local testing.
+# If we end up keeping this flag, let's give it a better name and
+# git it a better value.
+string_flag(
+    name = "output_config_dir",
+    build_setting_default = "/tmp",
+    make_variable = "OUTPUT_CONFIG_DIR",
+)
+
+# Use this configuration setting to select options that should be applied for
+# to a non-developer version of the product. It does not mean this is a delivery
+# pipeline. This is set for most CI runs, so that size and performance tests
+# are accurate.
+bool_flag(
+    name = "release",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "is_release",
+    flag_values = {
+        "//:release": "True",
+    },
+)
+
+# Matches Linux targets built with --//:release=true.
+# More specific than //:is_release (adds a platform constraint), so Bazel's
+# ambiguity resolution prefers it over the plain is_release setting when both
+# would match on Linux.
+# TODO(agent_build): We may need this for other platforms. Feel free to add if needed.
+config_setting(
+    name = "linux_and_release",
+    constraint_values = ["@platforms//os:linux"],
+    flag_values = {
+        "//:release": "True",
+    },
+)
+
+# bazel run //:write_all regenerates all protobuf-generated Go files in the repo.
+write_source_files(
+    name = "write_all",
+    additional_update_targets = [
+        "//comp/forwarder/defaultforwarder/internal/retry:write_pb_go",
+        "//pkg/discovery/tracermetadata/model:tracer_metadata_gen",
+        "//pkg/proto/msgpgo:key_gen",
+        "//pkg/proto/pbgo/core:remoteconfig_gen",
+        "//pkg/proto/pbgo/core:write_pb_go",
+        "//pkg/proto/pbgo/dogstatsdhttp:write_pb_go",
+        "//pkg/proto/pbgo/languagedetection:write_pb_go",
+        "//pkg/proto/pbgo/mocks/core:api_mockgen",
+        "//pkg/proto/pbgo/privateactionrunner/actionsclient:write_pb_go",
+        "//pkg/proto/pbgo/privateactionrunner/errorcode:write_pb_go",
+        "//pkg/proto/pbgo/privateactionrunner/executor:write_pb_go",
+        "//pkg/proto/pbgo/privateactionrunner/privateactions:write_pb_go",
+        "//pkg/proto/pbgo/process:write_pb_go",
+        "//pkg/proto/pbgo/procmgr:write_pb_go",
+        "//pkg/proto/pbgo/sbom:write_pb_go",
+        "//pkg/proto/pbgo/trace/idx:write_pb_go",
+        "//pkg/proto/pbgo/trace:agent_payload_gen",
+        "//pkg/proto/pbgo/trace:span_gen",
+        "//pkg/proto/pbgo/trace:stats_gen",
+        "//pkg/proto/pbgo/trace:trace_gen",
+        "//pkg/proto/pbgo/trace:tracer_payload_gen",
+        "//pkg/proto/pbgo/trace:write_pb_go",
+        "//pkg/security/proto/api:write_pb_go",
+    ],
+)

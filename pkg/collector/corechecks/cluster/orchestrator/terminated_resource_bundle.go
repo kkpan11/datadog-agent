@@ -24,6 +24,7 @@ import (
 // TerminatedResourceBundle buffers terminated resources
 type TerminatedResourceBundle struct {
 	mu                  sync.Mutex
+	enabled             bool
 	runCfg              *collectors.CollectorRunConfig
 	check               *OrchestratorCheck
 	terminatedResources map[collectors.K8sCollector][]interface{}
@@ -46,8 +47,13 @@ func (tb *TerminatedResourceBundle) Add(k8sCollector collectors.K8sCollector, ob
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
+	// do not buffer terminated resources if the bundle is not enabled
+	if !tb.enabled {
+		return
+	}
+
 	if _, ok := tb.terminatedResources[k8sCollector]; !ok {
-		tb.terminatedResources[k8sCollector] = []interface{}{}
+		tb.terminatedResources[k8sCollector] = make([]interface{}, 0, tb.runCfg.Config.MaxPerMessage)
 	}
 
 	resource, err := getResource(obj)
@@ -59,10 +65,46 @@ func (tb *TerminatedResourceBundle) Add(k8sCollector collectors.K8sCollector, ob
 	tb.terminatedResources[k8sCollector] = append(tb.terminatedResources[k8sCollector], resource)
 }
 
-// Run sends all buffered terminated resources
+// Run sends all buffered terminated resources.
 func (tb *TerminatedResourceBundle) Run() {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
+	tb.flush(true)
+}
+
+// Enable enables the TerminatedResourceBundle to start buffering terminated resources.
+func (tb *TerminatedResourceBundle) Enable() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.enabled = true
+}
+
+// Disable flushes any buffered terminated resources and then disables the bundle
+// from accepting new terminated resources.
+// Manifests are sent directly via the sender (bypassing the ManifestBuffer)
+// because the buffer goroutine may already be stopped when Disable is called.
+func (tb *TerminatedResourceBundle) Disable() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	if !tb.enabled {
+		return
+	}
+
+	tb.flush(false)
+	tb.enabled = false
+}
+
+// flush processes and sends all buffered terminated resources.
+// Must be called with tb.mu held.
+// When useBuffer is true, manifest messages for collectors that support
+// buffering are sent through the ManifestBuffer channel (only safe while the
+// ManifestBuffer goroutine is running). When false, all manifests are sent
+// directly via the sender.
+func (tb *TerminatedResourceBundle) flush(useBuffer bool) {
+	if !tb.enabled {
+		return
+	}
 
 	orchSender, err := tb.check.GetSender()
 	if err != nil {
@@ -86,24 +128,18 @@ func (tb *TerminatedResourceBundle) Run() {
 		nt := collector.Metadata().NodeType
 		orchestrator.SetCacheStats(result.ResourcesListed, len(result.Result.MetadataMessages), nt)
 
-		if collector.Metadata().IsMetadataProducer { // for CR and CRD we don't have metadata but only manifests
+		if collector.Metadata().IsMetadataProducer {
 			orchSender.OrchestratorMetadata(result.Result.MetadataMessages, tb.runCfg.ClusterID, int(nt))
 		}
 
-		if collector.Metadata().SupportsManifestBuffering {
+		if useBuffer && collector.Metadata().SupportsManifestBuffering {
 			BufferManifestProcessResult(result.Result.ManifestMessages, tb.manifestBuffer)
 		} else {
 			orchSender.OrchestratorManifest(result.Result.ManifestMessages, tb.runCfg.ClusterID)
 		}
 
-		tb.terminatedResources[collector] = tb.terminatedResources[collector][:0]
+		tb.terminatedResources[collector] = make([]interface{}, 0, tb.runCfg.Config.MaxPerMessage)
 	}
-}
-
-// Stop stops TerminatedResourceBundle
-func (tb *TerminatedResourceBundle) Stop() {
-	// send all buffered terminated resources
-	tb.Run()
 }
 
 func toTypedSlice(k8sCollector collectors.K8sCollector, list []interface{}) interface{} {
@@ -111,7 +147,7 @@ func toTypedSlice(k8sCollector collectors.K8sCollector, list []interface{}) inte
 		return nil
 	}
 
-	if k8sCollector.Metadata().NodeType == orchestrator.K8sCR || k8sCollector.Metadata().NodeType == orchestrator.K8sCRD {
+	if k8sCollector.Metadata().NodeType == orchestrator.K8sCR || k8sCollector.Metadata().NodeType == orchestrator.K8sCRD || k8sCollector.Metadata().IsGenericCollector {
 		typedList := make([]runtime.Object, 0, len(list))
 		for i := range list {
 			if _, ok := list[i].(runtime.Object); !ok {
@@ -141,7 +177,7 @@ func getResource(obj interface{}) (interface{}, error) {
 		resource = deletedState.Obj
 	}
 
-	if resource == nil || (reflect.ValueOf(resource).Kind() == reflect.Ptr && reflect.ValueOf(resource).IsNil()) {
+	if resource == nil || (reflect.ValueOf(resource).Kind() == reflect.Pointer && reflect.ValueOf(resource).IsNil()) {
 		return nil, fmt.Errorf("object is nil, skipping, got type: %T", obj)
 	}
 

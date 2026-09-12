@@ -20,7 +20,7 @@ import (
 	kubeAutoscaling "github.com/DataDog/agent-payload/v5/autoscaling/kubernetes"
 	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
 
-	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling"
+	autoscalingstore "github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/store"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload/model"
 	"github.com/DataDog/datadog-agent/pkg/config/remote/data"
 	"github.com/DataDog/datadog-agent/pkg/remoteconfig/state"
@@ -29,7 +29,7 @@ import (
 
 func TestConfigRetriverAutoscalingValuesFollower(t *testing.T) {
 	testTime := time.Now()
-	store := autoscaling.NewStore[model.PodAutoscalerInternal]()
+	store := autoscalingstore.NewStore[model.PodAutoscalerInternal]()
 	_, mockRCClient := newMockConfigRetriever(t, func() bool { return false }, store, clock.NewFakeClock(testTime))
 
 	// Dummy objects in store
@@ -41,8 +41,10 @@ func TestConfigRetriverAutoscalingValuesFollower(t *testing.T) {
 		Namespace: "ns",
 		Name:      "name3",
 	}
-	store.Set("ns/name2", dummy2.Build(), "unittest")
-	store.Set("ns/name3", dummy3.Build(), "unittest")
+	item2, _ := store.Get("ns/name2")
+	item2.Upsert(dummy2.Build(), "unittest")
+	item3, _ := store.Get("ns/name3")
+	item3.Upsert(dummy3.Build(), "unittest")
 
 	// Object specs
 	value1 := &kubeAutoscaling.WorkloadValues{
@@ -55,7 +57,7 @@ func TestConfigRetriverAutoscalingValuesFollower(t *testing.T) {
 		},
 	}
 
-	// New Autoscaling settings received, should do nothing
+	// New Autoscaling values received, should store values in state
 	stateCallbackCalled := 0
 	mockRCClient.triggerUpdate(
 		data.ProductContainerAutoscalingValues,
@@ -65,34 +67,55 @@ func TestConfigRetriverAutoscalingValuesFollower(t *testing.T) {
 		func(_ string, applyState state.ApplyStatus) {
 			stateCallbackCalled++
 			assert.Equal(t, applyState, state.ApplyStatus{
-				State: state.ApplyStateUnacknowledged,
+				State: state.ApplyStateAcknowledged,
 				Error: "",
 			})
 		},
 	)
 
 	assert.Equal(t, 1, stateCallbackCalled)
-	podAutoscalers := store.GetAll()
+	podAutoscalers := store.List(nil)
 	model.AssertPodAutoscalersEqual(t, []model.FakePodAutoscalerInternal{dummy2, dummy3}, podAutoscalers)
 }
 
 func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 	testTime := time.Now()
-	store := autoscaling.NewStore[model.PodAutoscalerInternal]()
+	store := autoscalingstore.NewStore[model.PodAutoscalerInternal]()
 	_, mockRCClient := newMockConfigRetriever(t, func() bool { return true }, store, clock.NewFakeClock(testTime))
 
 	// Dummy objects in store
-	store.Set("ns/name1", model.FakePodAutoscalerInternal{
+	item1, _ := store.Get("ns/name1")
+	item1.Upsert(model.FakePodAutoscalerInternal{
 		Namespace: "ns",
 		Name:      "name1",
 	}.Build(), "unittest")
-	store.Set("ns/name2", model.FakePodAutoscalerInternal{
+	item2, _ := store.Get("ns/name2")
+	item2.Upsert(model.FakePodAutoscalerInternal{
 		Namespace: "ns",
 		Name:      "name2",
 	}.Build(), "unittest")
-	store.Set("ns/name3", model.FakePodAutoscalerInternal{
+	item3, _ := store.Get("ns/name3")
+	item3.Upsert(model.FakePodAutoscalerInternal{
 		Namespace: "ns",
 		Name:      "name3",
+	}.Build(), "unittest")
+	// Custom recommender PodAutoscalers: backend vertical values should be partially merged,
+	// but backend horizontal values should be ignored (horizontal comes from the external recommender).
+	item4, _ := store.Get("ns/name4")
+	item4.Upsert(model.FakePodAutoscalerInternal{
+		Namespace: "ns",
+		Name:      "name4",
+		CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+			Endpoint: "http://recommender:8080",
+		},
+	}.Build(), "unittest")
+	item5, _ := store.Get("ns/name5")
+	item5.Upsert(model.FakePodAutoscalerInternal{
+		Namespace: "ns",
+		Name:      "name5",
+		CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+			Endpoint: "http://recommender:8080",
+		},
 	}.Build(), "unittest")
 
 	// Object specs
@@ -189,13 +212,53 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 		},
 	}
 
+	// Custom recommender: horizontal + vertical -> only vertical should be merged
+	value4 := &kubeAutoscaling.WorkloadValues{
+		Namespace: "ns",
+		Name:      "name4",
+		Horizontal: &kubeAutoscaling.WorkloadHorizontalValues{
+			Auto: &kubeAutoscaling.WorkloadHorizontalData{
+				Replicas: pointer.Ptr[int32](8),
+			},
+		},
+		Vertical: &kubeAutoscaling.WorkloadVerticalValues{
+			Auto: &kubeAutoscaling.WorkloadVerticalData{
+				Resources: []*kubeAutoscaling.ContainerResources{
+					{
+						ContainerName: "container1",
+						Requests: []*kubeAutoscaling.ContainerResources_ResourceList{
+							{
+								Name:  "cpu",
+								Value: "10m",
+							},
+							{
+								Name:  "memory",
+								Value: "10Mi",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	// Custom recommender: horizontal only -> should be entirely skipped
+	value5 := &kubeAutoscaling.WorkloadValues{
+		Namespace: "ns",
+		Name:      "name5",
+		Horizontal: &kubeAutoscaling.WorkloadHorizontalValues{
+			Auto: &kubeAutoscaling.WorkloadHorizontalData{
+				Replicas: pointer.Ptr[int32](10),
+			},
+		},
+	}
+
 	// Trigger update from Autoscaling values
 	stateCallbackCalled := 0
 	mockRCClient.triggerUpdate(
 		data.ProductContainerAutoscalingValues,
 		map[string]state.RawConfig{
 			"foo1": buildAutoscalingValuesRawConfig(t, 1, value1),
-			"foo2": buildAutoscalingValuesRawConfig(t, 2, value2, value3),
+			"foo2": buildAutoscalingValuesRawConfig(t, 2, value2, value3, value4, value5),
 		},
 		func(_ string, applyState state.ApplyStatus) {
 			stateCallbackCalled++
@@ -207,12 +270,13 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 	)
 
 	assert.Equal(t, 2, stateCallbackCalled)
-	podAutoscalers := store.GetAll()
+	podAutoscalers := store.List(nil)
 
 	model.AssertPodAutoscalersEqual(t, []model.FakePodAutoscalerInternal{
 		{
-			Namespace: "ns",
-			Name:      "name1",
+			Namespace:                "ns",
+			Name:                     "name1",
+			MainScalingValuesVersion: 1,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerManualValueSource,
@@ -222,8 +286,9 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 			},
 		},
 		{
-			Namespace: "ns",
-			Name:      "name2",
+			Namespace:                "ns",
+			Name:                     "name2",
+			MainScalingValuesVersion: 2,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
@@ -242,13 +307,14 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 						},
 					},
 					Timestamp:     testTime,
-					ResourcesHash: "8fe97e46aa840723",
+					ResourcesHash: "bd3e1563c85cc48f",
 				},
 			},
 		},
 		{
-			Namespace: "ns",
-			Name:      "name3",
+			Namespace:                "ns",
+			Name:                     "name3",
+			MainScalingValuesVersion: 2,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
@@ -271,8 +337,41 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 						},
 					},
 					Timestamp:     testTime,
-					ResourcesHash: "f41ccab869dc36a7",
+					ResourcesHash: "afd7d91c470cd169",
 				},
+			},
+		},
+		// Custom recommender: only vertical values should be merged, horizontal ignored
+		{
+			Namespace:                "ns",
+			Name:                     "name4",
+			MainScalingValuesVersion: 2,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+			MainScalingValues: model.ScalingValues{
+				Vertical: &model.VerticalScalingValues{
+					Source: datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+					ContainerResources: []datadoghqcommon.DatadogPodAutoscalerContainerResources{
+						{
+							Name: "container1",
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10m"),
+								corev1.ResourceMemory: resource.MustParse("10Mi"),
+							},
+						},
+					},
+					Timestamp:     testTime,
+					ResourcesHash: "bd3e1563c85cc48f",
+				},
+			},
+		},
+		// Custom recommender: horizontal only values should be entirely skipped
+		{
+			Namespace: "ns",
+			Name:      "name5",
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
 			},
 		},
 	}, podAutoscalers)
@@ -281,6 +380,26 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 	value1.Horizontal = nil
 	value3.Vertical = nil
 	value3.Horizontal.Auto.Replicas = pointer.Ptr[int32](6)
+	// Custom recommender: name5 now has vertical values, should be applied
+	value5.Vertical = &kubeAutoscaling.WorkloadVerticalValues{
+		Auto: &kubeAutoscaling.WorkloadVerticalData{
+			Resources: []*kubeAutoscaling.ContainerResources{
+				{
+					ContainerName: "container1",
+					Requests: []*kubeAutoscaling.ContainerResources_ResourceList{
+						{
+							Name:  "cpu",
+							Value: "10m",
+						},
+						{
+							Name:  "memory",
+							Value: "10Mi",
+						},
+					},
+				},
+			},
+		},
+	}
 
 	// Trigger update
 	stateCallbackCalled = 0
@@ -288,7 +407,7 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 		data.ProductContainerAutoscalingValues,
 		map[string]state.RawConfig{
 			"foo1": buildAutoscalingValuesRawConfig(t, 10, value1),
-			"foo2": buildAutoscalingValuesRawConfig(t, 20, value2, value3),
+			"foo2": buildAutoscalingValuesRawConfig(t, 20, value2, value3, value4, value5),
 		},
 		func(_ string, applyState state.ApplyStatus) {
 			stateCallbackCalled++
@@ -300,16 +419,18 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 	)
 	assert.Equal(t, 2, stateCallbackCalled)
 
-	podAutoscalers = store.GetAll()
+	podAutoscalers = store.List(nil)
 	model.AssertPodAutoscalersEqual(t, []model.FakePodAutoscalerInternal{
 		{
-			Namespace:         "ns",
-			Name:              "name1",
-			MainScalingValues: model.ScalingValues{},
+			Namespace:                "ns",
+			Name:                     "name1",
+			MainScalingValuesVersion: 10,
+			MainScalingValues:        model.ScalingValues{},
 		},
 		{
-			Namespace: "ns",
-			Name:      "name2",
+			Namespace:                "ns",
+			Name:                     "name2",
+			MainScalingValuesVersion: 20,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
@@ -328,18 +449,69 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 						},
 					},
 					Timestamp:     testTime,
-					ResourcesHash: "8fe97e46aa840723",
+					ResourcesHash: "bd3e1563c85cc48f",
 				},
 			},
 		},
 		{
-			Namespace: "ns",
-			Name:      "name3",
+			Namespace:                "ns",
+			Name:                     "name3",
+			MainScalingValuesVersion: 20,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
 					Replicas:  6,
 					Timestamp: testTime,
+				},
+			},
+		},
+		// Custom recommender: vertical values still applied, horizontal still ignored
+		{
+			Namespace:                "ns",
+			Name:                     "name4",
+			MainScalingValuesVersion: 20,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+			MainScalingValues: model.ScalingValues{
+				Vertical: &model.VerticalScalingValues{
+					Source: datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+					ContainerResources: []datadoghqcommon.DatadogPodAutoscalerContainerResources{
+						{
+							Name: "container1",
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10m"),
+								corev1.ResourceMemory: resource.MustParse("10Mi"),
+							},
+						},
+					},
+					Timestamp:     testTime,
+					ResourcesHash: "bd3e1563c85cc48f",
+				},
+			},
+		},
+		// Custom recommender: name5 now has vertical, should be applied
+		{
+			Namespace:                "ns",
+			Name:                     "name5",
+			MainScalingValuesVersion: 20,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+			MainScalingValues: model.ScalingValues{
+				Vertical: &model.VerticalScalingValues{
+					Source: datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+					ContainerResources: []datadoghqcommon.DatadogPodAutoscalerContainerResources{
+						{
+							Name: "container1",
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10m"),
+								corev1.ResourceMemory: resource.MustParse("10Mi"),
+							},
+						},
+					},
+					Timestamp:     testTime,
+					ResourcesHash: "bd3e1563c85cc48f",
 				},
 			},
 		},
@@ -362,16 +534,18 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 	)
 	assert.Equal(t, 1, stateCallbackCalled)
 
-	podAutoscalers = store.GetAll()
+	podAutoscalers = store.List(nil)
 	model.AssertPodAutoscalersEqual(t, []model.FakePodAutoscalerInternal{
 		{
-			Namespace:         "ns",
-			Name:              "name1",
-			MainScalingValues: model.ScalingValues{},
+			Namespace:                "ns",
+			Name:                     "name1",
+			MainScalingValuesVersion: 10,
+			MainScalingValues:        model.ScalingValues{},
 		},
 		{
-			Namespace: "ns",
-			Name:      "name2",
+			Namespace:                "ns",
+			Name:                     "name2",
+			MainScalingValuesVersion: 20,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
@@ -389,19 +563,69 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 							},
 						},
 					},
-					ResourcesHash: "8fe97e46aa840723",
+					ResourcesHash: "bd3e1563c85cc48f",
 					Timestamp:     testTime,
 				},
 			},
 		},
 		{
-			Namespace: "ns",
-			Name:      "name3",
+			Namespace:                "ns",
+			Name:                     "name3",
+			MainScalingValuesVersion: 20,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
 					Replicas:  6,
 					Timestamp: testTime,
+				},
+			},
+		},
+		// Custom recommender: unchanged from phase 2
+		{
+			Namespace:                "ns",
+			Name:                     "name4",
+			MainScalingValuesVersion: 20,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+			MainScalingValues: model.ScalingValues{
+				Vertical: &model.VerticalScalingValues{
+					Source: datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+					ContainerResources: []datadoghqcommon.DatadogPodAutoscalerContainerResources{
+						{
+							Name: "container1",
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10m"),
+								corev1.ResourceMemory: resource.MustParse("10Mi"),
+							},
+						},
+					},
+					ResourcesHash: "bd3e1563c85cc48f",
+					Timestamp:     testTime,
+				},
+			},
+		},
+		{
+			Namespace:                "ns",
+			Name:                     "name5",
+			MainScalingValuesVersion: 20,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+			MainScalingValues: model.ScalingValues{
+				Vertical: &model.VerticalScalingValues{
+					Source: datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+					ContainerResources: []datadoghqcommon.DatadogPodAutoscalerContainerResources{
+						{
+							Name: "container1",
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10m"),
+								corev1.ResourceMemory: resource.MustParse("10Mi"),
+							},
+						},
+					},
+					ResourcesHash: "bd3e1563c85cc48f",
+					Timestamp:     testTime,
 				},
 			},
 		},
@@ -424,15 +648,16 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 	)
 	assert.Equal(t, 1, stateCallbackCalled)
 
-	podAutoscalers = store.GetAll()
+	podAutoscalers = store.List(nil)
 	model.AssertPodAutoscalersEqual(t, []model.FakePodAutoscalerInternal{
 		{
 			Namespace: "ns",
 			Name:      "name1",
 		},
 		{
-			Namespace: "ns",
-			Name:      "name2",
+			Namespace:                "ns",
+			Name:                     "name2",
+			MainScalingValuesVersion: 21,
 			MainScalingValues: model.ScalingValues{
 				Horizontal: &model.HorizontalScalingValues{
 					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
@@ -451,13 +676,119 @@ func TestConfigRetriverAutoscalingValuesLeader(t *testing.T) {
 						},
 					},
 					Timestamp:     testTime,
-					ResourcesHash: "8fe97e46aa840723",
+					ResourcesHash: "bd3e1563c85cc48f",
 				},
 			},
 		},
 		{
 			Namespace: "ns",
 			Name:      "name3",
+		},
+		// Custom recommender: vertical values cleared since not present in latest config,
+		// version preserved as partial update with version 0 does not reset it
+		{
+			Namespace:                "ns",
+			Name:                     "name4",
+			MainScalingValuesVersion: 20,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+		},
+		{
+			Namespace:                "ns",
+			Name:                     "name5",
+			MainScalingValuesVersion: 20,
+			CustomRecommenderConfiguration: &model.RecommenderConfiguration{
+				Endpoint: "http://recommender:8080",
+			},
+		},
+	}, podAutoscalers)
+}
+
+func TestConfigRetriverAutoscalingValuesReconcile(t *testing.T) {
+	testClock := clock.NewFakeClock(time.Now())
+	store := autoscalingstore.NewStore[model.PodAutoscalerInternal]()
+	isLeader := false
+	isLeaderFunc := func() bool {
+		return isLeader
+	}
+
+	_, mockRCClient := newMockConfigRetriever(t, isLeaderFunc, store, testClock)
+
+	// Add a PodAutoscaler to the store
+	item1, _ := store.Get("ns/name1")
+	item1.Upsert(model.FakePodAutoscalerInternal{
+		Namespace: "ns",
+		Name:      "name1",
+	}.Build(), "unittest")
+
+	// Object values
+	value1 := &kubeAutoscaling.WorkloadValues{
+		Namespace: "ns",
+		Name:      "name1",
+		Horizontal: &kubeAutoscaling.WorkloadHorizontalValues{
+			Auto: &kubeAutoscaling.WorkloadHorizontalData{
+				Replicas: pointer.Ptr[int32](3),
+			},
+		},
+	}
+
+	// New Autoscaling values received, should store values in state but not update the store
+	stateCallbackCalled := 0
+	mockRCClient.triggerUpdate(
+		data.ProductContainerAutoscalingValues,
+		map[string]state.RawConfig{
+			"foo1": buildAutoscalingValuesRawConfig(t, 1, value1),
+		},
+		func(_ string, applyState state.ApplyStatus) {
+			stateCallbackCalled++
+			assert.Equal(t, applyState, state.ApplyStatus{
+				State: state.ApplyStateAcknowledged,
+				Error: "",
+			})
+		},
+	)
+
+	// Nothing changed in the store as we are not the leader
+	assert.Equal(t, 1, stateCallbackCalled)
+	podAutoscalers := store.List(nil)
+	assert.Equal(t, 1, len(podAutoscalers))
+	// Verify the PodAutoscaler doesn't have values
+	podAutoscaler := podAutoscalers[0]
+	assert.Equal(t, model.ScalingValues{}, podAutoscaler.MainScalingValues())
+
+	// Become leader and receive values again - now they should be processed and reconciled immediately
+	isLeader = true
+	callbackTimestamp := testClock.Now()
+	stateCallbackCalled = 0
+	mockRCClient.triggerUpdate(
+		data.ProductContainerAutoscalingValues,
+		map[string]state.RawConfig{
+			"foo1": buildAutoscalingValuesRawConfig(t, 2, value1),
+		},
+		func(_ string, applyState state.ApplyStatus) {
+			stateCallbackCalled++
+			assert.Equal(t, applyState, state.ApplyStatus{
+				State: state.ApplyStateAcknowledged,
+				Error: "",
+			})
+		},
+	)
+
+	assert.Equal(t, 1, stateCallbackCalled)
+	podAutoscalers = store.List(nil)
+	model.AssertPodAutoscalersEqual(t, []model.FakePodAutoscalerInternal{
+		{
+			Namespace:                "ns",
+			Name:                     "name1",
+			MainScalingValuesVersion: 2,
+			MainScalingValues: model.ScalingValues{
+				Horizontal: &model.HorizontalScalingValues{
+					Source:    datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+					Replicas:  3,
+					Timestamp: callbackTimestamp,
+				},
+			},
 		},
 	}, podAutoscalers)
 }
@@ -472,5 +803,5 @@ func buildAutoscalingValuesRawConfig(t *testing.T, version uint64, values ...*ku
 	content, err := json.Marshal(valuesList)
 	assert.NoError(t, err)
 
-	return buildRawConfig(t, data.ProductContainerAutoscalingSettings, version, content)
+	return buildRawConfig(t, data.ProductContainerAutoscalingValues, version, content)
 }

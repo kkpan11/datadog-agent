@@ -11,8 +11,8 @@ import (
 	"errors"
 	"expvar"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	metricscompression "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/def"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/compression"
 )
 
@@ -23,13 +23,13 @@ var (
 	expvarsBytesIn       = expvar.Int{}
 	expvarsBytesOut      = expvar.Int{}
 
-	tlmTotalPayloads = telemetry.NewCounter("compressor", "total_payloads",
+	tlmTotalPayloads = telemetryimpl.GetCompatComponent().NewCounter("compressor", "total_payloads",
 		nil, "Total payloads in the compressor serializer")
-	tlmTotalCycles = telemetry.NewCounter("compressor", "total_cycles",
+	tlmTotalCycles = telemetryimpl.GetCompatComponent().NewCounter("compressor", "total_cycles",
 		nil, "Total cycles in the compressor serializer")
-	tlmBytesIn = telemetry.NewCounter("compressor", "bytes_in",
+	tlmBytesIn = telemetryimpl.GetCompatComponent().NewCounter("compressor", "bytes_in",
 		nil, "Count of bytes entering the compressor serializer")
-	tlmBytesOut = telemetry.NewCounter("compressor", "bytes_out",
+	tlmBytesOut = telemetryimpl.GetCompatComponent().NewCounter("compressor", "bytes_out",
 		nil, "Count of bytes out the compressor serializer")
 )
 
@@ -110,7 +110,7 @@ func (c *Compressor) checkItemSize(data []byte) bool {
 
 // hasRoomForItem checks if the current payload has enough room to store the given item
 func (c *Compressor) hasRoomForItem(item []byte) bool {
-	uncompressedDataSize := c.input.Len() + len(item)
+	uncompressedDataSize := c.input.Len() + len(item) + len(c.footer)
 	if !c.firstItem {
 		uncompressedDataSize += len(c.separator)
 	}
@@ -208,5 +208,5 @@ func (c *Compressor) Close() ([]byte, error) {
 }
 
 func (c *Compressor) remainingSpace() int {
-	return c.maxPayloadSize - c.compressed.Len() - len(c.footer)
+	return c.maxPayloadSize - c.compressed.Len()
 }

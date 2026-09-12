@@ -28,6 +28,11 @@ param(
 
 . "$PSScriptRoot\common.ps1"
 
+trap {
+    Write-Host "trap: $($_.InvocationInfo.Line.Trim()) - $_" -ForegroundColor Yellow
+    continue
+}
+
 Invoke-BuildScript `
     -BuildOutOfSource $BuildOutOfSource `
     -InstallDeps $InstallDeps `
@@ -52,6 +57,15 @@ Invoke-BuildScript `
     Write-Host Go linter result is $err
     if($err -ne 0){
         Write-Host -ForegroundColor Red "go linter failed $err"
+        exit $err
+    }
+
+    # Lint system-probe Go
+    & dda inv -- -e linter.go --build system-probe-unit-tests --targets .\pkg
+    $err = $LASTEXITCODE
+    Write-Host system-probe Go linter result is $err
+    if($err -ne 0){
+        Write-Host -ForegroundColor Red "system-probe go linter failed $err"
         exit $err
     }
 

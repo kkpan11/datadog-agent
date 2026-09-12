@@ -10,9 +10,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"go.uber.org/fx"
@@ -20,10 +23,13 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	"github.com/DataDog/datadog-agent/comp/logs-library/diagnostic"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/logs/diagnostic"
 	"github.com/DataDog/datadog-agent/pkg/util/filesystem"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 
@@ -61,6 +67,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 				fx.Supply(cliParams),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -74,7 +81,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 	// PreRunE is used to validate duration before stream-logs is run.
 	cmd.PreRunE = func(_ *cobra.Command, _ []string) error {
 		if cliParams.Duration < 0 {
-			return fmt.Errorf("duration must be a positive value")
+			return errors.New("duration must be a positive value")
 		}
 		return nil
 	}
@@ -83,8 +90,8 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 }
 
 //nolint:revive // TODO(AML) Fix revive linter
-func streamLogs(lc log.Component, config config.Component, cliParams *CliParams) error {
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+func streamLogs(lc log.Component, config config.Component, client ipc.HTTPClient, cliParams *CliParams) error {
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return err
 	}
@@ -95,7 +102,7 @@ func streamLogs(lc log.Component, config config.Component, cliParams *CliParams)
 		return err
 	}
 
-	urlstr := fmt.Sprintf("https://%v:%v/agent/stream-logs", ipcAddress, config.GetInt("cmd_port"))
+	urlstr := fmt.Sprintf("https://%s/agent/stream-logs", net.JoinHostPort(ipcAddress, strconv.Itoa(config.GetInt("cmd_port"))))
 
 	var f *os.File
 	var bufWriter *bufio.Writer
@@ -119,7 +126,7 @@ func streamLogs(lc log.Component, config config.Component, cliParams *CliParams)
 		}()
 	}
 
-	return streamRequest(urlstr, body, cliParams.Duration, func(chunk []byte) {
+	return streamRequest(client, urlstr, body, cliParams.Duration, func(chunk []byte) {
 		if !cliParams.Quiet {
 			fmt.Print(string(chunk))
 		}
@@ -132,19 +139,8 @@ func streamLogs(lc log.Component, config config.Component, cliParams *CliParams)
 	})
 }
 
-func streamRequest(url string, body []byte, duration time.Duration, onChunk func([]byte)) error {
-	var e error
-	c := util.GetClient()
-	if duration != 0 {
-		c.Timeout = duration
-	}
-	// Set session token
-	e = util.SetAuthToken(pkgconfigsetup.Datadog())
-	if e != nil {
-		return e
-	}
-
-	e = util.DoPostChunked(c, url, "application/json", bytes.NewBuffer(body), onChunk)
+func streamRequest(client ipc.HTTPClient, url string, body []byte, duration time.Duration, onChunk func([]byte)) error {
+	e := client.PostChunk(url, "application/json", bytes.NewBuffer(body), onChunk, ipchttp.WithTimeout(duration), ipchttp.WithCloseConnection)
 
 	if e == io.EOF {
 		return nil
@@ -156,6 +152,6 @@ func streamRequest(url string, body []byte, duration time.Duration, onChunk func
 }
 
 // StreamLogs is a public function that can be used by other packages to stream logs.
-func StreamLogs(log log.Component, config config.Component, cliParams *CliParams) error {
-	return streamLogs(log, config, cliParams)
+func StreamLogs(log log.Component, config config.Component, client ipc.HTTPClient, cliParams *CliParams) error {
+	return streamLogs(log, config, client, cliParams)
 }

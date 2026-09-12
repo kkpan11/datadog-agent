@@ -23,16 +23,18 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	providerTypes "github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	acTelemetry "github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry/telemetryimpl"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	mocktelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/mock"
+	healthplatformmock "github.com/DataDog/datadog-agent/comp/healthplatform/store/mock"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 )
 
 func TestParseKubeServiceAnnotations(t *testing.T) {
-	telemetry := fxutil.Test[telemetry.Component](t, telemetryimpl.MockModule())
+	telemetry := fxutil.Test[telemetry.Component](t, mocktelemetry.Module())
 	telemetryStore := acTelemetry.NewStore(telemetry)
 
 	for _, tc := range []struct {
@@ -243,7 +245,7 @@ func TestParseKubeServiceAnnotations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := configmock.New(t)
 			if tc.hybrid {
-				cfg.SetWithoutSource("cluster_checks.support_hybrid_ignore_ad_tags", true)
+				cfg.SetInTest("cluster_checks.support_hybrid_ignore_ad_tags", true)
 			}
 
 			provider := KubeServiceConfigProvider{
@@ -350,7 +352,7 @@ func TestInvalidateIfChanged(t *testing.T) {
 }
 
 func TestGetConfigErrors_KubeServices(t *testing.T) {
-	telemetry := fxutil.Test[telemetry.Component](t, telemetryimpl.MockModule())
+	telemetry := fxutil.Test[telemetry.Component](t, mocktelemetry.Module())
 	telemetryStore := acTelemetry.NewStore(telemetry)
 
 	serviceWithErrors := v1.Service{
@@ -387,50 +389,50 @@ func TestGetConfigErrors_KubeServices(t *testing.T) {
 
 	tests := []struct {
 		name                        string
-		currentErrors               map[string]ErrorMsgSet
+		currentErrors               map[string]providerTypes.ErrorMsgSet
 		collectedServices           []runtime.Object
 		expectedNumCollectedConfigs int
-		expectedErrorsAfterCollect  map[string]ErrorMsgSet
+		expectedErrorsAfterCollect  map[string]providerTypes.ErrorMsgSet
 	}{
 		{
 			name:          "case without errors",
-			currentErrors: map[string]ErrorMsgSet{},
+			currentErrors: map[string]providerTypes.ErrorMsgSet{},
 			collectedServices: []runtime.Object{
 				&serviceWithoutErrors,
 			},
 			expectedNumCollectedConfigs: 1,
-			expectedErrorsAfterCollect:  map[string]ErrorMsgSet{},
+			expectedErrorsAfterCollect:  map[string]providerTypes.ErrorMsgSet{},
 		},
 		{
 			name: "service that has been deleted and had errors",
-			currentErrors: map[string]ErrorMsgSet{
+			currentErrors: map[string]providerTypes.ErrorMsgSet{
 				"kube_service://default/deletedService": {"error1": struct{}{}},
 			},
 			collectedServices: []runtime.Object{
 				&serviceWithoutErrors,
 			},
 			expectedNumCollectedConfigs: 1,
-			expectedErrorsAfterCollect:  map[string]ErrorMsgSet{},
+			expectedErrorsAfterCollect:  map[string]providerTypes.ErrorMsgSet{},
 		},
 		{
 			name: "service with error that has been fixed",
-			currentErrors: map[string]ErrorMsgSet{
+			currentErrors: map[string]providerTypes.ErrorMsgSet{
 				"kube_service://default/withoutErrors": {"error1": struct{}{}},
 			},
 			collectedServices: []runtime.Object{
 				&serviceWithoutErrors,
 			},
 			expectedNumCollectedConfigs: 1,
-			expectedErrorsAfterCollect:  map[string]ErrorMsgSet{},
+			expectedErrorsAfterCollect:  map[string]providerTypes.ErrorMsgSet{},
 		},
 		{
 			name:          "service that did not have an error but now does",
-			currentErrors: map[string]ErrorMsgSet{},
+			currentErrors: map[string]providerTypes.ErrorMsgSet{},
 			collectedServices: []runtime.Object{
 				&serviceWithErrors,
 			},
 			expectedNumCollectedConfigs: 0,
-			expectedErrorsAfterCollect: map[string]ErrorMsgSet{
+			expectedErrorsAfterCollect: map[string]providerTypes.ErrorMsgSet{
 				"kube_service://default/withErrors": {
 					"could not extract checks config: in instances: failed to unmarshal JSON: invalid character '\"' after object key": struct{}{},
 				},
@@ -438,7 +440,7 @@ func TestGetConfigErrors_KubeServices(t *testing.T) {
 		},
 		{
 			name: "service that had an error and still does",
-			currentErrors: map[string]ErrorMsgSet{
+			currentErrors: map[string]providerTypes.ErrorMsgSet{
 				"kube_service://default/withErrors": {
 					"could not extract checks config: in instances: failed to unmarshal JSON: invalid character '\"' after object key": struct{}{},
 				},
@@ -447,7 +449,7 @@ func TestGetConfigErrors_KubeServices(t *testing.T) {
 				&serviceWithErrors,
 			},
 			expectedNumCollectedConfigs: 0,
-			expectedErrorsAfterCollect: map[string]ErrorMsgSet{
+			expectedErrorsAfterCollect: map[string]providerTypes.ErrorMsgSet{
 				"kube_service://default/withErrors": {
 					"could not extract checks config: in instances: failed to unmarshal JSON: invalid character '\"' after object key": struct{}{},
 				},
@@ -455,10 +457,10 @@ func TestGetConfigErrors_KubeServices(t *testing.T) {
 		},
 		{
 			name:                        "nothing collected",
-			currentErrors:               map[string]ErrorMsgSet{},
+			currentErrors:               map[string]providerTypes.ErrorMsgSet{},
 			collectedServices:           []runtime.Object{},
 			expectedNumCollectedConfigs: 0,
-			expectedErrorsAfterCollect:  map[string]ErrorMsgSet{},
+			expectedErrorsAfterCollect:  map[string]providerTypes.ErrorMsgSet{},
 		},
 	}
 
@@ -486,4 +488,47 @@ func TestGetConfigErrors_KubeServices(t *testing.T) {
 			assert.Equal(t, test.expectedErrorsAfterCollect, provider.GetConfigErrors())
 		})
 	}
+}
+
+func TestKubeServiceHealthPlatformReporting(t *testing.T) {
+	telemetry := fxutil.Test[telemetry.Component](t, mocktelemetry.Module())
+	telemetryStore := acTelemetry.NewStore(telemetry)
+	hp := healthplatformmock.New(t)
+	cfg := configmock.New(t)
+
+	provider := KubeServiceConfigProvider{
+		configErrors:   map[string]providerTypes.ErrorMsgSet{},
+		telemetryStore: telemetryStore,
+		upToDate:       atomic.NewBool(false),
+		healthPlatform: hp,
+	}
+
+	const issueID = "ad-annotation:kube_service://default/withErrors"
+
+	svc := &v1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: kubernetes.ServiceKind},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "withErrors",
+			Namespace: "default",
+			UID:       "123",
+			Annotations: map[string]string{
+				"ad.datadoghq.com/service.checks": `{"some_check": {"instances": [{"url" "%%host%%"}]}}`, // Invalid JSON (missing ":" after "url")
+			},
+		},
+	}
+
+	// A malformed annotation is reported as a health-platform issue.
+	_, err := provider.parseServiceAnnotations([]*v1.Service{svc}, cfg)
+	require.NoError(t, err)
+	issue := hp.GetIssue(issueID)
+	require.NotNil(t, issue)
+	assert.Equal(t, issueID, issue.Id)
+	assert.Contains(t, issue.Description, "service annotation")
+
+	// Fixing the annotation resolves the issue.
+	fixed := svc.DeepCopy()
+	fixed.Annotations["ad.datadoghq.com/service.checks"] = `{"some_check": {"instances": [{"url": "%%host%%"}]}}`
+	_, err = provider.parseServiceAnnotations([]*v1.Service{fixed}, cfg)
+	require.NoError(t, err)
+	assert.Nil(t, hp.GetIssue(issueID))
 }

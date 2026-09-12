@@ -22,6 +22,8 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
 	workloadmetamock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/mock"
@@ -45,14 +47,14 @@ func testCollectEvent(t *testing.T, createResource func(*fake.Clientset) error, 
 	}
 
 	wlm := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
-		core.MockBundle(),
-		fx.Replace(config.MockParams{Overrides: overrides}),
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		fx.Provide(func() config.Component {
+			return config.NewMockWithOverrides(t, overrides)
+		}),
 		fx.Supply(context.Background()),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 	))
-	ctx := context.TODO()
-
-	store, _ := newStore(ctx, wlm, wlm.GetConfig(), client)
+	store, _ := newStore(wlm, wlm.GetConfig(), client)
 	stopStore := make(chan struct{})
 	go store.Run(stopStore)
 
@@ -119,7 +121,7 @@ func testCollectMetadataEvent(t *testing.T, createObjects func() []runtime.Objec
 	// Create a fake metadata client to mock API calls.
 	_, err = metadataclient.Resource(gvr).List(ctx, v1.ListOptions{})
 	assert.NoError(t, err)
-	store, _ := newMetadataStore(ctx, wlm, wlm.GetConfig(), metadataclient, gvr)
+	store, _ := newMetadataStore(wlm, wlm.GetConfig(), metadataclient, gvr)
 
 	stopStore := make(chan struct{})
 	go store.Run(stopStore)

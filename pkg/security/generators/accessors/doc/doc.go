@@ -8,8 +8,11 @@ package doc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,15 +20,13 @@ import (
 	"sort"
 	"strings"
 
-	"golang.org/x/tools/go/packages"
-
 	"github.com/DataDog/datadog-agent/pkg/security/generators/accessors/common"
 )
 
 const (
 	generateConstantsAnnotationPrefix = "// generate_constants:"
-	SECLDocForLength                  = "SECLDoc[length] Definition:`Length of the corresponding element`" // SECLDocForLength defines SECL doc for length
-
+	SECLDocForLength                  = "SECLDoc[length] Definition:`Length of the corresponding element`"           // SECLDocForLength defines SECL doc for length
+	SECLDocForRootDomain              = "SECLDoc[root_domain] Definition:`Root domain of the corresponding element`" // SECLDocForRootDomain defines SECL doc for root_domain
 )
 
 type documentation struct {
@@ -111,8 +112,8 @@ func GenerateDocJSON(module *common.Module, seclModelPath, outputPath string) er
 		var propertyKey string
 		var propertySuffix string
 		var propertyDefinition string
-		if strings.HasPrefix(field.Alias, field.AliasPrefix) {
-			propertySuffix = strings.TrimPrefix(field.Alias, field.AliasPrefix)
+		if after, ok := strings.CutPrefix(field.Alias, field.AliasPrefix); ok {
+			propertySuffix = after
 			propertyKey = field.Struct + propertySuffix
 			propertySuffix = strings.TrimPrefix(propertySuffix, ".")
 		} else {
@@ -305,7 +306,16 @@ func constsLinkFromName(constName string) string {
 	return nonLinkCharactersRegex.ReplaceAllString(strings.ReplaceAll(strings.ToLower(strings.TrimSpace(constName)), " ", "-"), "")
 }
 
-func parseConstantsFile(filepath string, tags []string) ([]constants, error) {
+// The second argument used to be passed to `packages.Load` as `-tags=<tags>`
+// so the loader honored //go:build constraints inside the file. After the
+// switch to `parser.ParseFile` we no longer evaluate build constraints here,
+// and in practice all callers only ever pass `unix` or `windows` — platform
+// gating happens one level up in `parseConstants` via a filename whitelist.
+// The parameter is kept on the signature for API stability; if real
+// custom-tag support is ever needed, plug `go/build/constraint` in here to
+// evaluate the file's `//go:build` line against the supplied tag set
+// (stays hermetic, no `golang.org/x/tools/go/packages` needed). See ABLD-420.
+func parseConstantsFile(filepath string, _ []string) ([]constants, error) {
 	// extract architecture from filename
 	arch, err := parseArchFromFilepath(filepath)
 	if err != nil {
@@ -314,22 +324,16 @@ func parseConstantsFile(filepath string, tags []string) ([]constants, error) {
 
 	// generate constants
 	var output []constants
-	cfg := packages.Config{
-		Mode:       packages.NeedSyntax | packages.NeedTypes | packages.NeedImports,
-		BuildFlags: []string{"-mod=readonly", fmt.Sprintf("-tags=%s", tags)},
-	}
-
-	pkgs, err := packages.Load(&cfg, filepath)
+	// We only need the AST to read const declarations and their doc comments,
+	// not type info or imports — so go/parser is enough and keeps this hermetic
+	// (no Go toolchain required at action time).
+	astFile, err := parser.ParseFile(token.NewFileSet(), filepath, nil, parser.ParseComments)
 	if err != nil {
-		return nil, fmt.Errorf("load error:%w", err)
+		return nil, fmt.Errorf("parse error: %w", err)
 	}
-
-	if len(pkgs) == 0 || len(pkgs[0].Syntax) == 0 {
-		return nil, fmt.Errorf("couldn't parse constant file")
+	if astFile == nil {
+		return nil, errors.New("couldn't parse constant file")
 	}
-
-	pkg := pkgs[0]
-	astFile := pkg.Syntax[0]
 	for _, decl := range astFile.Decls {
 		if decl, ok := decl.(*ast.GenDecl); ok {
 			for _, s := range decl.Specs {
@@ -454,9 +458,15 @@ func extractVersionAndDefinition(evtType *common.EventTypeMetadata) eventTypeInf
 }
 
 var (
-	seclDocRE  = regexp.MustCompile(`SECLDoc\[((?:[a-z0-9_]+\.?)*[a-z0-9_]+)\]\s*Definition:\s*\x60([^\x60]+)\x60\s*(?:Constants:\x60([^\x60]+)\x60\s*)?(?:Example:\s*\x60([^\x60]+)\x60\s*(?:Description:\s*\x60([^\x60]+)\x60\s*)?)*`)
-	examplesRE = regexp.MustCompile(`Example:\s*\x60([^\x60]+)\x60\s*(?:Description:\s*\x60([^\x60]+)\x60\s*)?`)
+	// Pattern explanation: (?:[^\x60\\]|\\.)+ means "one or more of: (non-backtick, non-backslash) OR (backslash followed by any char)"
+	seclDocRE  = regexp.MustCompile(`SECLDoc\[((?:[a-z0-9_]+\.?)*[a-z0-9_]+)\]\s*Definition:\s*\x60((?:[^\x60\\]|\\.)+)\x60\s*(?:Constants:\x60((?:[^\x60\\]|\\.)+)\x60\s*)?(?:Example:\s*\x60((?:[^\x60\\]|\\.)+)\x60\s*(?:Description:\s*\x60((?:[^\x60\\]|\\.)+)\x60\s*)?)*`)
+	examplesRE = regexp.MustCompile(`Example:\s*\x60((?:[^\x60\\]|\\.)+)\x60\s*(?:Description:\s*\x60((?:[^\x60\\]|\\.)+)\x60\s*)?`)
 )
+
+// unescapeBackticks replaces escaped backticks (\`) with actual backticks
+func unescapeBackticks(s string) string {
+	return strings.ReplaceAll(s, "\\`", "`")
+}
 
 func parseSECLDocWithSuffix(comment string, wantedSuffix string) (string, string, []example) {
 	trimmed := strings.TrimSpace(comment)
@@ -468,18 +478,18 @@ func parseSECLDocWithSuffix(comment string, wantedSuffix string) (string, string
 			continue
 		}
 
-		definition := trimmed[match[4]:match[5]]
+		definition := unescapeBackticks(trimmed[match[4]:match[5]])
 		var constants string
 		if match[6] != -1 && match[7] != -1 {
-			constants = trimmed[match[6]:match[7]]
+			constants = unescapeBackticks(trimmed[match[6]:match[7]])
 		}
 
 		var examples []example
 		for _, exampleMatch := range examplesRE.FindAllStringSubmatchIndex(matchedSubString, -1) {
-			expr := matchedSubString[exampleMatch[2]:exampleMatch[3]]
+			expr := unescapeBackticks(matchedSubString[exampleMatch[2]:exampleMatch[3]])
 			var desc string
 			if exampleMatch[4] != -1 && exampleMatch[5] != -1 {
-				desc = matchedSubString[exampleMatch[4]:exampleMatch[5]]
+				desc = unescapeBackticks(matchedSubString[exampleMatch[4]:exampleMatch[5]])
 			}
 			examples = append(examples, example{Expression: expr, Description: desc})
 		}

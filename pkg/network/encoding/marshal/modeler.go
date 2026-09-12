@@ -6,12 +6,16 @@
 package marshal
 
 import (
+	"fmt"
 	"sync"
 
 	model "github.com/DataDog/agent-payload/v5/process"
 
+	"github.com/DataDog/datadog-agent/pkg/util/kernel"
+
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/network"
+	"github.com/DataDog/datadog-agent/pkg/network/indexedset"
 )
 
 var (
@@ -21,11 +25,13 @@ var (
 
 // ConnectionsModeler contains all the necessary structs for modeling a connection.
 type ConnectionsModeler struct {
-	usmEncoders  []usmEncoder
-	dnsFormatter *dnsFormatter
-	ipc          ipCache
-	routeIndex   map[network.Via]RouteIdx
-	tagsSet      *network.TagsSet
+	usmEncoders         []USMEncoder
+	dnsFormatter        *dnsFormatter
+	resolvConfFormatter *resolvConfFormatter
+	ipc                 ipCache
+	routeIndex          map[network.Via]RouteIdx
+	tagsSet             *indexedset.IndexedSet[string]
+	sysProbePid         uint32
 }
 
 // NewConnectionsModeler initializes the connection modeler with encoders, dns formatter for
@@ -33,15 +39,21 @@ type ConnectionsModeler struct {
 // It also includes formatted connection telemetry related to all batches, not specific batches.
 // Furthermore, it stores the current agent configuration which applies to all instances related to the entire set of connections,
 // rather than just individual batches.
-func NewConnectionsModeler(conns *network.Connections) *ConnectionsModeler {
+func NewConnectionsModeler(conns *network.Connections) (*ConnectionsModeler, error) {
 	ipc := make(ipCache, len(conns.Conns)/2)
-	return &ConnectionsModeler{
-		usmEncoders:  initializeUSMEncoders(conns),
-		ipc:          ipc,
-		dnsFormatter: newDNSFormatter(conns, ipc),
-		routeIndex:   make(map[network.Via]RouteIdx),
-		tagsSet:      network.NewTagsSet(),
+	nspid, err := kernel.RootNSPID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get root namespace PID: %w", err)
 	}
+	return &ConnectionsModeler{
+		usmEncoders:         InitializeUSMEncoders(conns),
+		ipc:                 ipc,
+		dnsFormatter:        newDNSFormatter(conns, ipc),
+		resolvConfFormatter: newResolvConfFormatter(conns),
+		routeIndex:          make(map[network.Via]RouteIdx),
+		tagsSet:             indexedset.New[string](0),
+		sysProbePid:         uint32(nspid),
+	}, nil
 }
 
 // Close cleans all encoders resources.
@@ -53,17 +65,12 @@ func (c *ConnectionsModeler) Close() {
 
 func (c *ConnectionsModeler) modelConnections(builder *model.ConnectionsBuilder, conns *network.Connections) {
 	cfgOnce.Do(func() {
-		agentCfg = &model.AgentConfiguration{
-			NpmEnabled: pkgconfigsetup.SystemProbe().GetBool("network_config.enabled"),
-			UsmEnabled: pkgconfigsetup.SystemProbe().GetBool("service_monitoring_config.enabled"),
-			CcmEnabled: pkgconfigsetup.SystemProbe().GetBool("ccm_network_config.enabled"),
-			CsmEnabled: pkgconfigsetup.SystemProbe().GetBool("runtime_security_config.enabled"),
-		}
+		agentCfg = NewAgentConfiguration(pkgconfigsetup.SystemProbe(), pkgconfigsetup.Datadog())
 	})
 
 	for _, conn := range conns.Conns {
 		builder.AddConns(func(builder *model.ConnectionBuilder) {
-			FormatConnection(builder, conn, c.routeIndex, c.usmEncoders, c.dnsFormatter, c.ipc, c.tagsSet)
+			FormatConnection(builder, conn, c.routeIndex, c.usmEncoders, c.dnsFormatter, c.ipc, c.resolvConfFormatter, c.tagsSet, c.sysProbePid)
 		})
 	}
 
@@ -78,6 +85,8 @@ func (c *ConnectionsModeler) modelConnections(builder *model.ConnectionsBuilder,
 		w.SetUsmEnabled(agentCfg.UsmEnabled)
 		w.SetCcmEnabled(agentCfg.CcmEnabled)
 		w.SetCsmEnabled(agentCfg.CsmEnabled)
+		w.SetEudmEnabled(agentCfg.EudmEnabled)
+		w.SetDiscoveryServiceMapEnabled(agentCfg.DiscoveryServiceMapEnabled)
 	})
 	for _, d := range c.dnsFormatter.Domains() {
 		builder.AddDomains(d)
@@ -100,7 +109,9 @@ func (c *ConnectionsModeler) modelConnections(builder *model.ConnectionsBuilder,
 
 	c.dnsFormatter.FormatDNS(builder)
 
-	for _, tag := range c.tagsSet.GetStrings() {
+	c.resolvConfFormatter.FormatResolvConfs(builder)
+
+	for _, tag := range c.tagsSet.UniqueKeys() {
 		builder.AddTags(tag)
 	}
 

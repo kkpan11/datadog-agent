@@ -1,0 +1,116 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+//go:build test
+
+package setup
+
+import (
+	"runtime"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestSystemProbeDefaultConfig tests that InitSystemProbeConfig sets system probe settings correctly
+func TestSystemProbeDefaultConfig(t *testing.T) {
+	cfg := newEmptyMockConf(t)
+	InitSystemProbeConfig(cfg)
+
+	for _, tc := range []struct {
+		key          string
+		defaultValue interface{}
+	}{
+		{
+			key:          "dynamic_instrumentation.circuit_breaker.interval",
+			defaultValue: 1 * time.Second,
+		},
+		{
+			key:          "dynamic_instrumentation.circuit_breaker.per_probe_cpu_limit",
+			defaultValue: 0.1,
+		},
+		{
+			key:          "dynamic_instrumentation.circuit_breaker.all_probes_cpu_limit",
+			defaultValue: 0.5,
+		},
+		{
+			key:          "dynamic_instrumentation.circuit_breaker.interrupt_overhead",
+			defaultValue: 2 * time.Microsecond,
+		},
+		// EBPF-1082: defaults added when migrating BindEnv → BindEnvAndSetDefault
+		{key: "system_probe_config.enable_runtime_compiler", defaultValue: false},
+		{key: "system_probe_config.enable_kernel_header_download", defaultValue: false},
+		{key: "system_probe_config.allow_prebuilt_fallback", defaultValue: false},
+		{key: "system_probe_config.allow_precompiled_fallback", defaultValue: false},
+		{key: "system_probe_config.max_closed_connections_buffered", defaultValue: int64(0)},
+		{key: "network_config.max_failed_connections_buffered", defaultValue: int64(0)},
+		{key: "system_probe_config.closed_connection_flush_threshold", defaultValue: 0},
+		{key: "network_config.closed_connection_flush_threshold", defaultValue: 0},
+		{key: "system_probe_config.closed_channel_size", defaultValue: 0},
+		{key: "network_config.closed_channel_size", defaultValue: 500},
+		{key: "gpu_monitoring.nvml_lib_path", defaultValue: ""},
+		{key: "gpu_monitoring.driver_events_enabled", defaultValue: false},
+		{key: "discovery.service_collection_batch_size", defaultValue: 500},
+		{key: "discovery.service_collection_max_consecutive_timeouts", defaultValue: 5},
+		{key: "discovery.service_collection_min_process_age", defaultValue: time.Minute},
+		{key: "runtime_security_config.security_profile.v2.enabled", defaultValue: true},
+		{key: "runtime_security_config.security_profile.v2.max_dump_size", defaultValue: 2560},
+		{key: "runtime_security_config.security_profile.v2.event_types", defaultValue: []string{"exec", "open", "dns", "bind"}},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			switch expected := tc.defaultValue.(type) {
+			case time.Duration:
+				actual := cfg.GetDuration(tc.key)
+				require.NotZero(t, actual, "config key %s must not be zero - may indicate malformed key", tc.key)
+				assert.Equal(t, expected, actual)
+			case float64:
+				assert.Equal(t, expected, cfg.GetFloat64(tc.key))
+			case bool:
+				assert.Equal(t, expected, cfg.GetBool(tc.key))
+			case int:
+				assert.Equal(t, expected, cfg.GetInt(tc.key))
+			case int64:
+				assert.Equal(t, expected, cfg.GetInt64(tc.key))
+			case string:
+				assert.Equal(t, expected, cfg.GetString(tc.key))
+			case []string:
+				assert.Equal(t, expected, cfg.GetStringSlice(tc.key))
+			default:
+				t.Fatalf("unsupported type %T for key %s", tc.defaultValue, tc.key)
+			}
+		})
+	}
+}
+
+func TestDiscoveryUseSystemProbeLite(t *testing.T) {
+	t.Run("enabled by default on linux", func(t *testing.T) {
+		cfg := newEmptyMockConf(t)
+		InitSystemProbeConfig(cfg)
+		assert.Equal(t, runtime.GOOS == "linux", cfg.GetBool("discovery.use_system_probe_lite"))
+	})
+
+	t.Run("enabled from env var", func(t *testing.T) {
+		t.Setenv("DD_DISCOVERY_USE_SYSTEM_PROBE_LITE", "true")
+		cfg := newEmptyMockConf(t)
+		InitSystemProbeConfig(cfg)
+		assert.True(t, cfg.GetBool("discovery.use_system_probe_lite"))
+	})
+
+	t.Run("disabled from env var", func(t *testing.T) {
+		t.Setenv("DD_DISCOVERY_USE_SYSTEM_PROBE_LITE", "false")
+		cfg := newEmptyMockConf(t)
+		InitSystemProbeConfig(cfg)
+		assert.False(t, cfg.GetBool("discovery.use_system_probe_lite"))
+	})
+
+	t.Run("enabled from config", func(t *testing.T) {
+		cfg := newEmptyMockConf(t)
+		InitSystemProbeConfig(cfg)
+		cfg.SetInTest("discovery.use_system_probe_lite", true)
+		assert.True(t, cfg.GetBool("discovery.use_system_probe_lite"))
+	})
+}

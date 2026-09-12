@@ -7,8 +7,9 @@ package infraattributesprocessor
 
 import (
 	"context"
-	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/testutil"
 	"testing"
+
+	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/testutil"
 
 	"github.com/stretchr/testify/assert"
 	"go.opentelemetry.io/collector/consumer/consumertest"
@@ -99,6 +100,67 @@ var (
 				},
 			},
 		},
+		{
+			name: "detect container.id from PID",
+			inLogs: testResourceLogs([]logWithResource{
+				{
+					logNames: inLogNames,
+					resourceAttributes: map[string]any{
+						"process.pid": int64(12345),
+					},
+				},
+			}),
+			outResourceAttributes: []map[string]any{
+				{
+					"global":       "tag",
+					"process.pid":  int64(12345),
+					"container.id": "test",
+					"container":    "id",
+				},
+			},
+		},
+		{
+			name: "detect container.id from cgroup inode",
+			inLogs: testResourceLogs([]logWithResource{
+				{
+					logNames: inLogNames,
+					resourceAttributes: map[string]any{
+						"datadog.container.cgroup_inode": int64(12345),
+					},
+				},
+			}),
+			outResourceAttributes: []map[string]any{
+				{
+					"global":                         "tag",
+					"datadog.container.cgroup_inode": int64(12345),
+					"container.id":                   "test",
+					"container":                      "id",
+				},
+			},
+		},
+		{
+			name: "detect container.id from pod UID + container name",
+			inLogs: testResourceLogs([]logWithResource{
+				{
+					logNames: inLogNames,
+					resourceAttributes: map[string]any{
+						"k8s.pod.uid":               "01234567-89ab-cdef-0123-456789abcdef",
+						"k8s.container.name":        "mycontainer",
+						"datadog.container.is_init": true,
+					},
+				},
+			}),
+			outResourceAttributes: []map[string]any{
+				{
+					"global":                    "tag",
+					"k8s.pod.uid":               "01234567-89ab-cdef-0123-456789abcdef",
+					"k8s.container.name":        "mycontainer",
+					"datadog.container.is_init": true,
+					"container.id":              "test",
+					"container":                 "id",
+				},
+			},
+		},
 	}
 )
 
@@ -122,13 +184,15 @@ func TestInfraAttributesLogProcessor(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			next := new(consumertest.LogsSink)
 			cfg := &Config{
-				Logs:        LogInfraAttributes{},
 				Cardinality: types.LowCardinality,
 			}
 			tc := testutil.NewTestTaggerClient()
 			tc.TagMap["container_id://test"] = []string{"container:id"}
 			tc.TagMap["deployment://namespace/deployment"] = []string{"deployment:name"}
 			tc.TagMap[types.NewEntityID("internal", "global-entity-id").String()] = []string{"global:tag"}
+			tc.ContainerIDMap["pid:12345"] = "test"
+			tc.ContainerIDMap["inode:12345"] = "test"
+			tc.ContainerIDMap["pod:01234567-89ab-cdef-0123-456789abcdef,name:mycontainer,init:true"] = "test"
 
 			factory := NewFactoryForAgent(tc, func(_ context.Context) (string, error) {
 				return "test-host", nil
@@ -157,6 +221,52 @@ func TestInfraAttributesLogProcessor(t *testing.T) {
 				assert.NotNil(t, rms)
 				assert.EqualValues(t, out, rms.Resource().Attributes().AsRaw())
 			}
+		})
+	}
+}
+
+// TestInfraAttributesLogProcessorIgnoresContainerTagPromotion is a regression
+// guard: container_tag_promotion only makes sense for traces
+// (_dd.tags.container is a trace-agent-specific mechanism), so the logs
+// processor must always behave as "off" even when the option is set to
+// duplicate/rename.
+func TestInfraAttributesLogProcessorIgnoresContainerTagPromotion(t *testing.T) {
+	for _, mode := range []ContainerTagPromotionMode{ContainerTagPromotionDuplicate, ContainerTagPromotionRename} {
+		t.Run(string(mode), func(t *testing.T) {
+			next := new(consumertest.LogsSink)
+			cfg := &Config{
+				Cardinality:                types.LowCardinality,
+				TraceContainerTagPromotion: mode,
+			}
+			tc := testutil.NewTestTaggerClient()
+			tc.TagMap["container_id://test"] = []string{"test_tag:bar"}
+
+			factory := NewFactoryForAgent(tc, func(_ context.Context) (string, error) {
+				return "test-host", nil
+			})
+			flp, err := factory.CreateLogs(
+				context.Background(),
+				processortest.NewNopSettings(Type),
+				cfg,
+				next,
+			)
+			assert.NoError(t, err)
+			ctx := context.Background()
+			assert.NoError(t, flp.Start(ctx, nil))
+
+			ld := testResourceLogs([]logWithResource{{
+				logNames:           inLogNames,
+				resourceAttributes: map[string]any{"container.id": "test"},
+			}})
+			assert.NoError(t, flp.ConsumeLogs(ctx, ld))
+			assert.NoError(t, flp.Shutdown(ctx))
+
+			assert.Len(t, next.AllLogs(), 1)
+			out := next.AllLogs()[0].ResourceLogs().At(0).Resource().Attributes().AsRaw()
+			assert.EqualValues(t, map[string]any{
+				"container.id": "test",
+				"test_tag":     "bar",
+			}, out, "logs must never gain a datadog.container.tag.* copy, regardless of container_tag_promotion")
 		})
 	}
 }

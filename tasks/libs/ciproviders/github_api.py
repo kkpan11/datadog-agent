@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import base64
-import json
 import os
-import platform
 import re
-import subprocess
 from collections.abc import Iterable
 from datetime import datetime, timedelta
-from functools import lru_cache
 
 import requests
+from invoke import Context
 
 from tasks.libs.common.color import Color, color_message
 from tasks.libs.common.constants import GITHUB_REPO_NAME
@@ -23,7 +19,6 @@ try:
         Auth,
         Github,
         GithubException,
-        GithubIntegration,
         GithubObject,
         InputGitTreeElement,
         PullRequest,
@@ -223,7 +218,7 @@ class GithubAPI:
             protection_url = f"{self.repo.url}/branches/{branch_name}/protection"
             headers = {
                 "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                "Authorization": f"Bearer {self._auth.token}",
                 "X-GitHub-Api-Version": "2022-11-28",
             }
             payload = self.protection_to_payload(current_protection.raw_data)
@@ -264,11 +259,7 @@ class GithubAPI:
         """
         pr = self._repository.get_pull(int(pull_number))
         for file in pr.get_files():
-            if (
-                file.filename.startswith("releasenotes/notes/")
-                or file.filename.startswith("releasenotes-dca/notes/")
-                or file.filename.startswith("releasenotes-installscript/notes")
-            ):
+            if file.filename.startswith("releasenotes/notes/") or file.filename.startswith("releasenotes-dca/notes/"):
                 return True
         return False
 
@@ -303,65 +294,6 @@ class GithubAPI:
             return list(tags)
         return [t for t in tags if t.name.startswith(pattern)]
 
-    def trigger_workflow(self, workflow_name, ref, inputs=None):
-        """
-        Create a pipeline targeting a given reference of a project.
-        ref must be a branch or a tag.
-        """
-        workflow = self._repository.get_workflow(workflow_name)
-        if workflow is None:
-            return False
-        if inputs is None:
-            inputs = {}
-        return workflow.create_dispatch(ref, inputs)
-
-    def workflow_run(self, run_id):
-        """
-        Gets info on a specific workflow.
-        """
-        return self._repository.get_workflow_run(run_id)
-
-    def download_artifact(self, artifact, destination_dir):
-        """
-        Downloads the artifact identified by artifact_id to destination_dir.
-        """
-        url = artifact.archive_download_url
-
-        return self.download_from_url(url, destination_dir, destination_file=artifact.id)
-
-    def download_from_url(self, url, destination_dir, destination_file):
-        import requests
-
-        headers = {
-            "Authorization": f'{self._auth.token_type} {self._auth.token}',
-            "Accept": "application/vnd.github.v3+json",
-        }
-        # Retrying this request if needed is handled by the caller
-        with requests.get(url, headers=headers, stream=True, timeout=10) as r:
-            r.raise_for_status()
-            zip_target_path = os.path.join(destination_dir, f"{destination_file}.zip")
-            with open(zip_target_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        return zip_target_path
-
-    def download_logs(self, run_id, destination_dir):
-        run = self._repository.get_workflow_run(run_id)
-        logs_url = run.logs_url
-        _, headers, _ = run._requester.requestJson("GET", logs_url)
-
-        return self.download_from_url(headers["location"], destination_dir, run.id)
-
-    def workflow_run_for_ref_after_date(self, workflow_name, ref, oldest_date):
-        """
-        Gets all the workflow triggered after a given date
-        """
-        workflow = self._repository.get_workflow(workflow_name)
-        runs = workflow.get_runs(branch=ref)
-        recent_runs = [run for run in runs if run.created_at > oldest_date]
-
-        return sorted(recent_runs, key=lambda run: run.created_at, reverse=True)
-
     def latest_release(self, major_version=7) -> str:
         if major_version == 6:
             return max((r for r in self.get_releases() if r.title.startswith('6.53')), key=lambda r: r.created_at).title
@@ -393,12 +325,6 @@ class GithubAPI:
         for branch in self._repository.get_branches():
             if RELEASE_BRANCH_PATTERN.match(branch.name):
                 yield branch
-
-    def get_rate_limit_info(self):
-        """
-        Gets the current rate limit info.
-        """
-        return self._github.rate_limiting
 
     def publish_comment(self, pr, comment):
         """
@@ -490,10 +416,6 @@ class GithubAPI:
         """
         return self._github.search_issues(query)
 
-    def is_organization_member(self, user):
-        organization = self._repository.organization
-        return (user.company and 'datadog' in user.company.casefold()) or organization.has_in_members(user)
-
     def commit_and_push_signed(self, branch_name: str, commit_message: str, tree: dict[str, dict[str, str]]):
         # Create a commit from the given tree, see details in https://github.com/orgs/community/discussions/50055
         base_tree = self._repository.get_git_tree(tree['base_tree'])
@@ -518,67 +440,31 @@ class GithubAPI:
     def _chose_auth(self, public_repo):
         """
         Attempt to find a working authentication, in order:
-            - Personal access token through GITHUB_TOKEN environment variable
-            - An app token through the GITHUB_APP_ID & GITHUB_KEY_B64 environment
-              variables (can also use GITHUB_INSTALLATION_ID to save a request)
-            - A token from macOS keychain
-            - A fake login user/password to reach public repositories
+            - Locally:
+              - Short lived token generated locally
+            - On CI:
+              - GITHUB_TOKEN environment variable
+              - A fake login user/password to reach public repositories
+              - An app token through the GITHUB_APP_ID & GITHUB_KEY_B64 environment
+                variables (can also use GITHUB_INSTALLATION_ID to save a request).
+                This is required for Gitlab CI.
         """
+        from tasks.libs.common.utils import running_in_ci
+
+        if not running_in_ci():
+            return Auth.Token(generate_local_github_token(Context()))
         if "GITHUB_TOKEN" in os.environ:
-            return Auth.Token(os.environ["GITHUB_TOKEN"])
-        if "GITHUB_APP_ID" in os.environ and "GITHUB_KEY_B64" in os.environ:
-            appAuth = Auth.AppAuth(
-                os.environ['GITHUB_APP_ID'], base64.b64decode(os.environ['GITHUB_KEY_B64']).decode('ascii')
-            )
-            installation_id = os.environ.get('GITHUB_INSTALLATION_ID', None)
-            if installation_id is None:
-                # Even if we don't know the installation id, there's an API endpoint to
-                # retrieve it, given the other credentials (app id + key).
-                integration = GithubIntegration(auth=appAuth)
-                installations = integration.get_installations()
-                if len(installations) == 0:
-                    raise Exit(message='No usable installation found', code=1)
-                installation_id = installations[0]
-            return appAuth.get_installation_auth(int(installation_id))
+            token = os.environ["GITHUB_TOKEN"]
+            if not token:
+                raise RuntimeError("GITHUB_TOKEN is set but empty, dd-octo-sts may not be installed or failed to run")
+            return Auth.Token(token)
         if public_repo:
             return Auth.Login("user", "password")
-        if platform.system() == "Darwin":
-            try:
-                output = (
-                    subprocess.check_output(
-                        ['security', 'find-generic-password', '-a', os.environ["USER"], '-s', 'GITHUB_TOKEN', '-w']
-                    )
-                    .decode()
-                    .strip()
-                )
 
-                if output:
-                    return Auth.Token(output)
-            except subprocess.CalledProcessError:
-                print("GITHUB_TOKEN not found in keychain...")
-                pass
         raise Exit(
-            message="Please create a 'repo' access token at "
-            "https://github.com/settings/tokens and "
-            "add it as GITHUB_TOKEN in your keychain "
-            "or export it from your .bashrc or equivalent.",
+            message="No authentication found, you must pass a GITHUB_TOKEN in the CI, Github App authentication is no longer supported in the CI, use dd-octo-sts instead",
             code=1,
         )
-
-    @staticmethod
-    def get_token_from_app(app_id_env='GITHUB_APP_ID', pkey_env='GITHUB_KEY_B64'):
-        app_id = os.environ.get(app_id_env)
-        app_key_b64 = os.environ.get(pkey_env)
-        app_key = base64.b64decode(app_key_b64).decode("ascii")
-
-        auth = Auth.AppAuth(app_id, app_key)
-        integration = GithubIntegration(auth=auth)
-        installations = integration.get_installations()
-        if installations.totalCount == 0:
-            raise RuntimeError("Failed to list app installations")
-        install_id = installations[0].id
-        auth_token = integration.get_access_token(install_id)
-        print(auth_token.token)
 
     def create_label(self, name, color, description="", exist_ok=False):
         """
@@ -625,27 +511,13 @@ class GithubAPI:
         Get the complexity of the code review for a given PR, taking into account the number of files, lines and comments.
         """
         pr = self._repository.get_pull(pr_id)
-        # Criteria are defined with the average of PR attributes (files, lines, comments) so that:
-        # - easy PRs are merged in less than 1 day
-        # - hard PRs are merged in more than 1 week
-        # More details about criteria definition: https://datadoghq.atlassian.net/wiki/spaces/agent/pages/4271079846/Code+Review+Experience+Improvement#Complexity-label
-        criteria = {
-            'easy': {'files': 4, 'lines': 150, 'comments': 2},
-            'hard': {'files': 12, 'lines': 650, 'comments': 9},
+        size = get_pr_size(pr)
+        size_to_label = {
+            'small': 'short review',
+            'medium': 'medium review',
+            'large': 'long review',
         }
-        if (
-            pr.changed_files < criteria['easy']['files']
-            and pr.additions + pr.deletions < criteria['easy']['lines']
-            and pr.review_comments < criteria['easy']['comments']
-        ):
-            return 'short review'
-        elif (
-            pr.changed_files > criteria['hard']['files']
-            or pr.additions + pr.deletions > criteria['hard']['lines']
-            or pr.review_comments > criteria['hard']['comments']
-        ):
-            return 'long review'
-        return 'medium review'
+        return size_to_label[size]
 
     def find_teams(self, obj, exclude_teams=None, exclude_permissions=None, depth=None):
         """Get teams from a Github object (repository or team)"""
@@ -685,34 +557,12 @@ class GithubAPI:
         data = self.graphql(query)
         return [member["login"] for member in data["data"]["organization"]["team"]["members"]["nodes"]]
 
-
-def get_github_teams(users):
-    for user in users:
-        yield from query_teams(user.login)
-
-
-@lru_cache
-def query_teams(login):
-    query = get_user_query(login)
-    headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Content-Type": "application/json"}
-    response = requests.post("https://api.github.com/graphql", headers=headers, data=query, timeout=10)
-    data = response.json()
-    teams = []
-    try:
-        if data["data"]["user"]["organization"] and data["data"]["user"]["organization"]["teams"]:
-            for team in data["data"]["user"]["organization"]["teams"]["nodes"]:
-                teams.append(team["slug"])
-    except KeyError:
-        print(f"Error for user {login}: {data}")
-        raise
-    return teams
-
-
-def get_user_query(login):
-    variables = {"login": login, "org": "datadog"}
-    query = '{"query": "query GetUserTeam($login: String!, $org: String!) { user(login: $login) {organization(login: $org) { teams(first:10, userLogins: [$login]){ nodes { slug } } } } }", '
-    string_var = f'"variables": {json.dumps(variables)}'
-    return query + string_var
+    def get_fork_name(self, owner):
+        forks = self._repository.get_forks()
+        for fork in forks:
+            if fork.owner.login == owner:
+                return fork.name
+        return None
 
 
 def create_datadog_agent_pr(title, base_branch, target_branch, milestone_name, other_labels=None, body=""):
@@ -790,7 +640,55 @@ def create_release_pr(title, base_branch, target_branch, version, changelog_pr=F
     return create_datadog_agent_pr(title, base_branch, target_branch, milestone_name, labels)
 
 
-def ask_review_actor(pr):
-    for event in pr.get_issue_events():
-        if event.event == "labeled" and event.label.name == "ask-review":
-            return event.actor.name or event.actor.login
+def generate_local_github_token(ctx):
+    """
+    Generates a github token locally.
+    """
+
+    try:
+        token = ctx.run('ddtool auth github token', hide=True).stdout.strip()
+
+        assert token.startswith('gh') and ' ' not in token, (
+            "`ddtool auth github token` returned an invalid token, "
+            "it might be due to ddtool outdated. "
+            "Please run `brew update && brew upgrade ddtool`."
+        )
+
+        return token
+    except AssertionError:
+        # No retry on asserts
+        raise
+    except Exception:
+        # Try to login and then get a token
+        ctx.run('ddtool auth github login')
+        token = ctx.run('ddtool auth github token', hide=True).stdout.strip()
+
+        return token
+
+
+def get_pr_size(pr) -> str:
+    """Return 'small', 'medium', or 'large' based on PR stats."""
+    # Criteria are defined with the average of PR attributes (files, lines, comments) so that:
+    # - easy PRs are merged in less than 1 day
+    # - hard PRs are merged in more than 1 week
+    # More details: https://datadoghq.atlassian.net/wiki/spaces/agent/pages/4271079846/Code+Review+Experience+Improvement#Complexity-label
+    _SIZE_CRITERIA = {
+        'easy': {'files': 4, 'lines': 150, 'comments': 3},
+        'hard': {'files': 12, 'lines': 650, 'comments': 9},
+    }
+    human_review_comments = sum(
+        1 for comment in pr.get_review_comments() if comment.user is not None and "[bot]" not in comment.user.login
+    )
+    if (
+        pr.changed_files < _SIZE_CRITERIA['easy']['files']
+        and pr.additions + pr.deletions < _SIZE_CRITERIA['easy']['lines']
+        and human_review_comments < _SIZE_CRITERIA['easy']['comments']
+    ):
+        return 'small'
+    if (
+        pr.changed_files > _SIZE_CRITERIA['hard']['files']
+        or pr.additions + pr.deletions > _SIZE_CRITERIA['hard']['lines']
+        or human_review_comments > _SIZE_CRITERIA['hard']['comments']
+    ):
+        return 'large'
+    return 'medium'

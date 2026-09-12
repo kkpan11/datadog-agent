@@ -3,6 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+//go:build test
+
 package run
 
 import (
@@ -14,8 +16,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/core/pid/pidimpl"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
+	pidimpl "github.com/DataDog/datadog-agent/comp/core/pid/impl"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
@@ -24,9 +25,7 @@ func TestCommand(t *testing.T) {
 		Commands(newGlobalParamsTest(t)),
 		[]string{"run"},
 		run,
-		func(_ pidimpl.Params, _ core.BundleParams, secretParams secrets.Params) {
-			require.Equal(t, true, secretParams.Enabled)
-		})
+		func(_ pidimpl.Params, _ core.BundleParams) {})
 }
 
 func TestCommandPidfile(t *testing.T) {
@@ -34,9 +33,8 @@ func TestCommandPidfile(t *testing.T) {
 		Commands(newGlobalParamsTest(t)),
 		[]string{"run", "--pidfile", "/pid/file"},
 		run,
-		func(pidParams pidimpl.Params, _ core.BundleParams, secretParams secrets.Params) {
+		func(pidParams pidimpl.Params, _ core.BundleParams) {
 			require.Equal(t, "/pid/file", pidParams.PIDfilePath)
-			require.Equal(t, true, secretParams.Enabled)
 		})
 }
 
@@ -45,11 +43,11 @@ func newGlobalParamsTest(t *testing.T) *command.GlobalParams {
 	// which lead to build:
 	//   - config.Component which requires a valid datadog.yaml
 	//   - hostname.Component which requires a valid hostname
-	config := path.Join(t.TempDir(), "datadog.yaml")
-	err := os.WriteFile(config, []byte("hostname: test"), 0644)
+	configPath := path.Join(t.TempDir(), "datadog.yaml")
+	err := os.WriteFile(configPath, []byte("hostname: test"), 0644)
 	require.NoError(t, err)
 
 	return &command.GlobalParams{
-		ConfFilePath: config,
+		ConfFilePath: configPath,
 	}
 }

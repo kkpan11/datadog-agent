@@ -8,23 +8,20 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"html"
 	"io"
 	"net/http"
-
-	"github.com/gorilla/mux"
 
 	"github.com/DataDog/datadog-agent/pkg/process/checks"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 func checkHandler(w http.ResponseWriter, req *http.Request) {
-	requestedCheck := mux.Vars(req)["check"]
+	requestedCheck := req.PathValue("check")
 	checkOutput, ok := checks.GetCheckOutput(requestedCheck)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
-		_, err := io.WriteString(w, fmt.Sprintf("%s check is not running or has not been scheduled yet\n", html.EscapeString(requestedCheck)))
+		_, err := io.WriteString(w, html.EscapeString(requestedCheck)+" check is not running or has not been scheduled yet\n")
 		if err != nil {
 			_ = log.Error()
 		}

@@ -10,14 +10,15 @@ package integration
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/twmb/murmur3"
-	yaml "gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -73,6 +74,13 @@ type Config struct {
 	// see ADIdentifiers.  (optional)
 	AdvancedADIdentifiers []AdvancedADIdentifier `json:"advanced_ad_identifiers"` // (include in digest: false)
 
+	// CELSelector is the list of CEL-based selectors for this integration. (optional)
+	CELSelector workloadfilter.Rules `json:"cel_selector"` // (include in digest: true)
+
+	// Internal field to Autodiscovery, not serialized.
+	// Maps resource type to the compiled CEL matching program for that type.
+	matchingPrograms map[workloadfilter.ResourceType]MatchingProgram // (include in digest: false)
+
 	// Provider is the name of the config provider that issued the config.  If
 	// this is "", then the config is a service config, representing a service
 	// discovered by a listener.
@@ -107,6 +115,36 @@ type Config struct {
 	// LogsExcluded is whether logs collection is disabled (set by container
 	// listeners only)
 	LogsExcluded bool `json:"logs_excluded"` // (include in digest: false)
+
+	// PodNamespace is the k8s namespace for the container being monitored if any
+	PodNamespace string `json:"pod_namespace"` // (include in digest: false)
+
+	// ImageName is the container image name if any
+	ImageName string `json:"image_name"` // (include in digest: false)
+
+	// Discovery indicates that this config is a configuration-discovery
+	// template: the agent should not schedule it directly, and any matched
+	// instance is meant to discover its own config at runtime. A non-nil
+	// pointer means discovery is requested. (optional)
+	Discovery *DiscoveryConfig `json:"discovery,omitempty"` // (include in digest: true)
+}
+
+// DiscoveryConfig holds per-template configuration-discovery options.
+type DiscoveryConfig struct {
+	// MetricsPrefix is the integration's own metric namespace/prefix, as
+	// declared by its auto_conf.yaml's `discovery.metrics_prefix` field.
+	// Empty when the integration doesn't declare one, in which case
+	// consumers may fall back to the check name as the expected namespace
+	// root instead.
+	MetricsPrefix string `yaml:"metrics_prefix,omitempty"`
+}
+
+// MatchingProgram is an interface for matching objects against filter rules.
+type MatchingProgram interface {
+	// IsMatched returns true if the object matches the filter rules
+	IsMatched(obj workloadfilter.Filterable) bool
+	// GetTargetType returns the target resource type of the program
+	GetTargetType() workloadfilter.ResourceType
 }
 
 // CommonInstanceConfig holds the reserved fields for the yaml instance data
@@ -128,8 +166,16 @@ type CommonGlobalConfig struct {
 // AdvancedADIdentifier contains user-defined autodiscovery information
 // It replaces ADIdentifiers for advanced use-cases. Typically, file-based k8s service and endpoint checks.
 type AdvancedADIdentifier struct {
-	KubeService   KubeNamespacedName `yaml:"kube_service,omitempty"`
-	KubeEndpoints KubeNamespacedName `yaml:"kube_endpoints,omitempty"`
+	KubeService   KubeNamespacedName      `yaml:"kube_service,omitempty"`
+	KubeEndpoints KubeEndpointsIdentifier `yaml:"kube_endpoints,omitempty"`
+	Crd           CrdIdentifier           `yaml:"crd,omitempty"`
+}
+
+// KubeEndpointsIdentifier identifies a kubernetes endpoints object
+// alongside the method to resolve the endpoints.
+type KubeEndpointsIdentifier struct {
+	KubeNamespacedName `yaml:",inline"`
+	Resolve            string `yaml:"resolve,omitempty"` // Endpoint resolve mode: "auto" (default) or "ip"
 }
 
 // KubeNamespacedName identifies a kubernetes object.
@@ -141,6 +187,15 @@ type KubeNamespacedName struct {
 // IsEmpty returns true if the KubeNamespacedName is empty
 func (k KubeNamespacedName) IsEmpty() bool {
 	return k.Name == "" && k.Namespace == ""
+}
+
+type CrdIdentifier struct {
+	Gvr string `yaml:"gvr"`
+}
+
+// IsEmpty returns true if the CrdsIdentifier is empty
+func (c CrdIdentifier) IsEmpty() bool {
+	return c.Gvr == ""
 }
 
 // Equal determines whether the passed config is the same
@@ -160,6 +215,11 @@ func (c *Config) String() string {
 	var logsConfig interface{}
 
 	rawConfig["check_name"] = c.Name
+
+	celString := c.CELSelector.String()
+	if celString != "" {
+		rawConfig["cel_selector"] = celString
+	}
 
 	yaml.Unmarshal(c.InitConfig, &initConfig) //nolint:errcheck
 	rawConfig["init_config"] = initConfig
@@ -187,6 +247,31 @@ func (c *Config) IsTemplate() bool {
 	return len(c.ADIdentifiers) > 0 || len(c.AdvancedADIdentifiers) > 0
 }
 
+// IsDiscovery returns true if this config is a configuration-discovery
+// template (a non-nil Discovery field).
+func (c *Config) IsDiscovery() bool {
+	return c.Discovery != nil
+}
+
+// IsMatched returns true if the given object matches the filtering program of the config.
+// Note: this method should only be used within the autodiscovery component.
+func (c *Config) IsMatched(obj workloadfilter.Filterable) bool {
+	if len(c.matchingPrograms) == 0 {
+		return true
+	}
+	prg, found := c.matchingPrograms[obj.Type()]
+	if !found {
+		// No CEL program for this resource type — the match was via AD identifiers
+		return true
+	}
+	return prg.IsMatched(obj)
+}
+
+// SetMatchingPrograms sets the matching programs for the config, keyed by resource type.
+func (c *Config) SetMatchingPrograms(programs map[workloadfilter.ResourceType]MatchingProgram) {
+	c.matchingPrograms = programs
+}
+
 // IsCheckConfig returns true if the config is a node-agent check configuration,
 func (c *Config) IsCheckConfig() bool {
 	return !c.ClusterCheck && len(c.Instances) > 0
@@ -198,13 +283,13 @@ func (c *Config) IsLogConfig() bool {
 }
 
 // HasFilter returns true if metrics or logs collection must be disabled for this config.
-func (c *Config) HasFilter(filter containers.FilterType) bool {
+func (c *Config) HasFilter(fs workloadfilter.Scope) bool {
 	// no containers.GlobalFilter case here because we don't create services
 	// that are globally excluded in AD
-	switch filter {
-	case containers.MetricsFilter:
+	switch fs {
+	case workloadfilter.MetricsFilter:
 		return c.MetricsExcluded
-	case containers.LogsFilter:
+	case workloadfilter.LogsFilter:
 		return c.LogsExcluded
 	}
 	return false
@@ -322,6 +407,8 @@ func (c *Data) MergeAdditionalTags(tags []string) error {
 	for k := range tagSet {
 		rawConfig["tags"] = append(rawConfig["tags"].([]string), k)
 	}
+	// sort the list of tags so the digest stays stable for identical configs
+	slices.Sort(rawConfig["tags"].([]string))
 	// modify original config
 	out, err := yaml.Marshal(&rawConfig)
 	if err != nil {
@@ -395,10 +482,14 @@ func (c *Config) IntDigest() uint64 {
 	for _, i := range c.ADIdentifiers {
 		_, _ = h.Write([]byte(i))
 	}
+	_, _ = h.Write([]byte(c.CELSelector.String()))
 	_, _ = h.Write([]byte(c.NodeName))
 	_, _ = h.Write([]byte(c.LogsConfig))
 	_, _ = h.Write([]byte(c.ServiceID))
 	_, _ = h.Write([]byte(strconv.FormatBool(c.IgnoreAutodiscoveryTags)))
+	if c.Discovery != nil {
+		_, _ = h.Write([]byte("discovery:" + c.Discovery.MetricsPrefix))
+	}
 
 	return h.Sum64()
 }
@@ -418,10 +509,14 @@ func (c *Config) FastDigest() uint64 {
 	for _, i := range c.ADIdentifiers {
 		_, _ = h.Write([]byte(i))
 	}
+	_, _ = h.Write([]byte(c.CELSelector.String()))
 	_, _ = h.Write([]byte(c.NodeName))
 	_, _ = h.Write([]byte(c.LogsConfig))
 	_, _ = h.Write([]byte(c.ServiceID))
 	_, _ = h.Write([]byte(strconv.FormatBool(c.IgnoreAutodiscoveryTags)))
+	if c.Discovery != nil {
+		_, _ = h.Write([]byte("discovery:" + c.Discovery.MetricsPrefix))
+	}
 
 	return h.Sum64()
 }

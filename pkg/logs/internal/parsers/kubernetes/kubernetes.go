@@ -3,13 +3,15 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//nolint:revive // TODO(AML) Fix revive linter
+// Package kubernetes provides Kubernetes log format parsing
 package kubernetes
 
 import (
 	"bytes"
 	"errors"
+	"time"
 
+	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/logs/internal/parsers"
 	"github.com/DataDog/datadog-agent/pkg/logs/message"
 )
@@ -54,16 +56,35 @@ func parseKubernetes(msg *message.Message) (*message.Message, error) {
 	if len(components) > 3 {
 		content = components[3]
 	}
-	timestamp = string(components[0])
+
 	status = getStatus(components[1])
 	flag = string(components[2])
+	stream := getStream(components[1])
 
 	msg.SetContent(content)
 	msg.Status = status
 	msg.ParsingExtra = message.ParsingExtra{
 		IsPartial: isPartial(flag),
-		Timestamp: timestamp,
+		Stream:    stream,
 	}
+	// Optionally tag the stream (stdout/stderr) so downstream consumers can filter by origin.
+	// Controlled by logs_config.add_logsource_tag (disabled by default).
+	if pkgconfigsetup.Datadog().GetBool("logs_config.add_logsource_tag") {
+		if stream != "" {
+			msg.ParsingExtra.Tags = append(msg.ParsingExtra.Tags, message.LogSourceTag(stream))
+		}
+	}
+	// Validate timestamp format. K8s API uses either RFC3339 or RFC3339Nano
+	// but RFC3339Nano is a superset that can parse both formats.
+	timestamp = string(components[0])
+	_, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		// Invalid timestamp format - return error to prevent downstream issues
+		// where the timestamp is used as an offset for log tailing
+		return msg, errors.New("invalid timestamp format")
+	}
+
+	msg.ParsingExtra.Timestamp = timestamp
 
 	return msg, nil
 }
@@ -72,14 +93,25 @@ func isPartial(flag string) bool {
 	return flag == "P"
 }
 
+func getStream(streamType []byte) string {
+	switch string(streamType) {
+	case message.StreamStdout:
+		return message.StreamStdout
+	case message.StreamStderr:
+		return message.StreamStderr
+	default:
+		return ""
+	}
+}
+
 // getStatus returns the status of the message based on
 // the value of the STREAM_TYPE field in the header,
 // returns the status INFO by default
 func getStatus(streamType []byte) string {
 	switch string(streamType) {
-	case "stdout":
+	case message.StreamStdout:
 		return message.StatusInfo
-	case "stderr":
+	case message.StreamStderr:
 		return message.StatusError
 	default:
 		return message.StatusInfo

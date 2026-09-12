@@ -10,12 +10,16 @@
 package senderhelper
 
 import (
+	"testing"
+
 	"go.uber.org/fx"
 
-	"github.com/DataDog/datadog-agent/comp/aggregator/demultiplexer"
-	"github.com/DataDog/datadog-agent/comp/aggregator/demultiplexer/demultiplexerimpl"
-	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
+	demultiplexer "github.com/DataDog/datadog-agent/comp/aggregator/demultiplexer/def"
+	demultiplexerimpl "github.com/DataDog/datadog-agent/comp/aggregator/demultiplexer/impl"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
+	defaultforwardermock "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/mock"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/mocksender"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 )
@@ -23,11 +27,12 @@ import (
 // Opts is a set of options for providing a demux with a mock sender.
 // We can remove this if the Sender is ever exposed as a component.
 var Opts = fx.Options(
-	defaultforwarder.MockModule(),
+	defaultforwardermock.MockModule(),
 	demultiplexerimpl.MockModule(),
-	core.MockBundle(),
-	fx.Provide(func() (*mocksender.MockSender, sender.Sender) {
-		mockSender := mocksender.NewMockSender("mock-sender")
+	hostnameimpl.MockModule(),
+	fx.Provide(func(t testing.TB) log.Component { return logmock.New(t) }),
+	fx.Provide(func(t testing.TB) (*mocksender.MockSender, sender.Sender) {
+		mockSender := mocksender.NewMockSender(t, "mock-sender")
 		mockSender.SetupAcceptAll()
 		return mockSender, mockSender
 	}),

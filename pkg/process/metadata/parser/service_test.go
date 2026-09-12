@@ -297,7 +297,7 @@ func TestExtractServiceMetadata(t *testing.T) {
 			useImprovedAlgorithm: true,
 			cmdline: []string{
 				"/usr/bin/node",
-				"./nodejs/testData/inner/index.js",
+				"./nodejs/testdata/inner/index.js",
 			},
 			expectedServiceTag: "process_context:node",
 		},
@@ -310,7 +310,7 @@ func TestExtractServiceMetadata(t *testing.T) {
 				"/private/node-patches_legacy/register.js",
 				"--preserve-symlinks-main",
 				"--",
-				"./nodejs/testData/index.js",
+				"./nodejs/testdata/index.js",
 			},
 			expectedServiceTag: "process_context:my-awesome-package",
 		},
@@ -366,7 +366,11 @@ func TestExtractServiceMetadata(t *testing.T) {
 			useImprovedAlgorithm := tt.useImprovedAlgorithm
 			se := NewServiceExtractor(serviceExtractorEnabled, useWindowsServiceName, useImprovedAlgorithm)
 			se.Extract(procsByPid)
-			assert.Equal(t, []string{tt.expectedServiceTag}, se.GetServiceContext(proc.Pid))
+			if tt.expectedServiceTag != "" {
+				assert.Equal(t, []string{tt.expectedServiceTag}, se.GetServiceContext(proc.Pid))
+			} else {
+				assert.Nil(t, se.GetServiceContext(proc.Pid))
+			}
 		})
 	}
 }
@@ -422,7 +426,7 @@ func TestChooseServiceNameFromEnvs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			value, ok := chooseServiceNameFromEnvs(tt.envs)
+			value, ok := ChooseServiceNameFromEnvs(tt.envs)
 			require.Equal(t, tt.expected, value)
 			require.Equal(t, tt.found, ok)
 		})

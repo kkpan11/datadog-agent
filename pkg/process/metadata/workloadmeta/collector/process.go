@@ -8,6 +8,7 @@ package collector
 
 import (
 	"context"
+	"crypto/tls"
 	"time"
 
 	"github.com/benbjohnson/clock"
@@ -17,6 +18,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/process/checks"
 	workloadmetaExtractor "github.com/DataDog/datadog-agent/pkg/process/metadata/workloadmeta"
 	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
+	"github.com/DataDog/datadog-agent/pkg/process/util/coreagent"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -26,7 +28,7 @@ const (
 )
 
 // NewProcessCollector creates a new process collector.
-func NewProcessCollector(coreConfig, sysProbeConfig pkgconfigmodel.Reader) *Collector {
+func NewProcessCollector(coreConfig, sysProbeConfig pkgconfigmodel.Reader, grpcServerTLSConfig *tls.Config) *Collector {
 	wlmExtractor := workloadmetaExtractor.NewWorkloadMetaExtractor(sysProbeConfig)
 
 	processData := checks.NewProcessData(coreConfig)
@@ -35,7 +37,7 @@ func NewProcessCollector(coreConfig, sysProbeConfig pkgconfigmodel.Reader) *Coll
 	return &Collector{
 		ddConfig:        coreConfig,
 		wlmExtractor:    wlmExtractor,
-		grpcServer:      workloadmetaExtractor.NewGRPCServer(coreConfig, wlmExtractor),
+		grpcServer:      workloadmetaExtractor.NewGRPCServer(coreConfig, wlmExtractor, grpcServerTLSConfig),
 		processData:     processData,
 		collectionClock: clock.New(),
 		pidToCid:        make(map[int]string),
@@ -108,10 +110,10 @@ func (c *Collector) run(ctx context.Context, containerProvider proccontainers.Co
 }
 
 // Enabled checks to see if we should enable the local process collector.
-// Since it's job is to collect processes when the process check is disabled, we only enable it when `process_config.process_collection.enabled` == false
+// Since its job is to collect processes when the process check is disabled, we only enable it when `process_config.process_collection.enabled` == false.
 // Additionally, if the remote process collector is not enabled in the core agent, there is no reason to collect processes. Therefore, we check `language_detection.enabled`.
-// We also check `process_config.run_in_core_agent.enabled` because this collector should only be used when the core agent collector is not running.
-// Finally, we only want to run this collector in the process agent, so if we're running as anything else we should disable the collector.
+// On Linux, process checks always run in the core agent, so this collector is always disabled.
+// On non-Linux, we only want to run this collector in the process agent.
 func Enabled(cfg pkgconfigmodel.Reader) bool {
 	if cfg.GetBool("process_config.process_collection.enabled") {
 		return false
@@ -121,7 +123,7 @@ func Enabled(cfg pkgconfigmodel.Reader) bool {
 		return false
 	}
 
-	if cfg.GetBool("process_config.run_in_core_agent.enabled") {
+	if coreagent.ProcessChecksRunInCoreAgent() {
 		return false
 	}
 

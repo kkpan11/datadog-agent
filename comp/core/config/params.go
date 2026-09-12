@@ -5,6 +5,10 @@
 
 package config
 
+import (
+	"github.com/DataDog/datadog-agent/pkg/config/setup"
+)
+
 // Params defines the parameters for the config component.
 type Params struct {
 	// ConfFilePath is the path at which to look for configuration, usually
@@ -31,10 +35,6 @@ type Params struct {
 	// configLoadSecurityAgent determines whether to read the config from
 	// SecurityAgentConfigFilePaths or from ConfFilePath.
 	configLoadSecurityAgent bool
-
-	// configMissingOK determines whether it is a fatal error if the config
-	// file does not exist.
-	configMissingOK bool
 
 	// ignoreErrors determines whether it is OK if the config is not valid
 	// If an error occurs, Component.warnings.Warning contains the error.
@@ -65,6 +65,7 @@ func NewParams(defaultConfPath string, options ...func(*Params)) Params {
 func NewAgentParams(confFilePath string, options ...func(*Params)) Params {
 	params := NewParams(DefaultConfPath, options...)
 	params.ConfFilePath = confFilePath
+	setup.InitConfigObjects()
 	return params
 }
 
@@ -78,7 +79,6 @@ func NewSecurityAgentParams(securityAgentConfigFilePaths []string, options ...fu
 		params.securityAgentConfigFilePaths = securityAgentConfigFilePaths[1:] // Default: security-agent.yaml
 	}
 	params.configLoadSecurityAgent = true
-	params.configMissingOK = false
 	return params
 }
 
@@ -94,13 +94,6 @@ func NewClusterAgentParams(configFilePath string, options ...func(*Params)) Para
 func WithConfigName(name string) func(*Params) {
 	return func(b *Params) {
 		b.configName = name
-	}
-}
-
-// WithConfigMissingOK returns an option which sets configMissingOK
-func WithConfigMissingOK(v bool) func(*Params) {
-	return func(b *Params) {
-		b.configMissingOK = v
 	}
 }
 
@@ -152,12 +145,4 @@ func WithCLIOverride(setting string, value interface{}) func(*Params) {
 	return func(b *Params) {
 		b.cliOverride[setting] = value
 	}
-}
-
-// These functions are used in unit tests.
-
-// ConfigMissingOK determines whether it is a fatal error if the config
-// file does not exist.
-func (p Params) ConfigMissingOK() bool {
-	return p.configMissingOK
 }

@@ -6,9 +6,25 @@
 package procutil
 
 import (
-	"github.com/DataDog/gopsutil/cpu"
-	// using process.FilledProcess
-	"github.com/DataDog/gopsutil/process"
+	"hash/fnv"
+	"slices"
+	"strconv"
+	"strings"
+
+	tracermetadata "github.com/DataDog/datadog-agent/pkg/discovery/tracermetadata/model"
+	"github.com/DataDog/datadog-agent/pkg/languagedetection/languagemodels"
+)
+
+// InjectionState represents the APM injection state of a process
+type InjectionState int
+
+const (
+	// InjectionUnknown means we haven't determined the injection status yet
+	InjectionUnknown InjectionState = 0
+	// InjectionInjected means the process has APM auto-injection enabled
+	InjectionInjected InjectionState = 1
+	// InjectionNotInjected means the process does not have APM auto-injection
+	InjectionNotInjected InjectionState = 2
 )
 
 // Process holds all relevant metadata and metrics for a process
@@ -24,8 +40,18 @@ type Process struct {
 	Username string // (Windows only)
 	Uids     []int32
 	Gids     []int32
+	Language *languagemodels.Language
 
-	Stats *Stats
+	// ports are stored on the process because they may/should be collected by default in the future
+	// however, currently this data is collected by service discovery collection
+	PortsCollected bool
+	TCPPorts       []uint16
+	UDPPorts       []uint16
+
+	Stats          *Stats
+	Service        *Service
+	InjectionState InjectionState // APM auto-injector detection status
+	ContainerID    string
 }
 
 //nolint:revive // TODO(PROC) Fix revive linter
@@ -43,17 +69,61 @@ func (p *Process) GetCmdline() []string {
 	return p.Cmdline
 }
 
+// ProcessIdentity generates a unique identity string for a process based on PID, creation time,
+// and command line hash. This allows detection of exec scenarios where the PID and creation time
+// remain the same but the command line changes.
+//
+// IMPORTANT: This function uses the same identity fields as IsSameProcess (pid, createTime, cmdline).
+// If you modify the identity fields here, update IsSameProcess as well.
+// See TestProcessIdentityAndIsSameProcessInSync for enforcement.
+func ProcessIdentity(pid int32, createTime int64, cmdline []string) string {
+	return "pid:" + strconv.FormatInt(int64(pid), 10) + "|createTime:" + strconv.FormatInt(createTime, 10) + "|cmdHash:" + strconv.FormatUint(hashCmdline(cmdline), 16)
+}
+
+// IsSameProcess returns true if two processes have the same identity (PID, create time, and cmdline).
+//
+// IMPORTANT: This function uses the same identity fields as ProcessIdentity (pid, createTime, cmdline).
+// If you modify the identity fields here, update ProcessIdentity as well.
+// See TestProcessIdentityAndIsSameProcessInSync for enforcement.
+func IsSameProcess(a, b *Process) bool {
+	if a.Pid != b.Pid {
+		return false
+	}
+	// Only check CreateTime if both processes have Stats populated
+	if a.Stats != nil && b.Stats != nil {
+		if a.Stats.CreateTime != b.Stats.CreateTime {
+			return false
+		}
+	}
+	return slices.Equal(a.Cmdline, b.Cmdline)
+}
+
+// hashCmdline computes a fast FNV-1a hash of the command line arguments.
+// Only hashes first 100 args to bound work for processes with huge cmdlines (some have 70K+ args).
+// 100 args covers ~p99.9 of real-world processes
+func hashCmdline(cmdline []string) uint64 {
+	const maxArgs = 100
+	if len(cmdline) > maxArgs {
+		cmdline = cmdline[:maxArgs]
+	}
+	h := fnv.New64a()
+	h.Write([]byte(strings.Join(cmdline, "\x00")))
+	return h.Sum64()
+}
+
 // DeepCopy creates a deep copy of Process
 func (p *Process) DeepCopy() *Process {
 	//nolint:revive // TODO(PROC) Fix revive linter
 	copy := &Process{
-		Pid:      p.Pid,
-		Ppid:     p.Ppid,
-		NsPid:    p.NsPid,
-		Name:     p.Name,
-		Cwd:      p.Cwd,
-		Exe:      p.Exe,
-		Username: p.Username,
+		Pid:            p.Pid,
+		Ppid:           p.Ppid,
+		NsPid:          p.NsPid,
+		Name:           p.Name,
+		Cwd:            p.Cwd,
+		Exe:            p.Exe,
+		Comm:           p.Comm,
+		Username:       p.Username,
+		PortsCollected: p.PortsCollected,
 	}
 	copy.Cmdline = make([]string, len(p.Cmdline))
 	for i := range p.Cmdline {
@@ -67,6 +137,14 @@ func (p *Process) DeepCopy() *Process {
 	for i := range p.Gids {
 		copy.Gids[i] = p.Gids[i]
 	}
+	copy.TCPPorts = make([]uint16, len(p.TCPPorts))
+	for i := range p.TCPPorts {
+		copy.TCPPorts[i] = p.TCPPorts[i]
+	}
+	copy.UDPPorts = make([]uint16, len(p.UDPPorts))
+	for i := range p.UDPPorts {
+		copy.UDPPorts[i] = p.UDPPorts[i]
+	}
 	if p.Stats != nil {
 		copy.Stats = p.Stats.DeepCopy()
 	}
@@ -75,11 +153,16 @@ func (p *Process) DeepCopy() *Process {
 
 // Stats holds all relevant stats metrics of a process
 type Stats struct {
-	CreateTime int64
-	// Status returns the process status.
-	// Return value could be one of these.
-	// R: Running S: Sleep T: Stop I: Idle
-	// Z: Zombie W: Wait L: Lock
+	CreateTime int64 // milliseconds
+	// Status returns the process status. https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+	// Supported return values:
+	// U: unknown state
+	// D: uninterruptible sleep
+	// R: running
+	// S: interruptible sleep
+	// T: stopped
+	// W: waiting (todo: potentially removable, W = paging only before Linux 2.6.0, waking Linux 2.6.33 to 3.13 only)
+	// Z: zombie
 	// The character is the same within all supported platforms.
 	Status      string
 	Nice        int32
@@ -92,6 +175,30 @@ type Stats struct {
 	IOStat      *IOCountersStat
 	IORateStat  *IOCountersRateStat
 	CtxSwitches *NumCtxSwitchesStat
+}
+
+// Service holds service discovery data for a process
+type Service struct {
+	// GeneratedName is the name generated from the process info
+	GeneratedName string
+
+	// GeneratedNameSource indicates the source of the generated name
+	GeneratedNameSource string
+
+	// AdditionalGeneratedNames contains other potential names for the service
+	AdditionalGeneratedNames []string
+
+	// TracerMetadata contains APM tracer metadata
+	TracerMetadata []tracermetadata.TracerMetadata
+
+	// DDService is the value from DD_SERVICE environment variable
+	DDService string
+
+	// APMInstrumentation indicates the APM instrumentation status
+	APMInstrumentation bool
+
+	// LogFiles contains paths to log files associated with this service
+	LogFiles []string
 }
 
 // DeepCopy creates a deep copy of Stats
@@ -212,113 +319,4 @@ type IOCountersRateStat struct {
 type NumCtxSwitchesStat struct {
 	Voluntary   int64
 	Involuntary int64
-}
-
-// ConvertAllFilledProcesses takes a group of FilledProcess objects and convert them into Process
-func ConvertAllFilledProcesses(processes map[int32]*process.FilledProcess) map[int32]*Process {
-	result := make(map[int32]*Process, len(processes))
-	for pid, p := range processes {
-		result[pid] = ConvertFromFilledProcess(p)
-	}
-	return result
-}
-
-// ConvertAllFilledProcessesToStats takes a group of FilledProcess objects and convert them into Stats
-func ConvertAllFilledProcessesToStats(processes map[int32]*process.FilledProcess) map[int32]*Stats {
-	stats := make(map[int32]*Stats, len(processes))
-	for pid, p := range processes {
-		stats[pid] = ConvertFilledProcessesToStats(p)
-	}
-	return stats
-}
-
-// ConvertFilledProcessesToStats takes a group of FilledProcess objects and convert them into Stats
-func ConvertFilledProcessesToStats(p *process.FilledProcess) *Stats {
-	return &Stats{
-		CreateTime:  p.CreateTime,
-		Status:      p.Status,
-		Nice:        p.Nice,
-		OpenFdCount: p.OpenFdCount,
-		NumThreads:  p.NumThreads,
-		CPUTime:     ConvertFromCPUStat(p.CpuTime),
-		MemInfo:     ConvertFromMemInfo(p.MemInfo),
-		MemInfoEx:   ConvertFromMemInfoEx(p.MemInfoEx),
-		IOStat:      ConvertFromIOStats(p.IOStat),
-		CtxSwitches: ConvertFromCtxSwitches(p.CtxSwitches),
-	}
-}
-
-// ConvertFromFilledProcess takes a FilledProcess object and convert it into Process
-func ConvertFromFilledProcess(p *process.FilledProcess) *Process {
-	return &Process{
-		Pid:      p.Pid,
-		Ppid:     p.Ppid,
-		NsPid:    p.NsPid,
-		Name:     p.Name,
-		Cwd:      p.Cwd,
-		Exe:      p.Exe,
-		Cmdline:  p.Cmdline,
-		Username: p.Username,
-		Uids:     p.Uids,
-		Gids:     p.Gids,
-		Stats:    ConvertFilledProcessesToStats(p),
-	}
-}
-
-// ConvertFromCPUStat converts gopsutil TimesStat object to CPUTimesStat in procutil
-func ConvertFromCPUStat(s cpu.TimesStat) *CPUTimesStat {
-	return &CPUTimesStat{
-		User:      s.User,
-		System:    s.System,
-		Idle:      s.Idle,
-		Nice:      s.Nice,
-		Iowait:    s.Iowait,
-		Irq:       s.Irq,
-		Softirq:   s.Softirq,
-		Steal:     s.Steal,
-		Guest:     s.Guest,
-		GuestNice: s.GuestNice,
-		Stolen:    s.Stolen,
-		Timestamp: s.Timestamp,
-	}
-}
-
-// ConvertFromMemInfo converts gopsutil MemoryInfoStat object to MemoryInfoStat in procutil
-func ConvertFromMemInfo(s *process.MemoryInfoStat) *MemoryInfoStat {
-	return &MemoryInfoStat{
-		RSS:  s.RSS,
-		VMS:  s.VMS,
-		Swap: s.Swap,
-	}
-}
-
-// ConvertFromMemInfoEx converts gopsutil MemoryInfoExStat object to MemoryInfoExStat in procutil
-func ConvertFromMemInfoEx(s *process.MemoryInfoExStat) *MemoryInfoExStat {
-	return &MemoryInfoExStat{
-		RSS:    s.RSS,
-		VMS:    s.VMS,
-		Shared: s.Shared,
-		Text:   s.Text,
-		Lib:    s.Lib,
-		Data:   s.Data,
-		Dirty:  s.Dirty,
-	}
-}
-
-// ConvertFromIOStats converts gopsutil IOCountersStat object to IOCounterStat in procutil
-func ConvertFromIOStats(s *process.IOCountersStat) *IOCountersStat {
-	return &IOCountersStat{
-		ReadCount:  int64(s.ReadCount),
-		WriteCount: int64(s.WriteCount),
-		ReadBytes:  int64(s.ReadBytes),
-		WriteBytes: int64(s.WriteBytes),
-	}
-}
-
-// ConvertFromCtxSwitches converts gopsutil NumCtxSwitchesStat object to NumCtxSwitchesStat in procutil
-func ConvertFromCtxSwitches(s *process.NumCtxSwitchesStat) *NumCtxSwitchesStat {
-	return &NumCtxSwitchesStat{
-		Voluntary:   s.Voluntary,
-		Involuntary: s.Involuntary,
-	}
 }

@@ -1,0 +1,40 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+  profiling:
+    symbol_uploader:
+      enabled: true
+      symbol_endpoints:
+        - site: ${env:DD_SITE}
+          api_key: ${env:DD_API_KEY}
+processors:
+  cumulativetodelta: {}
+  resourcedetection:
+    detectors: ["system"]
+    system:
+      resource_attributes:
+        host.arch:
+          enabled: true
+        host.name:
+          enabled: false
+        os.type:
+          enabled: false
+
+exporters:
+  otlp_http:
+    endpoint: https://otlp.${env:DD_SITE}
+    headers:
+      dd-api-key: ${env:DD_API_KEY}
+      dd-otel-metric-config: '{"resource_attributes_as_tags": true}'
+service:
+  pipelines:
+    profiles:
+      receivers: [profiling]
+      processors: [resourcedetection]
+      exporters: [otlp_http]
+    metrics:
+      receivers: [otlp]
+      processors: [cumulativetodelta]
+      exporters: [otlp_http]

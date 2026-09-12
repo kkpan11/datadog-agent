@@ -12,9 +12,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/go-version"
@@ -59,7 +61,7 @@ func detectAgentV1URL() (string, error) {
 			log.Debugf("Could not get docker default gateway: %s", err)
 		}
 		if gw != nil {
-			urls = append(urls, fmt.Sprintf("http://%s:%d/", gw.String(), v1.DefaultAgentPort))
+			urls = append(urls, fmt.Sprintf("http://%s/", net.JoinHostPort(gw.String(), strconv.Itoa(v1.DefaultAgentPort))))
 		}
 
 		// Try the default IP for awsvpc mode
@@ -95,8 +97,8 @@ func getAgentV1ContainerURLs(ctx context.Context) ([]string, error) {
 
 	for _, network := range ecsConfig.NetworkSettings.Networks {
 		ip := network.IPAddress
-		if ip != "" {
-			urls = append(urls, fmt.Sprintf("http://%s:%d/", ip, v1.DefaultAgentPort))
+		if ip.IsValid() {
+			urls = append(urls, fmt.Sprintf("http://%s/", net.JoinHostPort(ip.String(), strconv.Itoa(v1.DefaultAgentPort))))
 		}
 	}
 
@@ -104,7 +106,7 @@ func getAgentV1ContainerURLs(ctx context.Context) ([]string, error) {
 	// runs in the (default) host network mode. This allows us to connect back to it
 	// from an agent container running in awsvpc mode.
 	if ecsConfig.Config != nil && ecsConfig.Config.Hostname != "" {
-		urls = append(urls, fmt.Sprintf("http://%s:%d/", ecsConfig.Config.Hostname, v1.DefaultAgentPort))
+		urls = append(urls, fmt.Sprintf("http://%s/", net.JoinHostPort(ecsConfig.Config.Hostname, strconv.Itoa(v1.DefaultAgentPort))))
 	}
 
 	return urls, nil
@@ -137,7 +139,7 @@ func testURLs(urls []string, timeout time.Duration) string {
 func getAgentV3URLFromEnv() (string, error) {
 	agentURL, found := os.LookupEnv(v3or4.DefaultMetadataURIv3EnvVariable)
 	if !found {
-		return "", fmt.Errorf("Could not initialize client: missing metadata v3 URL")
+		return "", errors.New("Could not initialize client: missing metadata v3 URL")
 	}
 	return agentURL, nil
 }
@@ -145,7 +147,7 @@ func getAgentV3URLFromEnv() (string, error) {
 func getAgentV4URLFromEnv() (string, error) {
 	agentURL, found := os.LookupEnv(v3or4.DefaultMetadataURIv4EnvVariable)
 	if !found {
-		return "", fmt.Errorf("Could not initialize client: missing metadata v4 URL")
+		return "", errors.New("Could not initialize client: missing metadata v4 URL")
 	}
 	return agentURL, nil
 }

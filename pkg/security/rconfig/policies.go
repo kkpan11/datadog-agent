@@ -20,8 +20,8 @@ import (
 	"github.com/skydive-project/go-debouncer"
 	"go.uber.org/atomic"
 
-	"github.com/DataDog/datadog-agent/pkg/api/security"
-	apiutil "github.com/DataDog/datadog-agent/pkg/api/util"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	"github.com/DataDog/datadog-agent/pkg/config/remote/client"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/remoteconfig/state"
@@ -40,9 +40,10 @@ type RCPolicyProvider struct {
 	sync.RWMutex
 
 	client               *client.Client
-	onNewPoliciesReadyCb func()
+	onNewPoliciesReadyCb func(silent bool)
 	lastDefaults         map[string]state.RawConfig
 	lastCustoms          map[string]state.RawConfig
+	lastRemediations     map[string]state.RawConfig
 	debouncer            *debouncer.Debouncer
 	dumpPolicies         bool
 	setEnforcementCb     func(bool)
@@ -53,22 +54,22 @@ type RCPolicyProvider struct {
 var _ rules.PolicyProvider = (*RCPolicyProvider)(nil)
 
 // NewRCPolicyProvider returns a new Remote Config based policy provider
-func NewRCPolicyProvider(dumpPolicies bool, setEnforcementCallback func(bool)) (*RCPolicyProvider, error) {
+func NewRCPolicyProvider(dumpPolicies bool, setEnforcementCallback func(bool), ipc ipc.Component) (*RCPolicyProvider, error) {
 	agentVersion, err := utils.GetAgentSemverVersion()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse agent version: %w", err)
 	}
 
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ipc address: %w", err)
 	}
 
-	c, err := client.NewGRPCClient(ipcAddress, pkgconfigsetup.GetIPCPort(),
-		func() (string, error) { return security.FetchAuthToken(pkgconfigsetup.Datadog()) },
-		apiutil.GetTLSClientConfig, // using helper command from pkg/api/util because there is no access to components
+	c, err := client.NewGRPCClient(ipcAddress, pkgconfighelper.GetIPCPort(pkgconfigsetup.Datadog()),
+		ipc.GetAuthToken(),
+		ipc.GetTLSClientConfig(),
 		client.WithAgent(agentName, agentVersion.String()),
-		client.WithProducts(state.ProductCWSDD, state.ProductCWSCustom),
+		client.WithProducts(state.ProductCWSDD, state.ProductCWSCustom, state.ProductCWSRemediation),
 		client.WithPollInterval(securityAgentRCPollInterval),
 		client.WithDirectorRootOverride(pkgconfigsetup.Datadog().GetString("site"), pkgconfigsetup.Datadog().GetString("remote_configuration.director_root")),
 	)
@@ -95,6 +96,7 @@ func (r *RCPolicyProvider) Start() {
 
 	r.client.SubscribeAll(state.ProductCWSDD, client.NewListener(r.rcDefaultsUpdateCallback, r.rcStateChanged))
 	r.client.SubscribeAll(state.ProductCWSCustom, client.NewListener(r.rcCustomsUpdateCallback, r.rcStateChanged))
+	r.client.SubscribeAll(state.ProductCWSRemediation, client.NewListener(r.rcRemediationsUpdateCallback, r.rcStateChanged))
 
 	r.client.Start()
 
@@ -116,7 +118,7 @@ func (r *RCPolicyProvider) rcDefaultsUpdateCallback(configs map[string]state.Raw
 	r.lastDefaults = configs
 	r.Unlock()
 
-	log.Info("new policies from remote-config policy provider")
+	log.Info("new policies from remote-config policy provider for default policices")
 
 	r.debouncer.Call()
 }
@@ -130,7 +132,21 @@ func (r *RCPolicyProvider) rcCustomsUpdateCallback(configs map[string]state.RawC
 	r.lastCustoms = configs
 	r.Unlock()
 
-	log.Info("new policies from remote-config policy provider")
+	log.Info("new policies from remote-config policy provider for custom policices")
+
+	r.debouncer.Call()
+}
+
+func (r *RCPolicyProvider) rcRemediationsUpdateCallback(configs map[string]state.RawConfig, _ func(string, state.ApplyStatus)) {
+	r.Lock()
+	if len(r.lastRemediations) == 0 && len(configs) == 0 {
+		r.Unlock()
+		return
+	}
+	r.lastRemediations = configs
+	r.Unlock()
+
+	log.Info("new policies from remote-config policy provider for remediations")
 
 	r.debouncer.Call()
 }
@@ -163,7 +179,7 @@ func (r *RCPolicyProvider) LoadPolicies(macroFilters []rules.MacroFilter, ruleFi
 	r.RLock()
 	defer r.RUnlock()
 
-	load := func(policyType rules.PolicyType, id string, cfg []byte) error {
+	load := func(internalType rules.InternalPolicyType, id string, cfg []byte) error {
 		if r.dumpPolicies {
 			name, err := writePolicy(id, cfg)
 			if err != nil {
@@ -174,9 +190,9 @@ func (r *RCPolicyProvider) LoadPolicies(macroFilters []rules.MacroFilter, ruleFi
 		}
 
 		pInfo := &rules.PolicyInfo{
-			Name:   normalizePolicyName(id),
-			Source: rules.PolicyProviderTypeRC,
-			Type:   policyType,
+			Name:         normalizePolicyName(id),
+			Source:       rules.PolicyProviderTypeRC,
+			InternalType: internalType,
 		}
 		reader := bytes.NewReader(cfg)
 		policy, err := rules.LoadPolicy(pInfo, reader, macroFilters, ruleFilters)
@@ -206,11 +222,22 @@ func (r *RCPolicyProvider) LoadPolicies(macroFilters []rules.MacroFilter, ruleFi
 		}
 	}
 
+	for _, cfgPath := range slices.Sorted(maps.Keys(r.lastRemediations)) {
+		rawConfig := r.lastRemediations[cfgPath]
+
+		if err := load(rules.RemediationPolicyType, rawConfig.Metadata.ID, rawConfig.Config); err != nil {
+			r.client.UpdateApplyStatus(cfgPath, state.ApplyStatus{State: state.ApplyStateError, Error: err.Error()})
+			errs = multierror.Append(errs, err)
+		} else {
+			r.client.UpdateApplyStatus(cfgPath, state.ApplyStatus{State: state.ApplyStateAcknowledged})
+		}
+	}
+
 	return policies, errs
 }
 
 // SetOnNewPoliciesReadyCb implements the PolicyProvider interface
-func (r *RCPolicyProvider) SetOnNewPoliciesReadyCb(cb func()) {
+func (r *RCPolicyProvider) SetOnNewPoliciesReadyCb(cb func(silent bool)) {
 	r.onNewPoliciesReadyCb = cb
 }
 
@@ -223,7 +250,8 @@ func (r *RCPolicyProvider) onNewPoliciesReady() {
 			r.setEnforcementCb(true)
 		}
 
-		r.onNewPoliciesReadyCb()
+		// Remote config updates are never silent - they always trigger heartbeat events
+		r.onNewPoliciesReadyCb(false)
 	}
 }
 

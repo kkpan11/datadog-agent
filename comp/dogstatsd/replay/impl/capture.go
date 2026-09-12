@@ -8,7 +8,7 @@ package replayimpl
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path"
 	"sync"
 	"time"
@@ -23,7 +23,6 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 )
 
-//nolint:revive // TODO(AML) Fix revive linter
 type Requires struct {
 	Lc     compdef.Lifecycle
 	Config configComponent.Component
@@ -41,7 +40,7 @@ type trafficCapture struct {
 }
 
 //nolint:revive // TODO(AML) Fix revive linter
-func NewTrafficCapture(deps Requires) replay.Component {
+func NewComponent(deps Requires) replay.Component {
 	tc := &trafficCapture{
 		config: deps.Config,
 		tagger: deps.Tagger,
@@ -56,7 +55,7 @@ func NewTrafficCapture(deps Requires) replay.Component {
 func (tc *trafficCapture) configure(_ context.Context) error {
 	writer := NewTrafficCaptureWriter(tc.config.GetInt("dogstatsd_capture_depth"), tc.tagger)
 	if writer == nil {
-		tc.startUpError = fmt.Errorf("unable to instantiate capture writer")
+		tc.startUpError = errors.New("unable to instantiate capture writer")
 	}
 	tc.writer = writer
 
@@ -78,7 +77,7 @@ func (tc *trafficCapture) IsOngoing() bool {
 // StartCapture starts a TrafficCapture and returns an error in the event of an issue.
 func (tc *trafficCapture) StartCapture(p string, d time.Duration, compressed bool) (string, error) {
 	if tc.IsOngoing() {
-		return "", fmt.Errorf("Ongoing capture in progress")
+		return "", errors.New("Ongoing capture in progress")
 	}
 
 	target, path, err := OpenFile(afero.NewOsFs(), p, tc.defaultlocation())

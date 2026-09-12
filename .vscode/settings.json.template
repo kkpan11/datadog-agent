@@ -1,13 +1,27 @@
 {{
     "go.buildTags": "{build_tags}",
-    "go.lintTool": "golangci-lint",
+    "go.testTags": "{build_tags}",
+    "go.lintTool": "bazelisk",
+    "go.buildFlags": ["-buildvcs=false"],
     "go.lintFlags": [
+        "run",
+        "//internal/tools:golangci-lint",
+        "--",
+        "run",
+        "--issues-exit-code=0",
+        "--output.text.print-issued-lines=false",
+        "--show-stats=false",
+        "--output.text.path=stdout",
+        "--path-mode=abs",
         "--build-tags",
         "{build_tags}"
     ],
     "[go]": {{
         "editor.formatOnSave": true,
     }},
+    "go.lintOnSave": "package",
+    "go.toolsManagement.checkForUpdates": "local",
+    "go.useLanguageServer": true,
     "gopls": {{
         "formatting.local": "github.com/DataDog/datadog-agent",
         "directoryFilters": {excluded_directories},

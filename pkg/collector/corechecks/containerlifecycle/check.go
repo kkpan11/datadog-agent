@@ -11,7 +11,7 @@ import (
 	"errors"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
@@ -49,17 +49,18 @@ type Check struct {
 	instance          *Config
 	processor         *processor
 	stopCh            chan struct{}
+	extendedSet       bool
 }
 
 // Configure parses the check configuration and initializes the container_lifecycle check
-func (c *Check) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string) error {
+func (c *Check) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string, provider string) error {
 	if !pkgconfigsetup.Datadog().GetBool("container_lifecycle.enabled") {
 		return errors.New("collection of container lifecycle events is disabled")
 	}
 
 	var err error
 
-	err = c.CommonConfigure(senderManager, initConfig, config, source)
+	err = c.CommonConfigure(senderManager, initConfig, config, source, provider)
 	if err != nil {
 		return err
 	}
@@ -82,7 +83,9 @@ func (c *Check) Configure(senderManager sender.SenderManager, _ uint64, config, 
 		c.instance.PollInterval = defaultPollInterval
 	}
 
-	c.processor = newProcessor(sender, c.instance.ChunkSize, c.workloadmetaStore)
+	c.extendedSet = pkgconfigsetup.Datadog().GetBool("container_lifecycle.extended_set")
+
+	c.processor = newProcessor(sender, c.instance.ChunkSize, c.workloadmetaStore, c.extendedSet)
 
 	return nil
 }
@@ -92,28 +95,54 @@ func (c *Check) Run() error {
 	log.Infof("Starting long-running check %q", c.ID())
 	defer log.Infof("Shutting down long-running check %q", c.ID())
 
-	filter := workloadmeta.NewFilterBuilder().
+	contDeleteFilterBuilder := workloadmeta.NewFilterBuilder().
 		SetSource(workloadmeta.SourceRuntime).
 		SetEventType(workloadmeta.EventTypeUnset).
-		AddKind(workloadmeta.KindContainer).
-		Build()
+		AddKind(workloadmeta.KindContainer)
 
 	contEventsCh := c.workloadmetaStore.Subscribe(
 		CheckName+"-cont",
 		workloadmeta.NormalPriority,
-		filter,
+		contDeleteFilterBuilder.Build(),
 	)
 
-	podFilter := workloadmeta.NewFilterBuilder().
+	var contCreateEventsCh chan workloadmeta.EventBundle
+	var contNodeOrchestratorDeleteEventsCh chan workloadmeta.EventBundle
+	if c.extendedSet {
+		contCreateFilterBuilder := workloadmeta.NewFilterBuilder().
+			SetSource(workloadmeta.SourceAll).
+			SetEventType(workloadmeta.EventTypeSet).
+			AddKind(workloadmeta.KindContainer)
+
+		contCreateEventsCh = c.workloadmetaStore.Subscribe(
+			CheckName+"-cont-create",
+			workloadmeta.NormalPriority,
+			contCreateFilterBuilder.Build(),
+		)
+
+		contNodeOrchestratorDeleteFilterBuilder := workloadmeta.NewFilterBuilder().
+			SetSource(workloadmeta.SourceNodeOrchestrator).
+			SetEventType(workloadmeta.EventTypeUnset).
+			AddKind(workloadmeta.KindContainer)
+
+		contNodeOrchestratorDeleteEventsCh = c.workloadmetaStore.Subscribe(
+			CheckName+"-cont-node-orchestrator-delete",
+			workloadmeta.NormalPriority,
+			contNodeOrchestratorDeleteFilterBuilder.Build(),
+		)
+	}
+
+	podFilterBuilder := workloadmeta.NewFilterBuilder().
 		SetSource(workloadmeta.SourceNodeOrchestrator).
-		SetEventType(workloadmeta.EventTypeUnset).
-		AddKind(workloadmeta.KindKubernetesPod).
-		Build()
+		AddKind(workloadmeta.KindKubernetesPod)
+	if !c.extendedSet {
+		podFilterBuilder = podFilterBuilder.SetEventType(workloadmeta.EventTypeUnset)
+	}
 
 	podEventsCh := c.workloadmetaStore.Subscribe(
 		CheckName+"-pod",
 		workloadmeta.NormalPriority,
-		podFilter,
+		podFilterBuilder.Build(),
 	)
 
 	var taskEventsCh chan workloadmeta.EventBundle
@@ -147,19 +176,31 @@ func (c *Check) Run() error {
 			if !ok {
 				return nil
 			}
-			c.processor.processEvents(eventBundle)
+			c.processor.processEvents(eventBundle, workloadmeta.SourceRuntime)
+		case eventBundle, ok := <-contCreateEventsCh:
+			if !ok {
+				stopProcessor()
+				return nil
+			}
+			c.processor.processEvents(eventBundle, workloadmeta.SourceAll)
+		case eventBundle, ok := <-contNodeOrchestratorDeleteEventsCh:
+			if !ok {
+				stopProcessor()
+				return nil
+			}
+			c.processor.processEvents(eventBundle, workloadmeta.SourceNodeOrchestrator)
 		case eventBundle, ok := <-podEventsCh:
 			if !ok {
 				stopProcessor()
 				return nil
 			}
-			c.processor.processEvents(eventBundle)
+			c.processor.processEvents(eventBundle, workloadmeta.SourceNodeOrchestrator)
 		case eventBundle, ok := <-taskEventsCh:
 			if !ok {
 				stopProcessor()
 				return nil
 			}
-			c.processor.processEvents(eventBundle)
+			c.processor.processEvents(eventBundle, workloadmeta.SourceNodeOrchestrator)
 		case <-c.stopCh:
 			return nil
 		}
@@ -187,7 +228,7 @@ func Factory(store workloadmeta.Component) option.Option[func() check.Check] {
 // sendFargateTaskEvent sends Fargate task lifecycle event at the end of the check
 func (c *Check) sendFargateTaskEvent() {
 	if !pkgconfigsetup.Datadog().GetBool("ecs_task_collection_enabled") ||
-		!env.IsECSFargate() {
+		!env.IsECSSidecarMode(pkgconfigsetup.Datadog()) {
 		return
 	}
 
@@ -206,5 +247,5 @@ func (c *Check) sendFargateTaskEvent() {
 			},
 		},
 		Ch: make(chan struct{}),
-	})
+	}, workloadmeta.SourceNodeOrchestrator)
 }

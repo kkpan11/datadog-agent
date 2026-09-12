@@ -1,6 +1,8 @@
 ARG BASE_IMAGE_UBUNTU_VERSION=24.04
 ARG BASE_IMAGE_UBUNTU_NAME=noble
-FROM ubuntu:$BASE_IMAGE_UBUNTU_VERSION AS baseimage
+ARG BASE_IMAGE_REGISTRY=docker.io
+
+FROM ${BASE_IMAGE_REGISTRY}/ubuntu:$BASE_IMAGE_UBUNTU_VERSION AS baseimage
 ARG BASE_IMAGE_UBUNTU_VERSION
 ARG BASE_IMAGE_UBUNTU_NAME
 LABEL baseimage.os="ubuntu ${BASE_IMAGE_UBUNTU_NAME}"
@@ -8,32 +10,50 @@ LABEL baseimage.name="ubuntu:${BASE_IMAGE_UBUNTU_VERSION}"
 LABEL org.opencontainers.image.base.name="ubuntu:${BASE_IMAGE_UBUNTU_VERSION}"
 LABEL org.opencontainers.image.title="Datadog Agent"
 
-ARG CIBUILD
-# NOTE about APT mirrorlists:
-# It seems that this feature could use some improvement. If you just get mirrorlist
-# from mirrors.ubuntu.com/mirrors.txt, it might contain faulty mirrors that either
-# cause `apt update` to fail with exit code 100 or make it hang on `0% [Working]`
-# indefinitely. Therefore we create a mirrorlist with the 2 mirrors that we know
-# should be reliable enough in combination and also well maintained.
-RUN if [ "$CIBUILD" = "true" ]; then \
-  echo "http://us-east-1.ec2.archive.ubuntu.com/ubuntu\tpriority:1\nhttp://archive.ubuntu.com/ubuntu" > /etc/apt/mirrorlist.main && \
-  echo "http://us-east-1.ec2.ports.ubuntu.com/ubuntu-ports\tpriority:1\nhttp://ports.ubuntu.com/ubuntu-ports" > /etc/apt/mirrorlist.ports && \
-  sed -i -e 's#http://archive.ubuntu.com\S*#mirror+file:/etc/apt/mirrorlist.main#g' \
-         -e 's#http://security.ubuntu.com\S*#mirror+file:/etc/apt/mirrorlist.main#g' \
-         -e 's#http://ports.ubuntu.com\S*#mirror+file:/etc/apt/mirrorlist.ports#g' /etc/apt/sources.list; \
+ARG CI
+# APT mirror resilience in CI:
+# Ubuntu EC2 AMIs point apt at a single regional mirror (us-east-1) with no real
+# failover. When that mirror is slow-but-reachable, apt would stall until the CI
+# job timeout: the `mirror` method only falls back on a fully-unreachable mirror,
+# and Acquire::Retries retries the SAME URI. The base image version is
+# configurable (BASE_IMAGE_UBUNTU_VERSION), so we handle both source formats:
+#   - deb822 ubuntu.sources (>= 24.04): rewrite the URIs: fields to an ordered
+#     multi-URI list so apt fails over to the next mirror on error.
+#   - legacy one-line sources.list (< 24.04): the format can't list multiple URIs
+#     per entry, so use mirror+file with a peer mirrorlist (fallback on an
+#     unreachable mirror).
+# Canonical's global archive.ubuntu.com / ports.ubuntu.com endpoints are used first,
+# with mirror.leaseweb.net as an ordered fallback. A short Acquire timeout + Retries 1
+# turns a slow mirror into a fast error that triggers failover. Related:
+# test/new-e2e/tests/installer/host/host.go (ConfigureAptMirrors).
+RUN if [ "$CI" = "true" ]; then \
+  printf 'Acquire::Retries "1";\nAcquire::http::Timeout "10";\nAcquire::https::Timeout "10";\n' > /etc/apt/apt.conf.d/99datadog-mirror-resilience && \
+  printf 'http://archive.ubuntu.com/ubuntu\nhttp://mirror.leaseweb.net/ubuntu\n' > /etc/apt/mirrorlist.main && \
+  printf 'http://ports.ubuntu.com/ubuntu-ports\nhttp://mirror.leaseweb.net/ubuntu-ports\n' > /etc/apt/mirrorlist.ports && \
+  if [ -f /etc/apt/sources.list ]; then \
+    sed -i -e 's#http://archive.ubuntu.com\S*#mirror+file:/etc/apt/mirrorlist.main#g' \
+           -e 's#http://security.ubuntu.com\S*#mirror+file:/etc/apt/mirrorlist.main#g' \
+           -e 's#http://ports.ubuntu.com\S*#mirror+file:/etc/apt/mirrorlist.ports#g' /etc/apt/sources.list; \
+  fi && \
+  if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+    sed -i -E \
+      -e 's#^(URIs:[[:space:]]+)https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?[[:space:]]*$#\1http://archive.ubuntu.com/ubuntu http://mirror.leaseweb.net/ubuntu#' \
+      -e 's#^(URIs:[[:space:]]+)https?://security\.ubuntu\.com/ubuntu/?[[:space:]]*$#\1http://archive.ubuntu.com/ubuntu http://mirror.leaseweb.net/ubuntu#' \
+      -e 's#^(URIs:[[:space:]]+)https?://[a-z0-9.-]*ports\.ubuntu\.com/ubuntu-ports/?[[:space:]]*$#\1http://ports.ubuntu.com/ubuntu-ports http://mirror.leaseweb.net/ubuntu-ports#' \
+      /etc/apt/sources.list.d/ubuntu.sources; \
+  fi; \
   fi
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt update
 
 FROM baseimage AS nosys-seccomp
-RUN apt install --no-install-recommends -y gcc libc6-dev libseccomp-dev
+RUN apt update && apt install --no-install-recommends -y gcc libc6-dev libseccomp-dev
 COPY nosys-seccomp/nosys.c   /tmp/nosys.c
 COPY nosys-seccomp/nosys.sym /tmp/nosys.sym
 RUN gcc -pipe -Wall -Wextra -O2 -shared -fPIC -Wl,--version-script=/tmp/nosys.sym -o /tmp/nosys.so /tmp/nosys.c  -lseccomp
 
 FROM baseimage AS extract-base
-RUN apt install --no-install-recommends -y curl ca-certificates maven xz-utils
+RUN apt update && apt install --no-install-recommends -y curl ca-certificates maven xz-utils
 
 ############################################################
 #  Preparation stage: retrieval of 3rd party dependencies  #
@@ -60,48 +80,6 @@ RUN echo "$(cat /output/s6.$TARGETARCH.sha256) /output/s6.tgz" | sha256sum -c - 
 COPY bouncycastle-fips/pom.xml /opt/bouncycastle-fips/
 RUN if [ -n "$WITH_JMX_FIPS" ]; then cd /opt/bouncycastle-fips && mvn dependency:copy-dependencies; else mkdir -p /opt/bouncycastle-fips/target/dependency; fi
 
-############################################
-#  Preparation stage: extract and cleanup  #
-############################################
-
-FROM extract-base AS extract
-ARG TARGETARCH
-ARG WITH_JMX
-
-ARG DD_AGENT_ARTIFACT=datadog-agent*-$TARGETARCH.tar.xz
-# copy everything - globbing with args wont work
-COPY ${DD_AGENT_ARTIFACT} /
-WORKDIR /output
-
-# Configuration:
-#   - copy default config files
-COPY datadog*.yaml etc/datadog-agent/
-
-# Installation information
-COPY install_info etc/datadog-agent/
-
-# Extract and cleanup:
-#   - unused systemd unit
-#   - GPL sources for embedded software  # FIXME: move upstream
-#   - docs and manpages                  # FIXME: move upstream
-#   - static libraries                   # FIXME: move upstream
-#   - jmxfetch on nojmx build
-
-RUN --mount=from=artifacts,target=/artifacts \
- find /artifacts -maxdepth 1 -type f -name "datadog-*-$TARGETARCH.tar.xz" ! -name "$DD_AGENT_ARTIFACT" -exec rm {} \; \
- && find /artifacts -maxdepth 1 -name "${DD_AGENT_ARTIFACT}" -exec tar xvf {} -C . \; \
- && rm -rf usr etc/init lib \
-    go/ \
-    opt/datadog-agent/sources \
-    opt/datadog-agent/embedded/share/doc \
-    opt/datadog-agent/embedded/share/man \
-    # self-test certificates that are detected (false positive) as private keys
-    opt/datadog-agent/embedded/lib/python*/site-packages/future/backports/test \
- && find opt/datadog-agent/ -iname "*.a" -delete \
- && if [ -z "$WITH_JMX" ]; then rm -rf opt/datadog-agent/bin/agent/dist/jmx; fi \
- && mkdir conf.d checks.d
-
-
 ########################################################################
 #  Construct the base image for the release, everything but the Agent  #
 ########################################################################
@@ -121,12 +99,13 @@ ENV DOCKER_DD_AGENT=true \
     S6_READ_ONLY_ROOT=1
 
 # make sure we have recent dependencies -- CVE-fixing time!
-RUN apt full-upgrade -y \
+RUN apt update \
+  && apt full-upgrade -y \
   # Install iproute2 package for the ss utility that is used by the network check.
   # When the network check will have switched from using ss to directly parsing /proc/net/tcp,
   # this can be removed
   # Install libseccomp2 as required by `nosys-seccomp` wrapper
-  && apt install -y iproute2 libseccomp2 tzdata adduser
+  && apt install --no-install-recommends -y iproute2 libseccomp2 tzdata adduser
 
 ARG WITH_JMX
 ARG WITH_JMX_FIPS
@@ -167,7 +146,51 @@ ENV JAVA_TOOL_OPTIONS="${WITH_JMX_FIPS:+--module-path=/opt/bouncycastle-fips -Dj
 # S6 entrypoint, service definitions, healthcheck probe
 COPY s6-services /etc/services.d/
 COPY cont-init.d /etc/cont-init.d/
-COPY probe.sh initlog.sh secrets-helper/readsecret.py secrets-helper/readsecret.sh secrets-helper/readsecret_multiple_providers.sh /
+COPY probe.sh par-probe.sh initlog.sh secrets-helper/readsecret.py secrets-helper/readsecret.sh secrets-helper/readsecret_multiple_providers.sh /
+
+# dd-procmgrd process definitions
+COPY --chmod=644 processes.d /opt/datadog-agent/processes.d/
+
+##########################################################
+#  Preparation stage: extract Agent package and cleanup  #
+##########################################################
+
+FROM extract-base AS extract
+ARG TARGETARCH
+ARG WITH_JMX
+
+ARG DD_AGENT_ARTIFACT=datadog-agent*-$TARGETARCH.tar.xz
+WORKDIR /output
+
+# Configuration:
+#   - copy default config files
+COPY datadog*.yaml etc/datadog-agent/
+
+# Installation information
+COPY install_info etc/datadog-agent/
+
+# Extract and cleanup:
+#   - unused systemd unit
+#   - unused installer binary
+#   - GPL sources for embedded software  # FIXME: move upstream
+#   - docs and manpages                  # FIXME: move upstream
+#   - static libraries                   # FIXME: move upstream
+#   - jmxfetch on nojmx build
+
+RUN --mount=from=artifacts,target=/artifacts \
+ find /artifacts -maxdepth 1 -name "${DD_AGENT_ARTIFACT}" -exec tar xvf {} -C . \; \
+ && rm -rf usr etc/init lib \
+    go/ \
+    opt/datadog-agent/embedded/bin/installer \
+    opt/datadog-agent/embedded/bin/dd-compile-policy \
+    opt/datadog-agent/sources \
+    opt/datadog-agent/embedded/share/doc \
+    opt/datadog-agent/embedded/share/man \
+    # self-test certificates that are detected (false positive) as private keys
+    opt/datadog-agent/embedded/lib/python*/site-packages/future/backports/test \
+ && find opt/datadog-agent/ -iname "*.a" -delete \
+ && if [ -z "$WITH_JMX" ]; then rm -rf opt/datadog-agent/bin/agent/dist/jmx; fi \
+ && mkdir conf.d checks.d
 
 ###########################################################
 #  Release docker image construction including the Agent  #
@@ -193,14 +216,23 @@ COPY --from=extract /output/ /
 # - Remove the /var/run -> /run symlink and create a legit /var/run folder
 # as some docker versions re-create /run from zero at container start
 RUN adduser --system --no-create-home --disabled-password --ingroup root dd-agent \
+  && install -o dd-agent -g root -m 0440 /dev/null /opt/datadog-agent/.dd-agent-identity \
   && addgroup --system secret-manager \
   && usermod -a -G secret-manager dd-agent \
-  && rm /var/run && mkdir -p /var/run/s6 && mkdir -p /var/run/datadog \
-  && chown -R dd-agent:root /etc/datadog-agent/ /etc/s6/ /var/run/s6/ /var/log/datadog/ /var/run/datadog/ \
-  && chmod g+r,g+w,g+X -R /etc/datadog-agent/ /etc/s6/ /var/run/s6/ /var/log/datadog/ /var/run/datadog/ \
-  && chmod 755 /probe.sh /initlog.sh \
-  && chown root:secret-manager /readsecret.py /readsecret.sh /readsecret_multiple_providers.sh \
-  && chmod 550 /readsecret.py /readsecret.sh /readsecret_multiple_providers.sh
+  && rm /var/run && mkdir -p /var/run/s6 /var/run/datadog /var/run/datadog-procmgrd /opt/datadog-agent/run \
+  && chown -R dd-agent:root /etc/datadog-agent/ /etc/s6/ /var/run/s6/ /var/log/datadog/ /var/run/datadog/ /var/run/datadog-procmgrd/ /opt/datadog-agent/run \
+  && chmod g+r,g+w,g+X -R /etc/datadog-agent/ /etc/s6/ /var/run/s6/ /var/log/datadog/ /var/run/datadog/ /var/run/datadog-procmgrd/ /opt/datadog-agent/run \
+  && chmod 755 /probe.sh /par-probe.sh /initlog.sh \
+  && chown root:secret-manager /readsecret.py /readsecret.sh /readsecret_multiple_providers.sh /opt/datadog-agent/embedded/bin/secret-generic-connector \
+  && chmod 550 /readsecret.py /readsecret.sh /readsecret_multiple_providers.sh /opt/datadog-agent/embedded/bin/secret-generic-connector \
+  # Keep the PAR config read-only, but group-readable so init containers can
+  # copy it on OpenShift where containers run with a random UID in the root group.
+  && chmod u=r,g=r,o= /etc/datadog-agent/private-action-runner/*
+
+# Restrict built-in Rust shared-library checks to root and the root group (no-op when none are present).
+# Group-readable so init containers can copy them on OpenShift, where containers run with a
+# random UID in the root group (same reasoning as the private-action-runner config above).
+RUN find /etc/datadog-agent/checks.d -name 'libdatadog-agent-*.so' -exec chmod 0550 {} \;
 
 # Check that the UID of dd-agent is still 100.
 #
@@ -216,7 +248,8 @@ RUN [ "$(getent passwd dd-agent | cut -d: -f 3)" -eq 100 ]
 # cleaning up
 # We remove /etc/ssl because in JMX images, openjdk triggers installation of ca-certificates-java
 # which writes to /etc/ssl. Yet, in the Agent we only rely on certs shipped in the Agent package.
-RUN rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /etc/ssl
+RUN apt-get purge -y adduser \
+  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /etc/ssl
 RUN ln -sf /opt/datadog-agent/embedded/ssl /etc/ssl
 
 # Enable FIPS if needed
@@ -229,6 +262,11 @@ RUN if [ ! -f /opt/datadog-agent/embedded/bin/otel-agent ]; then \
   rm -rf /etc/services.d/otel ; \
   else \
   mv /etc/datadog-agent/otel-config.yaml.example /etc/datadog-agent/otel-config.yaml; fi
+
+# Update if optional Agent Data Plane process should not run
+RUN if [ ! -f /opt/datadog-agent/embedded/bin/agent-data-plane ]; then \
+  rm -rf /etc/services.d/data-plane ; \
+fi
 
 RUN find /etc -type d,f -perm -o+w -print0 | xargs -r -0 chmod g-w,o-w
 

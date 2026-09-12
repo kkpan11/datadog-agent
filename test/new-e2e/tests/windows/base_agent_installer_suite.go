@@ -9,8 +9,8 @@ package windows
 import (
 	"path/filepath"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
 	platformCommon "github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-platform/common"
 	windowsAgent "github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common/agent"
 )
@@ -45,9 +45,11 @@ func (b *BaseAgentInstallerSuite[Env]) SetupSuite() {
 	defer b.CleanupOnSetupFailure()
 
 	var err error
-	b.AgentPackage, err = windowsAgent.GetPackageFromEnv()
-	if err != nil {
-		b.T().Fatalf("failed to get MSI URL from env: %v", err)
+	if b.AgentPackage == nil {
+		b.AgentPackage, err = windowsAgent.GetPackageFromEnv()
+		if err != nil {
+			b.T().Fatalf("failed to get MSI URL from env: %v", err)
+		}
 	}
 	b.T().Logf("Using Agent: %#v", b.AgentPackage)
 }

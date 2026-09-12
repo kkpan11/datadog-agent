@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2025-present Datadog, Inc.
 
-//go:build (linux && linux_bpf) || (windows && npm)
+//go:build (linux && bpf) || (windows && npm)
 
 package modules
 
@@ -20,7 +20,7 @@ import (
 
 func registerUSMCommonEndpoints(nt *networkTracer, httpMux *module.Router) {
 	httpMux.HandleFunc("/debug/http_monitoring", func(w http.ResponseWriter, req *http.Request) {
-		if !coreconfig.SystemProbe().GetBool("service_monitoring_config.enable_http_monitoring") {
+		if !coreconfig.SystemProbe().GetBool("service_monitoring_config.http.enabled") {
 			writeDisabledProtocolMessage("http", w)
 			return
 		}
@@ -33,7 +33,7 @@ func registerUSMCommonEndpoints(nt *networkTracer, httpMux *module.Router) {
 		}
 		defer cleanup()
 
-		utils.WriteAsJSON(w, httpdebugging.HTTP(cs.USMData.HTTP, cs.DNS), utils.GetPrettyPrintFromQueryParams(req))
+		utils.WriteAsJSON(req, w, httpdebugging.HTTP(cs.USMData.HTTP, cs.DNS), utils.GetPrettyPrintFromQueryParams(req))
 	})
 
 	httpMux.HandleFunc("/debug/usm_telemetry", telemetry.Handler)

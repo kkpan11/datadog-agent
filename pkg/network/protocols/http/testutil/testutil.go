@@ -10,7 +10,7 @@ package testutil
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -38,6 +38,8 @@ type Options struct {
 	ReadTimeout         time.Duration
 	WriteTimeout        time.Duration
 	SlowResponse        time.Duration
+	CertPath            string
+	KeyPath             string
 }
 
 func isNetIPV4TCPTimestampEnabled(t *testing.T) bool {
@@ -190,7 +192,7 @@ func GetCertsPaths() (string, string, error) {
 func CurDir() (string, error) {
 	_, file, _, ok := runtime.Caller(1)
 	if !ok {
-		return "", fmt.Errorf("unable to get current file build path")
+		return "", errors.New("unable to get current file build path")
 	}
 
 	buildDir := filepath.Dir(file)
@@ -200,6 +202,14 @@ func CurDir() (string, error) {
 	relPath, err := filepath.Rel(buildRoot, buildDir)
 	if err != nil {
 		return "", err
+	}
+
+	// Under Bazel, the test runs from the sandbox execroot and its data
+	// dependencies live in the runfiles tree, not next to the package sources.
+	// Resolve the package directory relative to the runfiles root so that
+	// `data`-declared testdata is found.
+	if srcDir := os.Getenv("TEST_SRCDIR"); srcDir != "" {
+		return filepath.Join(srcDir, os.Getenv("TEST_WORKSPACE"), relPath), nil
 	}
 
 	cwd, err := os.Getwd()

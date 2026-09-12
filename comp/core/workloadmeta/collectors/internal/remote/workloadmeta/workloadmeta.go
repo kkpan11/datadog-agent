@@ -8,18 +8,21 @@ package workloadmeta
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
 	"go.uber.org/fx"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/grpclog"
 
+	config "github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	"github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/internal/remote"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/comp/core/workloadmeta/proto"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 	grpcutil "github.com/DataDog/datadog-agent/pkg/util/grpc"
 )
@@ -40,8 +43,10 @@ const (
 // types to protobuf and vice versa.
 var supportedKinds = []workloadmeta.Kind{
 	workloadmeta.KindContainer,
+	workloadmeta.KindContainerImageMetadata,
 	workloadmeta.KindKubernetesPod,
 	workloadmeta.KindECSTask,
+	workloadmeta.KindProcess,
 }
 
 // Params defines the parameters of the remote workloadmeta collector.
@@ -53,6 +58,8 @@ type dependencies struct {
 	fx.In
 
 	Params Params
+	Config config.Component
+	IPC    ipc.Component
 }
 
 type client struct {
@@ -88,14 +95,15 @@ func (s *stream) Recv() (interface{}, error) {
 
 type streamHandler struct {
 	port   int
+	ipc    ipc.Component
 	filter *workloadmeta.Filter
-	model.Config
+	model.Reader
 }
 
 // NewCollector returns a CollectorProvider to build a remote workloadmeta collector, and an error if any.
 func NewCollector(deps dependencies) (workloadmeta.CollectorProvider, error) {
 	if filterHasUnsupportedKind(deps.Params.Filter) {
-		return workloadmeta.CollectorProvider{}, fmt.Errorf("the filter specified contains unsupported kinds")
+		return workloadmeta.CollectorProvider{}, errors.New("the filter specified contains unsupported kinds")
 	}
 
 	return workloadmeta.CollectorProvider{
@@ -103,9 +111,12 @@ func NewCollector(deps dependencies) (workloadmeta.CollectorProvider, error) {
 			CollectorID: collectorID,
 			StreamHandler: &streamHandler{
 				filter: deps.Params.Filter,
-				Config: pkgconfigsetup.Datadog(),
+				ipc:    deps.IPC,
+				Reader: deps.Config,
 			},
 			Catalog: workloadmeta.Remote,
+			Config:  deps.Config,
+			IPC:     deps.IPC,
 		},
 	}, nil
 }
@@ -122,10 +133,19 @@ func init() {
 
 func (s *streamHandler) Port() int {
 	if s.port == 0 {
-		return s.Config.GetInt("cmd_port")
+		return s.Reader.GetInt("cmd_port")
 	}
 	// for tests
 	return s.port
+}
+
+func (s *streamHandler) Address() string {
+	return fmt.Sprintf(":%d", s.Port())
+}
+
+func (s *streamHandler) Credentials() credentials.TransportCredentials {
+	creds := credentials.NewTLS(s.ipc.GetTLSClientConfig())
+	return creds
 }
 
 func (s *streamHandler) NewClient(cc grpc.ClientConnInterface) remote.GrpcClient {
@@ -143,7 +163,7 @@ func (s *streamHandler) IsEnabled() bool {
 func (s *streamHandler) HandleResponse(_ workloadmeta.Component, resp interface{}) ([]workloadmeta.CollectorEvent, error) {
 	response, ok := resp.(*pb.WorkloadmetaStreamResponse)
 	if !ok {
-		return nil, fmt.Errorf("incorrect response type")
+		return nil, errors.New("incorrect response type")
 	}
 	var collectorEvents []workloadmeta.CollectorEvent
 
@@ -163,6 +183,14 @@ func (s *streamHandler) HandleResponse(_ workloadmeta.Component, resp interface{
 	}
 
 	return collectorEvents, nil
+}
+
+func (s *streamHandler) IsResyncComplete(response interface{}) bool {
+	resp, ok := response.(*pb.WorkloadmetaStreamResponse)
+	if !ok {
+		return true
+	}
+	return resp.GetInitialSnapshotComplete()
 }
 
 func (s *streamHandler) HandleResync(store workloadmeta.Component, events []workloadmeta.CollectorEvent) {

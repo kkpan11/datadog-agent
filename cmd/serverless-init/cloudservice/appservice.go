@@ -10,6 +10,10 @@ import (
 	"maps"
 	"os"
 
+	serverlessInitLog "github.com/DataDog/datadog-agent/cmd/serverless-init/log"
+	"github.com/DataDog/datadog-agent/cmd/serverless-init/mode"
+	"github.com/DataDog/datadog-agent/pkg/metrics"
+	serverlessMetrics "github.com/DataDog/datadog-agent/pkg/serverless/metrics"
 	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
 )
 
@@ -28,6 +32,15 @@ const (
 
 	// AppServiceOrigin origin tag value
 	AppServiceOrigin = "appservice"
+
+	appServicePrefix             = "azure.app_services."
+	appServiceShutdownMetricName = "azure.app_services.enhanced.shutdown"
+	appServiceStartMetricName    = "azure.app_services.enhanced.cold_start"
+
+	appServiceLegacyShutdownMetricName = "azure.appservice.enhanced.shutdown"
+	appServiceLegacyStartMetricName    = "azure.appservice.enhanced.cold_start"
+
+	appServiceUsageMetricSuffix = "instance"
 )
 
 // GetTags returns a map of Azure-related tags
@@ -47,21 +60,66 @@ func (a *AppService) GetTags() map[string]string {
 	return tags
 }
 
+func (a *AppService) GetEnhancedMetricTags(tags map[string]string) EnhancedMetricTags {
+	baseTags := map[string]string{
+		"name":            tagValueOrUnknown(tags["app_name"]),
+		"origin":          tagValueOrUnknown(tags["origin"]),
+		"region":          tagValueOrUnknown(tags["region"]),
+		"resource_group":  tagValueOrUnknown(tags["aas.resource.group"]),
+		"subscription_id": tagValueOrUnknown(tags["aas.subscription.id"]),
+	}
+
+	usageTags := maps.Clone(baseTags)
+	usageTags["instance"] = tagValueOrUnknown(tags["aas.environment.instance_name"])
+
+	return EnhancedMetricTags{Base: baseTags, Usage: usageTags}
+}
+
+// GetDefaultLogsSource returns the default logs source if `DD_SOURCE` is not set
+func (a *AppService) GetDefaultLogsSource() string {
+	return AppServiceOrigin
+}
+
 // GetOrigin returns the `origin` attribute type for the given
 // cloud service.
 func (a *AppService) GetOrigin() string {
 	return AppServiceOrigin
 }
 
-// GetPrefix returns the prefix that we're prefixing all
-// metrics with.
-func (a *AppService) GetPrefix() string {
-	return "azure.appservice"
+func (a *AppService) GetMetricPrefix() string {
+	return appServicePrefix
+}
+
+func (a *AppService) GetUsageMetricSuffix() string {
+	return appServiceUsageMetricSuffix
+}
+
+// GetSource returns the metrics source
+func (a *AppService) GetSource() metrics.MetricSource {
+	return metrics.MetricSourceAzureAppServiceEnhanced
 }
 
 // Init is empty for AppService
-func (a *AppService) Init() error {
+func (a *AppService) Init(_ *TracingContext) error {
 	return nil
+}
+
+// Run uses the default run behaviour for AppService.
+func (a *AppService) Run(modeConf mode.Conf, logConfig *serverlessInitLog.Config) error {
+	return defaultRun(modeConf, logConfig)
+}
+
+// Shutdown emits the shutdown metric for AppService
+func (a *AppService) Shutdown(metricAgent *serverlessMetrics.ServerlessMetricAgent, enhancedMetricsEnabled bool, _ error) {
+	if metricAgent != nil && enhancedMetricsEnabled {
+		metricAgent.AddEnhancedMetric(appServiceShutdownMetricName, 1.0, a.GetSource(), 0)
+		metricAgent.AddLegacyEnhancedMetric(appServiceLegacyShutdownMetricName, 1.0, a.GetSource())
+	}
+}
+
+func (a *AppService) AddStartMetric(metricAgent *serverlessMetrics.ServerlessMetricAgent) {
+	metricAgent.AddEnhancedMetric(appServiceStartMetricName, 1.0, a.GetSource(), 0)
+	metricAgent.AddLegacyEnhancedMetric(appServiceLegacyStartMetricName, 1.0, a.GetSource())
 }
 
 func isAppService() bool {

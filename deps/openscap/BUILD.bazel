@@ -1,0 +1,2 @@
+# Empty package; required so the openscap.MODULE.bazel include in the root
+# MODULE.bazel can resolve.

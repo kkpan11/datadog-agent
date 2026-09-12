@@ -10,10 +10,6 @@ package autoinstrumentation
 import (
 	"fmt"
 	"slices"
-
-	corev1 "k8s.io/api/core/v1"
-
-	"github.com/DataDog/datadog-agent/pkg/clusteragent/admission/common"
 )
 
 const (
@@ -23,15 +19,17 @@ const (
 	dotnet language = "dotnet"
 	ruby   language = "ruby"
 	php    language = "php"
+	c      language = "c"
 )
 
 // language is lang-library we might be injecting.
 type language string
 
 func (l language) defaultLibInfo(registry, ctrName string) libInfo {
-	return l.libInfo(ctrName, l.libImageName(registry, l.defaultLibVersion()))
+	return l.libInfoWithResolver(ctrName, registry, l.defaultLibVersion())
 }
 
+// DEV: This is just formatting, no resolution is done here
 func (l language) libImageName(registry, tag string) string {
 	if tag == defaultVersionMagicString {
 		tag = l.defaultLibVersion()
@@ -40,6 +38,7 @@ func (l language) libImageName(registry, tag string) string {
 	return fmt.Sprintf("%s/dd-lib-%s-init:%s", registry, l, tag)
 }
 
+// DEV: Legacy
 func (l language) libInfo(ctrName, image string) libInfo {
 	return libInfo{
 		lang:    l,
@@ -48,53 +47,19 @@ func (l language) libInfo(ctrName, image string) libInfo {
 	}
 }
 
-const (
-	libVersionAnnotationKeyFormat    = "admission.datadoghq.com/%s-lib.version"
-	customLibAnnotationKeyFormat     = "admission.datadoghq.com/%s-lib.custom-image"
-	libVersionAnnotationKeyCtrFormat = "admission.datadoghq.com/%s.%s-lib.version"
-	customLibAnnotationKeyCtrFormat  = "admission.datadoghq.com/%s.%s-lib.custom-image"
-)
-
-func (l language) customLibAnnotationExtractor() annotationExtractor[libInfo] {
-	return annotationExtractor[libInfo]{
-		key: fmt.Sprintf(customLibAnnotationKeyFormat, l),
-		do: func(image string) (libInfo, error) {
-			return l.libInfo("", image), nil
-		},
+// DEV: Will attempt to resolve, defaults to legacy if unable
+func (l language) libInfoWithResolver(ctrName, registry string, version string) libInfo {
+	if version == defaultVersionMagicString {
+		version = l.defaultLibVersion()
 	}
-}
 
-func (l language) libVersionAnnotationExtractor(registry string) annotationExtractor[libInfo] {
-	return annotationExtractor[libInfo]{
-		key: fmt.Sprintf(libVersionAnnotationKeyFormat, l),
-		do: func(version string) (libInfo, error) {
-			return l.libInfo("", l.libImageName(registry, version)), nil
-		},
-	}
-}
-
-func (l language) ctrCustomLibAnnotationExtractor(ctr string) annotationExtractor[libInfo] {
-	return annotationExtractor[libInfo]{
-		key: fmt.Sprintf(customLibAnnotationKeyCtrFormat, ctr, l),
-		do: func(image string) (libInfo, error) {
-			return l.libInfo(ctr, image), nil
-		},
-	}
-}
-
-func (l language) ctrLibVersionAnnotationExtractor(ctr, registry string) annotationExtractor[libInfo] {
-	return annotationExtractor[libInfo]{
-		key: fmt.Sprintf(libVersionAnnotationKeyCtrFormat, ctr, l),
-		do: func(version string) (libInfo, error) {
-			return l.libInfo(ctr, l.libImageName(registry, version)), nil
-		},
-	}
-}
-
-func (l language) libConfigAnnotationExtractor() annotationExtractor[common.LibConfig] {
-	return annotationExtractor[common.LibConfig]{
-		key: fmt.Sprintf(common.LibConfigV1AnnotKeyFormat, l),
-		do:  parseConfigJSON,
+	return libInfo{
+		lang:       l,
+		ctrName:    ctrName,
+		image:      l.libImageName(registry, version),
+		registry:   registry,
+		repository: fmt.Sprintf("dd-lib-%s-init", l),
+		tag:        version,
 	}
 }
 
@@ -107,11 +72,22 @@ var supportedLanguages = []language{
 	dotnet,
 	ruby,
 	php, // PHP only works with injection v2, no environment variables are set in any case
+	c,
 }
 
-func defaultSupportedLanguagesMap() map[language]bool {
+// defaultInjectedLanguages defines the languages included in the default/all bundle.
+var defaultInjectedLanguages = []language{
+	java,
+	js,
+	python,
+	dotnet,
+	ruby,
+	php,
+}
+
+func defaultInjectedLanguagesMap() map[language]bool {
 	m := map[language]bool{}
-	for _, l := range supportedLanguages {
+	for _, l := range defaultInjectedLanguages {
 		m[l] = true
 	}
 
@@ -133,10 +109,11 @@ const defaultVersionMagicString = "default"
 var languageVersions = map[language]string{
 	java:   "v1", // https://datadoghq.atlassian.net/browse/APMON-1064
 	dotnet: "v3", // https://datadoghq.atlassian.net/browse/APMON-1390
-	python: "v3", // https://datadoghq.atlassian.net/browse/INPLAT-598
+	python: "v4", // https://datadoghq.atlassian.net/browse/INPLAT-852
 	ruby:   "v2", // https://datadoghq.atlassian.net/browse/APMON-1066
-	js:     "v5", // https://datadoghq.atlassian.net/browse/APMON-1065
+	js:     "v6",
 	php:    "v1", // https://datadoghq.atlassian.net/browse/APMON-1128
+	c:      "v0",
 }
 
 func (l language) defaultLibVersion() string {
@@ -148,165 +125,14 @@ func (l language) defaultLibVersion() string {
 }
 
 type libInfo struct {
-	ctrName string // empty means all containers
-	lang    language
-	image   string
+	ctrName    string // empty means all containers
+	lang       language
+	image      string
+	registry   string
+	repository string
+	tag        string
 }
 
-func (i libInfo) podMutator(v version, opts libRequirementOptions) podMutator {
-	return podMutatorFunc(func(pod *corev1.Pod) error {
-		reqs, ok := i.libRequirement(v)
-		if !ok {
-			return fmt.Errorf(
-				"language %q is not supported. Supported languages are %v",
-				i.lang, supportedLanguages,
-			)
-		}
-
-		reqs.libRequirementOptions = opts
-
-		if err := reqs.injectPod(pod, i.ctrName); err != nil {
-			return err
-		}
-
-		return nil
-	})
-}
-
-// initContainers is which initContainers we are injecting
-// into the pod that runs for this language.
-func (i libInfo) initContainers(v version) []initContainer {
-	var (
-		args, command []string
-		mounts        []corev1.VolumeMount
-		cName         = initContainerName(i.lang)
-	)
-
-	if v.usesInjector() {
-		mounts = []corev1.VolumeMount{
-			// we use the library mount on its lang-based sub-path
-			{
-				MountPath: v1VolumeMount.MountPath,
-				SubPath:   v2VolumeMountLibrary.SubPath + "/" + string(i.lang),
-				Name:      sourceVolume.Name,
-			},
-			// injector mount for the timestamps
-			v2VolumeMountInjector.VolumeMount,
-		}
-		tsFilePath := v2VolumeMountInjector.MountPath + "/c-init-time." + cName
-		command = []string{"/bin/sh", "-c", "--"}
-		args = []string{
-			fmt.Sprintf(
-				`sh copy-lib.sh %s && echo $(date +%%s) >> %s`,
-				mounts[0].MountPath, tsFilePath,
-			),
-		}
-	} else {
-		mounts = []corev1.VolumeMount{v1VolumeMount.VolumeMount}
-		command = []string{"sh", "copy-lib.sh", mounts[0].MountPath}
-	}
-
-	return []initContainer{
-		{
-			Container: corev1.Container{
-				Name:         cName,
-				Image:        i.image,
-				Command:      command,
-				Args:         args,
-				VolumeMounts: mounts,
-			},
-		},
-	}
-}
-
-func (i libInfo) volumeMount(v version) volumeMount {
-	if v.usesInjector() {
-		return v2VolumeMountLibrary
-	}
-
-	return v1VolumeMount
-}
-
-func (i libInfo) envVars(v version) []envVar {
-	if v.usesInjector() {
-		return nil
-	}
-
-	switch i.lang {
-	case java:
-		return []envVar{
-			{
-				key:     javaToolOptionsKey,
-				valFunc: javaEnvValFunc,
-			},
-		}
-	case js:
-		return []envVar{
-			{
-				key:     nodeOptionsKey,
-				valFunc: jsEnvValFunc,
-			},
-		}
-	case python:
-		return []envVar{
-			{
-				key:     pythonPathKey,
-				valFunc: pythonEnvValFunc,
-			},
-		}
-	case dotnet:
-		return []envVar{
-			{
-				key:     dotnetClrEnableProfilingKey,
-				valFunc: identityValFunc(dotnetClrEnableProfilingValue),
-			},
-			{
-				key:     dotnetClrProfilerIDKey,
-				valFunc: identityValFunc(dotnetClrProfilerIDValue),
-			},
-			{
-				key:     dotnetClrProfilerPathKey,
-				valFunc: identityValFunc(dotnetClrProfilerPathValue),
-			},
-			{
-				key:     dotnetTracerHomeKey,
-				valFunc: identityValFunc(dotnetTracerHomeValue),
-			},
-			{
-				key:     dotnetTracerLogDirectoryKey,
-				valFunc: identityValFunc(dotnetTracerLogDirectoryValue),
-			},
-			{
-				key:     dotnetProfilingLdPreloadKey,
-				valFunc: dotnetProfilingLdPreloadEnvValFunc,
-				isEligibleToInject: func(_ *corev1.Container) bool {
-					// N.B. Always disabled for now until we have a better mechanism to inject
-					//      this safely.
-					return false
-				},
-			},
-		}
-	case ruby:
-		return []envVar{
-			{
-				key:     rubyOptKey,
-				valFunc: rubyEnvValFunc,
-			},
-		}
-	default:
-		return nil
-	}
-}
-
-func (i libInfo) libRequirement(v version) (libRequirement, bool) {
-	if !i.lang.isSupported() {
-		return libRequirement{}, false
-	}
-
-	return libRequirement{
-		envVars:        i.envVars(v),
-		initContainers: i.initContainers(v),
-		volumeMounts:   []volumeMount{i.volumeMount(v)},
-		volumes:        []volume{sourceVolume},
-	}, true
+func initContainerName(lang language) string {
+	return fmt.Sprintf("datadog-lib-%s-init", lang)
 }

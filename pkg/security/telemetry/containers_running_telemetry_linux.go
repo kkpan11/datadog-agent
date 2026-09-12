@@ -10,9 +10,11 @@ import (
 	"os"
 	"time"
 
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/security/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+
 	"github.com/DataDog/datadog-go/v5/statsd"
 )
 
@@ -23,9 +25,9 @@ type ContainersRunningTelemetry struct {
 }
 
 // NewContainersRunningTelemetry creates a new ContainersRunningTelemetry instance
-func NewContainersRunningTelemetry(cfg ContainersRunningTelemetryConfig, statsdClient statsd.ClientInterface, wmeta workloadmeta.Component) (*ContainersRunningTelemetry, error) {
+func NewContainersRunningTelemetry(cfg ContainersRunningTelemetryConfig, statsdClient statsd.ClientInterface, wmeta workloadmeta.Component, filterStore workloadfilter.Component) (*ContainersRunningTelemetry, error) {
 	telemetrySender := NewSimpleTelemetrySenderFromStatsd(statsdClient)
-	containersTelemetry, err := NewContainersTelemetry(telemetrySender, wmeta)
+	containersTelemetry, err := NewContainersTelemetry(telemetrySender, wmeta, filterStore.GetContainerRuntimeSecurityFilters())
 	if err != nil {
 		return nil, err
 	}

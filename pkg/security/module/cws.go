@@ -9,29 +9,35 @@ package module
 import (
 	"context"
 	"errors"
-	"fmt"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
 
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	compression "github.com/DataDog/datadog-agent/comp/serializer/logscompression/def"
 	"github.com/DataDog/datadog-agent/pkg/eventmonitor"
+	"github.com/DataDog/datadog-agent/pkg/security/common"
 	"github.com/DataDog/datadog-agent/pkg/security/config"
 	"github.com/DataDog/datadog-agent/pkg/security/events"
+	"github.com/DataDog/datadog-agent/pkg/security/flareregistry"
 	"github.com/DataDog/datadog-agent/pkg/security/metrics"
 	"github.com/DataDog/datadog-agent/pkg/security/probe"
 	"github.com/DataDog/datadog-agent/pkg/security/probe/selftests"
 	"github.com/DataDog/datadog-agent/pkg/security/proto/api"
 	rulesmodule "github.com/DataDog/datadog-agent/pkg/security/rules"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/compiler/eval"
-	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
 	"github.com/DataDog/datadog-agent/pkg/security/seclog"
 	"github.com/DataDog/datadog-agent/pkg/security/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/security/utils"
+	grpcutils "github.com/DataDog/datadog-agent/pkg/security/utils/grpc"
+	"github.com/DataDog/datadog-agent/pkg/util/system/socket"
 )
 
 const (
@@ -42,39 +48,93 @@ const (
 	selftestPassedDelay = 60 * time.Minute
 )
 
+// CommandServer is the gRPC server for the module command API
+type CommandServer struct {
+	started       bool
+	grpcCmdServer *grpcutils.Server
+}
+
+// Start starts the command server
+func (c *CommandServer) Start() error {
+	if c.started {
+		return nil
+	}
+
+	if err := c.grpcCmdServer.Start(); err != nil {
+		return err
+	}
+
+	c.started = true
+	return nil
+}
+
+// Stop stops the command server
+func (c *CommandServer) Stop() {
+	if !c.started {
+		return
+	}
+	c.grpcCmdServer.Stop()
+	c.started = false
+}
+
+// NewCommandServer initializes the gRPC server for the module command API
+func NewCommandServer(cfg *config.RuntimeSecurityConfig) (*CommandServer, error) {
+	cmdSocketPath, err := common.GetCmdSocketPath(cfg.SocketPath, cfg.CmdSocketPath)
+	if err != nil {
+		return nil, err
+	}
+
+	family, socketPath := socket.GetSocketAddress(cmdSocketPath)
+
+	return &CommandServer{
+		grpcCmdServer: grpcutils.NewServer(family, socketPath),
+	}, nil
+}
+
 // CWSConsumer represents the system-probe module for the runtime security agent
 type CWSConsumer struct {
 	sync.RWMutex
+
 	config       *config.RuntimeSecurityConfig
 	probe        *probe.Probe
 	statsdClient statsd.ClientInterface
 
 	// internals
-	wg             sync.WaitGroup
-	ctx            context.Context
-	cancelFnc      context.CancelFunc
-	apiServer      *APIServer
-	rateLimiter    *events.RateLimiter
-	sendStatsChan  chan chan bool
-	eventSender    events.EventSender
-	grpcServer     *GRPCServer
-	ruleEngine     *rulesmodule.RuleEngine
-	selfTester     *selftests.SelfTester
-	selfTestCount  int
-	selfTestPassed bool
-	reloader       ReloaderInterface
-	crtelemetry    *telemetry.ContainersRunningTelemetry
+	wg              sync.WaitGroup
+	ctx             context.Context
+	cancelFnc       context.CancelFunc
+	apiServer       *APIServer
+	cmdServer       *CommandServer
+	grpcEventServer *grpcutils.Server
+	rateLimiter     *events.RateLimiter
+	sendStatsChan   chan chan bool
+	eventSender     events.EventSender
+	ruleEngine      *rulesmodule.RuleEngine
+	selfTester      *selftests.SelfTester
+	selfTestCount   int
+	selfTestPassed  bool
+	reloader        ReloaderInterface
+	crtelemetry     *telemetry.ContainersRunningTelemetry
 }
 
 // NewCWSConsumer initializes the module with options
-func NewCWSConsumer(evm *eventmonitor.EventMonitor, cfg *config.RuntimeSecurityConfig, wmeta workloadmeta.Component, opts Opts, compression compression.Component) (*CWSConsumer, error) {
+func NewCWSConsumer(cmdServer *CommandServer, evm *eventmonitor.EventMonitor, cfg *config.RuntimeSecurityConfig, wmeta workloadmeta.Component, filterStore workloadfilter.Component, opts Opts, compression compression.Component, ipc ipc.Component, hostname string, secretsComp secrets.Component) (*CWSConsumer, error) {
 	crtelemcfg := telemetry.ContainersRunningTelemetryConfig{
 		RuntimeEnabled: cfg.RuntimeEnabled,
 		FIMEnabled:     cfg.FIMEnabled,
 	}
-	crtelemetry, err := telemetry.NewContainersRunningTelemetry(crtelemcfg, evm.StatsdClient, wmeta)
-	if err != nil {
-		return nil, err
+
+	var (
+		crtelemetry *telemetry.ContainersRunningTelemetry
+		err         error
+	)
+
+	// filterStore can be nil, especially in the case of functional tests
+	if filterStore != nil {
+		crtelemetry, err = telemetry.NewContainersRunningTelemetry(crtelemcfg, evm.StatsdClient, wmeta, filterStore)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var selfTester *selftests.SelfTester
@@ -85,9 +145,8 @@ func NewCWSConsumer(evm *eventmonitor.EventMonitor, cfg *config.RuntimeSecurityC
 		}
 	}
 
-	family := config.GetFamilyAddress(cfg.SocketPath)
-
-	apiServer, err := NewAPIServer(cfg, evm.Probe, opts.MsgSender, evm.StatsdClient, selfTester, compression)
+	stopChan := make(chan struct{})
+	apiServer, err := NewAPIServer(cfg, evm.Probe, opts.MsgSender, evm.StatsdClient, selfTester, compression, hostname, stopChan, secretsComp, filterStore)
 	if err != nil {
 		return nil, err
 	}
@@ -102,9 +161,9 @@ func NewCWSConsumer(evm *eventmonitor.EventMonitor, cfg *config.RuntimeSecurityC
 		ctx:           ctx,
 		cancelFnc:     cancelFnc,
 		apiServer:     apiServer,
+		cmdServer:     cmdServer,
 		rateLimiter:   events.NewRateLimiter(cfg, evm.StatsdClient),
 		sendStatsChan: make(chan chan bool, 1),
-		grpcServer:    NewGRPCServer(family, cfg.SocketPath),
 		selfTester:    selfTester,
 		reloader:      NewReloader(),
 		crtelemetry:   crtelemetry,
@@ -124,25 +183,59 @@ func NewCWSConsumer(evm *eventmonitor.EventMonitor, cfg *config.RuntimeSecurityC
 		listeners = append(listeners, selfTester)
 	}
 
-	c.ruleEngine, err = rulesmodule.NewRuleEngine(evm, cfg, evm.Probe, c.rateLimiter, c.apiServer, c, c.statsdClient, listeners...)
+	c.ruleEngine, err = rulesmodule.NewRuleEngine(evm, cfg, evm.Probe, c.rateLimiter, c.apiServer, c, c.statsdClient, hostname, ipc, listeners...)
 	if err != nil {
 		return nil, err
 	}
 	c.apiServer.SetCWSConsumer(c)
+
+	// Publish a loaded-policies callback so the system-probe remoteagent flare
+	// provider can serialize the active policy set into the flare without
+	// importing pkg/security from the component layer.
+	flareregistry.SetLoadedPolicies(func(includeBundled bool) ([]byte, error) {
+		resp, err := c.apiServer.GetLoadedPolicies(context.Background(), &api.GetLoadedPoliciesParams{IncludeBundled: includeBundled})
+		if err != nil {
+			return nil, err
+		}
+		return []byte(resp.Policies), nil
+	})
 
 	// add self test as rule provider
 	if c.selfTester != nil {
 		c.ruleEngine.AddPolicyProvider(c.selfTester)
 	}
 
-	if err := evm.Probe.AddCustomEventHandler(model.UnknownEventType, c); err != nil {
+	if err := evm.Probe.AddCustomEventHandler(c); err != nil {
 		return nil, err
 	}
 
 	seclog.SetPatterns(cfg.LogPatterns...)
 	seclog.SetTags(cfg.LogTags...)
 
-	api.RegisterSecurityModuleServer(c.grpcServer.server, c.apiServer)
+	// setup gRPC servers
+	seclog.Debugf("Registering API server")
+	api.RegisterSecurityModuleCmdServer(c.cmdServer.grpcCmdServer.ServiceRegistrar(), c.apiServer)
+
+	switch cfg.EventGRPCServer {
+	case "security-agent":
+		// system-probe connects to security-agent's event server; no local server needed here
+	case "system-probe":
+		// system-probe acts as the event server for remote system-probes (e.g., in micro VMs via vsock)
+		seclog.Infof("starting system-probe remote event server on %s", cfg.SocketPath)
+
+		family, addr := socket.GetSocketAddress(cfg.SocketPath)
+		c.grpcEventServer = grpcutils.NewServer(family, addr)
+
+		api.RegisterSecurityAgentAPIServer(c.grpcEventServer.ServiceRegistrar(), NewRemoteEventServer(c.apiServer))
+	default:
+		// legacy mode: system-probe hosts SecurityModuleEvent server, security-agent connects
+		seclog.Infof("starting security module event grpc server on %s", cfg.SocketPath)
+
+		family := common.GetFamilyAddress(cfg.SocketPath)
+		c.grpcEventServer = grpcutils.NewServer(family, cfg.SocketPath)
+
+		api.RegisterSecurityModuleEventServer(c.grpcEventServer.ServiceRegistrar(), c.apiServer)
+	}
 
 	// platform specific initialization
 	if err := c.init(evm, cfg, opts); err != nil {
@@ -173,8 +266,14 @@ func (c *CWSConsumer) ID() string {
 
 // Start the module
 func (c *CWSConsumer) Start() error {
-	if err := c.grpcServer.Start(); err != nil {
+	if err := c.cmdServer.Start(); err != nil {
 		return err
+	}
+
+	if c.grpcEventServer != nil {
+		if err := c.grpcEventServer.Start(); err != nil {
+			return err
+		}
 	}
 
 	if err := c.reloader.Start(); err != nil {
@@ -210,20 +309,21 @@ func (c *CWSConsumer) Start() error {
 			c.selfTestPassed = true
 
 			c.reportSelfTest(success, fails)
+			delay = selftestPassedDelay
 		}
+
+		time.Sleep(delay)
 
 		if _, err := c.RunSelfTest(false); err != nil {
 			seclog.Errorf("self-test error: %s", err)
 		}
-
-		time.Sleep(delay)
 	}
 	if c.selfTester != nil {
 		go c.selfTester.WaitForResult(cb)
 	}
 
 	// do not wait external api connection, send directly running metrics
-	if c.config.SendEventFromSystemProbe {
+	if c.config.SendPayloadsFromSystemProbe {
 		c.startRunningMetrics()
 	}
 
@@ -275,11 +375,11 @@ func (c *CWSConsumer) reportSelfTest(success []eval.RuleID, fails []eval.RuleID)
 
 	// send metric with number of success and fails
 	tags := []string{
-		fmt.Sprintf("success:%d", len(success)),
-		fmt.Sprintf("fails:%d", len(fails)),
-		fmt.Sprintf("os:%s", runtime.GOOS),
-		fmt.Sprintf("arch:%s", utils.RuntimeArch()),
-		fmt.Sprintf("origin:%s", c.probe.Origin()),
+		"success:" + strconv.Itoa(len(success)),
+		"fails:" + strconv.Itoa(len(fails)),
+		"os:" + runtime.GOOS,
+		"arch:" + utils.RuntimeArch(),
+		"origin:" + c.probe.Origin(),
 	}
 	if err := c.statsdClient.Gauge(metrics.MetricSelfTest, 1.0, tags, 1.0); err != nil {
 		seclog.Errorf("failed to send self_test metric: %s", err)
@@ -294,17 +394,22 @@ func (c *CWSConsumer) reportSelfTest(success []eval.RuleID, fails []eval.RuleID)
 func (c *CWSConsumer) Stop() {
 	c.reloader.Stop()
 
-	if c.apiServer != nil {
-		c.apiServer.Stop()
-	}
-
 	c.cancelFnc()
 
+	// Stop the rule engine first to stop goroutines that send heartbeat/ruleset loaded events to the reporter
 	c.ruleEngine.Stop()
 
 	c.wg.Wait()
 
-	c.grpcServer.Stop()
+	// Now we shouldn't have anymore events to send so we can safely stop the API server to close reporter channels
+	if c.apiServer != nil {
+		c.apiServer.Stop()
+	}
+
+	c.cmdServer.Stop()
+	if c.grpcEventServer != nil {
+		c.grpcEventServer.Stop()
+	}
 }
 
 // HandleCustomEvent is called by the probe when an event should be sent to Datadog but doesn't need evaluation
@@ -314,7 +419,7 @@ func (c *CWSConsumer) HandleCustomEvent(rule *rules.Rule, event *events.CustomEv
 
 // SendEvent sends an event to the backend after checking that the rate limiter allows it for the provided rule
 // Implements the EventSender interface
-func (c *CWSConsumer) SendEvent(rule *rules.Rule, event events.Event, extTagsCb func() []string, service string) {
+func (c *CWSConsumer) SendEvent(rule *rules.Rule, event events.Event, extTagsCb func() ([]string, bool), service string) {
 	if c.rateLimiter.Allow(rule.ID, event) {
 		c.eventSender.SendEvent(rule, event, extTagsCb, service)
 	} else {
@@ -329,15 +434,7 @@ func (c *CWSConsumer) APIServer() *APIServer {
 
 // HandleActivityDump sends an activity dump to the backend
 func (c *CWSConsumer) HandleActivityDump(imageName string, imageTag string, header []byte, data []byte) error {
-	msg := &api.ActivityDumpStreamMessage{
-		Selector: &api.WorkloadSelectorMessage{
-			Name: imageName,
-			Tag:  imageTag,
-		},
-		Header: header,
-		Data:   data,
-	}
-	c.apiServer.SendActivityDump(msg)
+	c.apiServer.SendActivityDump(imageName, imageTag, header, data)
 	return nil
 }
 
@@ -355,15 +452,8 @@ func (c *CWSConsumer) sendStats() {
 	if err := c.apiServer.SendStats(); err != nil {
 		seclog.Debugf("failed to send api server stats: %s", err)
 	}
-	for statsTags, counter := range c.ruleEngine.AutoSuppression.GetStats() {
-		if counter > 0 {
-			tags := []string{
-				fmt.Sprintf("rule_id:%s", statsTags.RuleID),
-				fmt.Sprintf("suppression_type:%s", statsTags.SuppressionType),
-			}
-			_ = c.statsdClient.Count(metrics.MetricRulesSuppressed, counter, tags, 1.0)
-		}
-	}
+
+	c.ruleEngine.SendStats()
 }
 
 func (c *CWSConsumer) statsSender() {
@@ -396,4 +486,9 @@ func (c *CWSConsumer) GetRuleEngine() *rulesmodule.RuleEngine {
 func (c *CWSConsumer) PrepareForFunctionalTests() {
 	// no need for container running telemetry in functional tests
 	c.crtelemetry = nil
+}
+
+// GetStatus returns the status of the module
+func (c *CWSConsumer) GetStatus(ctx context.Context) (*api.Status, error) {
+	return c.apiServer.GetStatus(ctx, &api.GetStatusParams{})
 }

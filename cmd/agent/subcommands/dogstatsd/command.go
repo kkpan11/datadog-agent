@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/DataDog/zstd"
@@ -20,11 +22,14 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
+	"github.com/DataDog/datadog-agent/cmd/agent/subcommands/dogstatsdcommon"
 	"github.com/DataDog/datadog-agent/comp/core"
 	cconfig "github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
@@ -55,6 +60,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					ConfigParams: cconfig.NewAgentParams(globalParams.ConfFilePath, cconfig.WithExtraConfFiles(globalParams.ExtraConfFilePath), cconfig.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
 					LogParams:    log.ForOneShot(command.LoggerName, topFlags.logLevelDefaultOff.Value(), true)}),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -74,6 +80,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					ConfigParams: cconfig.NewAgentParams(globalParams.ConfFilePath, cconfig.WithExtraConfFiles(globalParams.ExtraConfFilePath), cconfig.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
 					LogParams:    log.ForOneShot(command.LoggerName, topFlags.logLevelDefaultOff.Value(), true)}),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	})
@@ -81,22 +88,16 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 	return []*cobra.Command{c}
 }
 
-func triggerDump(config cconfig.Component) (string, error) {
-	c := util.GetClient()
-	addr, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+func triggerDump(config cconfig.Component, client ipc.HTTPClient) (string, error) {
+	addr, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return "", err
 	}
 
 	port := config.GetInt("cmd_port")
-	url := fmt.Sprintf("https://%v:%v/agent/dogstatsd-contexts-dump", addr, port)
+	url := fmt.Sprintf("https://%s/agent/dogstatsd-contexts-dump", net.JoinHostPort(addr, strconv.Itoa(port)))
 
-	err = util.SetAuthToken(config)
-	if err != nil {
-		return "", err
-	}
-
-	body, err := util.DoPost(c, url, "", nil)
+	body, err := client.Post(url, "", nil)
 	if err != nil {
 		return "", err
 	}
@@ -109,8 +110,12 @@ func triggerDump(config cconfig.Component) (string, error) {
 	return path, nil
 }
 
-func dumpContexts(config cconfig.Component, _ log.Component) error {
-	path, err := triggerDump(config)
+func dumpContexts(config cconfig.Component, _ log.Component, client ipc.HTTPClient) error {
+	if err := dogstatsdcommon.CheckDataPlaneOwnsDogstatsd(config); err != nil {
+		return err
+	}
+
+	path, err := triggerDump(config, client)
 	if err != nil {
 		return err
 	}
@@ -125,12 +130,16 @@ type metric struct {
 	tags  map[string]struct{}
 }
 
-func topContexts(config cconfig.Component, flags *topFlags, _ log.Component) error {
+func topContexts(config cconfig.Component, flags *topFlags, _ log.Component, client ipc.HTTPClient) error {
 	var err error
 
 	path := flags.path
 	if path == "" {
-		path, err = triggerDump(config)
+		if err := dogstatsdcommon.CheckDataPlaneOwnsDogstatsd(config); err != nil {
+			return err
+		}
+
+		path, err = triggerDump(config, client)
 		if err != nil {
 			return err
 		}

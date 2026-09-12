@@ -9,17 +9,23 @@ package flowaggregator
 import (
 	"encoding/json"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/networkdevice/integrations"
+	model "github.com/DataDog/agent-payload/v5/process"
+	"github.com/DataDog/datadog-agent/comp/netflow/topn"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
 
+	"github.com/DataDog/datadog-agent/pkg/networkdevice/integrations"
+
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatform"
+	eventplatform "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/def"
 	"github.com/DataDog/datadog-agent/comp/netflow/format"
+	npcollector "github.com/DataDog/datadog-agent/comp/networkpath/npcollector/def"
+	npmodel "github.com/DataDog/datadog-agent/comp/networkpath/npcollector/model"
 	rdnsquerier "github.com/DataDog/datadog-agent/comp/rdnsquerier/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/logs/message"
@@ -28,7 +34,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/networkdevice/metadata"
 
 	"github.com/DataDog/datadog-agent/comp/netflow/common"
-	"github.com/DataDog/datadog-agent/comp/netflow/config"
+	"github.com/DataDog/datadog-agent/comp/netflow/config/def"
 	"github.com/DataDog/datadog-agent/comp/netflow/goflowlib"
 )
 
@@ -38,7 +44,7 @@ const metricPrefix = "datadog.netflow."
 // FlowAggregator is used for space and time aggregation of NetFlow flows
 type FlowAggregator struct {
 	flowIn                       chan *common.Flow
-	FlushFlowsToSendInterval     time.Duration // interval for checking flows to flush and send them to EP Forwarder
+	FlushConfig                  common.FlushConfig
 	rollupTrackerRefreshInterval time.Duration
 	flowAcc                      *flowAccumulator
 	sender                       sender.Sender
@@ -51,11 +57,15 @@ type FlowAggregator struct {
 	hostname                     string
 	goflowPrometheusGatherer     prometheus.Gatherer
 	TimeNowFunction              func() time.Time // Allows to mock time in tests
+	NewTicker                    func(duration time.Duration) <-chan time.Time
+	networkPathEnabled           bool
+	npCollector                  npcollector.Component
 
 	lastSequencePerExporter   map[sequenceDeltaKey]uint32
 	lastSequencePerExporterMu sync.Mutex
 
-	logger log.Component
+	flowFilter FlowFlushFilter
+	logger     log.Component
 }
 
 type sequenceDeltaKey struct {
@@ -70,6 +80,11 @@ type sequenceDeltaValue struct {
 	Reset        bool
 }
 
+// FlowFlushFilter is an interface that can be used to filter flows before they are sent to the EP Forwarder.
+type FlowFlushFilter interface {
+	Filter(flushCtx common.FlushContext, flows []*common.Flow) []*common.Flow
+}
+
 // maxNegativeSequenceDiffToReset are thresholds used to detect sequence reset
 var maxNegativeSequenceDiffToReset = map[common.FlowType]int{
 	common.TypeSFlow5:   -1000,
@@ -79,14 +94,27 @@ var maxNegativeSequenceDiffToReset = map[common.FlowType]int{
 }
 
 // NewFlowAggregator returns a new FlowAggregator
-func NewFlowAggregator(sender sender.Sender, epForwarder eventplatform.Forwarder, config *config.NetflowConfig, hostname string, logger log.Component, rdnsQuerier rdnsquerier.Component) *FlowAggregator {
-	flushInterval := time.Duration(config.AggregatorFlushInterval) * time.Second
+func NewFlowAggregator(sender sender.Sender, epForwarder eventplatform.Forwarder, config *config.NetflowConfig, hostname string, logger log.Component, rdnsQuerier rdnsquerier.Component, networkPathEnabled bool, npCollector npcollector.Component) *FlowAggregator {
+	flushConfig := common.FlushConfig{
+		FlowCollectionDuration: time.Duration(config.AggregatorFlushInterval) * time.Second,
+		FlushTickFrequency:     flushFlowsToSendInterval,
+	}
+
+	var topNFilter FlowFlushFilter = topn.NoopFilter{}
+	var flowScheduler FlowScheduler = ImmediateFlowScheduler{
+		flushConfig: flushConfig,
+	}
+	if config.AggregatorMaxFlowsPerPeriod > 0 {
+		topNFilter = topn.NewPerFlushFilter(int64(config.AggregatorMaxFlowsPerPeriod), flushConfig, sender, logger)
+		flowScheduler = JitterFlowScheduler{flushConfig: flushConfig}
+	}
+
 	flowContextTTL := time.Duration(config.AggregatorFlowContextTTL) * time.Second
 	rollupTrackerRefreshInterval := time.Duration(config.AggregatorRollupTrackerRefreshInterval) * time.Second
 	return &FlowAggregator{
 		flowIn:                       make(chan *common.Flow, config.AggregatorBufferSize),
-		flowAcc:                      newFlowAccumulator(flushInterval, flowContextTTL, config.AggregatorPortRollupThreshold, config.AggregatorPortRollupDisabled, logger, rdnsQuerier),
-		FlushFlowsToSendInterval:     flushFlowsToSendInterval,
+		flowAcc:                      newFlowAccumulator(flushConfig, flowScheduler, flowContextTTL, config.AggregatorPortRollupThreshold, config.AggregatorPortRollupDisabled, logger, rdnsQuerier),
+		FlushConfig:                  flushConfig,
 		rollupTrackerRefreshInterval: rollupTrackerRefreshInterval,
 		sender:                       sender,
 		epForwarder:                  epForwarder,
@@ -98,8 +126,12 @@ func NewFlowAggregator(sender sender.Sender, epForwarder eventplatform.Forwarder
 		hostname:                     hostname,
 		goflowPrometheusGatherer:     prometheus.DefaultGatherer,
 		TimeNowFunction:              time.Now,
+		NewTicker:                    time.Tick,
+		networkPathEnabled:           networkPathEnabled,
+		npCollector:                  npCollector,
 		lastSequencePerExporter:      make(map[sequenceDeltaKey]uint32),
 		logger:                       logger,
+		flowFilter:                   topNFilter,
 	}
 }
 
@@ -134,6 +166,51 @@ func (agg *FlowAggregator) run() {
 			agg.flowAcc.add(flow)
 		}
 	}
+}
+
+func (agg *FlowAggregator) scheduleNetworkPathForFlow(flow *common.Flow) {
+	if !agg.networkPathEnabled || agg.npCollector == nil || flow == nil {
+		return
+	}
+
+	connType, ok := netflowProtocolToConnectionType(flow.IPProtocol)
+	if !ok {
+		return
+	}
+
+	srcIP, ok := netip.AddrFromSlice(flow.SrcAddr)
+	if !ok {
+		return
+	}
+	dstIP, ok := netip.AddrFromSlice(flow.DstAddr)
+	if !ok {
+		return
+	}
+
+	srcPort, ok := sourcePortForNetworkPath(flow.SrcPort)
+	if !ok {
+		return
+	}
+	dstPort, ok := toUint16Port(flow.DstPort)
+	if !ok {
+		return
+	}
+
+	family := model.ConnectionFamily_v4
+	if srcIP.Is6() || dstIP.Is6() {
+		family = model.ConnectionFamily_v6
+	}
+
+	agg.npCollector.ScheduleNetflowPathTests(func(yield func(npmodel.NetworkPathConnection) bool) {
+		yield(npmodel.NetworkPathConnection{
+			Source:    netip.AddrPortFrom(srcIP, srcPort),
+			Dest:      netip.AddrPortFrom(dstIP, dstPort),
+			Namespace: flow.Namespace,
+			Type:      connType,
+			Direction: model.ConnectionDirection_outgoing,
+			Family:    family,
+		})
+	})
 }
 
 func (agg *FlowAggregator) sendFlows(flows []*common.Flow, flushTime time.Time) {
@@ -192,7 +269,7 @@ func (agg *FlowAggregator) sendExporterMetadata(flows []*common.Flow, flushTime 
 		for _, exporterID := range ids {
 			netflowExporters = append(netflowExporters, exporterMap[namespace][exporterID])
 		}
-		metadataPayloads := metadata.BatchPayloads(integrations.Netflow, namespace, "", flushTime, metadata.PayloadMetadataBatchSize, nil, nil, nil, nil, netflowExporters, nil)
+		metadataPayloads := metadata.BatchPayloads(integrations.Netflow, namespace, "", flushTime, metadata.PayloadMetadataBatchSize, nil, nil, nil, nil, nil, netflowExporters, nil)
 		for _, payload := range metadataPayloads {
 			payloadBytes, err := json.Marshal(payload)
 			if err != nil {
@@ -210,19 +287,12 @@ func (agg *FlowAggregator) sendExporterMetadata(flows []*common.Flow, flushTime 
 }
 
 func (agg *FlowAggregator) flushLoop() {
-	var flushFlowsToSendTicker <-chan time.Time
-
-	if agg.FlushFlowsToSendInterval > 0 {
-		flushTicker := time.NewTicker(agg.FlushFlowsToSendInterval)
-		flushFlowsToSendTicker = flushTicker.C
-		defer flushTicker.Stop()
-	} else {
+	flushFlowsToSendTicker := agg.NewTicker(agg.FlushConfig.FlushTickFrequency)
+	if flushFlowsToSendTicker == nil {
 		agg.logger.Debug("flushFlowsToSendInterval set to 0: will never flush automatically")
 	}
 
-	rollupTicker := time.NewTicker(agg.rollupTrackerRefreshInterval)
-	defer rollupTicker.Stop()
-	rollupTrackersRefresh := rollupTicker.C
+	rollupTrackersRefresh := agg.NewTicker(agg.rollupTrackerRefreshInterval)
 	// TODO: move rollup tracker refresh to a separate loop (separate PR) to avoid rollup tracker and flush flows impacting each other
 
 	var lastFlushTime time.Time
@@ -233,16 +303,31 @@ func (agg *FlowAggregator) flushLoop() {
 			agg.flushLoopDone <- struct{}{}
 			return
 		// automatic flush sequence
-		case <-flushFlowsToSendTicker:
-			now := time.Now()
+		case flushStartTime := <-flushFlowsToSendTicker:
 			if !lastFlushTime.IsZero() {
-				flushInterval := now.Sub(lastFlushTime)
+				flushInterval := flushStartTime.Sub(lastFlushTime)
 				agg.sender.Gauge("datadog.netflow.aggregator.flush_interval", flushInterval.Seconds(), "", nil)
 			}
-			lastFlushTime = now
 
-			flushStartTime := time.Now()
-			agg.flush()
+			// Calculate how many flushes should have happened since the last tick. Ticks can be missed for various reasons,
+			// including CPU pauses or if this goroutine gets blocked longer than usual waiting on network requests.
+			var expectedFlushes int64 = 1
+			if !lastFlushTime.IsZero() {
+				// add one millisecond to account for small variations in the time.Ticker
+				timeSinceLast := flushStartTime.Sub(lastFlushTime) + time.Millisecond
+
+				// We do not want this to default to 0 for small time deltas or if time.Tick fires a little early.
+				// Make the expected flushes either 1 or the result of calculation
+				expectedFlushes = max(1, int64(timeSinceLast/agg.FlushConfig.FlushTickFrequency))
+			}
+			flushCtx := common.FlushContext{
+				FlushTime:     flushStartTime,
+				LastFlushedAt: lastFlushTime,
+				NumFlushes:    expectedFlushes,
+			}
+
+			lastFlushTime = flushStartTime
+			agg.flush(flushCtx)
 			agg.sender.Gauge("datadog.netflow.aggregator.flush_duration", time.Since(flushStartTime).Seconds(), "", nil)
 			agg.sender.Commit()
 		// refresh rollup trackers
@@ -253,11 +338,20 @@ func (agg *FlowAggregator) flushLoop() {
 }
 
 // Flush flushes the aggregator
-func (agg *FlowAggregator) flush() int {
+func (agg *FlowAggregator) flush(ctx common.FlushContext) int {
 	flowsContexts := agg.flowAcc.getFlowContextCount()
-	flushTime := agg.TimeNowFunction()
-	flowsToFlush := agg.flowAcc.flush()
-	agg.logger.Debugf("Flushing %d flows to the forwarder (flush_duration=%d, flow_contexts_before_flush=%d)", len(flowsToFlush), time.Since(flushTime).Milliseconds(), flowsContexts)
+	flushTime := ctx.FlushTime
+	flowsToFlush := agg.flowAcc.flush(ctx)
+
+	// apply filtering
+	flowsBeforeFilter := len(flowsToFlush)
+	flowsToFlush = agg.flowFilter.Filter(ctx, flowsToFlush)
+	numRowsFiltered := flowsBeforeFilter - len(flowsToFlush)
+	for _, flow := range flowsToFlush {
+		agg.scheduleNetworkPathForFlow(flow)
+	}
+
+	agg.logger.Debugf("Flushing %d flows to the forwarder, %d have been dropped by TopN filtering (flush_duration=%d, flow_contexts_before_flush=%d)", len(flowsToFlush), numRowsFiltered, time.Since(flushTime).Milliseconds(), flowsContexts)
 
 	sequenceDeltaPerExporter := agg.getSequenceDelta(flowsToFlush)
 	for key, seqDelta := range sequenceDeltaPerExporter {
@@ -271,9 +365,9 @@ func (agg *FlowAggregator) flush() int {
 
 	// TODO: Add flush stats to agent telemetry e.g. aggregator newFlushCountStats()
 	if len(flowsToFlush) > 0 {
-		agg.sendFlows(flowsToFlush, flushTime)
+		agg.sendFlows(flowsToFlush, ctx.FlushTime)
 	}
-	agg.sendExporterMetadata(flowsToFlush, flushTime)
+	agg.sendExporterMetadata(flowsToFlush, ctx.FlushTime)
 
 	flushCount := len(flowsToFlush)
 

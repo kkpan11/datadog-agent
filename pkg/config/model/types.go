@@ -6,22 +6,18 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
-
-	"github.com/mitchellh/mapstructure"
 )
 
-// ConfigFileNotFoundError wrapper error for when a config file is not found
-type ConfigFileNotFoundError struct {
-	Err error
-}
+// ErrConfigFileNotFound is an error for when the config file is not found
+var ErrConfigFileNotFound = errors.New("Config File Not Found")
 
-// Error returns the error message
-func (e ConfigFileNotFoundError) Error() string {
-	return fmt.Sprintf("Config File Not Found %v", e.Err.Error())
+// NewConfigFileNotFoundError returns a well known error for the config file missing
+func NewConfigFileNotFoundError(err error) error {
+	return fmt.Errorf("%w: %w", ErrConfigFileNotFound, err)
 }
 
 // Source stores what edits a setting as a string
@@ -34,19 +30,25 @@ const (
 	// SourceDefault are the values from defaults.
 	SourceDefault Source = "default"
 	// SourceUnknown are the values from unknown source. This should only be used in tests when calling
-	// SetWithoutSource.
+	// SetInTest.
 	SourceUnknown Source = "unknown"
+	// SourceInfraMode are the values set by infrastructure mode configurations. These values have higher
+	// priority than defaults but lower priority than user configuration (file, env vars, etc.).
+	SourceInfraMode Source = "infra-mode"
 	// SourceFile are the values loaded from configuration file.
 	SourceFile Source = "file"
 	// SourceEnvVar are the values loaded from the environment variables.
 	SourceEnvVar Source = "environment-variable"
+	// SourceConfigPostInit are values computed by the agent during initial config setup.
+	SourceConfigPostInit Source = "config-post-init"
+	// SourceSecret are values resolved from secrets (ENC[...] placeholders).
+	SourceSecret Source = "secret"
+	// SourceLocalConfigProcess are the values mirrored from the config process via the configsync HTTP
+	// polling mechanism.
+	SourceLocalConfigProcess Source = "local-config-process"
 	// SourceAgentRuntime are the values configured by the agent itself. The agent can dynamically compute the best
 	// value for some settings when not set by the user.
 	SourceAgentRuntime Source = "agent-runtime"
-	// SourceLocalConfigProcess are the values mirrored from the config process. The config process is the
-	// core-agent. This is used when side process like security-agent or trace-agent pull their configuration from
-	// the core-agent.
-	SourceLocalConfigProcess Source = "local-config-process"
 	// SourceRC are the values loaded from remote-config (aka Datadog backend)
 	SourceRC Source = "remote-config"
 	// SourceFleetPolicies are the values loaded from remote-config file
@@ -61,11 +63,14 @@ const (
 var Sources = []Source{
 	SourceDefault,
 	SourceUnknown,
+	SourceInfraMode,
 	SourceFile,
 	SourceEnvVar,
 	SourceFleetPolicies,
-	SourceAgentRuntime,
+	SourceConfigPostInit,
+	SourceSecret,
 	SourceLocalConfigProcess,
+	SourceAgentRuntime,
 	SourceRC,
 	SourceCLI,
 }
@@ -76,13 +81,23 @@ var sourcesPriority = map[Source]int{
 	SourceSchema:             -1,
 	SourceDefault:            0,
 	SourceUnknown:            1,
-	SourceFile:               2,
-	SourceEnvVar:             3,
-	SourceFleetPolicies:      4,
-	SourceAgentRuntime:       5,
-	SourceLocalConfigProcess: 6,
-	SourceRC:                 7,
-	SourceCLI:                8,
+	SourceInfraMode:          2,
+	SourceFile:               3,
+	SourceEnvVar:             4,
+	SourceFleetPolicies:      5,
+	SourceConfigPostInit:     6,
+	SourceSecret:             7,
+	SourceLocalConfigProcess: 8,
+	SourceAgentRuntime:       9,
+	SourceRC:                 10,
+	SourceCLI:                11,
+}
+
+// DirectSetting is one key/value/source assignment for nodetreemodel's DirectBulkSet.
+type DirectSetting struct {
+	Key    string
+	Value  interface{}
+	Source Source
 }
 
 // ValueWithSource is a tuple for a source and a value, not necessarily the applied value in the main config
@@ -121,10 +136,14 @@ type Proxy struct {
 	NoProxy []string `mapstructure:"no_proxy"`
 }
 
-// NotificationReceiver represents the callback type to receive notifications each time the `Set` method is called. The
-// configuration will call each NotificationReceiver registered through the 'OnUpdate' method, therefore
-// 'NotificationReceiver' should not be blocking.
-type NotificationReceiver func(setting string, oldValue, newValue any)
+// NotificationReceiver represents the callback type to receive notifications each time the `Set` or
+// `UnsetForSource` method is called. The configuration will call each NotificationReceiver
+// registered through the 'OnUpdate' method, therefore 'NotificationReceiver' should not be blocking.
+//
+// source and newValue describe what the setting resolves to after the change. unsetSource is empty
+// except for a removal, where it names the layer that was cleared and source is the layer now
+// winning, or SourceUnknown when none is left.
+type NotificationReceiver func(setting string, source Source, oldValue, newValue any, sequenceID uint64, unsetSource Source)
 
 // Reader is a subset of Config that only allows reading of configuration
 type Reader interface {
@@ -143,6 +162,7 @@ type Reader interface {
 	GetStringMapStringSlice(key string) map[string][]string
 	GetSizeInBytes(key string) uint
 	GetProxies() *Proxy
+	GetSequenceID() uint64
 
 	GetSource(key string) Source
 	GetAllSources(key string) []ValueWithSource
@@ -152,44 +172,46 @@ type Reader interface {
 
 	AllSettings() map[string]interface{}
 	AllSettingsWithoutDefault() map[string]interface{}
+	// AllSettingsWithoutSecrets returns all settings excluding the secrets layer.
+	AllSettingsWithoutSecrets() map[string]interface{}
+	// AllSettingsWithoutDefaultOrSecrets returns settings excluding both defaults and the secrets layer.
+	AllSettingsWithoutDefaultOrSecrets() map[string]interface{}
 	AllSettingsBySource() map[Source]interface{}
 	// AllKeysLowercased returns all config keys in the config, no matter how they are set.
 	// Note that it returns the keys lowercased.
 	AllKeysLowercased() []string
+	// AllFlattenedSettingsWithSequenceID returns all settings as a flattened map of schema leaf keys
+	// (for example, "logs_config.enabled" instead of nested {"logs_config": {"enabled": ...}})
+	// along with the current sequence ID.
+	// This provides atomic access to flattened keys, values, and sequence ID under a single lock.
+	AllFlattenedSettingsWithSequenceID() (map[string]interface{}, uint64)
 
 	// SetTestOnlyDynamicSchema is used by tests to disable validation of the config schema
 	// This lets tests use the config is more flexible ways (can add to the schema at any point,
 	// can modify env vars and the config will rebuild itself, etc)
 	SetTestOnlyDynamicSchema(allow bool)
 
-	// IsSet return true if a non nil values is found in the configuration, including defaults. This is legacy
-	// behavior from viper and don't answer the need to know if something was set by the user (see IsConfigured for
-	// this).
-	//
-	// Deprecated: this method will be removed once all settings have a default, use 'IsConfigured' instead.
-	IsSet(key string) bool
-	// IsConfigured returns true if a setting exists, has a value and doesn't come from the defaults (ie: was
-	// configured by the user). If a setting is configured by the user with the same value than the defaults this
-	// method will still return true as it tests the source of a setting not its value.
+	// IsConfigured returns true if a setting is configured by the user. This means that either:
+	//  1. The key is for a leaf, and the setting has a non-nil value on a non-default source OR
+	//  2. The key is for an inner node, and one of its children IsConfigured
 	IsConfigured(key string) bool
-
-	// UnmarshalKey Unmarshal a configuration key into a struct
-	UnmarshalKey(key string, rawVal interface{}, opts ...func(*mapstructure.DecoderConfig)) error
+	// HasSection returns true if the key is for a non-leaf setting that is defined by the user
+	HasSection(key string) bool
 
 	// IsKnown returns whether this key is known
 	IsKnown(key string) bool
-
-	// GetKnownKeysLowercased returns all the keys that meet at least one of these criteria:
-	// 1) have a default, 2) have an environment variable binded, 3) are an alias or 4) have been SetKnown()
-	// Note that it returns the keys lowercased.
-	GetKnownKeysLowercased() map[string]interface{}
+	// IsSetting returns whether the key identifies a setting (and not a section)
+	IsSetting(key string) bool
 
 	// GetEnvVars returns a list of the env vars that the config supports.
 	// These have had the EnvPrefix applied, as well as the EnvKeyReplacer.
 	GetEnvVars() []string
 
 	// Warnings returns pointer to a list of warnings (completes config.Component interface)
-	Warnings() *Warnings
+	Warnings() []string
+
+	// StartTime returns the time at which the agent process started (completes config.Component interface)
+	StartTime() time.Time
 
 	// Object returns Reader to config (completes config.Component interface)
 	Object() Reader
@@ -205,8 +227,14 @@ type Reader interface {
 // Writer is a subset of Config that only allows writing the configuration
 type Writer interface {
 	Set(key string, value interface{}, source Source)
-	SetWithoutSource(key string, value interface{})
+	SetInTest(key string, value interface{})
 	UnsetForSource(key string, source Source)
+	// DirectBulkSet writes settings already resolved by another config, keeping each one in the
+	// source layer it came from so the result mirrors the sender. It exists for config streaming
+	// and nothing else should call it: unlike Set it accepts SourceEnvVar, which makes it unfit
+	// for applying a live change. shouldNotify notifies receivers for every setting whose resolved
+	// value changed, which a snapshot replacing a config the process already runs on requires.
+	DirectBulkSet(settings []DirectSetting, shouldNotify bool)
 }
 
 // ReaderWriter is a subset of Config that allows reading and writing the configuration
@@ -225,19 +253,18 @@ type Setup interface {
 	SetDefault(key string, value interface{})
 
 	SetEnvPrefix(in string)
-	BindEnv(key string, envvars ...string)
-	SetEnvKeyReplacer(r *strings.Replacer)
 
-	// The following helpers allow a type to be enforce when parsing environment variables. Most of them exists to
-	// support historic behavior. Refrain from adding more as it's most likely a sign of poorly design configuration
-	// layout.
+	// ParseEnvSplitComma registers a transformer to parse the env var for key as a comma-separated list.
+	ParseEnvSplitComma(key string)
+	// ParseEnvSplitSpace registers a transformer to parse the env var for key as a space-separated list.
+	ParseEnvSplitSpace(key string)
+	// ParseEnvJSON registers a transformer to parse the env var for key as a JSON payload into varType.
+	// varType must be a zero value of the target type (e.g. []string{}, []map[string]string{}).
+	ParseEnvJSON(key string, varType any)
+
+	// The following helpers are legacy and should no longer be used. Instead leverage the one above
 	ParseEnvAsStringSlice(key string, fx func(string) []string)
 	ParseEnvAsMapStringInterface(key string, fx func(string) map[string]interface{})
-	ParseEnvAsSliceMapString(key string, fx func(string) []map[string]string)
-	ParseEnvAsSlice(key string, fx func(string) []interface{})
-
-	// SetKnown adds a key to the set of known valid config keys
-	SetKnown(key string)
 
 	// API not implemented by viper.Viper and that have proven useful for our config usage
 
@@ -247,6 +274,13 @@ type Setup interface {
 	// If env is provided, it will override the name of the environment variable used for this
 	// config key
 	BindEnvAndSetDefault(key string, val interface{}, env ...string)
+
+	// BindEnvAndSetDefaultWithDeprecation fully declares a setting with a default value, a list of deprecated names and
+	// optional env var overrides.
+	// If no env vars are declared, one will be derived from the key name.
+	// Settings in the deprecated names list take precedence over the official and will automatically generate a warning.
+	// Name in the list must be sorted by priority (oldest name first).
+	BindEnvAndSetDefaultWithDeprecation(key string, defaultVal interface{}, deprecatedNames []string, envvars ...string)
 
 	AddConfigPath(in string)
 	AddExtraConfigPaths(in []string) error
@@ -258,21 +292,30 @@ type Setup interface {
 // Compound is an interface for retrieving compound elements from the config, plus
 // some misc functions, that should likely be split into another interface
 type Compound interface {
-	UnmarshalKey(key string, rawVal interface{}, opts ...func(*mapstructure.DecoderConfig)) error
-
 	ReadInConfig() error
 	ReadConfig(in io.Reader) error
 	MergeConfig(in io.Reader) error
 	MergeFleetPolicy(configPath string) error
+
+	// Revert a finished configuration so that more can be build on top of it.
+	// When building is completed, the caller should call BuildSchema.
+	// NOTE: This method should not be used by any new callsites, it is needed
+	// currently because of the unique requirements of OTel's configuration.
+	RevertFinishedBackToBuilder() BuildableConfig
 }
 
-// Config represents an object that can load and store configuration parameters
-// coming from different kind of sources:
-// - defaults
-// - files
-// - environment variables
-// - flags
+// Config is an interface that can read/write the config after it has been
+// build and initialized.
 type Config interface {
+	ReaderWriter
+	Compound
+}
+
+// BuildableConfig is the most-general interface for the Config, it can be
+// used both to build the config and also to read/write its values. It should
+// only be used when necessary, such as when constructing a new config object
+// from scratch.
+type BuildableConfig interface {
 	ReaderWriter
 	Setup
 	Compound

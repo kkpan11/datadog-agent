@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && linux_bpf
+//go:build linux && bpf
 
 package modules
 
@@ -26,8 +26,7 @@ func init() { registerModule(OOMKillProbe) }
 
 // OOMKillProbe Factory
 var OOMKillProbe = &module.Factory{
-	Name:             config.OOMKillProbeModule,
-	ConfigNamespaces: []string{},
+	Name: config.OOMKillProbeModule,
 	Fn: func(_ *sysconfigtypes.Config, _ module.FactoryDependencies) (module.Module, error) {
 		log.Infof("Starting the OOM Kill probe")
 		okp, err := oomkill.NewProbe(ebpf.NewConfig())
@@ -51,10 +50,10 @@ type oomKillModule struct {
 }
 
 func (o *oomKillModule) Register(httpMux *module.Router) error {
-	httpMux.HandleFunc("/check", utils.WithConcurrencyLimit(utils.DefaultMaxConcurrentRequests, func(w http.ResponseWriter, _ *http.Request) {
+	httpMux.HandleFunc("/check", utils.WithConcurrencyLimit(utils.DefaultMaxConcurrentRequests, func(w http.ResponseWriter, req *http.Request) {
 		o.lastCheck.Store(time.Now().Unix())
 		stats := o.Probe.GetAndFlush()
-		utils.WriteAsJSON(w, stats, utils.CompactOutput)
+		utils.WriteAsJSON(req, w, stats, utils.CompactOutput)
 	}))
 
 	return nil

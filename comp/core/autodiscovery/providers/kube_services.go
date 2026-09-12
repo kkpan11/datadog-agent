@@ -10,7 +10,9 @@ package providers
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
+	"sync"
 
 	"go.uber.org/atomic"
 	v1 "k8s.io/api/core/v1"
@@ -21,9 +23,12 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
+	healthplatformdef "github.com/DataDog/datadog-agent/comp/healthplatform/store/def"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -37,13 +42,15 @@ const (
 type KubeServiceConfigProvider struct {
 	lister         listersv1.ServiceLister
 	upToDate       *atomic.Bool
-	configErrors   map[string]ErrorMsgSet
+	configErrorsMu sync.RWMutex
+	configErrors   map[string]types.ErrorMsgSet
 	telemetryStore *telemetry.Store
+	healthPlatform healthplatformdef.Component
 }
 
 // NewKubeServiceConfigProvider returns a new ConfigProvider connected to apiserver.
 // Connectivity is not checked at this stage to allow for retries, Collect will do it.
-func NewKubeServiceConfigProvider(_ *pkgconfigsetup.ConfigurationProviders, telemetryStore *telemetry.Store) (ConfigProvider, error) {
+func NewKubeServiceConfigProvider(_ *constants.ConfigurationProviders, hp healthplatformdef.Component, telemetryStore *telemetry.Store) (types.ConfigProvider, error) {
 	// Using GetAPIClient() (no retry)
 	ac, err := apiserver.GetAPIClient()
 	if err != nil {
@@ -57,9 +64,10 @@ func NewKubeServiceConfigProvider(_ *pkgconfigsetup.ConfigurationProviders, tele
 
 	p := &KubeServiceConfigProvider{
 		lister:         servicesInformer.Lister(),
-		configErrors:   make(map[string]ErrorMsgSet),
+		configErrors:   make(map[string]types.ErrorMsgSet),
 		telemetryStore: telemetryStore,
 		upToDate:       atomic.NewBool(false),
+		healthPlatform: hp,
 	}
 
 	if _, err := servicesInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -164,7 +172,7 @@ func valuesDiffer(first, second map[string]string, prefix string) bool {
 func (k *KubeServiceConfigProvider) parseServiceAnnotations(services []*v1.Service, ddConf model.Config) ([]integration.Config, error) {
 	var configs []integration.Config
 
-	setServiceIDs := map[string]struct{}{}
+	newErrors := make(map[string]types.ErrorMsgSet)
 
 	for _, svc := range services {
 		if svc == nil || svc.ObjectMeta.UID == "" {
@@ -173,17 +181,15 @@ func (k *KubeServiceConfigProvider) parseServiceAnnotations(services []*v1.Servi
 		}
 
 		serviceID := apiserver.EntityForService(svc)
-		setServiceIDs[serviceID] = struct{}{}
-		svcConf, errors := utils.ExtractTemplatesFromAnnotations(serviceID, svc.Annotations, kubeServiceID)
+		hybridIgnoreADTags := ddConf.GetBool("cluster_checks.support_hybrid_ignore_ad_tags")
+		svcConf, errors := utils.ExtractTemplatesFromAnnotations(serviceID, svc.Annotations, kubeServiceID, hybridIgnoreADTags)
 		if len(errors) > 0 {
-			errMsgSet := make(ErrorMsgSet)
+			errMsgSet := make(types.ErrorMsgSet)
 			for _, err := range errors {
 				log.Errorf("Cannot parse service template for service %s/%s: %s", svc.Namespace, svc.Name, err)
 				errMsgSet[err.Error()] = struct{}{}
 			}
-			k.configErrors[serviceID] = errMsgSet
-		} else {
-			delete(k.configErrors, serviceID)
+			newErrors[serviceID] = errMsgSet
 		}
 
 		ignoreAdForHybridScenariosTags := ignoreADTagsFromAnnotations(svc.GetAnnotations(), kubeServiceAnnotationPrefix)
@@ -200,29 +206,30 @@ func (k *KubeServiceConfigProvider) parseServiceAnnotations(services []*v1.Servi
 		configs = append(configs, svcConf...)
 	}
 
-	k.cleanErrorsOfDeletedServices(setServiceIDs)
-
+	k.configErrorsMu.Lock()
+	previousErrors := k.configErrors
+	k.configErrors = newErrors
 	if k.telemetryStore != nil {
 		k.telemetryStore.Errors.Set(float64(len(k.configErrors)), names.KubeServices)
+	}
+	k.configErrorsMu.Unlock()
+
+	for serviceID, errMsgSet := range newErrors {
+		reportConfigurationError(k.healthPlatform, serviceID, errMsgSet, types.KubeServiceAnnotationSource)
+	}
+	for serviceID := range previousErrors {
+		if _, stillErroring := newErrors[serviceID]; !stillErroring {
+			clearConfigurationErrors(k.healthPlatform, serviceID)
+		}
 	}
 
 	return configs, nil
 }
 
-func (k *KubeServiceConfigProvider) cleanErrorsOfDeletedServices(setCurrentServiceIDs map[string]struct{}) {
-	setServiceIDsWithErrors := map[string]struct{}{}
-	for serviceID := range k.configErrors {
-		setServiceIDsWithErrors[serviceID] = struct{}{}
-	}
-
-	for serviceID := range setServiceIDsWithErrors {
-		if _, exists := setCurrentServiceIDs[serviceID]; !exists {
-			delete(k.configErrors, serviceID)
-		}
-	}
-}
-
 // GetConfigErrors returns a map of configuration errors for each Kubernetes service
-func (k *KubeServiceConfigProvider) GetConfigErrors() map[string]ErrorMsgSet {
-	return k.configErrors
+func (k *KubeServiceConfigProvider) GetConfigErrors() map[string]types.ErrorMsgSet {
+	k.configErrorsMu.RLock()
+	defer k.configErrorsMu.RUnlock()
+
+	return maps.Clone(k.configErrors)
 }

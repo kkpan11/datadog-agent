@@ -1,0 +1,686 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+//go:build linux && bpf
+
+// Package procsubscribe hosts ProcessSubscriber implementations that source
+// configuration from Remote Config.
+package procsubscribe
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	ddgostatsd "github.com/DataDog/datadog-go/v5/statsd"
+	"github.com/benbjohnson/clock"
+	"google.golang.org/grpc"
+
+	"github.com/DataDog/datadog-agent/pkg/config/remote/data"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/process"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/procsubscribe/procscan"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/rcjson"
+	pbgo "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
+	"github.com/DataDog/datadog-agent/pkg/util/kernel"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+)
+
+const (
+	rcInitialReconnectDelay = 200 * time.Millisecond
+	rcMaxReconnectDelay     = 30 * time.Second
+
+	// defaultScanInterval is the delay between the end of one process scan and
+	// the start of the next. It is also the delay before the first retry of a
+	// process whose tracer metadata could not be read, so that retry lands on
+	// the next scan.
+	//
+	// Every process on the host costs a stat read on every scan, which is
+	// around 1% of a core at two thousand processes if we scan every three
+	// seconds. Five buys most of that back for two extra seconds of discovery
+	// latency.
+	defaultScanInterval = 5 * time.Second
+
+	// minScanRestMultiple floors the delay after a scan at this multiple of how
+	// long that scan took, bounding the loop at roughly one twentieth of a core
+	// however slow a scan becomes. Nothing else bounds it: a scan reads every
+	// process' start time and searches the open descriptors of those due for a
+	// retry, and neither the number of processes on a host nor the number of
+	// descriptors any one of them holds is under the scanner's control.
+	//
+	// This is a safety valve, not a schedule. A scan at two thousand processes
+	// takes tens of milliseconds, so twenty times that is well inside
+	// defaultScanInterval and the delay is exactly that constant. The floor
+	// engages only once a scan is slow enough that resting the interval would
+	// cost more than the budget.
+	minScanRestMultiple = 20
+
+	// discoveryLatencyMetric measures the seconds between a process starting
+	// and the agent asking Remote Config for its configuration.
+	discoveryLatencyMetric = "datadog.dynamic_instrumentation.process_discovery_latency_seconds"
+
+	// discoveryAttemptsMetric measures how many scans looked at a process
+	// before discovering it.
+	discoveryAttemptsMetric = "datadog.dynamic_instrumentation.process_discovery_scan_attempts"
+)
+
+type config struct {
+	scanInterval   time.Duration
+	processScanner processScanner
+	clk            clock.Clock
+	wait           func(ctx context.Context, duration time.Duration) error
+	statsd         ddgostatsd.ClientInterface
+}
+
+var defaultConfig = config{
+	scanInterval: defaultScanInterval,
+	clk:          clock.New(),
+	wait: func(ctx context.Context, duration time.Duration) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(duration):
+			return nil
+		}
+	},
+}
+
+// RemoteConfigSubscriber represents the subset of the Remote Config gRPC client
+// used by the process subscriber.
+type RemoteConfigSubscriber interface {
+	CreateConfigSubscription(
+		ctx context.Context, opts ...grpc.CallOption,
+	) (pbgo.AgentSecure_CreateConfigSubscriptionClient, error)
+}
+
+// Subscriber implements the module.ProcessSubscriber interface using Remote
+// Config subscription streams to drive process updates.
+type Subscriber struct {
+	client         RemoteConfigSubscriber
+	scanner        processScanner
+	clk            clock.Clock
+	statsd         ddgostatsd.ClientInterface
+	notifyRequests chan struct{}
+
+	mu struct {
+		sync.Mutex
+		state           subscriberState
+		started         bool
+		pendingRequests []*pbgo.ConfigSubscriptionRequest
+		callback        func(process.ProcessesUpdate)
+	}
+
+	scanInterval time.Duration
+	wait         func(ctx context.Context, duration time.Duration) error
+
+	stats scannerStats
+
+	start sync.Once
+	stop  sync.Once
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+// scannerStats describes the cadence of the scan loop.
+type scannerStats struct {
+	scans              atomic.Uint64
+	scanDurationMillis atomic.Int64
+}
+
+// processScanner is an interface that allows for the discovery of processes.
+//
+// It is exported for testing purposes.
+type processScanner interface {
+	Scan() (
+		added []procscan.DiscoveredProcess,
+		removed []procscan.ProcessID,
+		_ error,
+	)
+	// LiveProcesses returns the processes alive as of the last Scan.
+	LiveProcesses() []procscan.ProcessID
+}
+
+// Option configures a RemoteConfigProcessSubscriber.
+type Option interface {
+	apply(*config)
+}
+
+type optionFunc func(*config)
+
+func (f optionFunc) apply(c *config) { f(c) }
+
+// WithStatsd sets the statsd client that process discovery metrics are
+// reported to. Without one, no metrics are reported.
+func WithStatsd(client ddgostatsd.ClientInterface) Option {
+	return optionFunc(func(c *config) { c.statsd = client })
+}
+
+// NewSubscriber creates a Subscriber that sources updates directly from Remote
+// Config.
+func NewSubscriber(
+	client RemoteConfigSubscriber,
+	opts ...Option,
+) *Subscriber {
+	cfg := defaultConfig
+	for _, opt := range opts {
+		opt.apply(&cfg)
+	}
+	scanner := cfg.processScanner
+	if scanner == nil {
+		scanner = procscan.NewScanner(
+			kernel.ProcFSRoot(),
+			// The first retry lands on the next scan, and doubles from there.
+			cfg.scanInterval, procscan.DefaultRetryBackoffCap,
+		)
+	}
+	s := &Subscriber{
+		client:         client,
+		notifyRequests: make(chan struct{}, 1),
+		scanner:        scanner,
+		clk:            cfg.clk,
+		statsd:         cfg.statsd,
+		scanInterval:   cfg.scanInterval,
+		wait:           cfg.wait,
+	}
+	s.mu.state = makeSubscriberState()
+	return s
+}
+
+// Subscribe registers the callback that will receive process updates.
+//
+// Must be called before Start. Cannot be called more than once.
+func (s *Subscriber) Subscribe(cb func(process.ProcessesUpdate)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mu.callback != nil {
+		panic("callback already set")
+	}
+	if s.mu.started {
+		panic("already started")
+	}
+	s.mu.callback = cb
+}
+
+// Start begins delivering updates to the registered callback.
+func (s *Subscriber) Start() {
+	s.start.Do(func() {
+		cbCtx := context.Background()
+		ctx, cancel := context.WithCancel(cbCtx)
+		s.cancel = cancel
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runScanner(ctx)
+		}()
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runStreamManager(ctx)
+		}()
+	})
+}
+
+// Close stops processing updates and releases resources.
+func (s *Subscriber) Close() {
+	var notStarted bool
+	if s.start.Do(func() { notStarted = true }); notStarted {
+		s.stop.Do(func() {})
+		return
+	}
+	s.stop.Do(func() {
+		defer s.wg.Wait()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.cancel()
+	})
+}
+
+func (s *Subscriber) runScanner(ctx context.Context) {
+	var next time.Duration
+	for {
+		if err := s.wait(ctx, next); err != nil {
+			return
+		}
+
+		start := s.clk.Now()
+		added, removed, err := s.scanner.Scan()
+		if err != nil {
+			log.Warnf("process subscriber: scanner error: %v", err)
+		} else if len(added) > 0 || len(removed) > 0 {
+			if log.ShouldLog(log.TraceLvl) {
+				log.Tracef("process subscriber: onScanUpdate: added=%v, removed=%v", added, removed)
+			}
+			s.withlocked(func(l *lockedSubscriber) {
+				l.mu.state.onScanUpdate(added, removed, start, l)
+			})
+		} else if log.ShouldLog(log.TraceLvl) {
+			log.Tracef("process subscriber: onScanUpdate: no changes")
+		}
+		took := s.clk.Since(start)
+		s.stats.scans.Add(1)
+		s.stats.scanDurationMillis.Store(took.Milliseconds())
+		next = max(s.scanInterval, minScanRestMultiple*took)
+	}
+}
+
+// Stats returns a snapshot of the process discovery counters.
+func (s *Subscriber) Stats() map[string]any {
+	return map[string]any{
+		"scans":                s.stats.scans.Load(),
+		"scan_duration_millis": s.stats.scanDurationMillis.Load(),
+	}
+}
+
+func (s *Subscriber) withlocked(fn func(*lockedSubscriber)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn((*lockedSubscriber)(s))
+}
+
+type lockedSubscriber Subscriber
+
+// clearPendingRequests implements effects.
+func (l *lockedSubscriber) clearPendingRequests() {
+	l.mu.pendingRequests = nil
+}
+
+// emitUpdate implements effects.
+func (l *lockedSubscriber) emitUpdate(update process.ProcessesUpdate) {
+	l.mu.callback(update)
+}
+
+// track implements effects.
+func (l *lockedSubscriber) track(runtimeID string) {
+	l.reportDiscovery(runtimeID)
+	l.queueRequest(&pbgo.ConfigSubscriptionRequest{
+		RuntimeId: runtimeID,
+		Action:    pbgo.ConfigSubscriptionRequest_TRACK,
+		Products:  pbgo.ConfigSubscriptionProducts_LIVE_DEBUGGING,
+	})
+}
+
+// reportDiscovery reports how long it took to get from the start of a process
+// to asking Remote Config about it, and how many scans that took. Reconnecting
+// the stream re-tracks every process, so only the first request for a process
+// is reported. The attempt count does not depend on the process start time, so
+// it is still reported on hosts where the boot time could not be read.
+func (l *lockedSubscriber) reportDiscovery(runtimeID string) {
+	entry, ok := l.mu.state.tracked[runtimeID]
+	if !ok || entry.trackRequested {
+		return
+	}
+	entry.trackRequested = true
+	if l.statsd == nil {
+		return
+	}
+	tags := []string{"language:" + entry.language}
+	if err := l.statsd.Distribution(
+		discoveryAttemptsMetric, float64(entry.discoveryAttempts), tags, 1,
+	); err != nil {
+		log.Debugf("process subscriber: failed to report discovery attempts: %v", err)
+	}
+	if entry.startTime.IsZero() {
+		return
+	}
+	latency := l.clk.Since(entry.startTime)
+	if err := l.statsd.Distribution(
+		discoveryLatencyMetric, latency.Seconds(), tags, 1,
+	); err != nil {
+		log.Debugf("process subscriber: failed to report discovery latency: %v", err)
+	}
+}
+
+// untrack implements effects.
+func (l *lockedSubscriber) untrack(runtimeID string) {
+	l.queueRequest(&pbgo.ConfigSubscriptionRequest{
+		RuntimeId: runtimeID,
+		Action:    pbgo.ConfigSubscriptionRequest_UNTRACK,
+	})
+}
+
+func (l *lockedSubscriber) queueRequest(req *pbgo.ConfigSubscriptionRequest) {
+	l.mu.pendingRequests = append(l.mu.pendingRequests, req)
+	select {
+	case l.notifyRequests <- struct{}{}:
+	default:
+	}
+}
+
+var _ effects = (*lockedSubscriber)(nil)
+
+func (s *Subscriber) runStreamManager(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // to ensure that the stream is closed
+	reconnectDelay := time.Duration(0)
+
+	var lastConnected time.Time
+	for {
+		if reconnectDelay > 0 {
+			log.Debugf("process subscriber: waiting %s before reconnecting", reconnectDelay)
+		}
+		if err := s.wait(ctx, reconnectDelay); err != nil {
+			return
+		}
+
+		if lastConnected.IsZero() {
+			log.Debugf("connecting to remote config subscription")
+		} else {
+			log.Debugf("reconnecting to remote config subscription")
+		}
+		lastConnected = s.clk.Now()
+		stream, err := s.client.CreateConfigSubscription(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Warnf(
+				"process subscriber: failed to create remote config subscription: %v",
+				err,
+			)
+			reconnectDelay = nextReconnectDelay(reconnectDelay)
+			continue
+		}
+		log.Debug("process subscriber: remote config stream opened")
+		s.withlocked(func(l *lockedSubscriber) {
+			l.mu.state.onStreamEstablished(l)
+		})
+		_, err = stream.Header()
+		if err != nil {
+			log.Warnf("process subscriber: failed to get stream header: %v", err)
+			reconnectDelay = nextReconnectDelay(reconnectDelay)
+			continue
+		}
+
+		err = s.runConnectedStream(ctx, stream)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Warnf("process subscriber: remote config stream error: %v", err)
+		reconnectDelay = nextReconnectDelay(reconnectDelay)
+		if s.clk.Since(lastConnected) > reconnectDelay {
+			reconnectDelay = 0
+		}
+	}
+}
+
+func (s *Subscriber) runConnectedStream(
+	ctx context.Context,
+	stream pbgo.AgentSecure_CreateConfigSubscriptionClient,
+) error {
+	log.Infof("runConnectedStream started")
+	defer func() { log.Infof("runConnectedStream done") }()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	sendErr := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	popPendingRequest := func() *pbgo.ConfigSubscriptionRequest {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if len(s.mu.pendingRequests) == 0 {
+			return nil
+		}
+		req := s.mu.pendingRequests[0]
+		s.mu.pendingRequests[0] = nil
+		s.mu.pendingRequests = s.mu.pendingRequests[1:]
+		return req
+	}
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			for {
+				req := popPendingRequest()
+				if req == nil {
+					break
+				}
+				if err := stream.Send(req); err != nil {
+					sendErr(err)
+					return
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.notifyRequests:
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				sendErr(err)
+				return
+			}
+			s.withlocked(func(l *lockedSubscriber) {
+				l.mu.state.onStreamConfig(resp, l)
+			})
+		}
+	}()
+	go func() { wg.Wait(); close(errCh) }()
+
+	return <-errCh
+}
+
+// ProcessReport contains information about a Go process that has been detected
+// and is being monitored for Dynamic Instrumentation updates.
+type ProcessReport struct {
+	RuntimeID    string             `json:"runtime_id"`
+	ProcessID    int32              `json:"process_id"`
+	Executable   process.Executable `json:"executable"`
+	SymDBEnabled bool               `json:"symdb_enabled"`
+	Probes       []ProbeInfo        `json:"probes"`
+	// ProcessAlive is set if the procscan.Scanner reports the process as alive.
+	// This should be true, except for races between the report and the Scanner
+	// recently figuring out that a process is dead.
+	ProcessAlive bool `json:"process_alive"`
+}
+
+// ProbeInfo contains information about a probe for the ProcessReport.
+type ProbeInfo struct {
+	ID      string `json:"id"`
+	Version int    `json:"version"`
+}
+
+// Report is a snapshot of the current state of the subscriber.
+type Report struct {
+	// Processes contains the state for all the currently tracked processes.
+	Processes []ProcessReport `json:"processes"`
+	// ProcessesNotTracked contains the PIDs of processes known to the scanner
+	// that are not tracked. This should be empty, except for to race conditions
+	// between producing this report and the scanner discovering new processes
+	// that have not been added to the tracked set yet.
+	ProcessesNotTracked []int32 `json:"processes_not_tracked"`
+}
+
+// GetReport returns a snapshot of the current state of the subscriber.
+func (s *Subscriber) GetReport() Report {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	liveProcs := map[int32]struct{}{}
+	for _, proc := range s.scanner.LiveProcesses() {
+		liveProcs[int32(proc)] = struct{}{}
+	}
+
+	var ret Report
+	for _, entry := range s.mu.state.tracked {
+		pid := entry.Info.ProcessID.PID
+		_, alive := liveProcs[pid]
+		pr := ProcessReport{
+			RuntimeID:    entry.runtimeID,
+			ProcessID:    pid,
+			Executable:   entry.Executable,
+			SymDBEnabled: entry.symdbEnabled,
+			ProcessAlive: alive,
+		}
+		for _, probe := range entry.probesByPath {
+			pr.Probes = append(pr.Probes, ProbeInfo{
+				ID:      probe.GetID(),
+				Version: probe.GetVersion(),
+			})
+		}
+		ret.Processes = append(ret.Processes, pr)
+	}
+	// Look for processes known to the scanner that are not tracked. There
+	// should be no such processes, modulo race conditions between producing
+	// this report and the scanner discovering new processes that have not been
+	// added to the tracked set yet.
+	for pid := range liveProcs {
+		_, ok := s.mu.state.pidToRuntime[pid]
+		if ok {
+			continue
+		}
+		ret.ProcessesNotTracked = append(ret.ProcessesNotTracked, pid)
+	}
+	return ret
+}
+
+type parsedRemoteConfigUpdate struct {
+	probes        map[string]ir.ProbeDefinition
+	haveSymdbFile bool
+	symdbEnabled  bool
+}
+
+func parseRemoteConfigFiles(
+	runtimeID string,
+	files []*pbgo.File,
+) parsedRemoteConfigUpdate {
+	r := parsedRemoteConfigUpdate{
+		probes:        make(map[string]ir.ProbeDefinition, len(files)),
+		haveSymdbFile: false,
+		symdbEnabled:  false,
+	}
+
+	for _, file := range files {
+		path := file.GetPath()
+		if path == "" {
+			continue
+		}
+		cfgPath, err := data.ParseConfigPath(path)
+		if err != nil {
+			log.Warnf(
+				"process subscriber: runtime %s: failed to parse config path %q: %v",
+				runtimeID, path, err,
+			)
+			continue
+		}
+		switch cfgPath.Product {
+		case data.ProductLiveDebugging:
+			raw := file.GetRaw()
+			if len(raw) == 0 {
+				continue
+			}
+			probe, err := rcjson.UnmarshalProbe(raw)
+			if err != nil {
+				log.Warnf(
+					"process subscriber: runtime %s: failed to parse probe from %q: %v",
+					runtimeID, path, err,
+				)
+				continue
+			}
+			r.probes[path] = probe
+			if log.ShouldLog(log.TraceLvl) {
+				log.Tracef(
+					"process subscriber: runtime %s parsed probe %s version=%d",
+					runtimeID, probe.GetID(), probe.GetVersion(),
+				)
+			}
+		case data.ProductLiveDebuggingSymbolDB:
+			r.haveSymdbFile = true
+			raw := file.GetRaw()
+			if len(raw) == 0 {
+				r.symdbEnabled = false
+				continue
+			}
+			var payload struct {
+				UploadSymbols bool `json:"upload_symbols"`
+			}
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				log.Warnf(
+					"process subscriber: runtime %s: failed to parse symdb payload from %q: %v",
+					runtimeID, path, err,
+				)
+				continue
+			}
+			r.symdbEnabled = payload.UploadSymbols
+		}
+	}
+
+	return r
+}
+
+func gitInfoFromTags(tags []string) *process.GitInfo {
+	var info process.GitInfo
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(tag, "git.repository_url:"):
+			info.RepositoryURL = strings.TrimPrefix(tag, "git.repository_url:")
+		case strings.HasPrefix(tag, "git.commit.sha:"):
+			info.CommitSha = strings.TrimPrefix(tag, "git.commit.sha:")
+		}
+	}
+	if info == (process.GitInfo{}) {
+		return nil
+	}
+	return &info
+}
+
+func containerIDFromTracer(tracer *pbgo.ClientTracer) string {
+	if tracer == nil {
+		return ""
+	}
+	containerID := containerIDFromTags(tracer.GetContainerTags())
+	if containerID != "" {
+		return containerID
+	}
+	return containerIDFromTags(tracer.GetTags())
+}
+
+func containerIDFromTags(tags []string) string {
+	const key = "container_id"
+	prefix := key + ":"
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if strings.HasPrefix(tag, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(tag, prefix))
+		}
+	}
+	return ""
+}
+
+func nextReconnectDelay(current time.Duration) time.Duration {
+	next := time.Duration(current.Seconds() * 2 * float64(time.Second))
+	if next > rcMaxReconnectDelay {
+		return rcMaxReconnectDelay
+	}
+	if next < rcInitialReconnectDelay {
+		return rcInitialReconnectDelay
+	}
+	return next
+}

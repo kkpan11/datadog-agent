@@ -9,9 +9,14 @@ import sys
 from invoke import task
 from invoke.exceptions import Exit
 
-from tasks.build_tags import filter_incompatible_tags, get_build_tags, get_default_build_tags
+from tasks.build_tags import (
+    compute_build_tags_for_flavor,
+)
 from tasks.flavor import AgentFlavor
-from tasks.libs.common.utils import REPO_PATH, bin_name, get_build_flags, get_root
+from tasks.libs.build.bazel import build_binary_with_bazel
+from tasks.libs.common.go import go_build
+from tasks.libs.common.utils import REPO_PATH, bin_name, get_build_flags
+from tasks.schema.template import CORE_SCHEMA_FILE, generate_template
 from tasks.windows_resources import build_messagetable, build_rc, versioninfo_vars
 
 # constants
@@ -19,6 +24,7 @@ DOGSTATSD_BIN_PATH = os.path.join(".", "bin", "dogstatsd")
 STATIC_BIN_PATH = os.path.join(".", "bin", "static")
 MAX_BINARY_SIZE = 44 * 1024
 DOGSTATSD_TAG = "datadog/dogstatsd:master"
+DOGSTATSD_CONFIG_OUTPUT = "./cmd/dogstatsd/dist/dogstatsd.yaml"
 
 
 @task
@@ -29,61 +35,59 @@ def build(
     static=False,
     build_include=None,
     build_exclude=None,
-    major_version='7',
     go_mod="readonly",
+    enable_bazel=False,
 ):
     """
     Build Dogstatsd
     """
-    build_include = (
-        get_default_build_tags(build="dogstatsd", flavor=AgentFlavor.dogstatsd)
-        if build_include is None
-        else filter_incompatible_tags(build_include.split(","))
-    )
-    build_exclude = [] if build_exclude is None else build_exclude.split(",")
-    build_tags = get_build_tags(build_include, build_exclude)
-    ldflags, gcflags, env = get_build_flags(ctx, static=static, major_version=major_version)
     bin_path = DOGSTATSD_BIN_PATH
 
-    # generate windows resources
-    if sys.platform == 'win32':
-        build_messagetable(ctx)
-        vars = versioninfo_vars(ctx, major_version=major_version)
-        build_rc(
+    if enable_bazel:
+        if race:
+            raise NotImplementedError("--enable-bazel does not support --race.")
+        if static:
+            raise NotImplementedError("--enable-bazel does not support --static.")
+        if build_include is not None or build_exclude is not None:
+            raise NotImplementedError("--enable-bazel does not support --build-include/--build-exclude.")
+        build_binary_with_bazel("//cmd/dogstatsd:dogstatsd", bin_path=os.path.join(bin_path, bin_name("dogstatsd")))
+    else:
+        if static:
+            bin_path = STATIC_BIN_PATH
+        build_tags = compute_build_tags_for_flavor(
+            build="dogstatsd", flavor=AgentFlavor.dogstatsd, build_include=build_include, build_exclude=build_exclude
+        )
+        ldflags, gcflags, env = get_build_flags(ctx, static=static)
+
+        # generate windows resources
+        if sys.platform == 'win32':
+            build_messagetable(ctx)
+            vars = versioninfo_vars(ctx)
+            build_rc(
+                ctx,
+                "cmd/dogstatsd/windows_resources/dogstatsd.rc",
+                vars=vars,
+                out="cmd/dogstatsd/rsrc.syso",
+            )
+
+        go_build(
             ctx,
-            "cmd/dogstatsd/windows_resources/dogstatsd.rc",
-            vars=vars,
-            out="cmd/dogstatsd/rsrc.syso",
+            f"{REPO_PATH}/cmd/dogstatsd",
+            mod=go_mod,
+            race=race,
+            rebuild=rebuild,
+            gcflags=gcflags,
+            ldflags=ldflags,
+            build_tags=build_tags,
+            bin_path=os.path.join(bin_path, bin_name("dogstatsd")),
+            env=env,
+            check_deadcode=os.getenv("DEPLOY_AGENT") == "true",
         )
 
-    if static:
-        bin_path = STATIC_BIN_PATH
-
-    # NOTE: consider stripping symbols to reduce binary size
-    cmd = "go build -mod={go_mod} {race_opt} {build_type} -tags \"{build_tags}\" -o {bin_name} "
-    cmd += "-gcflags=\"{gcflags}\" -ldflags=\"{ldflags}\" {REPO_PATH}/cmd/dogstatsd"
-    args = {
-        "go_mod": go_mod,
-        "race_opt": "-race" if race else "",
-        "build_type": "-a" if rebuild else "",
-        "build_tags": " ".join(build_tags),
-        "bin_name": os.path.join(bin_path, bin_name("dogstatsd")),
-        "gcflags": gcflags,
-        "ldflags": ldflags,
-        "REPO_PATH": REPO_PATH,
-    }
-    ctx.run(cmd.format(**args), env=env)
-
-    # Render the configuration file template
-    #
-    # We need to remove cross compiling bits if any because go generate must
-    # build and execute in the native platform
-    env = {
-        "GOOS": "",
-        "GOARCH": "",
-    }
-    cmd = "go generate -mod={} {}/cmd/dogstatsd"
-    ctx.run(cmd.format(go_mod, REPO_PATH), env=env)
+    # Render the configuration file template. The dogstatsd binary ships
+    # on linux containers, so we always target linux (matches the legacy
+    # `go generate` behavior on the native build host).
+    generate_template(CORE_SCHEMA_FILE, DOGSTATSD_CONFIG_OUTPUT, "dogstatsd", "linux")
 
     if static and sys.platform.startswith("linux"):
         cmd = "file {bin_name} "
@@ -125,27 +129,6 @@ def run(ctx, rebuild=False, race=False, build_include=None, build_exclude=None, 
 
     target = os.path.join(DOGSTATSD_BIN_PATH, bin_name("dogstatsd"))
     ctx.run(f"{target} start")
-
-
-@task
-def system_tests(ctx, skip_build=False, go_mod="readonly"):
-    """
-    Run the system testsuite.
-    """
-    if not skip_build:
-        print("Building dogstatsd...")
-        build(ctx)
-
-    env = {
-        "DOGSTATSD_BIN": os.path.join(get_root(), DOGSTATSD_BIN_PATH, bin_name("dogstatsd")),
-    }
-    cmd = "go test -mod={go_mod} -tags '{build_tags}' -v {REPO_PATH}/test/system/dogstatsd/"
-    args = {
-        "go_mod": go_mod,
-        "build_tags": " ".join(get_default_build_tags(build="system-tests", flavor=AgentFlavor.dogstatsd)),
-        "REPO_PATH": REPO_PATH,
-    }
-    ctx.run(cmd.format(**args), env=env)
 
 
 @task

@@ -3,13 +3,15 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+// Package logs provides log collection and scheduling for serverless environments.
 package logs
 
 import (
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
-	logsAgent "github.com/DataDog/datadog-agent/comp/logs/agent"
-	"github.com/DataDog/datadog-agent/comp/logs/agent/agentimpl"
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
+	logsAgent "github.com/DataDog/datadog-agent/comp/logs/agent/def"
+	agentimpl "github.com/DataDog/datadog-agent/comp/logs/agent/impl"
 	logscompression "github.com/DataDog/datadog-agent/comp/serializer/logscompression/def"
 	"github.com/DataDog/datadog-agent/pkg/logs/schedulers/channel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -20,8 +22,8 @@ import (
 var logsScheduler *channel.Scheduler
 
 // SetupLogAgent sets up the logs agent to handle messages on the given channel.
-func SetupLogAgent(logChannel chan *config.ChannelMessage, sourceName string, source string, tagger tagger.Component, compression logscompression.Component) (logsAgent.ServerlessLogsAgent, error) {
-	agent := agentimpl.NewServerlessLogsAgent(tagger, compression)
+func SetupLogAgent(logChannel chan *config.ChannelMessage, sourceName string, source string, tagger tagger.Component, compression logscompression.Component, hostname hostnameinterface.Component) (logsAgent.ServerlessLogsAgent, error) {
+	agent := agentimpl.NewServerlessLogsAgent(tagger, compression, hostname)
 	err := agent.Start()
 	if err != nil {
 		log.Error("Could not start an instance of the Logs Agent:", err)
@@ -41,12 +43,4 @@ func SetLogsTags(tags []string) {
 	if logsScheduler != nil {
 		logsScheduler.SetLogsTags(tags)
 	}
-}
-
-//nolint:revive // TODO(SERV) Fix revive linter
-func GetLogsTags() []string {
-	if logsScheduler != nil {
-		return logsScheduler.GetLogsTags()
-	}
-	return nil
 }

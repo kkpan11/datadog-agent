@@ -8,8 +8,11 @@ package utils
 
 import (
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
+	pkgfips "github.com/DataDog/datadog-agent/pkg/fips"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -28,7 +31,7 @@ func SetLogLevel(level string, config pkgconfigmodel.Writer, source pkgconfigmod
 		return err
 	}
 	// Logger subscribe to config changes to automatically apply new log_level value
-	config.Set("log_level", seelogLogLevel, source)
+	config.Set("log_level", seelogLogLevel.String(), source)
 	return nil
 }
 
@@ -56,4 +59,68 @@ func IsCoreAgentEnabled(cfg pkgconfigmodel.Reader) bool {
 func IsAPMEnabled(cfg pkgconfigmodel.Reader) bool {
 	return cfg.GetBool("apm_config.enabled") ||
 		cfg.GetBool("apm_config.error_tracking_standalone.enabled")
+}
+
+// IsDataSecurityEnabled returns true if Data Security is enabled. It requires both
+// data_security.enabled and shared_library_check.enabled, as it relies on the datasecurity
+// shared-library check.
+func IsDataSecurityEnabled(cfg pkgconfigmodel.Reader) bool {
+	if !cfg.GetBool("data_security.enabled") {
+		return false
+	}
+	if !cfg.GetBool("shared_library_check.enabled") {
+		log.Warnf("data_security.enabled cannot be enabled without shared_library_check.enabled. Skipping Data Security.")
+		return false
+	}
+	return true
+}
+
+// IsRemoteConfigEnabled returns true if Remote Configuration should be enabled
+func IsRemoteConfigEnabled(cfg pkgconfigmodel.Reader) bool {
+	// Disable Remote Config for GovCloud if it's not explicitly enabled
+	if IsFed(cfg) && !cfg.IsConfigured("remote_configuration.enabled") {
+		return false
+	}
+	return cfg.GetBool("remote_configuration.enabled")
+}
+
+// IsFed returns true if the Agent is running in a gov environment
+func IsFed(cfg pkgconfigmodel.Reader) bool {
+	reSite := regexp.MustCompile(`(.+\.)?ddog-gov\.com`)
+	reURL := regexp.MustCompile(`https://.+\.ddog-gov\.com`)
+	isFipsAgent, _ := pkgfips.Enabled()
+	return cfg.GetBool("fips.enabled") || isFipsAgent ||
+		reSite.MatchString(cfg.GetString("site")) || reURL.MatchString(cfg.GetString("dd_url"))
+}
+
+// IsCloudProviderEnabled checks the cloud provider family provided in
+// pkg/util/<cloud_provider>.go against the value for cloud_provider: on the
+// global config object Datadog
+func IsCloudProviderEnabled(cloudProviderName string, config pkgconfigmodel.Reader) bool {
+	cloudProviderFromConfig := config.GetStringSlice("cloud_provider_metadata")
+
+	for _, cloudName := range cloudProviderFromConfig {
+		if strings.EqualFold(cloudName, cloudProviderName) {
+			log.Debugf("cloud_provider_metadata is set to %s in agent configuration, trying endpoints for %s Cloud Provider",
+				cloudProviderFromConfig,
+				cloudProviderName)
+			return true
+		}
+	}
+
+	log.Debugf("cloud_provider_metadata is set to %s in agent configuration, skipping %s Cloud Provider",
+		cloudProviderFromConfig,
+		cloudProviderName)
+	return false
+}
+
+// GetBindHost returns the `bind_host` value. Callers that need to distinguish
+// "user explicitly set bind_host" from "default applied" must check
+// `cfg.IsConfigured("bind_host")` directly (see trace-agent's containerized
+// auto-`0.0.0.0` logic).
+func GetBindHost(cfg pkgconfigmodel.Reader) string {
+	if cfg.IsConfigured("bind_host") {
+		return cfg.GetString("bind_host")
+	}
+	return "localhost"
 }

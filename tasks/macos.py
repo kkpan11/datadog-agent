@@ -1,5 +1,6 @@
 import glob
 import os
+import shutil
 import time
 
 from invoke import task
@@ -49,8 +50,7 @@ def list_ci_active_versions(_, lang, n_days=30):
     from datadog_api_client import ApiClient, Configuration
     from datadog_api_client.v1.api.metrics_api import MetricsApi
 
-    configuration = Configuration()
-    with ApiClient(configuration) as api_client:
+    with ApiClient(Configuration(enable_retry=True)) as api_client:
         api_instance = MetricsApi(api_client)
         response = api_instance.query_metrics(
             _from=int((datetime.now() + timedelta(days=-n_days)).timestamp()),
@@ -144,4 +144,4 @@ def remove_inactive_versions(ctx, lang, target_version="", n_days=30, dry_run=Fa
                     elif lang == "go":
                         install_dir = glob.glob(f"{os.environ['HOME']}/.gimme/versions/go{version}*")
                         assert len(install_dir) == 1, f"Expected one Go version for {version}: {install_dir}"
-                        ctx.run(f"rm -rf {install_dir}")
+                        shutil.rmtree(install_dir[0])

@@ -8,30 +8,33 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/DataDog/datadog-go/v5/statsd"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/api/apiutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/api/internal/header"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
-	"github.com/DataDog/datadog-go/v5/statsd"
 )
 
 const (
 	validSubdomainSymbols       = "_-."
 	validPathSymbols            = "/_-+"
-	validPathQueryStringSymbols = "/_-+@?&=.:\""
+	validPathQueryStringSymbols = "/_-+@?&=.:\"[]"
 )
 
 // EvpProxyAllowedHeaders contains the headers that the proxy will forward. All others will be cleared.
-var EvpProxyAllowedHeaders = []string{"Content-Type", "Accept-Encoding", "Content-Encoding", "User-Agent", "DD-CI-PROVIDER-NAME"}
+var EvpProxyAllowedHeaders = []string{"Content-Type", "Accept-Encoding", "Content-Encoding", "User-Agent", "DD-CI-PROVIDER-NAME", "DD-EVP-ORIGIN", "DD-EVP-ORIGIN-VERSION"}
 
 // evpProxyEndpointsFromConfig returns the configured list of endpoints to forward payloads to.
 func evpProxyEndpointsFromConfig(conf *config.AgentConfig) []config.Endpoint {
@@ -80,13 +83,12 @@ func evpProxyForwarder(conf *config.AgentConfig, statsd statsd.ClientInterface) 
 	endpoints := evpProxyEndpointsFromConfig(conf)
 	logger := stdlog.New(log.NewThrottled(5, 10*time.Second), "EVPProxy: ", 0) // limit to 5 messages every 10 seconds
 	return &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
+		Rewrite: func(_ *httputil.ProxyRequest) {
 			// The X-Forwarded-For header can be abused to fake the origin of requests and we don't need it,
-			// so we set it to null to tell ReverseProxy to not set it.
-			req.Header["X-Forwarded-For"] = nil
+			// so we do not call pr.SetXForwarded().
 		},
 		ErrorLog:  logger,
-		Transport: &evpProxyTransport{conf.NewHTTPTransport(), endpoints, conf, NewIDProvider(conf.ContainerProcRoot, conf.ContainerIDFromOriginInfo), statsd},
+		Transport: &evpProxyTransport{conf.NewHTTPTransport(), endpoints, conf, NewContainerIDProviderFromConfig(conf), statsd},
 	}
 }
 
@@ -123,11 +125,10 @@ func (t *evpProxyTransport) RoundTrip(req *http.Request) (rresp *http.Response, 
 
 	subdomain := req.Header.Get("X-Datadog-EVP-Subdomain")
 	containerID := t.containerIDProvider.GetContainerID(req.Context(), req.Header)
-	needsAppKey := (strings.ToLower(req.Header.Get("X-Datadog-NeedsAppKey")) == "true")
 
 	// Sanitize the input, don't accept any valid URL but just some limited subset
 	if len(subdomain) == 0 {
-		return nil, fmt.Errorf("EVPProxy: no subdomain specified")
+		return nil, errors.New("EVPProxy: no subdomain specified")
 	}
 	if !isValidSubdomain(subdomain) {
 		return nil, fmt.Errorf("EVPProxy: invalid subdomain: %s", subdomain)
@@ -140,17 +141,13 @@ func (t *evpProxyTransport) RoundTrip(req *http.Request) (rresp *http.Response, 
 		return nil, fmt.Errorf("EVPProxy: invalid query string: %s", req.URL.RawQuery)
 	}
 
-	if needsAppKey && t.conf.EVPProxy.ApplicationKey == "" {
-		return nil, fmt.Errorf("EVPProxy: ApplicationKey needed but not set")
-	}
-
 	// We don't want to forward arbitrary headers, create a copy of the input headers and clear them
 	inputHeaders := req.Header
 	req.Header = http.Header{}
 
 	// Set standard headers
 	req.Header.Set("User-Agent", "") // Set to empty string so Go doesn't set its default
-	req.Header.Set("Via", fmt.Sprintf("trace-agent %s", t.conf.AgentVersion))
+	req.Header.Set("Via", "trace-agent "+t.conf.AgentVersion)
 
 	// Copy allowed headers from the input request
 	for _, header := range EvpProxyAllowedHeaders {
@@ -173,15 +170,15 @@ func (t *evpProxyTransport) RoundTrip(req *http.Request) (rresp *http.Response, 
 	req.Header.Set("X-Datadog-AgentDefaultEnv", t.conf.DefaultEnv)
 	log.Debugf("Setting headers X-Datadog-Hostnames=%s, X-Datadog-AgentDefaultEnv=%s for evp proxy", t.conf.Hostname, t.conf.DefaultEnv)
 	req.Header.Set(header.ContainerID, containerID)
-	if needsAppKey {
-		req.Header.Set("DD-APPLICATION-KEY", t.conf.EVPProxy.ApplicationKey)
+	if t.conf.ErrorTrackingStandalone {
+		req.Header.Set("X-Datadog-Error-Tracking-Standalone", "true")
 	}
 
 	// Timeout: Our outbound request(s) can't take longer than the WriteTimeout of the server
 	timeout := getConfiguredEVPRequestTimeoutDuration(t.conf)
 	req.Header.Set("X-Datadog-Timeout", strconv.Itoa((int(timeout.Seconds()))))
 	deadline := time.Now().Add(timeout)
-	//nolint:govet,lostcancel we don't need to manually cancel this context, we can rely on the parent context being cancelled
+	//nolint:govet // we don't need to manually cancel this context, we can rely on the parent context being cancelled
 	ctx, _ := context.WithDeadline(req.Context(), deadline)
 	req = req.WithContext(ctx)
 
@@ -254,7 +251,12 @@ func isValidPath(s string) bool {
 }
 
 func isValidQueryString(s string) bool {
-	for _, c := range s {
+	decoded, err := url.QueryUnescape(s)
+	if err != nil {
+		log.Debugf("failed to unescape query string: %v", err)
+		return false
+	}
+	for _, c := range decoded {
 		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && !strings.ContainsRune(validPathQueryStringSymbols, c) {
 			return false
 		}

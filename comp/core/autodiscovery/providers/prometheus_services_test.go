@@ -23,103 +23,6 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 )
 
-func TestPromAnnotationsDiffer(t *testing.T) {
-	tests := []struct {
-		name   string
-		checks []*types.PrometheusCheck
-		first  map[string]string
-		second map[string]string
-		want   bool
-	}{
-		{
-			name:   "scrape annotation changed",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/scrape": "true"},
-			second: map[string]string{"prometheus.io/scrape": "false"},
-			want:   true,
-		},
-		{
-			name:   "scrape annotation unchanged",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/scrape": "true"},
-			second: map[string]string{"prometheus.io/scrape": "true"},
-			want:   false,
-		},
-		{
-			name:   "scrape annotation removed",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/scrape": "true"},
-			second: map[string]string{"foo": "bar"},
-			want:   true,
-		},
-		{
-			name:   "path annotation changed",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/path": "/metrics"},
-			second: map[string]string{"prometheus.io/path": "/metrics_custom"},
-			want:   true,
-		},
-		{
-			name:   "path annotation unchanged",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/path": "/metrics"},
-			second: map[string]string{"prometheus.io/path": "/metrics"},
-			want:   false,
-		},
-		{
-			name:   "port annotation changed",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/port": "1234"},
-			second: map[string]string{"prometheus.io/port": "4321"},
-			want:   true,
-		},
-		{
-			name:   "port annotation unchanged",
-			checks: []*types.PrometheusCheck{types.DefaultPrometheusCheck},
-			first:  map[string]string{"prometheus.io/port": "1234"},
-			second: map[string]string{"prometheus.io/port": "1234"},
-			want:   false,
-		},
-		{
-			name:   "include annotation changed",
-			checks: []*types.PrometheusCheck{{AD: &types.ADConfig{KubeAnnotations: &types.InclExcl{Incl: map[string]string{"include": "true"}}}}},
-			first:  map[string]string{"include": "true"},
-			second: map[string]string{"include": "foo"},
-			want:   true,
-		},
-		{
-			name:   "include annotation unchanged",
-			checks: []*types.PrometheusCheck{{AD: &types.ADConfig{KubeAnnotations: &types.InclExcl{Incl: map[string]string{"include": "true"}}}}},
-			first:  map[string]string{"include": "true"},
-			second: map[string]string{"include": "true"},
-			want:   false,
-		},
-		{
-			name:   "exclude annotation changed",
-			checks: []*types.PrometheusCheck{{AD: &types.ADConfig{KubeAnnotations: &types.InclExcl{Excl: map[string]string{"exclude": "true"}}}}},
-			first:  map[string]string{"exclude": "true"},
-			second: map[string]string{"exclude": "foo"},
-			want:   true,
-		},
-		{
-			name:   "exclude annotation unchanged",
-			checks: []*types.PrometheusCheck{{AD: &types.ADConfig{KubeAnnotations: &types.InclExcl{Excl: map[string]string{"exclude": "true"}}}}},
-			first:  map[string]string{"exclude": "true"},
-			second: map[string]string{"exclude": "true"},
-			want:   false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := &PrometheusServicesConfigProvider{}
-			p.checks = tt.checks
-			if got := p.promAnnotationsDiffer(tt.first, tt.second); got != tt.want {
-				t.Errorf("PrometheusServicesConfigProvider.promAnnotationsDiffer() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 type MockServiceAPI struct {
 	mock.Mock
 }
@@ -179,6 +82,36 @@ func TestPrometheusServicesCollect(t *testing.T) {
 					Source:        "prometheus_services:kube_service://ns/svc",
 				},
 			},
+		},
+		{
+			name: "skip check with kubernetes_container_names",
+			checks: []*types.PrometheusCheck{
+				{
+					Instances: types.DefaultPrometheusCheck.Instances,
+					AD: &types.ADConfig{
+						KubeAnnotations: &types.InclExcl{
+							Excl: map[string]string{"prometheus.io/scrape": "false"},
+							Incl: map[string]string{"prometheus.io/scrape": "true"},
+						},
+						KubeContainerNames: []string{"example-container"},
+					},
+				},
+			},
+			services: []*v1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:       k8stypes.UID("test"),
+						Name:      "svc",
+						Namespace: "ns",
+						Annotations: map[string]string{
+							"prometheus.io/scrape": "true",
+							"prometheus.io/path":   "/mewtrix",
+							"prometheus.io/port":   "1234",
+						},
+					},
+				},
+			},
+			expectConfigs: nil,
 		},
 		{
 			name:   "collect only endpoints",
@@ -260,7 +193,7 @@ func TestPrometheusServicesCollect(t *testing.T) {
 	}
 
 	cfg := pkgconfigmock.New(t)
-	cfg.SetWithoutSource("prometheus_scrape.version", 2)
+	cfg.SetInTest("prometheus_scrape.version", 2)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -450,10 +383,12 @@ func TestPrometheusServicesInvalidateIfChangedEndpoints(t *testing.T) {
 		old                *v1.Endpoints
 		new                *v1.Endpoints
 		monitoredEndpoints []string
+		initialUpToDate    bool
 		expectUpToDate     bool
 	}{
 		{
-			name: "no change",
+			name:            "no change",
+			initialUpToDate: true,
 			old: &v1.Endpoints{
 				ObjectMeta: metav1.ObjectMeta{
 					ResourceVersion: "v1",
@@ -545,7 +480,8 @@ func TestPrometheusServicesInvalidateIfChangedEndpoints(t *testing.T) {
 			monitoredEndpoints: []string{
 				"kube_endpoint_uid://ns/svc/",
 			},
-			expectUpToDate: true,
+			initialUpToDate: true,
+			expectUpToDate:  true,
 		},
 		{
 			name: "subsets change",
@@ -602,7 +538,58 @@ func TestPrometheusServicesInvalidateIfChangedEndpoints(t *testing.T) {
 			monitoredEndpoints: []string{
 				"kube_endpoint_uid://ns/svc/",
 			},
-			expectUpToDate: false,
+			initialUpToDate: true,
+			expectUpToDate:  false,
+		},
+		{
+			name: "unchanged subsets must not re-validate a pending invalidation",
+			old: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					ResourceVersion: "v1",
+					Name:            "svc",
+					Namespace:       "ns",
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{
+								IP: "10.0.0.1",
+								TargetRef: &v1.ObjectReference{
+									Kind: "Pod",
+									UID:  "svc-pod-1",
+								},
+								NodeName: &node,
+							},
+						},
+					},
+				},
+			},
+			new: &v1.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					ResourceVersion: "v2",
+					Name:            "svc",
+					Namespace:       "ns",
+				},
+				Subsets: []v1.EndpointSubset{
+					{
+						Addresses: []v1.EndpointAddress{
+							{
+								IP: "10.0.0.1",
+								TargetRef: &v1.ObjectReference{
+									Kind: "Pod",
+									UID:  "svc-pod-1",
+								},
+								NodeName: &node,
+							},
+						},
+					},
+				},
+			},
+			monitoredEndpoints: []string{
+				"kube_endpoint_uid://ns/svc/",
+			},
+			initialUpToDate: false,
+			expectUpToDate:  false,
 		},
 	}
 
@@ -610,7 +597,7 @@ func TestPrometheusServicesInvalidateIfChangedEndpoints(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			p := newPromServicesProvider(checks, api, true)
-			p.setUpToDate(true)
+			p.setUpToDate(test.initialUpToDate)
 			for _, monitored := range test.monitoredEndpoints {
 				p.monitoredEndpoints[monitored] = true
 			}

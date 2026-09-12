@@ -22,35 +22,42 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/cluster-agent/command"
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
 type cliParams struct {
+	args            []string
 	jsonStatus      bool
 	prettyPrintJSON bool
 	statusFilePath  string
+	list            bool
 }
 
 // Commands returns a slice of subcommands for the 'cluster-agent' command.
 func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 	cliParams := &cliParams{}
 	cmd := &cobra.Command{
-		Use:   "status",
+		Use:   "status [section]",
 		Short: "Print the current status",
-		Long:  ``,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		Long: `Print the current status.
+If no section is specified, this command will display all status sections.
+If a specific section is provided, such as 'admission controller', it will only display the status of that section.
+The --list flag can be used to list all available status sections.`,
+		RunE: func(_ *cobra.Command, args []string) error {
+			cliParams.args = args
 			return fxutil.OneShot(run,
 				fx.Supply(cliParams),
 				fx.Supply(core.BundleParams{
 					ConfigParams: config.NewClusterAgentParams(globalParams.ConfFilePath),
-					SecretParams: secrets.NewEnabledParams(),
 					LogParams:    log.ForOneShot(command.LoggerName, command.DefaultLogLevel, true),
 				}),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -58,18 +65,26 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 	cmd.Flags().BoolVarP(&cliParams.jsonStatus, "json", "j", false, "print out raw json")
 	cmd.Flags().BoolVarP(&cliParams.prettyPrintJSON, "pretty-json", "p", false, "pretty print JSON")
 	cmd.Flags().StringVarP(&cliParams.statusFilePath, "file", "o", "", "Output the status command to a file")
+	cmd.Flags().BoolVarP(&cliParams.list, "list", "l", false, "list all available status sections")
 
 	return []*cobra.Command{cmd}
 }
 
 //nolint:revive // TODO(CINT) Fix revive linter
-func run(log log.Component, config config.Component, cliParams *cliParams) error {
-	if !cliParams.prettyPrintJSON && !cliParams.jsonStatus {
+func run(log log.Component, config config.Component, client ipc.HTTPClient, cliParams *cliParams) error {
+	if cliParams.list {
+		return requestSections(client)
+	}
+
+	if len(cliParams.args) > 1 {
+		return errors.New("only one section must be specified")
+	}
+
+	if len(cliParams.args) == 0 && !cliParams.prettyPrintJSON && !cliParams.jsonStatus {
 		fmt.Printf("Getting the status from the agent.\n")
 	}
 	var e error
 	var s string
-	c := util.GetClient()
 
 	v := url.Values{}
 	if cliParams.prettyPrintJSON || cliParams.jsonStatus {
@@ -78,20 +93,19 @@ func run(log log.Component, config config.Component, cliParams *cliParams) error
 		v.Set("format", "text")
 	}
 
+	path := "/status"
+	if len(cliParams.args) == 1 {
+		path += "/section/" + cliParams.args[0]
+	}
+
 	url := url.URL{
 		Scheme:   "https",
 		Host:     fmt.Sprintf("localhost:%v", pkgconfigsetup.Datadog().GetInt("cluster_agent.cmd_port")),
-		Path:     "/status",
+		Path:     path,
 		RawQuery: v.Encode(),
 	}
 
-	// Set session token
-	e = util.SetAuthToken(config)
-	if e != nil {
-		return e
-	}
-
-	r, e := util.DoGet(c, url.String(), util.LeaveConnectionOpen)
+	r, e := client.Get(url.String(), ipchttp.WithLeaveConnectionOpen)
 	if e != nil {
 		var errMap = make(map[string]string)
 		json.Unmarshal(r, &errMap) //nolint:errcheck
@@ -120,6 +134,30 @@ func run(log log.Component, config config.Component, cliParams *cliParams) error
 		os.WriteFile(cliParams.statusFilePath, []byte(s), 0644) //nolint:errcheck
 	} else {
 		fmt.Println(s)
+	}
+
+	return nil
+}
+
+func requestSections(client ipc.HTTPClient) error {
+	url := url.URL{
+		Scheme: "https",
+		Host:   fmt.Sprintf("localhost:%v", pkgconfigsetup.Datadog().GetInt("cluster_agent.cmd_port")),
+		Path:   "/status/sections",
+	}
+
+	res, err := client.Get(url.String(), ipchttp.WithLeaveConnectionOpen)
+	if err != nil {
+		return err
+	}
+
+	var sections []string
+	if err := json.Unmarshal(res, &sections); err != nil {
+		return err
+	}
+
+	for _, section := range sections {
+		fmt.Printf("- \"%s\"\n", section)
 	}
 
 	return nil

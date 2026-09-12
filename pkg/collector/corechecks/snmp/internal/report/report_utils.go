@@ -6,6 +6,7 @@
 package report
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -66,7 +67,11 @@ func processValueUsingSymbolConfig(value valuestore.ResultValue, symbol profiled
 		}
 
 		if symbol.MatchPatternCompiled.MatchString(strValue) {
-			replacedVal := checkconfig.RegexReplaceValue(strValue, symbol.MatchPatternCompiled, symbol.MatchValue)
+			replacement := symbol.MatchValue
+			if replacement == "" {
+				replacement = "$1"
+			}
+			replacedVal := checkconfig.RegexReplaceValue(strValue, symbol.MatchPatternCompiled, replacement)
 			if replacedVal == "" {
 				return valuestore.ResultValue{}, fmt.Errorf("the pattern `%v` matched value `%v`, but template `%s` is not compatible", symbol.MatchPattern, strValue, symbol.MatchValue)
 			}
@@ -88,6 +93,7 @@ func processValueUsingSymbolConfig(value valuestore.ResultValue, symbol profiled
 // getTagsFromMetricTagConfigList retrieve tags using the metric config and values
 func getTagsFromMetricTagConfigList(mtcl profiledefinition.MetricTagConfigList, fullIndex string, values *valuestore.ResultValueStore) []string {
 	var rowTags []string
+	var missingOIDs []*valuestore.OIDNotFoundError
 	indexes := strings.Split(fullIndex, ".")
 	for _, metricTag := range mtcl {
 		// get tag using `index` field
@@ -109,7 +115,12 @@ func getTagsFromMetricTagConfigList(mtcl profiledefinition.MetricTagConfigList, 
 			// TODO: Support extract value see II-635
 			columnValues, err := getColumnValueFromSymbol(values, profiledefinition.SymbolConfig(metricTag.Symbol))
 			if err != nil {
-				log.Debugf("error getting column value: %v", err)
+				var oidErr *valuestore.OIDNotFoundError
+				if errors.As(err, &oidErr) {
+					missingOIDs = append(missingOIDs, oidErr)
+				} else {
+					log.Debugf("error getting column value: %v", err)
+				}
 				continue
 			}
 
@@ -133,6 +144,9 @@ func getTagsFromMetricTagConfigList(mtcl profiledefinition.MetricTagConfigList, 
 			}
 			rowTags = append(rowTags, checkconfig.BuildMetricTagsFromValue(&metricTag, strValue)...)
 		}
+	}
+	if len(missingOIDs) > 0 {
+		log.Debugf("missing OIDs: %v", valuestore.ListOIDs(missingOIDs))
 	}
 	return rowTags
 }
@@ -181,6 +195,7 @@ func getInterfaceConfig(interfaceConfigs []snmpintegration.InterfaceConfig, inde
 // getConstantMetricValues retrieve all metric tags indexes and set their value as 1
 func getConstantMetricValues(mtcl profiledefinition.MetricTagConfigList, values *valuestore.ResultValueStore) map[string]valuestore.ResultValue {
 	constantValues := make(map[string]valuestore.ResultValue)
+	var missingOIDs []*valuestore.OIDNotFoundError
 	for _, metricTag := range mtcl {
 		if len(metricTag.IndexTransform) > 0 {
 			// If index transform is set, indexes are from another table, we don't want to collect them
@@ -189,7 +204,12 @@ func getConstantMetricValues(mtcl profiledefinition.MetricTagConfigList, values 
 		if metricTag.Symbol.OID != "" {
 			columnValues, err := getColumnValueFromSymbol(values, profiledefinition.SymbolConfig(metricTag.Symbol))
 			if err != nil {
-				log.Debugf("error getting column value: %v", err)
+				var oidErr *valuestore.OIDNotFoundError
+				if errors.As(err, &oidErr) {
+					missingOIDs = append(missingOIDs, oidErr)
+				} else {
+					log.Debugf("error getting column value: %v", err)
+				}
 				continue
 			}
 			for index := range columnValues {
@@ -201,6 +221,9 @@ func getConstantMetricValues(mtcl profiledefinition.MetricTagConfigList, values 
 				}
 			}
 		}
+	}
+	if len(missingOIDs) > 0 {
+		log.Debugf("missing OIDs: %v", valuestore.ListOIDs(missingOIDs))
 	}
 	return constantValues
 }

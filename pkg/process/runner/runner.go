@@ -16,7 +16,7 @@ import (
 
 	model "github.com/DataDog/agent-payload/v5/process"
 
-	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
+	defaultforwarder "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/def"
 	"github.com/DataDog/datadog-agent/comp/process/types"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/process/checks"
@@ -24,6 +24,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/process/util/api"
 	sysconfig "github.com/DataDog/datadog-agent/pkg/system-probe/config"
 	sysconfigtypes "github.com/DataDog/datadog-agent/pkg/system-probe/config/types"
+	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -255,26 +256,14 @@ const (
 //nolint:revive // TODO(PROC) Fix revive linter
 func (l *CheckRunner) Run() error {
 	realTimeAllowed := !l.config.GetBool("process_config.disable_realtime_checks")
-
-	checkNamesLength := len(l.enabledChecks)
-	if realTimeAllowed {
-		// checkNamesLength is double when realtime checks is enabled as we append the Process real time name
-		// as well as the original check name
-		checkNamesLength = checkNamesLength * 2
-	}
-
-	checkNames := make([]string, 0, checkNamesLength)
-	for _, check := range l.enabledChecks {
-		checkNames = append(checkNames, check.Name())
-
-		// Append `process_rt` if process check is enabled, and rt is enabled, so the customer doesn't get confused if
-		// process_rt doesn't show up in the enabled checks
-		if check.Name() == checks.ProcessCheckName && realTimeAllowed {
-			checkNames = append(checkNames, checks.RTProcessCheckName)
-		}
-	}
+	checkNames := enabledCheckNames(l.enabledChecks, realTimeAllowed)
 	status.UpdateEnabledChecks(checkNames)
-	log.Infof("Starting process-agent with enabled checks=%v", checkNames)
+
+	runnerName := "process-agent"
+	if flavor.GetFlavor() == flavor.DefaultAgent {
+		runnerName = "process-component"
+	}
+	log.Infof("Starting %s with enabled checks=%v", runnerName, checkNames)
 
 	if realTimeAllowed && l.rtNotifierChan != nil {
 		l.listenForRTUpdates()
@@ -297,6 +286,31 @@ func (l *CheckRunner) Run() error {
 	}
 
 	return nil
+}
+
+// statusNamesProvider lets a check override the names published in Agent status.
+// The runner continues to use Check.Name as the check's operational identity for
+// execution, intervals, and payload submission.
+type statusNamesProvider interface {
+	StatusNames() []string
+}
+
+func enabledCheckNames(enabledChecks []checks.Check, realTimeAllowed bool) []string {
+	checkNames := make([]string, 0, len(enabledChecks)*2)
+	for _, check := range enabledChecks {
+		statusNames := []string{check.Name()}
+		if provider, ok := check.(statusNamesProvider); ok {
+			statusNames = provider.StatusNames()
+		}
+
+		for _, statusName := range statusNames {
+			checkNames = append(checkNames, statusName)
+			if statusName == checks.ProcessCheckName && realTimeAllowed {
+				checkNames = append(checkNames, checks.RTProcessCheckName)
+			}
+		}
+	}
+	return checkNames
 }
 
 func (l *CheckRunner) listenForRTUpdates() {
@@ -435,7 +449,12 @@ func (l *CheckRunner) UpdateRTStatus(statuses []*model.CollectorStatus) {
 		// Pass along the real-time interval, one per check, so that every
 		// check routine will see the new interval.
 		for range l.enabledChecks {
-			l.rtIntervalCh <- l.realTimeInterval
+			select {
+			case l.rtIntervalCh <- l.realTimeInterval:
+			case <-l.stop:
+				// Stop sending when shutting down to avoid blocking forever without receivers.
+				return
+			}
 		}
 		log.Infof("real time interval updated to %s", l.realTimeInterval)
 	}
@@ -531,8 +550,6 @@ func readResponseStatuses(checkName string, responses <-chan defaultforwarder.Re
 
 func ignoreResponseBody(checkName string) bool {
 	switch checkName {
-	case checks.ProcessEventsCheckName:
-		return true
 	default:
 		return false
 	}

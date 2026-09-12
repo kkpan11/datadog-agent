@@ -14,16 +14,15 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/comp/dogstatsd/listeners/ratelimit"
 	"github.com/DataDog/datadog-agent/comp/dogstatsd/packets"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap"
+	pidmap "github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap/def"
 	replay "github.com/DataDog/datadog-agent/comp/dogstatsd/replay/def"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -197,7 +196,6 @@ func (l *UDSListener) handleConnection(conn netUnixConn, closeFunc CloseFunction
 	l.telemetryStore.tlmUDSConnections.Inc(tlmListenerID, l.transport)
 	defer func() {
 		_ = closeFunc(conn)
-		packetsBuffer.Flush()
 		packetsBuffer.Close()
 		if telemetryWithFullListenerID {
 			l.clearTelemetry(tlmListenerID)
@@ -271,15 +269,25 @@ func (l *UDSListener) handleConnection(conn netUnixConn, closeFunc CloseFunction
 			// Read the expected packet length (in stream mode)
 			b := []byte{0, 0, 0, 0}
 			_, err = io.ReadFull(conn, b)
-			expectedPacketLength := binary.LittleEndian.Uint32(b)
-
-			switch {
-			case err == io.EOF, errors.Is(err, io.ErrUnexpectedEOF):
-				log.Debugf("dogstatsd-uds: %s connection closed", l.transport)
+			if err != nil {
+				switch {
+				case errors.Is(err, io.EOF):
+					log.Debugf("dogstatsd-uds: %s connection closed", l.transport)
+				case errors.Is(err, io.ErrUnexpectedEOF):
+					log.Errorf("dogstatsd-uds: %s connection closed while reading payload length", l.transport)
+				default:
+					log.Errorf("dogstatsd-uds: %s: error reading payload length: %v", l.transport, err)
+				}
 				return nil
 			}
+			expectedPacketLength = binary.LittleEndian.Uint32(b)
 			if expectedPacketLength > uint32(len(packet.Buffer)) {
-				log.Info("dogstatsd-uds: packet length too large, dropping connection")
+				if l.config.GetBool("dogstatsd_stream_log_too_big") {
+					n, _, _ := conn.ReadFromUnix(packet.Buffer[:])
+					log.Infof("dogstatsd-uds: dropping connection, packet length %d is too large. packet starts with: %q", expectedPacketLength, string(packet.Buffer[:n]))
+				} else {
+					log.Infof("dogstatsd-uds: dropping connection, packet length %d is too large.", expectedPacketLength)
+				}
 				return nil
 			}
 			maxPacketLength = expectedPacketLength
@@ -288,12 +296,15 @@ func (l *UDSListener) handleConnection(conn netUnixConn, closeFunc CloseFunction
 		}
 
 		for err == nil {
+			var nRead int
 			if oob != nil {
-				n, oobn, _, _, err = conn.ReadMsgUnix(packet.Buffer[n:maxPacketLength], oobS[oobn:])
+				nRead, oobn, _, _, err = conn.ReadMsgUnix(packet.Buffer[n:maxPacketLength], oobS)
 			} else {
-				n, _, err = conn.ReadFromUnix(packet.Buffer[n:maxPacketLength])
+				nRead, _, err = conn.ReadFromUnix(packet.Buffer[n:maxPacketLength])
 			}
-			if n == 0 && oobn == 0 && l.transport == "unix" {
+			n += nRead
+
+			if nRead == 0 && oobn == 0 && l.transport == "unix" {
 				log.Debugf("dogstatsd-uds: %s connection closed", l.transport)
 				return nil
 			}
@@ -350,7 +361,7 @@ func (l *UDSListener) handleConnection(conn netUnixConn, closeFunc CloseFunction
 
 		if err != nil {
 			// connection has been closed
-			if strings.HasSuffix(err.Error(), " use of closed network connection") {
+			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 
@@ -362,7 +373,7 @@ func (l *UDSListener) handleConnection(conn netUnixConn, closeFunc CloseFunction
 		l.telemetryStore.tlmUDSPackets.Inc(tlmListenerID, l.transport, "ok")
 
 		udsBytes.Add(int64(n))
-		l.telemetryStore.tlmUDSPacketsBytes.Add(float64(n), tlmListenerID, l.transport)
+		l.telemetryStore.tlmUDSPacketsBytes.Add(float64(n), "agent", tlmListenerID, l.transport)
 		packet.Contents = packet.Buffer[:n]
 		packet.Source = packets.UDS
 		packet.ListenerID = listenerID
@@ -410,5 +421,5 @@ func (l *UDSListener) clearTelemetry(id string) {
 	l.telemetryStore.tlmUDSConnections.Delete(id, l.transport)
 	l.telemetryStore.tlmUDSPackets.Delete(id, l.transport, "error")
 	l.telemetryStore.tlmUDSPackets.Delete(id, l.transport, "ok")
-	l.telemetryStore.tlmUDSPacketsBytes.Delete(id, l.transport)
+	l.telemetryStore.tlmUDSPacketsBytes.Delete("agent", id, l.transport)
 }

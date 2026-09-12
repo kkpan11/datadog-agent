@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build (linux && linux_bpf) || (windows && npm)
+//go:build (linux && bpf) || (windows && npm)
 
 package modules
 
@@ -24,7 +24,7 @@ import (
 
 func TestNetworkModuleOrder(t *testing.T) {
 	allModules := All()
-	assert.Less(t, slices.Index(allModules, EventMonitor), slices.Index(allModules, NetworkTracer))
+	assert.Less(t, slices.Index(allModules, NetworkTracer), slices.Index(allModules, EventMonitor))
 }
 
 func TestDecode(t *testing.T) {
@@ -69,10 +69,11 @@ func TestDecode(t *testing.T) {
 	marshaller := marshal.GetMarshaler(encoding.ContentTypeJSON)
 	ostream := bytes.NewBuffer(nil)
 
-	connectionsModeler := marshal.NewConnectionsModeler(in)
+	connectionsModeler, err := marshal.NewConnectionsModeler(in)
+	require.NoError(t, err)
 	defer connectionsModeler.Close()
 
-	err := marshaller.Marshal(in, ostream, connectionsModeler)
+	err = marshaller.Marshal(in, ostream, connectionsModeler)
 	require.NoError(t, err)
 
 	writeConnections(rec, marshaller, in)

@@ -1,0 +1,12 @@
+log_level: DEBUG
+process_config:
+  process_collection:
+    enabled: false
+
+logs_enabled: true
+
+extra_config_providers:
+  - process_log
+
+logs_config:
+  process_exclude_agent: true

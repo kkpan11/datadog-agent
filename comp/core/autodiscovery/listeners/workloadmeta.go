@@ -10,13 +10,15 @@ package listeners
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
+
+const tagCompletenessRetryInterval = 1 * time.Second
 
 // workloadmetaListener is a generic subscriber to workloadmeta events that
 // generates AD services.
@@ -32,10 +34,11 @@ type workloadmetaListener interface {
 	// passed, the service will be deleted when the parent service is
 	// removed.
 	AddService(svcID string, svc Service, parentSvcID string)
+}
 
-	// IsExcluded returns whether a container should be excluded according
-	// to the chosen ft filter.
-	IsExcluded(ft containers.FilterType, annotations map[string]string, name, image, ns string) bool
+type pendingEntityInfo struct {
+	entity    workloadmeta.Entity
+	firstSeen time.Time
 }
 
 // workloadmetaListenerImpl implements workloadmetaListener.
@@ -45,9 +48,8 @@ type workloadmetaListenerImpl struct {
 
 	processFn func(workloadmeta.Entity)
 
-	store            workloadmeta.Component
-	workloadFilters  *workloadmeta.Filter
-	containerFilters *containerFilters
+	store           workloadmeta.Component
+	workloadFilters *workloadmeta.Filter
 
 	services map[string]Service
 	children map[string]map[string]struct{}
@@ -56,6 +58,10 @@ type workloadmetaListenerImpl struct {
 	delService chan<- Service
 
 	telemetryStore *telemetry.Store
+
+	isReadyFn       func(workloadmeta.Entity) bool // when nil, consider ready
+	pendingEntities map[string]pendingEntityInfo   // svcID → pending info
+	maxWaitDuration time.Duration
 }
 
 var _ workloadmetaListener = &workloadmetaListenerImpl{}
@@ -73,22 +79,49 @@ func newWorkloadmetaListener(
 	wmeta workloadmeta.Component,
 	telemetryStore *telemetry.Store,
 ) (workloadmetaListener, error) {
-	containerFilters := newContainerFilters()
-
 	return &workloadmetaListenerImpl{
 		name: name,
 		stop: make(chan struct{}),
 
-		processFn:        processFn,
-		store:            wmeta,
-		workloadFilters:  workloadFilters,
-		containerFilters: containerFilters,
+		processFn:       processFn,
+		store:           wmeta,
+		workloadFilters: workloadFilters,
 
 		services: make(map[string]Service),
 		children: make(map[string]map[string]struct{}),
 
 		telemetryStore: telemetryStore,
 	}, nil
+}
+
+// newWorkloadmetaListenerWithTagWait is like newWorkloadmetaListener but defers
+// processing until isReadyFn returns true. Disabled when maxWait is 0.
+func newWorkloadmetaListenerWithTagWait(
+	name string,
+	workloadFilters *workloadmeta.Filter,
+	processFn func(workloadmeta.Entity),
+	wmeta workloadmeta.Component,
+	telemetryStore *telemetry.Store,
+	isReadyFn func(workloadmeta.Entity) bool,
+	maxWait time.Duration,
+) (workloadmetaListener, error) {
+	base, err := newWorkloadmetaListener(name, workloadFilters, processFn, wmeta, telemetryStore)
+	if err != nil {
+		return nil, err
+	}
+
+	if maxWait > 0 {
+		listener, ok := base.(*workloadmetaListenerImpl)
+		if !ok {
+			return nil, fmt.Errorf("unexpected listener type %T", base)
+		}
+
+		listener.isReadyFn = isReadyFn
+		listener.pendingEntities = make(map[string]pendingEntityInfo)
+		listener.maxWaitDuration = maxWait
+	}
+
+	return base, nil
 }
 
 func (l *workloadmetaListenerImpl) Store() workloadmeta.Component {
@@ -125,10 +158,6 @@ func (l *workloadmetaListenerImpl) AddService(svcID string, svc Service, parentS
 	}
 }
 
-func (l *workloadmetaListenerImpl) IsExcluded(ft containers.FilterType, annotations map[string]string, name, image, ns string) bool {
-	return l.containerFilters.IsExcluded(ft, annotations, name, image, ns)
-}
-
 func (l *workloadmetaListenerImpl) Listen(newSvc chan<- Service, delSvc chan<- Service) {
 	l.newService = newSvc
 	l.delService = delSvc
@@ -139,7 +168,17 @@ func (l *workloadmetaListenerImpl) Listen(newSvc chan<- Service, delSvc chan<- S
 	log.Infof("%s initialized successfully", l.name)
 
 	go func() {
+		var retryTicker *time.Ticker
+		var retryChan <-chan time.Time
+		if l.isReadyFn != nil {
+			retryTicker = time.NewTicker(tagCompletenessRetryInterval)
+			retryChan = retryTicker.C
+		}
+
 		defer func() {
+			if retryTicker != nil {
+				retryTicker.Stop()
+			}
 			err := health.Deregister()
 			if err != nil {
 				log.Warnf("error de-registering health check: %s", err)
@@ -154,6 +193,9 @@ func (l *workloadmetaListenerImpl) Listen(newSvc chan<- Service, delSvc chan<- S
 				}
 
 				l.processEvents(evBundle)
+
+			case <-retryChan:
+				l.retryPendingEntities()
 
 			case <-health.C:
 
@@ -194,6 +236,10 @@ func (l *workloadmetaListenerImpl) processEvents(evBundle workloadmeta.EventBund
 func (l *workloadmetaListenerImpl) processSetEntity(entity workloadmeta.Entity) {
 	svcID := buildSvcID(entity.GetID())
 
+	if l.isReadyFn != nil && l.waitIfNotReady(svcID, entity) {
+		return
+	}
+
 	// keep track of children of this entity from previous iterations ...
 	unseen := make(map[string]struct{})
 	for childSvcID := range l.children[svcID] {
@@ -217,9 +263,74 @@ func (l *workloadmetaListenerImpl) processSetEntity(entity workloadmeta.Entity) 
 	}
 }
 
+// waitIfNotReady returns true if the entity is not ready and should be retried
+// later.
+func (l *workloadmetaListenerImpl) waitIfNotReady(svcID string, entity workloadmeta.Entity) bool {
+	if l.isReadyFn(entity) {
+		_, wasPending := l.pendingEntities[svcID]
+		l.resolvePending(svcID)
+		if !wasPending && l.telemetryStore != nil {
+			l.telemetryStore.TagCompletenessDelay.Observe(0, l.name)
+		}
+		return false
+	}
+
+	now := time.Now()
+
+	pending, exists := l.pendingEntities[svcID]
+	if !exists {
+		pending = pendingEntityInfo{
+			entity:    entity,
+			firstSeen: now,
+		}
+	} else {
+		pending.entity = entity
+	}
+
+	if now.Sub(pending.firstSeen) < l.maxWaitDuration {
+		l.pendingEntities[svcID] = pending
+		log.Debugf("%s not adding entity %s: tags not complete yet", l.name, svcID)
+		return true
+	}
+
+	// Timeout exceeded
+	log.Warnf("%s adding entity %s with potentially incomplete tags", l.name, svcID)
+	l.resolvePending(svcID)
+
+	return false
+}
+
+func (l *workloadmetaListenerImpl) resolvePending(svcID string) {
+	pending, wasPending := l.pendingEntities[svcID]
+	if !wasPending {
+		return
+	}
+
+	delay := time.Since(pending.firstSeen).Seconds()
+	if l.telemetryStore != nil {
+		l.telemetryStore.TagCompletenessDelay.Observe(delay, l.name)
+	}
+	delete(l.pendingEntities, svcID)
+}
+
+func (l *workloadmetaListenerImpl) retryPendingEntities() {
+	pending := make([]workloadmeta.Entity, 0, len(l.pendingEntities))
+	for _, pendingEntity := range l.pendingEntities {
+		pending = append(pending, pendingEntity.entity)
+	}
+
+	for _, entity := range pending {
+		l.processSetEntity(entity)
+	}
+}
+
 func (l *workloadmetaListenerImpl) processUnsetEntity(entity workloadmeta.Entity) {
 	entityID := entity.GetID()
 	parentSvcID := buildSvcID(entityID)
+
+	if l.pendingEntities != nil {
+		delete(l.pendingEntities, parentSvcID)
+	}
 
 	l.removeService(parentSvcID)
 

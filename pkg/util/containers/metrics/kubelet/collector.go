@@ -16,6 +16,8 @@ import (
 
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
+	"github.com/DataDog/datadog-agent/pkg/config/helper"
+	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	pkgerrors "github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics/provider"
 	kutil "github.com/DataDog/datadog-agent/pkg/util/kubernetes/kubelet"
@@ -65,6 +67,13 @@ func newKubeletCollector(_ *provider.Cache, wmeta workloadmeta.Component) (provi
 		return collectorMetadata, provider.ErrPermaFail
 	}
 
+	// Cluster Checks Runners have no reachable local Kubelet: never let this
+	// collector be retried, otherwise the background collector discovery
+	// ticker will hammer the kubelet client forever and spam WARN logs.
+	if helper.IsCLCRunner(pkgconfigsetup.Datadog()) {
+		return collectorMetadata, provider.ErrPermaFail
+	}
+
 	client, err := kutil.GetKubeUtil()
 	if err != nil {
 		return collectorMetadata, provider.ConvertRetrierErr(err)
@@ -89,6 +98,7 @@ func newKubeletCollector(_ *provider.Cache, wmeta workloadmeta.Component) (provi
 			provider.NewRuntimeMetadata(string(provider.RuntimeNameContainerd), string(provider.RuntimeFlavorKata)): collectors,
 			provider.NewRuntimeMetadata(string(provider.RuntimeNameCRIO), ""):                                       collectors,
 			provider.NewRuntimeMetadata(string(provider.RuntimeNameDocker), ""):                                     collectors,
+			provider.NewRuntimeMetadata(string(provider.RuntimeNameCRINonstandard), ""):                             collectors,
 		},
 	}, nil
 }
@@ -103,15 +113,20 @@ func (kc *kubeletCollector) ContainerIDForPodUIDAndContName(podUID, contName str
 		}
 		return "", err
 	}
-	containers := pod.Containers
+
+	var containers []workloadmeta.OrchestratorContainer
 	if initCont {
 		containers = pod.InitContainers
+	} else {
+		containers = append(pod.Containers, pod.EphemeralContainers...)
 	}
+
 	for _, container := range containers {
 		if container.Name == contName {
 			return container.ID, nil
 		}
 	}
+
 	return "", nil
 }
 

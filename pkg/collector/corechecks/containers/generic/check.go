@@ -9,15 +9,17 @@ package generic
 import (
 	"time"
 
-	yaml "gopkg.in/yaml.v2"
+	yaml "go.yaml.in/yaml/v2"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/agentperformance"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
@@ -29,7 +31,9 @@ const (
 )
 
 // ContainerConfig holds the check configuration
-type ContainerConfig struct{}
+type ContainerConfig struct {
+	ExtendedMemoryMetrics bool `yaml:"extended_memory_metrics,omitempty"`
+}
 
 // Parse parses the container check config and set default values
 func (c *ContainerConfig) Parse(data []byte) error {
@@ -39,37 +43,43 @@ func (c *ContainerConfig) Parse(data []byte) error {
 // ContainerCheck generates metrics for all containers
 type ContainerCheck struct {
 	core.CheckBase
-	instance  *ContainerConfig
-	processor Processor
-	store     workloadmeta.Component
-	tagger    tagger.Component
+	instance         *ContainerConfig
+	processor        Processor
+	store            workloadmeta.Component
+	filterStore      workloadfilter.Component
+	tagger           tagger.Component
+	agentPerformance *agentperformance.Recorder
 }
 
 // Factory returns a new check factory
-func Factory(store workloadmeta.Component, tagger tagger.Component) option.Option[func() check.Check] {
+func Factory(wmeta workloadmeta.Component, filterStore workloadfilter.Component, tagger tagger.Component, telemetry telemetry.Component) option.Option[func() check.Check] {
+	agentPerformance := agentperformance.NewRecorder(telemetry)
 	return option.New(func() check.Check {
 		return &ContainerCheck{
-			CheckBase: core.NewCheckBase(CheckName),
-			instance:  &ContainerConfig{},
-			store:     store,
-			tagger:    tagger,
+			CheckBase:        core.NewCheckBase(CheckName),
+			instance:         &ContainerConfig{},
+			store:            wmeta,
+			filterStore:      filterStore,
+			tagger:           tagger,
+			agentPerformance: agentPerformance,
 		}
 	})
 }
 
 // Configure parses the check configuration and init the check
-func (c *ContainerCheck) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string) error {
-	err := c.CommonConfigure(senderManager, initConfig, config, source)
+func (c *ContainerCheck) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string, provider string) error {
+	err := c.CommonConfigure(senderManager, initConfig, config, source, provider)
 	if err != nil {
 		return err
 	}
 
-	filter, err := containers.GetSharedMetricFilter()
+	err = c.instance.Parse(config)
 	if err != nil {
 		return err
 	}
-	c.processor = NewProcessor(metrics.GetProvider(option.New(c.store)), NewMetadataContainerAccessor(c.store), GenericMetricsAdapter{}, LegacyContainerFilter{OldFilter: filter, Store: c.store}, c.tagger)
-	return c.instance.Parse(config)
+
+	c.processor = NewProcessor(metrics.GetProvider(option.New(c.store)), NewMetadataContainerAccessor(c.store), GenericMetricsAdapter{}, LegacyContainerFilter{ContainerFilter: c.filterStore.GetContainerSharedMetricFilters(), Store: c.store}, c.tagger, c.agentPerformance, c.instance.ExtendedMemoryMetrics)
+	return nil
 }
 
 // Run executes the check

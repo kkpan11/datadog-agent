@@ -18,11 +18,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	dimage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/client"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	dimage "github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/client"
 	"github.com/samber/lo"
 
 	"github.com/DataDog/datadog-agent/pkg/sbom/telemetry"
@@ -32,7 +32,7 @@ var mu sync.Mutex
 
 type opener func() (v1.Image, error)
 
-type imageSave func(context.Context, []string, ...client.ImageSaveOption) (io.ReadCloser, error)
+type imageSave func(context.Context, []string, ...client.ImageSaveOption) (client.ImageSaveResult, error)
 
 func imageOpener(ctx context.Context, collector, ref string, f *os.File, imageSave imageSave) opener {
 	return func() (v1.Image, error) {
@@ -117,22 +117,22 @@ func (img *image) ConfigFile() (*v1.ConfigFile, error) {
 		return nil, fmt.Errorf("unable to get diff IDs: %w", err)
 	}
 
-	created, err := time.Parse(time.RFC3339Nano, img.inspect.Created)
-	if err != nil {
-		return nil, fmt.Errorf("failed parsing created %s: %w", img.inspect.Created, err)
+	var created time.Time
+	if img.inspect.Created != "" {
+		var err error
+		created, err = time.Parse(time.RFC3339Nano, img.inspect.Created)
+		if err != nil {
+			return nil, fmt.Errorf("failed parsing created %s: %w", img.inspect.Created, err)
+		}
 	}
 
 	return &v1.ConfigFile{
 		Architecture: img.inspect.Architecture,
 		Author:       img.inspect.Author,
-		// Ignore deprecation warning
-		//nolint:staticcheck
-		Container:     img.inspect.Container,
-		Created:       v1.Time{Time: created},
-		DockerVersion: img.inspect.DockerVersion,
-		Config:        img.imageConfig(img.inspect.Config),
-		History:       img.history,
-		OS:            img.inspect.Os,
+		Created:      v1.Time{Time: created},
+		Config:       img.imageConfig(img.inspect.Config),
+		History:      img.history,
+		OS:           img.inspect.Os,
 		RootFS: v1.RootFS{
 			Type:    img.inspect.RootFS.Type,
 			DiffIDs: diffIDs,
@@ -183,34 +183,20 @@ func (img *image) diffIDs() ([]v1.Hash, error) {
 	return diffIDs, nil
 }
 
-func (img *image) imageConfig(config *container.Config) v1.Config {
+func (img *image) imageConfig(config *dockerspec.DockerOCIImageConfig) v1.Config {
 	if config == nil {
 		return v1.Config{}
 	}
 
 	c := v1.Config{
-		AttachStderr:    config.AttachStderr,
-		AttachStdin:     config.AttachStdin,
-		AttachStdout:    config.AttachStdout,
-		Cmd:             config.Cmd,
-		Domainname:      config.Domainname,
-		Entrypoint:      config.Entrypoint,
-		Env:             config.Env,
-		Hostname:        config.Hostname,
-		Image:           config.Image,
-		Labels:          config.Labels,
-		OnBuild:         config.OnBuild,
-		OpenStdin:       config.OpenStdin,
-		StdinOnce:       config.StdinOnce,
-		Tty:             config.Tty,
-		User:            config.User,
-		Volumes:         config.Volumes,
-		WorkingDir:      config.WorkingDir,
-		ArgsEscaped:     config.ArgsEscaped,
-		NetworkDisabled: config.NetworkDisabled,
-		// Ignore deprecation warning
-		//nolint:staticcheck
-		MacAddress: config.MacAddress,
+		Cmd:        config.Cmd,
+		Entrypoint: config.Entrypoint,
+		Env:        config.Env,
+		Labels:     config.Labels,
+		OnBuild:    config.OnBuild,
+		User:       config.User,
+		Volumes:    config.Volumes,
+		WorkingDir: config.WorkingDir,
 		StopSignal: config.StopSignal,
 		Shell:      config.Shell,
 	}

@@ -14,7 +14,7 @@ struct process_entry_t {
 };
 
 struct proc_cache_t {
-    struct container_context_t container;
+    struct cgroup_context_t cgroup;
     struct process_entry_t entry;
 };
 
@@ -33,11 +33,12 @@ struct credentials_t {
 
 struct pid_cache_t {
     u64 cookie;
-    u32 ppid;
-    u32 padding;
     u64 fork_timestamp;
     u64 exit_timestamp;
     u64 user_session_id;
+    u64 fork_flags;
+    u32 sid;
+    u32 padding_sid;
     struct credentials_t credentials;
 };
 
@@ -72,12 +73,6 @@ union selinux_write_payload_t {
         u16 disable_value;
         u16 enforce_value;
     } status;
-};
-
-struct span_tls_t {
-    u64 format;
-    u64 max_threads;
-    void *base;
 };
 
 #endif

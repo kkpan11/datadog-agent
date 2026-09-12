@@ -11,11 +11,12 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/autodiscoveryimpl"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	adcmock "github.com/DataDog/datadog-agent/comp/core/autodiscovery/mock"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/scheduler"
-	"github.com/DataDog/datadog-agent/comp/core/secrets/secretsimpl"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretsmock "github.com/DataDog/datadog-agent/comp/core/secrets/mock"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
 
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
@@ -23,16 +24,16 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
-//nolint:revive // TODO(AML) Fix revive linter
 func TestListenersGetScheduleCalls(t *testing.T) {
 	adsched := scheduler.NewControllerAndStart()
-	ac := fxutil.Test[autodiscovery.Mock](t,
-		fx.Supply(autodiscoveryimpl.MockParams{Scheduler: adsched}),
-		secretsimpl.MockModule(),
-		autodiscoveryimpl.MockModule(),
+	ac := fxutil.Test[adcmock.Mock](t,
+		fx.Supply(adcmock.MockParams{Scheduler: adsched}),
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		adcmock.MockModule(),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 		core.MockBundle(),
 		taggerfxmock.MockModule(),
+		workloadfilterfxmock.MockModule(),
 	)
 
 	got1 := make(chan struct{}, 1)

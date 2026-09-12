@@ -8,7 +8,7 @@
 package k8s
 
 import (
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
 	"k8s.io/apimachinery/pkg/labels"
@@ -19,13 +19,14 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 )
 
 // NewPodDisruptionBudgetCollectorVersions builds the group of collector versions.
-func NewPodDisruptionBudgetCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewPodDisruptionBudgetCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewPodDisruptionBudgetCollectorVersion(metadataAsTags),
+		NewPodDisruptionBudgetCollectorVersion(tagger),
 	)
 }
 
@@ -39,29 +40,24 @@ type PodDisruptionBudgetCollector struct {
 
 // NewPodDisruptionBudgetCollectorVersion creates a new collector for the Kubernetes Pod Disruption Budget
 // resource.
-func NewPodDisruptionBudgetCollectorVersion(metadataAsTags utils.MetadataAsTags) *PodDisruptionBudgetCollector {
-	resourceType := getResourceType(podDisruptionBudgetName, podDisruptionBudgetVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewPodDisruptionBudgetCollectorVersion(tagger tagger.Component) *PodDisruptionBudgetCollector {
 	return &PodDisruptionBudgetCollector{
 		informer: nil,
 		lister:   nil,
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
-			IsStable:                             true,
-			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
+			IsMetadataProducer:                   true,
+			IsStable:                             true,
 			SupportsManifestBuffering:            true,
-			Name:                                 podDisruptionBudgetName,
-			Kind:                                 kubernetes.PodDisruptionBudgetKind,
-			NodeType:                             orchestrator.K8sPodDisruptionBudget,
-			Version:                              podDisruptionBudgetVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
 			SupportsTerminatedResourceCollection: true,
+			Group:                                utilTypes.PodDisruptionBudgetGroup,
+			Kind:                                 kubernetes.PodDisruptionBudgetKind,
+			Name:                                 utilTypes.PodDisruptionBudgetName,
+			Version:                              utilTypes.PodDisruptionBudgetVersion,
+			NodeType:                             orchestrator.K8sPodDisruptionBudget,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.PodDisruptionBudgetHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewPodDisruptionBudgetHandlers(tagger)),
 	}
 }
 

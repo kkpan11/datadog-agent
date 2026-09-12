@@ -9,6 +9,7 @@ package trivy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -19,8 +20,42 @@ import (
 	containersimage "github.com/DataDog/datadog-agent/pkg/util/containers/image"
 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 
-	"github.com/docker/docker/client"
+	dimage "github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/client"
 )
+
+// buildDockerLayerPaths pairs DiffID and Path from the same overlay2
+// inspect response. Digest is left empty: the daemon exposes no
+// reliable per-layer manifest digest, and Trivy does not need one.
+func buildDockerLayerPaths(inspect dimage.InspectResponse) ([]ftypes.LayerPath, error) {
+	var paths []string
+	if dirs, ok := inspect.GraphDriver.Data["LowerDir"]; ok && dirs != "" {
+		parts := strings.Split(dirs, ":")
+		for i := len(parts) - 1; i >= 0; i-- {
+			paths = append(paths, parts[i])
+		}
+	}
+	if dirs, ok := inspect.GraphDriver.Data["UpperDir"]; ok && dirs != "" {
+		paths = append(paths, strings.Split(dirs, ":")...)
+	}
+
+	if env.IsContainerized() {
+		for i, p := range paths {
+			paths[i] = containersimage.SanitizeHostPath(p)
+		}
+	}
+
+	diffIDs := inspect.RootFS.Layers
+	if len(paths) != len(diffIDs) {
+		return nil, fmt.Errorf("%w: %d paths vs %d diff_ids", errLayerCountMismatch, len(paths), len(diffIDs))
+	}
+
+	out := make([]ftypes.LayerPath, len(diffIDs))
+	for i := range diffIDs {
+		out[i] = ftypes.LayerPath{DiffID: diffIDs[i], Path: paths[i]}
+	}
+	return out, nil
+}
 
 // DockerCollector defines the docker collector name
 const DockerCollector = "docker"
@@ -33,23 +68,23 @@ func convertDockerImage(ctx context.Context, client client.ImageAPIClient, imgMe
 	// or
 	// <image_name>@<digest> pattern like "alpine@sha256:21a3deaa0d32a8057914f36584b5288d2e5ecc984380bc0118285c70fa8c9300"
 	imageID := imgMeta.Name
-	inspect, err := client.ImageInspect(ctx, imageID)
+	inspectResult, err := client.ImageInspect(ctx, imageID)
 	if err != nil {
 		imageID = imgMeta.ID // <image_id> pattern like `5ac716b05a9c`
-		inspect, err = client.ImageInspect(ctx, imageID)
+		inspectResult, err = client.ImageInspect(ctx, imageID)
 		if err != nil {
 			return nil, cleanup, fmt.Errorf("unable to inspect the image (%s): %w", imageID, err)
 		}
 	}
 
-	history, err := client.ImageHistory(ctx, imageID)
+	historyResult, err := client.ImageHistory(ctx, imageID)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("unable to get history (%s): %w", imageID, err)
 	}
 
 	f, err := os.CreateTemp("", "fanal-docker-*")
 	if err != nil {
-		return nil, cleanup, fmt.Errorf("failed to create a temporary file")
+		return nil, cleanup, errors.New("failed to create a temporary file")
 	}
 
 	cleanup = func() {
@@ -58,9 +93,10 @@ func convertDockerImage(ctx context.Context, client client.ImageAPIClient, imgMe
 	}
 
 	img := &image{
+		name:    imgMeta.Name,
 		opener:  imageOpener(ctx, DockerCollector, imageID, f, client.ImageSave),
-		inspect: inspect,
-		history: configHistory(history),
+		inspect: inspectResult.InspectResponse,
+		history: configHistory(historyResult.Items),
 	}
 
 	return img, cleanup, nil
@@ -84,43 +120,42 @@ func (c *fakeDockerContainer) Layers() (layers []ftypes.LayerPath) {
 }
 
 // ScanDockerImage scans a docker image by exporting it and scanning the tarball
-func (c *Collector) ScanDockerImage(ctx context.Context, imgMeta *workloadmeta.ContainerImageMetadata, client client.ImageAPIClient, scanOptions sbom.ScanOptions) (sbom.Report, error) {
+func (c *Collector) ScanDockerImage(ctx context.Context, imgMeta *workloadmeta.ContainerImageMetadata, client client.ImageAPIClient, scanOptions sbom.ScanOptions) (*Report, string, error) {
 	fanalImage, cleanup, err := convertDockerImage(ctx, client, imgMeta)
 	if cleanup != nil {
 		defer cleanup()
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("unable to convert docker image, err: %w", err)
+		return nil, "", fmt.Errorf("unable to convert docker image, err: %w", err)
 	}
 
 	if scanOptions.OverlayFsScan && fanalImage.inspect.GraphDriver.Name == "overlay2" {
-		var layers []string
-		if layerDirs, ok := fanalImage.inspect.GraphDriver.Data["LowerDir"]; ok {
-			layers = append(layers, strings.Split(layerDirs, ":")...)
+		layers, err := buildDockerLayerPaths(fanalImage.inspect)
+		if err != nil {
+			return nil, "overlayfs", fmt.Errorf("unable to pair layer paths for image %s: %w", imgMeta.ID, err)
 		}
-
-		if layerDirs, ok := fanalImage.inspect.GraphDriver.Data["UpperDir"]; ok {
-			layers = append(layers, strings.Split(layerDirs, ":")...)
-		}
-
-		if env.IsContainerized() {
-			for i, layer := range layers {
-				layers[i] = containersimage.SanitizeHostPath(layer)
-			}
-		}
-
 		fakeContainer := &fakeDockerContainer{
-			image: fanalImage,
-			fakeContainer: &fakeContainer{
-				layerIDs:   fanalImage.inspect.RootFS.Layers,
-				layerPaths: layers,
-				imgMeta:    imgMeta,
-			},
+			image:         fanalImage,
+			fakeContainer: newFakeContainer(layers, imgMeta),
 		}
 
-		return c.scanOverlayFS(ctx, layers, fakeContainer, imgMeta, scanOptions)
+		paths := make([]string, len(layers))
+		for i, l := range layers {
+			paths[i] = l.Path
+		}
+		report, err := c.scanOverlayFS(ctx, paths, fakeContainer, imgMeta, scanOptions)
+		if err != nil {
+			return nil, "overlayfs", err
+		}
+
+		return report, "overlayfs", nil
 	}
 
-	return c.scanImage(ctx, fanalImage, imgMeta, scanOptions)
+	report, err := c.scanImage(ctx, fanalImage, imgMeta, scanOptions)
+	if err != nil {
+		return nil, "tarball", err
+	}
+
+	return report, "tarball", nil
 }

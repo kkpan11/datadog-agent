@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build (windows && npm) || linux_bpf
+//go:build (windows && npm) || (linux && bpf) || darwin
 
 package dns
 
@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/DataDog/datadog-agent/pkg/process/util"
-	"github.com/DataDog/datadog-agent/pkg/util/testutil/flake"
 )
 
 var disableAutomaticExpiration = 1 * time.Hour
@@ -33,6 +32,7 @@ func TestMultipleIPsForSameName(t *testing.T) {
 	datadogIPs.add(datadog2, 1*time.Minute)
 
 	cache := newReverseDNSCache(100, disableAutomaticExpiration)
+	defer cache.Close()
 	cache.Add(datadogIPs)
 
 	localhost := util.AddressFromString("127.0.0.1")
@@ -51,6 +51,7 @@ func TestMultipleIPsForSameName(t *testing.T) {
 
 func TestMultipleNamesForSameIP(t *testing.T) {
 	cache := newReverseDNSCache(100, disableAutomaticExpiration)
+	defer cache.Close()
 
 	raddr := util.AddressFromString("172.022.116.123")
 	tr1 := newTranslation("i-03e46c9ff42db4abc")
@@ -75,6 +76,7 @@ func TestMultipleNamesForSameIP(t *testing.T) {
 func TestDNSCacheExpiration(t *testing.T) {
 	ttl := 100 * time.Millisecond
 	cache := newReverseDNSCache(1000, disableAutomaticExpiration)
+	defer cache.Close()
 	t1 := time.Now()
 
 	laddr1 := util.AddressFromString("127.0.0.1")
@@ -141,7 +143,6 @@ func TestDNSCacheExpiration(t *testing.T) {
 }
 
 func TestDNSCacheTelemetry(t *testing.T) {
-	flake.Mark(t)
 	cacheTelemetry.lookups.Delete()
 	cacheTelemetry.resolved.Delete()
 	cacheTelemetry.length.Set(0)
@@ -150,6 +151,7 @@ func TestDNSCacheTelemetry(t *testing.T) {
 	cacheTelemetry.oversized.Delete()
 	ttl := 100 * time.Millisecond
 	cache := newReverseDNSCache(1000, disableAutomaticExpiration)
+	defer cache.Close()
 	t1 := time.Now()
 
 	translation := newTranslation("host-a")
@@ -211,6 +213,7 @@ func validateTelemetry(t *testing.T, expected map[string]int64) {
 func TestDNSCacheMerge(t *testing.T) {
 	ttl := 100 * time.Millisecond
 	cache := newReverseDNSCache(1000, disableAutomaticExpiration)
+	defer cache.Close()
 
 	conns := map[util.Address]struct{}{
 		util.AddressFromString("127.0.0.1"):   {},
@@ -239,6 +242,7 @@ func TestDNSCacheMerge(t *testing.T) {
 func TestDNSCacheMerge_MixedCaseNames(t *testing.T) {
 	ttl := 100 * time.Millisecond
 	cache := newReverseDNSCache(1000, disableAutomaticExpiration)
+	defer cache.Close()
 
 	conns := map[util.Address]struct{}{
 		util.AddressFromString("192.168.0.1"): {},
@@ -262,6 +266,7 @@ func TestDNSCacheMerge_MixedCaseNames(t *testing.T) {
 
 func TestGetOversizedDNS(t *testing.T) {
 	cache := newReverseDNSCache(1000, time.Minute)
+	defer cache.Close()
 	cache.maxDomainsPerIP = 10
 	addr := util.AddressFromString("192.168.0.1")
 	exp := time.Now().Add(1 * time.Hour)
@@ -301,6 +306,7 @@ func BenchmarkDNSCacheGet(b *testing.B) {
 		added   = make([]util.Address, 0, numIPs)
 		addrGen = randomAddressGen()
 	)
+	b.Cleanup(func() { cache.Close() })
 	for i := 0; i < numIPs; i++ {
 		address := addrGen()
 		added = append(added, address)

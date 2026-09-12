@@ -8,6 +8,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -33,7 +34,7 @@ func (tdh *TestDriverHandleFail) ReadFile(p []byte, bytesRead *uint32, ol *windo
 		if tdh.lastReturnBytes == 0 && tdh.lastError == windows.ERROR_MORE_DATA {
 			// last time we returned empty but more...if caller does that twice in a row it's bad
 			if len(p) <= tdh.lastBufferSize {
-				panic(fmt.Errorf("Consecutive calls"))
+				panic(errors.New("Consecutive calls"))
 			}
 		}
 	}
@@ -45,10 +46,22 @@ func (tdh *TestDriverHandleFail) GetWindowsHandle() windows.Handle {
 }
 
 //nolint:revive // TODO(WKIT) Fix revive linter
-func (tdh *TestDriverHandleFail) DeviceIoControl(ioControlCode uint32, inBuffer *byte, inBufferSize uint32, outBuffer *byte, outBufferSize uint32, bytesReturned *uint32, overlapped *windows.Overlapped) (err error) {
+func (tdh *TestDriverHandleFail) SynchronousDeviceIoControl(ioControlCode uint32, inBuffer *byte, inBufferSize uint32, outBuffer *byte, outBufferSize uint32) (bytesReturned uint32, err error) {
 	fmt.Printf("Got test ioctl call")
 	if ioControlCode != 0 {
-		return fmt.Errorf("wrong ioctl code")
+		return 0, errors.New("wrong ioctl code")
+	}
+	return 0, nil
+}
+
+// Deprecated: matches the deprecated shim on driver.Handle so this mock still
+// satisfies the interface; remove together with the production shim.
+//
+//nolint:revive // TODO(WKIT) Fix revive linter
+func (tdh *TestDriverHandleFail) DeviceIoControl(ioControlCode uint32, inBuffer *byte, inBufferSize uint32, outBuffer *byte, outBufferSize uint32, bytesReturned *uint32, overlapped *windows.Overlapped) error {
+	fmt.Printf("Got test ioctl call")
+	if ioControlCode != 0 {
+		return errors.New("wrong ioctl code")
 	}
 	return nil
 }
@@ -67,8 +80,5 @@ func NewFailHandle(flags uint32, handleType driver.HandleType) (driver.Handle, e
 	return &TestDriverHandleFail{}, nil
 }
 
-//nolint:revive // TODO(WKIT) Fix revive linter
-func TestSetFlowFiltersFail(t *testing.T) {
-	//nolint:gosimple // TODO(WKIT) Fix gosimple linter
-	return
+func TestSetFlowFiltersFail(*testing.T) {
 }

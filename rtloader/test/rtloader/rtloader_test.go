@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	common "github.com/DataDog/datadog-agent/rtloader/test/common"
 	"github.com/DataDog/datadog-agent/rtloader/test/helpers"
 )
 
@@ -35,13 +34,8 @@ func TestGetPyInfo(t *testing.T) {
 	helpers.ResetMemoryStats()
 
 	ver, path := getPyInfo()
-	prefix := "3."
-	if common.UsingTwo {
-		prefix = "2.7."
-	}
-
-	if !strings.HasPrefix(ver, prefix) {
-		t.Errorf("Version doesn't start with `%s`: %s", prefix, ver)
+	if !strings.HasPrefix(ver, "3.") {
+		t.Errorf("Version doesn't start with `3.`: %s", ver)
 	}
 
 	if path == "" {
@@ -152,11 +146,7 @@ func TestGetError(t *testing.T) {
 	helpers.ResetMemoryStats()
 
 	errorStr := getError()
-	expected := "unable to import module 'foo': No module named 'foo'"
-	if common.UsingTwo {
-		expected = "unable to import module 'foo': No module named foo"
-	}
-	if errorStr != expected {
+	if errorStr != "unable to import module 'foo': No module named 'foo'" {
 		t.Fatalf("Wrong error string returned: %s", errorStr)
 	}
 
@@ -206,6 +196,152 @@ func TestRunCheck(t *testing.T) {
 
 	if res != "" {
 		t.Fatal(res)
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}
+
+func TestRunCheckLoneSurrogateException(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	if err := setFakeRunExceptionLoneSurrogate(); err != nil {
+		t.Fatalf("error setting run exception: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resetFakeRunException(); err != nil {
+			t.Errorf("error resetting run exception: %v", err)
+		}
+	})
+
+	_, err := runFakeCheck()
+	if err == nil {
+		t.Fatal("expected run_check error")
+	}
+	if !strings.Contains(err.Error(), `\ud800`) {
+		t.Fatalf("expected escaped lone surrogate in python error, got %q", err.Error())
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}
+
+func TestDiscoverConfig(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	serviceJSON := `{"id":"svc","host":"10.0.0.1","ports":[{"number":8080,"name":"http"}]}`
+	resultJSON := `[{"url":"http://10.0.0.1:8080"}]`
+	if err := setFakeDiscoverConfigReturn(resultJSON); err != nil {
+		t.Fatalf("error setting discover_config return: %v", err)
+	}
+
+	res, err := discoverFakeConfig(serviceJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res != resultJSON {
+		t.Fatalf("expected %q, got %q", resultJSON, res)
+	}
+
+	gotServiceJSON, err := getFakeDiscoverConfigServiceJSON()
+	if err != nil {
+		t.Fatalf("error reading discover_config service JSON: %v", err)
+	}
+	if gotServiceJSON != serviceJSON {
+		t.Fatalf("expected service JSON %q, got %q", serviceJSON, gotServiceJSON)
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}
+
+func TestDiscoverConfigNull(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	if err := setFakeDiscoverConfigReturn("null"); err != nil {
+		t.Fatalf("error setting discover_config return: %v", err)
+	}
+
+	res, err := discoverFakeConfig(`{"id":"svc","host":"10.0.0.1","ports":[]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res != "null" {
+		t.Fatalf("expected %q, got %q", "null", res)
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}
+
+func TestDiscoverConfigRaises(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	if err := setFakeDiscoverConfigException("discover failed"); err != nil {
+		t.Fatalf("error setting discover_config exception: %v", err)
+	}
+
+	_, err := discoverFakeConfig(`{"id":"svc","host":"10.0.0.1","ports":[]}`)
+	if err == nil {
+		t.Fatal("expected discover_config error")
+	}
+	if !strings.Contains(err.Error(), "discover failed") {
+		t.Fatalf("expected python error to contain %q, got %q", "discover failed", err.Error())
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}
+
+func TestDiscoverConfigRaisesLoneSurrogate(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	if err := setFakeDiscoverConfigExceptionLoneSurrogate(); err != nil {
+		t.Fatalf("error setting discover_config exception: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resetFakeDiscoverConfig(); err != nil {
+			t.Errorf("error resetting discover_config: %v", err)
+		}
+	})
+
+	_, err := discoverFakeConfig(`{"id":"svc","host":"10.0.0.1","ports":[]}`)
+	if err == nil {
+		t.Fatal("expected discover_config error")
+	}
+	if !strings.Contains(err.Error(), `\ud800`) {
+		t.Fatalf("expected escaped lone surrogate in python error, got %q", err.Error())
+	}
+
+	// Check for leaks
+	helpers.AssertMemoryUsage(t)
+}
+
+func TestDiscoverConfigNonStringResult(t *testing.T) {
+	// Reset memory counters
+	helpers.ResetMemoryStats()
+
+	if err := setFakeDiscoverConfigReturnNonString(); err != nil {
+		t.Fatalf("error setting discover_config return: %v", err)
+	}
+
+	_, err := discoverFakeConfig(`{"id":"svc","host":"10.0.0.1","ports":[]}`)
+	if err == nil {
+		t.Fatal("expected discover_config error")
+	}
+	if !strings.Contains(err.Error(), "non-string") {
+		t.Fatalf("expected non-string error, got %q", err.Error())
+	}
+
+	if err := resetFakeDiscoverConfig(); err != nil {
+		t.Fatalf("error resetting discover_config: %v", err)
 	}
 
 	// Check for leaks

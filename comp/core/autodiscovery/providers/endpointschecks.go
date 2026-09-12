@@ -9,13 +9,15 @@ package providers
 
 import (
 	"context"
-	"fmt"
+	stderrors "errors"
 	"time"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/errors"
 	"github.com/DataDog/datadog-agent/pkg/util/clusteragent"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/kubelet"
@@ -35,7 +37,7 @@ type EndpointsChecksConfigProvider struct {
 // NewEndpointsChecksConfigProvider returns a new ConfigProvider collecting
 // endpoints check configurations from the cluster-agent.
 // Connectivity is not checked at this stage to allow for retries, Collect will do it.
-func NewEndpointsChecksConfigProvider(providerConfig *pkgconfigsetup.ConfigurationProviders, _ *telemetry.Store) (ConfigProvider, error) {
+func NewEndpointsChecksConfigProvider(providerConfig *constants.ConfigurationProviders, _ *telemetry.Store) (types.ConfigProvider, error) {
 	c := &EndpointsChecksConfigProvider{
 		degradedDuration: defaultDegradedDeadline,
 	}
@@ -111,7 +113,7 @@ func getNodename(ctx context.Context) (string, error) {
 	if pkgconfigsetup.Datadog().GetBool("cloud_foundry") {
 		boshID := pkgconfigsetup.Datadog().GetString("bosh_id")
 		if boshID == "" {
-			return "", fmt.Errorf("configuration variable cloud_foundry is set to true, but bosh_id is empty, can't retrieve node name")
+			return "", stderrors.New("configuration variable cloud_foundry is set to true, but bosh_id is empty, can't retrieve node name")
 		}
 		return boshID, nil
 	}
@@ -133,6 +135,6 @@ func (c *EndpointsChecksConfigProvider) initClient() error {
 }
 
 // GetConfigErrors is not implemented for the EndpointsChecksConfigProvider
-func (c *EndpointsChecksConfigProvider) GetConfigErrors() map[string]ErrorMsgSet {
-	return make(map[string]ErrorMsgSet)
+func (c *EndpointsChecksConfigProvider) GetConfigErrors() map[string]types.ErrorMsgSet {
+	return make(map[string]types.ErrorMsgSet)
 }

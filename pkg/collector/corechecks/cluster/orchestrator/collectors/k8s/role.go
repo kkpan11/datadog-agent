@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -22,9 +23,9 @@ import (
 )
 
 // NewRoleCollectorVersions builds the group of collector versions.
-func NewRoleCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewRoleCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewRoleCollector(metadataAsTags),
+		NewRoleCollector(tagger),
 	)
 }
 
@@ -37,11 +38,7 @@ type RoleCollector struct {
 }
 
 // NewRoleCollector creates a new collector for the Kubernetes Role resource.
-func NewRoleCollector(metadataAsTags utils.MetadataAsTags) *RoleCollector {
-	resourceType := getResourceType(roleName, roleVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewRoleCollector(tagger tagger.Component) *RoleCollector {
 	return &RoleCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
@@ -49,15 +46,14 @@ func NewRoleCollector(metadataAsTags utils.MetadataAsTags) *RoleCollector {
 			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
 			SupportsManifestBuffering:            true,
-			Name:                                 roleName,
+			Name:                                 utilTypes.RoleName,
 			Kind:                                 kubernetes.RoleKind,
 			NodeType:                             orchestrator.K8sRole,
-			Version:                              roleVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
+			Group:                                utilTypes.RoleGroup,
+			Version:                              utilTypes.RoleVersion,
 			SupportsTerminatedResourceCollection: true,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.RoleHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewRoleHandlers(tagger)),
 	}
 }
 

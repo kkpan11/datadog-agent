@@ -27,6 +27,8 @@ import (
  * individual tests so that the underlying event system is starting fresh each time
  */
 
+var _ = declare(TestBasicRegistryTestPowershell, testOpts{enableFIM: true})
+
 func TestBasicRegistryTestPowershell(t *testing.T) {
 	openDef := &rules.RuleDefinition{
 		ID:         "test_open_rule",
@@ -37,21 +39,19 @@ func TestBasicRegistryTestPowershell(t *testing.T) {
 		Expression: `create.registry.key_path == "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run"`,
 	}
 
-	opts := testOpts{
-		enableFIM: true,
-	}
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{openDef, createDef}, withStaticOpts(opts))
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{openDef, createDef})
 
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer test.Close()
 
-	// this is kinda hokey.  ETW (which is what FIM is based on) takes an indeterminant amount of time to start up.
-	// so wait around for it to start
-	time.Sleep(5 * time.Second)
+	// Wait for ETW to be ready (signaled on first event received)
+	if !test.WaitForETWReady(30 * time.Second) {
+		t.Fatal("Timeout waiting for ETW to be ready")
+	}
 
-	test.Run(t, "Test registry with powershell", func(t *testing.T, kind wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+	test.RunMultiMode(t, "Test registry with powershell", func(t *testing.T, kind wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
 		inputargs := []string{
 			"-c",
 			"Set-ItemProperty",
@@ -62,7 +62,7 @@ func TestBasicRegistryTestPowershell(t *testing.T) {
 			"-Value",
 			`"test"`,
 		}
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			cmd := cmdFunc("powershell.exe", inputargs, nil)
 
 			// we will ignore any error
@@ -70,9 +70,11 @@ func TestBasicRegistryTestPowershell(t *testing.T) {
 			return nil
 		}, test.validateRegistryEvent(t, noWrapperType, func(event *model.Event, _ *rules.Rule) {
 			assertFieldEqualCaseInsensitve(t, event, "open.registry.key_path", `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, "wrong registry key path")
-		}))
+		}), "test_open_rule")
 	})
 }
+
+var _ = declare(TestBasicRegistryTestRegExe, testOpts{enableFIM: true})
 
 func TestBasicRegistryTestRegExe(t *testing.T) {
 	openDef := &rules.RuleDefinition{
@@ -84,21 +86,19 @@ func TestBasicRegistryTestRegExe(t *testing.T) {
 		Expression: `create.registry.key_path == "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run"`,
 	}
 
-	opts := testOpts{
-		enableFIM: true,
-	}
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{openDef, createDef}, withStaticOpts(opts))
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{openDef, createDef})
 
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer test.Close()
 
-	// this is kinda hokey.  ETW (which is what FIM is based on) takes an indeterminant amount of time to start up.
-	// so wait around for it to start
-	time.Sleep(5 * time.Second)
+	// Wait for ETW to be ready (signaled on first event received)
+	if !test.WaitForETWReady(30 * time.Second) {
+		t.Fatal("Timeout waiting for ETW to be ready")
+	}
 
-	test.Run(t, "Test registry with reg.exe", func(t *testing.T, kind wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+	test.RunMultiMode(t, "Test registry with reg.exe", func(t *testing.T, kind wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
 		inputargs := []string{
 			"add",
 			"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -110,7 +110,7 @@ func TestBasicRegistryTestRegExe(t *testing.T) {
 			"/d",
 			"c:\\windows\\system32\\calc.exe",
 		}
-		test.WaitSignal(t, func() error {
+		test.WaitSignalFromRule(t, func() error {
 			cmd := cmdFunc("reg.exe", inputargs, nil)
 
 			// we will ignore any error
@@ -118,9 +118,11 @@ func TestBasicRegistryTestRegExe(t *testing.T) {
 			return nil
 		}, test.validateRegistryEvent(t, noWrapperType, func(event *model.Event, _ *rules.Rule) {
 			assertFieldEqualCaseInsensitve(t, event, "create.registry.key_path", `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, "wrong registry key path")
-		}))
+		}), "test_create_rule")
 	})
 }
+
+var _ = declare(TestBasicRegistryTestAPI, testOpts{enableFIM: true})
 
 func TestBasicRegistryTestAPI(t *testing.T) {
 	openDef := &rules.RuleDefinition{
@@ -132,22 +134,20 @@ func TestBasicRegistryTestAPI(t *testing.T) {
 		Expression: `create.registry.key_path == "HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run"`,
 	}
 
-	opts := testOpts{
-		enableFIM: true,
-	}
-	test, err := newTestModule(t, nil, []*rules.RuleDefinition{openDef, createDef}, withStaticOpts(opts))
+	test, err := newTestModule(t, nil, []*rules.RuleDefinition{openDef, createDef})
 
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer test.Close()
 
-	// this is kinda hokey.  ETW (which is what FIM is based on) takes an indeterminant amount of time to start up.
-	// so wait around for it to start
-	time.Sleep(5 * time.Second)
+	// Wait for ETW to be ready (signaled on first event received)
+	if !test.WaitForETWReady(30 * time.Second) {
+		t.Fatal("Timeout waiting for ETW to be ready")
+	}
 
-	test.Run(t, "Test registry with API", func(t *testing.T, kind wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
-		test.WaitSignal(t, func() error {
+	test.RunMultiMode(t, "Test registry with API", func(t *testing.T, kind wrapperType, cmdFunc func(cmd string, args []string, envs []string) *exec.Cmd) {
+		test.WaitSignalFromRule(t, func() error {
 			key, _, err := registry.CreateKey(windows.HKEY_LOCAL_MACHINE, `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, windows.KEY_READ|windows.KEY_WRITE)
 			if err == nil {
 				defer key.Close()
@@ -156,7 +156,7 @@ func TestBasicRegistryTestAPI(t *testing.T) {
 
 		}, test.validateRegistryEvent(t, noWrapperType, func(event *model.Event, _ *rules.Rule) {
 			assertFieldEqualCaseInsensitve(t, event, "create.registry.key_path", `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, "wrong registry key path")
-		}))
+		}), "test_create_rule")
 	})
 }
 

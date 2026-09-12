@@ -26,6 +26,7 @@
       {{- if .TotalHistogramBuckets}}
       Histogram Buckets: Last Run: {{humanize .HistogramBuckets}}, Total: {{humanize .TotalHistogramBuckets}}
       {{- end }}
+      First Execution Time : {{humanizeDuration .FirstExecutionTime "ms"}}
       Average Execution Time : {{humanizeDuration .AverageExecutionTime "ms"}}
       Last Execution Date : {{formatUnixTime .UpdateTimestamp}}
       Last Successful Execution Date : {{ if .LastSuccessDate }}{{formatUnixTime .LastSuccessDate}}{{ else }}Never{{ end }}
@@ -81,10 +82,31 @@
   {{- end }}
 {{- end }}
 
+{{- with .workerStats }}
+  Check Worker Utilization
+  ========================
+  {{- if .Count }}
+    Total Workers: {{.Count}}
+    {{- if .AverageUtilization }}
+    Average Utilization: {{percent .AverageUtilization}}%
+    {{- end }}
+    {{- if .TopWorkers }}
+
+    Top Workers (by utilization):
+      {{- range .TopWorkers }}
+      {{.Name}}: {{percent .Utilization}}%
+      {{- end }}
+    {{- end }}
+  {{- else }}
+    No worker utilization data available
+  {{- end }}
+
+{{- end }}
+
 {{- with .pyLoaderStats }}
   {{- if .Py3Warnings }}
   Python 3 Linter Warnings
-  =======================
+  ========================
     {{- range $CheckName, $warnings :=  .Py3Warnings }}
       {{ $CheckName }}
       {{printDashes $CheckName "-"}}

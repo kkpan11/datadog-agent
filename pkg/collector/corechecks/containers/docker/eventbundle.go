@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/events"
+	"github.com/moby/moby/api/types/events"
 
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
@@ -80,7 +80,7 @@ func (b *dockerEventBundle) toDatadogEvent(hostname string) (event.Event, error)
 		EventType:      CheckName,
 		AlertType:      b.alertType,
 		Ts:             b.maxTimestamp.Unix(),
-		AggregationKey: fmt.Sprintf("docker:%s", b.imageName),
+		AggregationKey: "docker:" + b.imageName,
 	}
 
 	seenContainers := make(map[string]bool)

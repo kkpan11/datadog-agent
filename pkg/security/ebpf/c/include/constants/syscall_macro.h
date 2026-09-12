@@ -2,7 +2,7 @@
 #define _CONSTANTS_SYSCALL_MACRO_H_
 
 #if defined(__x86_64__)
-#if USE_SYSCALL_WRAPPER == 1
+#ifdef USE_SYSCALL_WRAPPER
 #define SYSCALL64_PREFIX "__x64_"
 #define SYSCALL32_PREFIX "__ia32_"
 #else
@@ -13,7 +13,7 @@
 #define SYSCALL64_PT_REGS_PARM1(x) ((x)->di)
 #define SYSCALL64_PT_REGS_PARM2(x) ((x)->si)
 #define SYSCALL64_PT_REGS_PARM3(x) ((x)->dx)
-#if USE_SYSCALL_WRAPPER == 1
+#ifdef USE_SYSCALL_WRAPPER
 #define SYSCALL64_PT_REGS_PARM4(x) ((x)->r10)
 #else
 #define SYSCALL64_PT_REGS_PARM4(x) ((x)->cx)
@@ -29,7 +29,7 @@
 #define SYSCALL32_PT_REGS_PARM6(x) ((x)->bp)
 
 #elif defined(__aarch64__)
-#if USE_SYSCALL_WRAPPER == 1
+#ifdef USE_SYSCALL_WRAPPER
 #define SYSCALL64_PREFIX "__arm64_"
 #define SYSCALL32_PREFIX "__arm32_"
 #else
@@ -92,13 +92,13 @@
 #define FEXIT_CTX_TYPE ctx_t
 
 #define SYSCALL_ABI_HOOKx(x, word_size, type, TYPE, prefix, syscall, suffix, ...)                                                                      \
-    int __attribute__((always_inline)) type##__##sys##syscall(TYPE##_CTX_TYPE *ctx __JOIN(x, __SC_DECL, __VA_ARGS__));                                 \
+    static int __attribute__((always_inline)) type##__##sys##syscall(TYPE##_CTX_TYPE *ctx __JOIN(x, __SC_DECL, __VA_ARGS__));                          \
     SEC(#type "/" SYSCALL##word_size##_PREFIX #prefix SYSCALL_PREFIX #syscall #suffix)                                                                 \
     int type##__##word_size##_##prefix##sys##syscall##suffix(TYPE##_CTX_TYPE *ctx) {                                                                   \
         SYSCALL_##TYPE##_PROLOG(x, __SC_##word_size##_PARAM, syscall, __VA_ARGS__) return type##__sys##syscall(ctx __JOIN(x, __SC_PASS, __VA_ARGS__)); \
     }
 
-#define SYSCALL_HOOK_COMMON(x, type, TYPE, syscall, ...) int __attribute__((always_inline)) type##__sys##syscall(TYPE##_CTX_TYPE *ctx __JOIN(x, __SC_DECL, __VA_ARGS__))
+#define SYSCALL_HOOK_COMMON(x, type, TYPE, syscall, ...) static int __attribute__((always_inline)) type##__sys##syscall(TYPE##_CTX_TYPE *ctx __JOIN(x, __SC_DECL, __VA_ARGS__))
 #define SYSCALL_KRETPROBE_PROLOG(...)
 #define SYSCALL_FEXIT_PROLOG(...)
 
@@ -107,7 +107,7 @@
     if (!rctx) return 0;                               \
     __MAP(x, m, __VA_ARGS__)
 
-#if USE_SYSCALL_WRAPPER == 1
+#ifdef USE_SYSCALL_WRAPPER
 #define __SC_64_PARAM(n, t, a) \
     t a;                       \
     bpf_probe_read(&a, sizeof(t), (void *)&SYSCALL64_PT_REGS_PARM##n(rctx));

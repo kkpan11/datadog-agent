@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
-	"github.com/DataDog/datadog-agent/pkg/databasemonitoring/aurora"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/databasemonitoring/aws"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -29,7 +29,7 @@ type DBMAuroraListener struct {
 	delService   chan<- Service
 	stop         chan bool
 	services     map[string]Service
-	config       aurora.Config
+	config       aws.Config
 	awsRdsClient aws.RdsClient
 	// ticks is used primarily for testing purposes so
 	// the frequency the discovers loop iterates can be controlled
@@ -51,7 +51,7 @@ type DBMAuroraService struct {
 
 // NewDBMAuroraListener returns a new DBMAuroraListener
 func NewDBMAuroraListener(ServiceListernerDeps) (ServiceListener, error) {
-	config, err := aurora.NewAuroraAutodiscoveryConfig()
+	config, err := aws.NewAuroraAutodiscoveryConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func NewDBMAuroraListener(ServiceListernerDeps) (ServiceListener, error) {
 	return newDBMAuroraListener(config, client, nil), nil
 }
 
-func newDBMAuroraListener(config aurora.Config, awsClient aws.RdsClient, ticks <-chan time.Time) ServiceListener {
+func newDBMAuroraListener(config aws.Config, awsClient aws.RdsClient, ticks <-chan time.Time) ServiceListener {
 	l := &DBMAuroraListener{
 		config:       config,
 		services:     make(map[string]Service),
@@ -109,48 +109,52 @@ func (l *DBMAuroraListener) run() {
 func (l *DBMAuroraListener) discoverAuroraClusters() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(l.config.QueryTimeout)*time.Second)
 	defer cancel()
-	ids, err := l.awsRdsClient.GetAuroraClustersFromTags(ctx, l.config.Tags)
+	clusters, err := l.awsRdsClient.GetAuroraClustersFromTags(ctx, l.config.Tags)
 	if err != nil {
 		_ = log.Error(err)
 		return
 	}
-	if len(ids) == 0 {
+	if len(clusters) == 0 {
 		log.Debugf("no aurora clusters found with provided tags %v", l.config.Tags)
-		return
 	}
-	auroraCluster, err := l.awsRdsClient.GetAuroraClusterEndpoints(ctx, ids, l.config.DbmTag)
+	instances, err := l.awsRdsClient.GetAuroraClusterEndpoints(ctx, clusters, l.config)
 	if err != nil {
 		_ = log.Error(err)
 		return
 	}
 	discoveredServices := make(map[string]struct{})
-	for id, c := range auroraCluster {
-		for _, instance := range c.Instances {
-			if instance == nil {
-				_ = log.Warnf("received malformed instance response for cluster %s, skipping", id)
-				continue
-			}
-			entityID := instance.Digest(engineToIntegrationType[instance.Engine], id)
-			discoveredServices[entityID] = struct{}{}
-			l.createService(entityID, id, instance)
-		}
+	for _, instance := range instances {
+		entityID := instance.Digest(engineToIntegrationType[instance.Engine], instance.ID)
+		discoveredServices[entityID] = struct{}{}
+		l.createService(entityID, instance.ClusterID, instance)
 	}
+
 	deletedServices := findDeletedServices(l.services, discoveredServices)
 	l.deleteServices(deletedServices)
 }
 
-func (l *DBMAuroraListener) createService(entityID, clusterID string, instance *aws.Instance) {
-	if _, present := l.services[entityID]; present {
-		return
-	}
+func (l *DBMAuroraListener) createService(entityID, clusterID string, instance aws.Instance) {
 	svc := &DBMAuroraService{
 		adIdentifier: engineToAuroraADIdentifier[instance.Engine],
 		entityID:     entityID,
 		checkName:    engineToIntegrationType[instance.Engine],
-		instance:     instance,
+		instance:     &instance,
 		region:       l.config.Region,
 		clusterID:    clusterID,
 	}
+	log.Debugf("creating aurora service %v", svc)
+	if existing, present := l.services[entityID]; present {
+		if existingSvc, ok := existing.(*DBMAuroraService); ok && existingSvc.Equal(svc) {
+			log.Debugf("aurora service %v already exists", svc)
+			return
+		}
+		log.Debugf("aurora service %v already exists but is not equal to the new service", svc)
+		// If the cached service is not equal to the new service then metadata has changed
+		// Delete the cached service first and then send the updated one to the newSvc channel.
+		l.delService <- existing
+		delete(l.services, entityID)
+	}
+	log.Debugf("adding aurora service %v", svc)
 	l.services[entityID] = svc
 	l.newService <- svc
 }
@@ -200,9 +204,9 @@ func (d *DBMAuroraService) GetHosts() (map[string]string, error) {
 }
 
 // GetPorts returns the port for the aurora endpoint
-func (d *DBMAuroraService) GetPorts() ([]ContainerPort, error) {
+func (d *DBMAuroraService) GetPorts() ([]workloadmeta.ContainerPort, error) {
 	port := int(d.instance.Port)
-	return []ContainerPort{{port, fmt.Sprintf("p%d", port)}}, nil
+	return []workloadmeta.ContainerPort{{Port: port, Name: fmt.Sprintf("p%d", port)}}, nil
 }
 
 // GetTags returns the list of container tags - currently always empty
@@ -236,7 +240,7 @@ func (d *DBMAuroraService) GetCheckNames(context.Context) []string {
 }
 
 // HasFilter returns false on DBMAuroraService
-func (d *DBMAuroraService) HasFilter(containers.FilterType) bool {
+func (d *DBMAuroraService) HasFilter(workloadfilter.Scope) bool {
 	return false
 }
 
@@ -253,11 +257,18 @@ func (d *DBMAuroraService) GetExtraConfig(key string) (string, error) {
 		return d.clusterID, nil
 	case "dbname":
 		return d.instance.DbName, nil
+	case "global_view_db":
+		return d.instance.GlobalViewDb, nil
 	}
 
 	return "", ErrNotSupported
 }
 
 // FilterTemplates does nothing.
-func (d *DBMAuroraService) FilterTemplates(map[string]integration.Config) {
+func (d *DBMAuroraService) FilterTemplates(_ map[string]integration.Config) {
+}
+
+// GetImageName does nothing
+func (d *DBMAuroraService) GetImageName() string {
+	return ""
 }

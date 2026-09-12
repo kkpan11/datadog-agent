@@ -13,11 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/go-systemd/sdjournal"
+	"github.com/coreos/go-systemd/v22/sdjournal"
 	"github.com/stretchr/testify/assert"
 
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
 	"github.com/DataDog/datadog-agent/comp/logs/agent/config"
+	auditorMock "github.com/DataDog/datadog-agent/comp/logs/auditor/mock"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	"github.com/DataDog/datadog-agent/pkg/logs/message"
 	"github.com/DataDog/datadog-agent/pkg/logs/sources"
@@ -32,84 +33,82 @@ type MockJournal struct {
 	previous int
 	cursor   string
 	entries  []*sdjournal.JournalEntry
+	// idx tracks the current journal cursor position, mirroring real journald
+	// semantics: -1 means before the first entry (set by SeekHead),
+	// len(entries) means after the last entry (set by SeekTail).
+	// When creating a mock to read entries, initialize with idx: -1.
+	idx int
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
-func (m *MockJournal) AddMatch(match string) error {
+func (m *MockJournal) AddMatch(_ string) error {
 	return nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) AddDisjunction() error {
 	return nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) SeekTail() error {
 	m.seekTail++
+	m.idx = len(m.entries)
 	return nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) SeekHead() error {
 	m.seekHead++
+	m.idx = -1
 	return nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
-func (m *MockJournal) Wait(timeout time.Duration) int {
+func (m *MockJournal) Wait(_ time.Duration) int {
 	time.Sleep(time.Millisecond)
 	return 0
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) SeekCursor(cursor string) error {
 	m.cursor = cursor
 	return nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
-func (m *MockJournal) NextSkip(skip uint64) (uint64, error) {
+func (m *MockJournal) NextSkip(_ uint64) (uint64, error) {
 	return 0, nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) Close() error {
 	return nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) Next() (uint64, error) {
 	m.m.Lock()
 	defer m.m.Unlock()
 	m.next++
-	return uint64(len(m.entries)), nil
+	m.idx++
+	if m.idx < len(m.entries) {
+		return 1, nil
+	}
+	return 0, nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) Previous() (uint64, error) {
 	m.m.Lock()
 	defer m.m.Unlock()
 	m.previous++
-	return uint64(len(m.entries)), nil
+	m.idx--
+	if m.idx >= 0 && m.idx < len(m.entries) {
+		return 1, nil
+	}
+	return 0, nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) GetEntry() (*sdjournal.JournalEntry, error) {
 	m.m.Lock()
 	defer m.m.Unlock()
-	defer func() {
-		m.entries = m.entries[1:]
-	}()
-
-	if len(m.entries) == 0 {
+	if m.idx < 0 || m.idx >= len(m.entries) {
 		return nil, nil
 	}
-
-	return m.entries[0], nil
+	return m.entries[m.idx], nil
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockJournal) GetCursor() (string, error) {
 	return "", nil
 }
@@ -118,15 +117,16 @@ func TestIdentifier(t *testing.T) {
 	var tailer *Tailer
 	var source *sources.LogSource
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
+	fakeRegistry := auditorMock.NewMockAuditor()
 
 	// expect default identifier
 	source = sources.NewLogSource("", &config.LogsConfig{})
-	tailer = NewTailer(source, nil, nil, true, fakeTagger)
+	tailer = NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 	assert.Equal(t, "journald:default", tailer.Identifier())
 
 	// expect identifier to be overridden
 	source = sources.NewLogSource("", &config.LogsConfig{Path: "any_path"})
-	tailer = NewTailer(source, nil, nil, true, fakeTagger)
+	tailer = NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 	assert.Equal(t, "journald:any_path", tailer.Identifier())
 }
 
@@ -137,10 +137,10 @@ func TestShouldDropEntry(t *testing.T) {
 	var tailer *Tailer
 	var err error
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-
+	fakeRegistry := auditorMock.NewMockAuditor()
 	// expect only the specified service units or matching entries to be dropped
 	source = sources.NewLogSource("", &config.LogsConfig{ExcludeSystemUnits: []string{"foo", "bar"}, ExcludeUserUnits: []string{"baz", "qux"}, ExcludeMatches: []string{"quux=quuz"}})
-	tailer = NewTailer(source, nil, nil, true, fakeTagger)
+	tailer = NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 	err = tailer.setup()
 	assert.Nil(t, err)
 
@@ -212,7 +212,7 @@ func TestShouldDropEntry(t *testing.T) {
 
 	// expect all System-level service units to be dropped
 	source = sources.NewLogSource("", &config.LogsConfig{ExcludeSystemUnits: []string{"*"}})
-	tailer = NewTailer(source, nil, nil, true, fakeTagger)
+	tailer = NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 	err = tailer.setup()
 	assert.Nil(t, err)
 
@@ -248,7 +248,7 @@ func TestShouldDropEntry(t *testing.T) {
 
 	// expect all User-level service units to be dropped
 	source = sources.NewLogSource("", &config.LogsConfig{ExcludeUserUnits: []string{"*"}})
-	tailer = NewTailer(source, nil, nil, true, fakeTagger)
+	tailer = NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 	err = tailer.setup()
 	assert.Nil(t, err)
 
@@ -285,54 +285,108 @@ func TestShouldDropEntry(t *testing.T) {
 }
 
 func TestApplicationName(t *testing.T) {
-	source := sources.NewLogSource("", &config.LogsConfig{})
-	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	tests := []struct {
+		name                     string
+		yaml                     string
+		expectedContainerAppName string
+	}{
+		{
+			name: "default application name not set",
+			yaml: `
+logs:
+  - type: journald
+`,
+			expectedContainerAppName: "docker",
+		},
+		{
+			name: "default application name set to empty string",
+			yaml: `
+logs:
+  - type: journald
+    default_application_name: ""
+`,
+			expectedContainerAppName: "foo",
+		},
+		{
+			name: "default application name set to podman",
+			yaml: `
+logs:
+  - type: journald
+    default_application_name: "podman"
+`,
+			expectedContainerAppName: "podman",
+		},
+	}
 
-	assert.Equal(t, "foo", tailer.getApplicationName(
-		&sdjournal.JournalEntry{
-			Fields: map[string]string{
-				sdjournal.SD_JOURNAL_FIELD_SYSLOG_IDENTIFIER: "foo",
-				sdjournal.SD_JOURNAL_FIELD_SYSTEMD_USER_UNIT: "foo-user.service",
-				sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT:      "foo.service",
-				sdjournal.SD_JOURNAL_FIELD_COMM:              "foo.sh",
-			},
-		}, []string{}))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configs, err := config.ParseYAML([]byte(tt.yaml))
+			assert.NoError(t, err)
+			assert.Len(t, configs, 1)
 
-	assert.Equal(t, "foo-user.service", tailer.getApplicationName(
-		&sdjournal.JournalEntry{
-			Fields: map[string]string{
-				sdjournal.SD_JOURNAL_FIELD_SYSTEMD_USER_UNIT: "foo-user.service",
-				sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT:      "foo.service",
-				sdjournal.SD_JOURNAL_FIELD_COMM:              "foo.sh",
-			},
-		}, []string{}))
+			source := sources.NewLogSource("", configs[0])
+			fakeTagger := taggerfxmock.SetupFakeTagger(t)
+			fakeRegistry := auditorMock.NewMockAuditor()
+			tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
-	assert.Equal(t, "foo.service", tailer.getApplicationName(
-		&sdjournal.JournalEntry{
-			Fields: map[string]string{
-				sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT: "foo.service",
-				sdjournal.SD_JOURNAL_FIELD_COMM:         "foo.sh",
-			},
-		}, []string{}))
+			assert.Equal(t, "foo", tailer.getApplicationName(
+				&sdjournal.JournalEntry{
+					Fields: map[string]string{
+						sdjournal.SD_JOURNAL_FIELD_SYSLOG_IDENTIFIER: "foo",
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_USER_UNIT: "foo-user.service",
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT:      "foo.service",
+						sdjournal.SD_JOURNAL_FIELD_COMM:              "foo.sh",
+					},
+				}, []string{}))
 
-	assert.Equal(t, "foo.sh", tailer.getApplicationName(
-		&sdjournal.JournalEntry{
-			Fields: map[string]string{
-				sdjournal.SD_JOURNAL_FIELD_COMM: "foo.sh",
-			},
-		}, []string{}))
+			assert.Equal(t, "foo-user.service", tailer.getApplicationName(
+				&sdjournal.JournalEntry{
+					Fields: map[string]string{
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_USER_UNIT: "foo-user.service",
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT:      "foo.service",
+						sdjournal.SD_JOURNAL_FIELD_COMM:              "foo.sh",
+					},
+				}, []string{}))
 
-	assert.Equal(t, "", tailer.getApplicationName(
-		&sdjournal.JournalEntry{
-			Fields: map[string]string{},
-		}, []string{}))
+			assert.Equal(t, "foo.service", tailer.getApplicationName(
+				&sdjournal.JournalEntry{
+					Fields: map[string]string{
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT: "foo.service",
+						sdjournal.SD_JOURNAL_FIELD_COMM:         "foo.sh",
+					},
+				}, []string{}))
+
+			assert.Equal(t, "foo.sh", tailer.getApplicationName(
+				&sdjournal.JournalEntry{
+					Fields: map[string]string{
+						sdjournal.SD_JOURNAL_FIELD_COMM: "foo.sh",
+					},
+				}, []string{}))
+
+			assert.Equal(t, tt.expectedContainerAppName, tailer.getApplicationName(
+				&sdjournal.JournalEntry{
+					Fields: map[string]string{
+						sdjournal.SD_JOURNAL_FIELD_SYSLOG_IDENTIFIER: "foo",
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_USER_UNIT: "foo-user.service",
+						sdjournal.SD_JOURNAL_FIELD_SYSTEMD_UNIT:      "foo.service",
+						sdjournal.SD_JOURNAL_FIELD_COMM:              "foo.sh",
+						containerIDKey:                               "bar",
+					},
+				}, []string{}))
+
+			assert.Equal(t, "", tailer.getApplicationName(
+				&sdjournal.JournalEntry{
+					Fields: map[string]string{},
+				}, []string{}))
+		})
+	}
 }
 
 func TestContent(t *testing.T) {
 	source := sources.NewLogSource("", &config.LogsConfig{})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
 	_, marshaled := tailer.getContent(
 		&sdjournal.JournalEntry{
@@ -364,7 +418,8 @@ func TestContent(t *testing.T) {
 func TestSeverity(t *testing.T) {
 	source := sources.NewLogSource("", &config.LogsConfig{})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
 	priorityValues := []string{"0", "1", "2", "3", "4", "5", "6", "7", "foo"}
 	statuses := []string{message.StatusEmergency, message.StatusAlert, message.StatusCritical, message.StatusError, message.StatusWarning, message.StatusNotice, message.StatusInfo, message.StatusDebug, message.StatusInfo}
@@ -382,7 +437,8 @@ func TestSeverity(t *testing.T) {
 func TestApplicationNameShouldBeDockerForContainerEntries(t *testing.T) {
 	source := sources.NewLogSource("", &config.LogsConfig{})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
 	assert.Equal(t, "docker", tailer.getApplicationName(
 		&sdjournal.JournalEntry{
@@ -401,7 +457,8 @@ func TestApplicationNameShouldBeShortImageForContainerEntries(t *testing.T) {
 
 	source := sources.NewLogSource("", &config.LogsConfig{ContainerMode: true})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
 	assert.Equal(t, "testImage", tailer.getApplicationName(
 		&sdjournal.JournalEntry{
@@ -424,7 +481,8 @@ func TestApplicationNameShouldBeDockerWhenTagNotFound(t *testing.T) {
 
 	source := sources.NewLogSource("", &config.LogsConfig{ContainerMode: true})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
 	assert.Equal(t, "docker", tailer.getApplicationName(
 		&sdjournal.JournalEntry{
@@ -450,7 +508,8 @@ func TestWrongTypeFromCache(t *testing.T) {
 
 	source := sources.NewLogSource("", &config.LogsConfig{ContainerMode: true})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, nil, nil, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, nil, nil, true, fakeTagger, fakeRegistry)
 
 	assert.Equal(t, "testImage", tailer.getApplicationName(
 		&sdjournal.JournalEntry{
@@ -494,7 +553,8 @@ func TestTailingMode(t *testing.T) {
 			mockJournal := &MockJournal{m: m}
 			source := sources.NewLogSource("", tt.config)
 			fakeTagger := taggerfxmock.SetupFakeTagger(t)
-			tailer := NewTailer(source, nil, mockJournal, true, fakeTagger)
+			fakeRegistry := auditorMock.NewMockAuditor()
+			tailer := NewTailer(source, nil, mockJournal, true, fakeTagger, fakeRegistry)
 			tailer.Start(tt.cursor)
 
 			mockJournal.m.Lock()
@@ -516,10 +576,11 @@ func TestTailingMode(t *testing.T) {
 
 func TestTailerCanTailJournal(t *testing.T) {
 
-	mockJournal := &MockJournal{m: &sync.Mutex{}}
-	source := sources.NewLogSource("", &config.LogsConfig{})
+	mockJournal := &MockJournal{m: &sync.Mutex{}, idx: -1}
+	source := sources.NewLogSource("", &config.LogsConfig{TailingMode: "beginning"})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, make(chan *message.Message, 1), mockJournal, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, make(chan *message.Message, 1), mockJournal, true, fakeTagger, fakeRegistry)
 
 	mockJournal.entries = append(mockJournal.entries, &sdjournal.JournalEntry{Fields: map[string]string{"MESSAGE": "foobar"}})
 
@@ -534,13 +595,41 @@ func TestTailerCanTailJournal(t *testing.T) {
 	tailer.Stop()
 }
 
+func TestSeekHeadReadsFirstEntry(t *testing.T) {
+	mockJournal := &MockJournal{m: &sync.Mutex{}, idx: -1}
+	source := sources.NewLogSource("", &config.LogsConfig{TailingMode: "beginning"})
+	fakeTagger := taggerfxmock.SetupFakeTagger(t)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, make(chan *message.Message, 2), mockJournal, true, fakeTagger, fakeRegistry)
+
+	mockJournal.entries = []*sdjournal.JournalEntry{
+		{Fields: map[string]string{"MESSAGE": "first"}},
+		{Fields: map[string]string{"MESSAGE": "second"}},
+	}
+
+	tailer.Start("")
+
+	msg1 := <-tailer.outputChan
+	var parsed1 map[string]interface{}
+	json.Unmarshal(msg1.GetContent(), &parsed1)
+	assert.Equal(t, "first", parsed1["message"])
+
+	msg2 := <-tailer.outputChan
+	var parsed2 map[string]interface{}
+	json.Unmarshal(msg2.GetContent(), &parsed2)
+	assert.Equal(t, "second", parsed2["message"])
+
+	tailer.Stop()
+}
+
 func TestTailerWithStructuredMessage(t *testing.T) {
 	assert := assert.New(t)
 
-	mockJournal := &MockJournal{m: &sync.Mutex{}}
-	source := sources.NewLogSource("", &config.LogsConfig{})
+	mockJournal := &MockJournal{m: &sync.Mutex{}, idx: -1}
+	source := sources.NewLogSource("", &config.LogsConfig{TailingMode: "beginning"})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailer := NewTailer(source, make(chan *message.Message, 1), mockJournal, false, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, make(chan *message.Message, 1), mockJournal, false, fakeTagger, fakeRegistry)
 	mockJournal.entries = append(mockJournal.entries, &sdjournal.JournalEntry{Fields: map[string]string{
 		sdjournal.SD_JOURNAL_FIELD_MESSAGE: "foobar",
 		"_SESSION_UID":                     "a97aaca9-ea7a-4ea5-9ebe-048686f2c78a",
@@ -562,10 +651,11 @@ func TestTailerCompareUnstructuredAndStructured(t *testing.T) {
 
 	// v1 behavior tailer
 
-	mockJournalV1 := &MockJournal{m: &sync.Mutex{}}
-	sourceV1 := sources.NewLogSource("", &config.LogsConfig{})
+	mockJournalV1 := &MockJournal{m: &sync.Mutex{}, idx: -1}
+	sourceV1 := sources.NewLogSource("", &config.LogsConfig{TailingMode: "beginning"})
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
-	tailerV1 := NewTailer(sourceV1, make(chan *message.Message, 1), mockJournalV1, true, fakeTagger)
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailerV1 := NewTailer(sourceV1, make(chan *message.Message, 1), mockJournalV1, true, fakeTagger, fakeRegistry)
 	mockJournalV1.entries = append(mockJournalV1.entries, &sdjournal.JournalEntry{Fields: map[string]string{
 		sdjournal.SD_JOURNAL_FIELD_MESSAGE: "journald log message content",
 		"_SESSION_UID":                     "a97aaca9-ea7a-4ea5-9ebe-048686f2c78a",
@@ -576,9 +666,9 @@ func TestTailerCompareUnstructuredAndStructured(t *testing.T) {
 
 	// v2 behavior tailer
 
-	mockJournalV2 := &MockJournal{m: &sync.Mutex{}}
-	sourceV2 := sources.NewLogSource("", &config.LogsConfig{})
-	tailerV2 := NewTailer(sourceV2, make(chan *message.Message, 1), mockJournalV2, false, fakeTagger)
+	mockJournalV2 := &MockJournal{m: &sync.Mutex{}, idx: -1}
+	sourceV2 := sources.NewLogSource("", &config.LogsConfig{TailingMode: "beginning"})
+	tailerV2 := NewTailer(sourceV2, make(chan *message.Message, 1), mockJournalV2, false, fakeTagger, fakeRegistry)
 	mockJournalV2.entries = append(mockJournalV2.entries, &sdjournal.JournalEntry{Fields: map[string]string{
 		sdjournal.SD_JOURNAL_FIELD_MESSAGE: "journald log message content",
 		"_SESSION_UID":                     "a97aaca9-ea7a-4ea5-9ebe-048686f2c78a",
@@ -600,21 +690,20 @@ func TestTailerCompareUnstructuredAndStructured(t *testing.T) {
 }
 
 func TestExpectedTagDuration(t *testing.T) {
-
 	mockConfig := configmock.New(t)
 
 	tags := []string{"tag1:value1"}
 	fakeTagger := taggerfxmock.SetupFakeTagger(t)
 
-	mockConfig.SetWithoutSource("tags", tags)
-	defer mockConfig.SetWithoutSource("tags", nil)
+	mockConfig.SetInTest("tags", tags)
+	// We do not want to trigger the log, local tag provider cleanup routine. Setting it to 1h to make sure this
+	// test, even with the race detector enabled, don't hit that time limit.
+	mockConfig.SetInTest("logs_config.expected_tags_duration", "1h")
 
-	mockConfig.SetWithoutSource("logs_config.expected_tags_duration", "5s")
-	defer mockConfig.SetWithoutSource("logs_config.expected_tags_duration", "0")
-
-	mockJournal := &MockJournal{m: &sync.Mutex{}}
-	source := sources.NewLogSource("", &config.LogsConfig{})
-	tailer := NewTailer(source, make(chan *message.Message, 1), mockJournal, true, fakeTagger)
+	mockJournal := &MockJournal{m: &sync.Mutex{}, idx: -1}
+	source := sources.NewLogSource("", &config.LogsConfig{TailingMode: "beginning"})
+	fakeRegistry := auditorMock.NewMockAuditor()
+	tailer := NewTailer(source, make(chan *message.Message, 1), mockJournal, true, fakeTagger, fakeRegistry)
 
 	mockJournal.entries = append(mockJournal.entries, &sdjournal.JournalEntry{Fields: map[string]string{"MESSAGE": "foobar"}})
 

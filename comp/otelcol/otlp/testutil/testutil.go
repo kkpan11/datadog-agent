@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
 	"io"
 	"log"
 	"net/http"
@@ -18,34 +17,51 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-agent/comp/core/tagger/origindetection"
+	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/inframetadata/payload"
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes/source"
 	"github.com/DataDog/sketches-go/ddsketch"
+
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/inframetadata/payload"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
 
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	pkgConfigModel "github.com/DataDog/datadog-agent/pkg/config/model"
-	pkgConfigSetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 )
 
-// OTLPConfigFromPorts creates a test OTLP config map.
+// OTLPConfigFromPorts creates a test OTLP config map. A 0-port disables its protocol.
 func OTLPConfigFromPorts(bindHost string, gRPCPort uint, httpPort uint) map[string]interface{} {
-	otlpConfig := map[string]interface{}{"protocols": map[string]interface{}{}}
-
+	var gRPCEndpoint, httpEndpoint string
 	if gRPCPort > 0 {
-		otlpConfig["protocols"].(map[string]interface{})["grpc"] = map[string]interface{}{
-			"endpoint": fmt.Sprintf("%s:%d", bindHost, gRPCPort),
-		}
+		gRPCEndpoint = fmt.Sprintf("%s:%d", bindHost, gRPCPort)
 	}
 	if httpPort > 0 {
+		httpEndpoint = fmt.Sprintf("%s:%d", bindHost, httpPort)
+	}
+	return OTLPConfigFromEndpoints(gRPCEndpoint, httpEndpoint)
+}
+
+// OTLPConfigFromEndpoints is like OTLPConfigFromPorts but takes full "host:port" endpoints
+// directly, so callers can pass a ":0" port to avoid flaky binds on a fixed port. An empty
+// endpoint disables its protocol.
+func OTLPConfigFromEndpoints(gRPCEndpoint string, httpEndpoint string) map[string]interface{} {
+	otlpConfig := map[string]interface{}{"protocols": map[string]interface{}{}}
+
+	if gRPCEndpoint != "" {
+		otlpConfig["protocols"].(map[string]interface{})["grpc"] = map[string]interface{}{
+			"endpoint": gRPCEndpoint,
+		}
+	}
+	if httpEndpoint != "" {
 		otlpConfig["protocols"].(map[string]interface{})["http"] = map[string]interface{}{
-			"endpoint": fmt.Sprintf("%s:%d", bindHost, httpPort),
+			"endpoint": httpEndpoint,
 		}
 	}
 	return otlpConfig
@@ -54,7 +70,6 @@ func OTLPConfigFromPorts(bindHost string, gRPCPort uint, httpPort uint) map[stri
 // LoadConfig from a given path.
 func LoadConfig(t *testing.T, path string) (pkgConfigModel.Reader, error) {
 	cfg := configmock.New(t)
-	pkgConfigSetup.OTLP(cfg)
 	cfg.SetConfigFile(path)
 	err := cfg.ReadInConfig()
 	if err != nil {
@@ -528,7 +543,7 @@ func DatadogLogServerMock(overwriteHandlerFuncs ...OverwriteHandleFunc) *Datadog
 		// logs backend doesn't have validate endpoint
 		// but adding one here for ease of testing
 		"/api/v1/validate": validateAPIKeyEndpoint,
-		"/":                server.logsEndpoint,
+		"/{$}":             server.logsEndpoint,
 	}
 	for _, f := range overwriteHandlerFuncs {
 		p, hf := f()
@@ -614,13 +629,17 @@ func ProcessLogsAgentRequest(w http.ResponseWriter, r *http.Request) JSONLogs {
 
 // TestTaggerClient is used to store sample tags for testing purposes
 type TestTaggerClient struct {
-	TagMap map[string][]string
+	TagMap         map[string][]string
+	ContainerIDMap map[string]string
 }
+
+var _ types.TaggerClient = (*TestTaggerClient)(nil)
 
 // NewTestTaggerClient creates and returns a new testTaggerClient with an empty string map
 func NewTestTaggerClient() *TestTaggerClient {
 	return &TestTaggerClient{
-		TagMap: make(map[string][]string),
+		TagMap:         make(map[string][]string),
+		ContainerIDMap: make(map[string]string),
 	}
 }
 
@@ -632,4 +651,28 @@ func (t *TestTaggerClient) Tag(entityID types.EntityID, _ types.TagCardinality) 
 // GlobalTags mocks taggerimpl.GlobalTags functionality for purpose of testing, removing dependency on Taggerimpl
 func (t *TestTaggerClient) GlobalTags(_ types.TagCardinality) ([]string, error) {
 	return t.TagMap[types.NewEntityID("internal", "global-entity-id").String()], nil
+}
+
+// GenerateContainerIDFromOriginInfo mocks taggerimpl.GenerateContainerIDFromOriginInfo functionality
+func (t *TestTaggerClient) GenerateContainerIDFromOriginInfo(originInfo origindetection.OriginInfo) (string, error) {
+	if originInfo.LocalData.ContainerID != "" {
+		return originInfo.LocalData.ContainerID, nil
+	}
+	if originInfo.LocalData.ProcessID != 0 {
+		if containerID, ok := t.ContainerIDMap[fmt.Sprintf("pid:%d", originInfo.LocalData.ProcessID)]; ok {
+			return containerID, nil
+		}
+	}
+	if originInfo.LocalData.Inode != 0 {
+		if containerID, ok := t.ContainerIDMap[fmt.Sprintf("inode:%d", originInfo.LocalData.Inode)]; ok {
+			return containerID, nil
+		}
+	}
+	if originInfo.ExternalData.PodUID != "" && originInfo.ExternalData.ContainerName != "" {
+		key := fmt.Sprintf("pod:%s,name:%s,init:%v", originInfo.ExternalData.PodUID, originInfo.ExternalData.ContainerName, originInfo.ExternalData.Init)
+		if containerID, ok := t.ContainerIDMap[key]; ok {
+			return containerID, nil
+		}
+	}
+	return "", fmt.Errorf("unable to resolve container ID from OriginInfo: %+v", originInfo)
 }

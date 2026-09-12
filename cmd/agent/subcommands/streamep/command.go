@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/fx"
@@ -18,10 +20,12 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
+	"github.com/DataDog/datadog-agent/comp/logs-library/diagnostic"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/logs/diagnostic"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
@@ -46,6 +50,7 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 				fx.Supply(cliParams),
 				fx.Supply(command.GetDefaultCoreBundleParams(cliParams.GlobalParams)),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
@@ -55,8 +60,8 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 }
 
 //nolint:revive // TODO(CINT) Fix revive linter
-func streamEventPlatform(_ log.Component, config config.Component, cliParams *cliParams) error {
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+func streamEventPlatform(_ log.Component, config config.Component, client ipc.HTTPClient, cliParams *cliParams) error {
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return err
 	}
@@ -67,23 +72,14 @@ func streamEventPlatform(_ log.Component, config config.Component, cliParams *cl
 		return err
 	}
 
-	urlstr := fmt.Sprintf("https://%v:%v/agent/stream-event-platform", ipcAddress, config.GetInt("cmd_port"))
-	return streamRequest(urlstr, body, func(chunk []byte) {
+	urlstr := fmt.Sprintf("https://%s/agent/stream-event-platform", net.JoinHostPort(ipcAddress, strconv.Itoa(config.GetInt("cmd_port"))))
+	return streamRequest(client, urlstr, body, func(chunk []byte) {
 		fmt.Print(string(chunk))
 	})
 }
 
-func streamRequest(url string, body []byte, onChunk func([]byte)) error {
-	var e error
-	c := util.GetClient()
-
-	// Set session token
-	e = util.SetAuthToken(pkgconfigsetup.Datadog())
-	if e != nil {
-		return e
-	}
-
-	e = util.DoPostChunked(c, url, "application/json", bytes.NewBuffer(body), onChunk)
+func streamRequest(client ipc.HTTPClient, url string, body []byte, onChunk func([]byte)) error {
+	e := client.PostChunk(url, "application/json", bytes.NewBuffer(body), onChunk)
 
 	if e == io.EOF {
 		return nil

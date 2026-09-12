@@ -9,32 +9,16 @@ package status
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"runtime"
-	"sync"
 	"time"
 
-	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface"
-	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl/utils"
-	apiutil "github.com/DataDog/datadog-agent/pkg/api/util"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
+	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/impl/utils"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/version"
 )
-
-// httpClients should be reused instead of created as needed. They keep cached TCP connections
-// that may leak otherwise
-var (
-	httpClient     *http.Client
-	clientInitOnce sync.Once
-)
-
-func getHTTPClient() *http.Client {
-	clientInitOnce.Do(func() {
-		httpClient = apiutil.GetClient()
-	})
-
-	return httpClient
-}
 
 // CoreStatus holds core info about the process-agent
 type CoreStatus struct {
@@ -78,12 +62,10 @@ type ExpvarsMap struct {
 	RTProcessQueueSize              int                 `json:"rtprocess_queue_size"`
 	ConnectionsQueueSize            int                 `json:"connections_queue_size"`
 	EventQueueSize                  int                 `json:"event_queue_size"`
-	PodQueueSize                    int                 `json:"pod_queue_size"`
 	ProcessQueueBytes               int                 `json:"process_queue_bytes"`
 	RTProcessQueueBytes             int                 `json:"rtprocess_queue_bytes"`
 	ConnectionsQueueBytes           int                 `json:"connections_queue_bytes"`
 	EventQueueBytes                 int                 `json:"event_queue_bytes"`
-	PodQueueBytes                   int                 `json:"pod_queue_bytes"`
 	ContainerID                     string              `json:"container_id"`
 	ProxyURL                        string              `json:"proxy_url"`
 	LogFile                         string              `json:"log_file"`
@@ -143,13 +125,19 @@ func getCoreStatus(coreConfig pkgconfigmodel.Reader, hostname hostnameinterface.
 }
 
 func getExpvars(expVarURL string) (s ProcessExpvars, err error) {
-	client := getHTTPClient()
-	b, err := apiutil.DoGet(client, expVarURL, apiutil.CloseConnection)
+	client := http.Client{}
+	resp, err := client.Get(expVarURL)
+	if err != nil {
+		return s, ConnectionError{err}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return s, ConnectionError{err}
 	}
 
-	err = json.Unmarshal(b, &s)
+	err = json.Unmarshal(body, &s)
 	return
 }
 

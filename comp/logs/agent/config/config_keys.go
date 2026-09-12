@@ -6,12 +6,11 @@
 package config
 
 import (
-	"encoding/json"
 	"strings"
 	"time"
 
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/config/structure"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -60,7 +59,7 @@ func (l *LogsConfigKeys) getConfigKey(key string) string {
 }
 
 func isSetAndNotEmpty(config pkgconfigmodel.Reader, key string) bool {
-	return config.IsSet(key) && len(config.GetString(key)) > 0
+	return config.IsConfigured(key) && len(config.GetString(key)) > 0
 }
 
 func (l *LogsConfigKeys) isSetAndNotEmpty(key string) bool {
@@ -118,6 +117,10 @@ func (l *LogsConfigKeys) devModeUseProto() bool {
 	return l.getConfig().GetBool(l.getConfigKey("dev_mode_use_proto"))
 }
 
+func (l *LogsConfigKeys) httpConnectivityRetryIntervalMax() time.Duration {
+	return l.getConfig().GetDuration(l.getConfigKey("http_connectivity_retry_interval_max"))
+}
+
 func (l *LogsConfigKeys) compressionKind() string {
 	configKey := l.getConfigKey("compression_kind")
 	compressionKind := l.getConfig().GetString(configKey)
@@ -134,8 +137,8 @@ func (l *LogsConfigKeys) compressionKind() string {
 		return compressionKind
 	}
 
-	log.Warnf("Invalid compression kind: '%s', falling back to default compression: '%s' ", compressionKind, pkgconfigsetup.DefaultLogCompressionKind)
-	return pkgconfigsetup.DefaultLogCompressionKind
+	log.Warnf("Invalid compression kind: '%s', falling back to default compression: '%s' ", compressionKind, constants.DefaultLogCompressionKind)
+	return constants.DefaultLogCompressionKind
 }
 
 func (l *LogsConfigKeys) compressionLevel() int {
@@ -163,6 +166,12 @@ func (l *LogsConfigKeys) hasAdditionalEndpoints() bool {
 	return len(endpoints) > 0
 }
 
+// shouldUseTCP returns true if the configuration should use TCP.
+// This happens when force_use_tcp, socks5_proxy_address, or additional_endpoints are set.
+func (l *LogsConfigKeys) shouldUseTCP() bool {
+	return l.isForceTCPUse() || l.isSocks5ProxySet() || l.hasAdditionalEndpoints()
+}
+
 // getMainAPIKey return the global API key for the current config with the path used to get it. Main api key means the
 // top level one, not one from additional_endpoints.
 func (l *LogsConfigKeys) getMainAPIKey() (string, string) {
@@ -181,17 +190,8 @@ func (l *LogsConfigKeys) connectionResetInterval() time.Duration {
 
 func (l *LogsConfigKeys) getAdditionalEndpoints() ([]unmarshalEndpoint, string) {
 	var endpoints []unmarshalEndpoint
-	var err error
 	configKey := l.getConfigKey("additional_endpoints")
-	raw := l.getConfig().Get(configKey)
-	if raw == nil {
-		return nil, ""
-	}
-	if s, ok := raw.(string); ok && s != "" {
-		err = json.Unmarshal([]byte(s), &endpoints)
-	} else {
-		err = structure.UnmarshalKey(l.getConfig(), configKey, &endpoints, structure.EnableSquash)
-	}
+	err := structure.UnmarshalKey(l.getConfig(), configKey, &endpoints, structure.EnableStringUnmarshal, structure.EnableSquash)
 	if err != nil {
 		log.Warnf("Could not parse additional_endpoints for logs: %v", err)
 	}
@@ -210,20 +210,21 @@ func (l *LogsConfigKeys) taggerWarmupDuration() time.Duration {
 
 func (l *LogsConfigKeys) batchWait() time.Duration {
 	key := l.getConfigKey("batch_wait")
-	batchWait := l.getConfig().GetInt(key)
-	if batchWait < 1 || 10 < batchWait {
-		log.Warnf("Invalid %s: %v should be in [1, 10], fallback on %v", key, batchWait, pkgconfigsetup.DefaultBatchWait)
-		return pkgconfigsetup.DefaultBatchWait * time.Second
+	batchWaitFloat := l.getConfig().GetFloat64(key)
+	// Valid range: 0.1 seconds (100ms) to 10 seconds
+	if batchWaitFloat < 0.1 || 10 < batchWaitFloat {
+		log.Warnf("Invalid %s: %v should be in [0.1, 10], fallback on %v", key, batchWaitFloat, constants.DefaultBatchWait)
+		return time.Duration(constants.DefaultBatchWait * float64(time.Second))
 	}
-	return (time.Duration(batchWait) * time.Second)
+	return time.Duration(batchWaitFloat * float64(time.Second))
 }
 
 func (l *LogsConfigKeys) batchMaxConcurrentSend() int {
 	key := l.getConfigKey("batch_max_concurrent_send")
 	batchMaxConcurrentSend := l.getConfig().GetInt(key)
 	if batchMaxConcurrentSend < 0 {
-		log.Warnf("Invalid %s: %v should be >= 0, fallback on %v", key, batchMaxConcurrentSend, pkgconfigsetup.DefaultBatchMaxConcurrentSend)
-		return pkgconfigsetup.DefaultBatchMaxConcurrentSend
+		log.Warnf("Invalid %s: %v should be >= 0, fallback on %v", key, batchMaxConcurrentSend, constants.DefaultBatchMaxConcurrentSend)
+		return constants.DefaultBatchMaxConcurrentSend
 	}
 	return batchMaxConcurrentSend
 }
@@ -232,8 +233,8 @@ func (l *LogsConfigKeys) batchMaxSize() int {
 	key := l.getConfigKey("batch_max_size")
 	batchMaxSize := l.getConfig().GetInt(key)
 	if batchMaxSize <= 0 {
-		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, batchMaxSize, pkgconfigsetup.DefaultBatchMaxSize)
-		return pkgconfigsetup.DefaultBatchMaxSize
+		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, batchMaxSize, constants.DefaultBatchMaxSize)
+		return constants.DefaultBatchMaxSize
 	}
 	return batchMaxSize
 }
@@ -242,18 +243,18 @@ func (l *LogsConfigKeys) batchMaxContentSize() int {
 	key := l.getConfigKey("batch_max_content_size")
 	batchMaxContentSize := l.getConfig().GetInt(key)
 	if batchMaxContentSize <= 0 {
-		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, batchMaxContentSize, pkgconfigsetup.DefaultBatchMaxContentSize)
-		return pkgconfigsetup.DefaultBatchMaxContentSize
+		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, batchMaxContentSize, constants.DefaultBatchMaxContentSize)
+		return constants.DefaultBatchMaxContentSize
 	}
 	return batchMaxContentSize
 }
 
-func (l *LogsConfigKeys) inputChanSize() int {
+func (l *LogsConfigKeys) InputChanSize() int {
 	key := l.getConfigKey("input_chan_size")
 	inputChanSize := l.getConfig().GetInt(key)
 	if inputChanSize <= 0 {
-		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, inputChanSize, pkgconfigsetup.DefaultInputChanSize)
-		return pkgconfigsetup.DefaultInputChanSize
+		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, inputChanSize, constants.DefaultInputChanSize)
+		return constants.DefaultInputChanSize
 	}
 	return inputChanSize
 }
@@ -262,8 +263,8 @@ func (l *LogsConfigKeys) senderBackoffFactor() float64 {
 	key := l.getConfigKey("sender_backoff_factor")
 	senderBackoffFactor := l.getConfig().GetFloat64(key)
 	if senderBackoffFactor < 2 {
-		log.Warnf("Invalid %s: %v should be >= 2, fallback on %v", key, senderBackoffFactor, pkgconfigsetup.DefaultLogsSenderBackoffFactor)
-		return pkgconfigsetup.DefaultLogsSenderBackoffFactor
+		log.Warnf("Invalid %s: %v should be >= 2, fallback on %v", key, senderBackoffFactor, constants.DefaultLogsSenderBackoffFactor)
+		return constants.DefaultLogsSenderBackoffFactor
 	}
 	return senderBackoffFactor
 }
@@ -272,8 +273,8 @@ func (l *LogsConfigKeys) senderBackoffBase() float64 {
 	key := l.getConfigKey("sender_backoff_base")
 	senderBackoffBase := l.getConfig().GetFloat64(key)
 	if senderBackoffBase <= 0 {
-		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, senderBackoffBase, pkgconfigsetup.DefaultLogsSenderBackoffBase)
-		return pkgconfigsetup.DefaultLogsSenderBackoffBase
+		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, senderBackoffBase, constants.DefaultLogsSenderBackoffBase)
+		return constants.DefaultLogsSenderBackoffBase
 	}
 	return senderBackoffBase
 }
@@ -282,8 +283,8 @@ func (l *LogsConfigKeys) senderBackoffMax() float64 {
 	key := l.getConfigKey("sender_backoff_max")
 	senderBackoffMax := l.getConfig().GetFloat64(key)
 	if senderBackoffMax <= 0 {
-		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, senderBackoffMax, pkgconfigsetup.DefaultLogsSenderBackoffMax)
-		return pkgconfigsetup.DefaultLogsSenderBackoffMax
+		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, senderBackoffMax, constants.DefaultLogsSenderBackoffMax)
+		return constants.DefaultLogsSenderBackoffMax
 	}
 	return senderBackoffMax
 }
@@ -292,8 +293,8 @@ func (l *LogsConfigKeys) senderRecoveryInterval() int {
 	key := l.getConfigKey("sender_recovery_interval")
 	recoveryInterval := l.getConfig().GetInt(key)
 	if recoveryInterval <= 0 {
-		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, recoveryInterval, pkgconfigsetup.DefaultLogsSenderBackoffRecoveryInterval)
-		return pkgconfigsetup.DefaultLogsSenderBackoffRecoveryInterval
+		log.Warnf("Invalid %s: %v should be > 0, fallback on %v", key, recoveryInterval, constants.DefaultForwarderRecoveryInterval)
+		return constants.DefaultForwarderRecoveryInterval
 	}
 	return recoveryInterval
 }
@@ -323,6 +324,39 @@ func (l *LogsConfigKeys) obsPipelineWorkerEnabled() bool {
 		return true
 	}
 	return l.getConfig().GetBool(l.getObsPipelineConfigKey("vector", "enabled"))
+}
+
+// obsPipelineWorkerDualShip returns true when dual-ship mode is enabled, i.e. logs should be
+// sent to both the primary Datadog intake and the Observability Pipelines Worker simultaneously.
+// This method always returns false when the vectorPrefix is empty (i.e. the config keys instance
+// was not constructed with OPW support).
+// It mirrors the fallback pattern of obsPipelineWorkerEnabled / getObsPipelineURL: if the modern
+// observability_pipelines_worker key is not set it falls back to the legacy vector.* key so that
+// users still on the legacy config are not silently broken.
+func (l *LogsConfigKeys) obsPipelineWorkerDualShip() bool {
+	if l.vectorPrefix == "" {
+		return false
+	}
+	if l.getConfig().GetBool(l.getObsPipelineConfigKey("observability_pipelines_worker", "dual_ship")) {
+		return true
+	}
+	return l.getConfig().GetBool(l.getObsPipelineConfigKey("vector", "dual_ship"))
+}
+
+// obsPipelineWorkerDualShipReliable reports whether the OPW dual-ship endpoint should be treated
+// as reliable. Reliable additional endpoints apply backpressure to the main pipeline if they fail,
+// which can stall delivery to Datadog when OPW is degraded. The default is false (best-effort) so
+// that an unhealthy OPW cannot block the primary Datadog destination; operators who want OPW to
+// participate in flow control can opt in by setting this key to true.
+// Like obsPipelineWorkerDualShip it falls back to the legacy vector.* prefix.
+func (l *LogsConfigKeys) obsPipelineWorkerDualShipReliable() bool {
+	if l.vectorPrefix == "" {
+		return false
+	}
+	if l.getConfig().GetBool(l.getObsPipelineConfigKey("observability_pipelines_worker", "dual_ship_reliable")) {
+		return true
+	}
+	return l.getConfig().GetBool(l.getObsPipelineConfigKey("vector", "dual_ship_reliable"))
 }
 
 func (l *LogsConfigKeys) getObsPipelineURL() (string, bool) {

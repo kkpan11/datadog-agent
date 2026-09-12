@@ -11,7 +11,7 @@ import (
 	"github.com/DataDog/sketches-go/ddsketch"
 	"github.com/DataDog/sketches-go/ddsketch/mapping"
 	"github.com/DataDog/sketches-go/ddsketch/store"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 )
@@ -38,6 +38,7 @@ var ClientStatsTests = []struct {
 			Env:          "testing",
 			Version:      "0.1-alpha",
 			ImageTag:     "image-tag",
+			Lang:         "go",
 			GitCommitSha: "sha-1",
 			Stats: []*pb.ClientStatsBucket{
 				{
@@ -71,6 +72,7 @@ var ClientStatsTests = []struct {
 				Env:          "testing",
 				Version:      "0.1-alpha",
 				ImageTag:     "image-tag",
+				Lang:         "go",
 				GitCommitSha: "sha-1",
 				Stats: []*pb.ClientStatsBucket{
 					{
@@ -104,6 +106,7 @@ var ClientStatsTests = []struct {
 			Env:          "testing",
 			Version:      "0.1-alpha",
 			ImageTag:     "image-tag",
+			Lang:         "go",
 			GitCommitSha: "sha-1",
 			Stats: []*pb.ClientStatsBucket{
 				{
@@ -166,6 +169,7 @@ var ClientStatsTests = []struct {
 						Env:          "testing",
 						Version:      "0.1-alpha",
 						ImageTag:     "image-tag",
+						Lang:         "go",
 						GitCommitSha: "sha-1",
 						Stats: []*pb.ClientStatsBucket{
 							{

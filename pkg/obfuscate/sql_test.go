@@ -497,7 +497,7 @@ GROUP BY sales1828.product_key`,
 		} {
 			t.Run("", func(t *testing.T) {
 				assert := assert.New(t)
-				oq, err := NewObfuscator(Config{}).ObfuscateSQLStringWithOptions(tt.query, &SQLConfig{ReplaceDigits: true})
+				oq, err := NewObfuscator(Config{}).ObfuscateSQLStringWithOptions(tt.query, &SQLConfig{ReplaceDigits: true}, "")
 				assert.NoError(err)
 				assert.Empty(oq.Metadata.TablesCSV)
 				assert.Equal(tt.obfuscated, oq.Query)
@@ -739,7 +739,7 @@ func TestSQLTableFinderAndReplaceDigits(t *testing.T) {
 				oq, err = NewObfuscator(Config{}).ObfuscateSQLStringWithOptions(tt.query, &SQLConfig{
 					TableNames:    true,
 					ReplaceDigits: true,
-				})
+				}, "")
 				require.NoError(t, err)
 				assert.Equal(tt.tables, oq.Metadata.TablesCSV)
 				assert.Equal(tt.obfuscated, oq.Query)
@@ -1447,7 +1447,7 @@ in the middle'`,
 	}
 
 	for _, c := range cases {
-		t.Run(fmt.Sprintf("tokenize_%s", c.str), func(t *testing.T) {
+		t.Run("tokenize_"+c.str, func(t *testing.T) {
 			tokenizer := NewSQLTokenizer(c.str, false, nil)
 			kind, buffer := tokenizer.Scan()
 			assert.Equal(t, c.expectedKind, kind)
@@ -1576,7 +1576,7 @@ in the middle'`,
 	}
 
 	for _, c := range cases {
-		t.Run(fmt.Sprintf("tokenize_%s", c.str), func(t *testing.T) {
+		t.Run("tokenize_"+c.str, func(t *testing.T) {
 			tokenizer := NewSQLTokenizer(c.str, true, nil)
 			tokenizer.literalEscapes = true
 			kind, buffer := tokenizer.Scan()
@@ -1862,7 +1862,7 @@ func BenchmarkObfuscateSQLString(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_, err := obf.ObfuscateSQLStringWithOptions(bm.query, &SQLConfig{ReplaceDigits: true})
+				_, err := obf.ObfuscateSQLStringWithOptions(bm.query, &SQLConfig{ReplaceDigits: true}, "")
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -2146,6 +2146,7 @@ func TestSQLLexerObfuscationAndNormalization(t *testing.T) {
 		keepTrailingSemicolon         bool
 		keepIdentifierQuotation       bool
 		KeepJSONPath                  bool
+		replaceBindParameter          bool
 		metadata                      SQLMetadata
 	}{
 		{
@@ -2400,6 +2401,36 @@ func TestSQLLexerObfuscationAndNormalization(t *testing.T) {
 			},
 		},
 		{
+			name:                 "obfuscation with replace bind parameter",
+			query:                `SELECT * FROM users WHERE id = @P1 AND name = @P2`,
+			expected:             `SELECT * FROM users WHERE id = ? AND name = ?`,
+			replaceBindParameter: true,
+			metadata: SQLMetadata{
+				Size:      11,
+				TablesCSV: "users",
+				Commands: []string{
+					"SELECT",
+				},
+				Comments:   []string{},
+				Procedures: []string{},
+			},
+		},
+		{
+			name:                 "obfuscation without replace bind parameter",
+			query:                `SELECT * FROM users WHERE id = @P1 AND name = @P2`,
+			expected:             `SELECT * FROM users WHERE id = @P1 AND name = @P2`,
+			replaceBindParameter: false,
+			metadata: SQLMetadata{
+				Size:      11,
+				TablesCSV: "users",
+				Commands: []string{
+					"SELECT",
+				},
+				Comments:   []string{},
+				Procedures: []string{},
+			},
+		},
+		{
 			name:     "PostgreSQL Select Only",
 			query:    `SELECT * FROM ONLY users WHERE id = 1`,
 			expected: `SELECT * FROM ONLY users WHERE id = ?`,
@@ -2492,6 +2523,7 @@ func TestSQLLexerObfuscationAndNormalization(t *testing.T) {
 					KeepTrailingSemicolon:         tt.keepTrailingSemicolon,
 					KeepIdentifierQuotation:       tt.keepIdentifierQuotation,
 					KeepJSONPath:                  tt.KeepJSONPath,
+					ReplaceBindParameter:          tt.replaceBindParameter,
 				},
 			}).ObfuscateSQLString(tt.query)
 			require.NoError(t, err)
@@ -2512,6 +2544,7 @@ func TestSQLLexerNormalization(t *testing.T) {
 		keepTrailingSemicolon         bool
 		keepIdentifierQuotation       bool
 		keepSQLAlias                  bool
+		replaceBindParameter          bool
 		metadata                      SQLMetadata
 	}{
 		{
@@ -2687,6 +2720,7 @@ func TestSQLLexerNormalization(t *testing.T) {
 					RemoveSpaceBetweenParentheses: tt.removeSpaceBetweenParentheses,
 					KeepTrailingSemicolon:         tt.keepTrailingSemicolon,
 					KeepIdentifierQuotation:       tt.keepIdentifierQuotation,
+					ReplaceBindParameter:          tt.replaceBindParameter,
 				},
 			}).ObfuscateSQLString(tt.query)
 			require.NoError(t, err)
@@ -2906,14 +2940,14 @@ func TestObfuscatorCache(t *testing.T) {
 			assert.NotNil(t, obfuscator.queryCache)
 			assert.NotNil(t, obfuscator.queryCache.Metrics)
 
-			oq, err := obfuscator.ObfuscateSQLStringWithOptions(in, &SQLConfig{ObfuscationMode: tt.mode})
+			oq, err := obfuscator.ObfuscateSQLStringWithOptions(in, &SQLConfig{ObfuscationMode: tt.mode}, "")
 			require.NoError(t, err)
 			require.NotNil(t, oq)
 			// Wait for the cache to be updated
 			// This method isn't documented so if this test becomes flakey
 			// we should switch to polling for the cache to be set
 			obfuscator.queryCache.Wait()
-			oq2, err := obfuscator.ObfuscateSQLStringWithOptions(in, &SQLConfig{ObfuscationMode: tt.mode})
+			oq2, err := obfuscator.ObfuscateSQLStringWithOptions(in, &SQLConfig{ObfuscationMode: tt.mode}, "")
 			require.NoError(t, err)
 			require.NotNil(t, oq2)
 			assert.Equal(t, oq.Query, oq2.Query)
@@ -2944,7 +2978,7 @@ func TestObfuscatorCacheKey(t *testing.T) {
 		CollectComments:  true,
 	}
 
-	oq, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts)
+	oq, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts, "")
 	require.NoError(t, err)
 	require.NotNil(t, oq)
 	// Wait for the cache to be updated
@@ -2953,7 +2987,7 @@ func TestObfuscatorCacheKey(t *testing.T) {
 	obfuscator.queryCache.Wait()
 
 	// Test that with same opts cache is hit
-	oq2, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts)
+	oq2, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts, "")
 	require.NoError(t, err)
 	require.NotNil(t, oq2)
 	assert.Equal(t, oq.Query, oq2.Query)
@@ -2961,10 +2995,62 @@ func TestObfuscatorCacheKey(t *testing.T) {
 
 	// Test that with different opts cache is not
 	opts.KeepSQLAlias = false
-	oq3, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts)
+	oq3, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts, "")
 	require.NoError(t, err)
-	require.NotNil(t, oq2)
+	require.NotNil(t, oq3)
 	assert.NotEqual(t, oq3.Query, oq.Query)
 	assert.Equal(t, obfuscator.queryCache.Metrics.Hits(), uint64(1))
 
+	// Test that with explicit optsStr cache is not
+	opts.KeepSQLAlias = false
+	oq4, err := obfuscator.ObfuscateSQLStringWithOptions(in, &opts, "{opts}")
+	require.NoError(t, err)
+	require.NotNil(t, oq4)
+	assert.NotEqual(t, oq4.Query, oq.Query)
+	assert.Equal(t, obfuscator.queryCache.Metrics.Hits(), uint64(1))
+}
+
+// TestPostgresArraySliceObfuscation reproduces https://github.com/DataDog/datadog-agent/issues/49460.
+// PostgreSQL array slice syntax uses ':' as a range separator (e.g. arr[1:3], arr[$1:]).
+// The tokenizer mistakenly treats the ':' as the start of a bind variable (":name" form),
+// causing a LexError when the character after ':' is ']' or '$'.
+func TestPostgresArraySliceObfuscation(t *testing.T) {
+	o := NewObfuscator(Config{SQL: SQLConfig{DBMS: DBMSPostgres}})
+	for _, tt := range []struct {
+		in  string
+		out string
+	}{
+		// open upper bound: ':' followed by ']' — the minimal failing case
+		{
+			`SELECT arr[1:] FROM t`,
+			`SELECT arr [ ? : ] FROM t`,
+		},
+		// bind param as lower bound with open upper bound
+		{
+			`SELECT arr[$1:] FROM t`,
+			`SELECT arr [ ? : ] FROM t`,
+		},
+		// both bounds are bind params: ':' followed by '$'
+		{
+			`SELECT arr[$1:$2] FROM t`,
+			`SELECT arr [ ? : ? ] FROM t`,
+		},
+		// open lower bound: ':' followed by a digit still scans ':3' as a ValueArg
+		// (pre-existing quirk, not changed by this fix).
+		{
+			`SELECT arr[:3] FROM t`,
+			`SELECT arr [ :3 ] FROM t`,
+		},
+		// full query from the bug report (condensed to the problematic expression)
+		{
+			`SELECT river_job.attempted_by[$1:] FROM river_job`,
+			`SELECT river_job.attempted_by [ ? : ] FROM river_job`,
+		},
+	} {
+		t.Run(tt.in, func(t *testing.T) {
+			oq, err := o.ObfuscateSQLString(tt.in)
+			require.NoError(t, err)
+			assert.Equal(t, tt.out, oq.Query)
+		})
+	}
 }

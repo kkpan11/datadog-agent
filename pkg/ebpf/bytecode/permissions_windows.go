@@ -8,10 +8,16 @@
 package bytecode
 
 import (
-	"fmt"
+	"errors"
+	"os"
 )
 
 // VerifyAssetPermissions is for verifying the permissions of bpf programs
 func VerifyAssetPermissions(_ string) error {
-	return fmt.Errorf("verification of bpf assets is not supported on windows")
+	return errors.New("verification of bpf assets is not supported on windows")
+}
+
+// VerifyAssetPermissionsAndOpen is for verifying the permissions of bpf programs
+func VerifyAssetPermissionsAndOpen(_ string) (*os.File, error) {
+	return nil, errors.New("verification of bpf assets is not supported on windows")
 }

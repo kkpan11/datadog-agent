@@ -4,13 +4,13 @@
 // Copyright 2016-present Datadog, Inc.
 
 //go:build test && otlp
-// +build test,otlp
 
 // Package pipelineimpl implements the collector component
 package pipelineimpl
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	"github.com/DataDog/datadog-agent/comp/core/flare/helpers"
+	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
 	compdef "github.com/DataDog/datadog-agent/comp/def"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 )
@@ -129,18 +130,19 @@ func TestOTelExtFlareBuilder(t *testing.T) {
 
 	cfg := config.NewMock(t)
 	cfg.Set("otelcollector.enabled", true, pkgconfigmodel.SourceAgentRuntime)
-	cfg.Set("otelcollector.extension_url", 7777, pkgconfigmodel.SourceAgentRuntime)
+	cfg.Set("otelcollector.extension_url", "https://localhost:7777", pkgconfigmodel.SourceAgentRuntime)
 
 	reqs := Requires{
 		Lc:     compdef.NewTestLifecycle(t),
 		Config: cfg,
+		Client: ipcmock.New(t).GetClient(),
 	}
 	provs, _ := NewComponent(reqs)
 	col := provs.Comp.(*collectorImpl)
 
 	// Fill the flare
 	f := helpers.NewFlareBuilderMock(t, false)
-	col.fillFlare(f)
+	col.fillFlare(context.Background(), f)
 
 	f.AssertFileExists("otel", "otel-response.json")
 

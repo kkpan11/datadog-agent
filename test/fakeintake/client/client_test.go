@@ -7,6 +7,7 @@ package client
 
 import (
 	_ "embed"
+	"strconv"
 	"time"
 
 	"encoding/base64"
@@ -19,9 +20,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/DataDog/agent-payload/v5/agentdiscovery"
+	"github.com/DataDog/agent-payload/v5/healthplatform"
 	"github.com/DataDog/datadog-agent/test/fakeintake/aggregator"
 	"github.com/DataDog/datadog-agent/test/fakeintake/api"
 	"github.com/DataDog/datadog-agent/test/fakeintake/fixtures"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 //go:embed fixtures/api_v2_series_response
@@ -63,8 +68,8 @@ var apiV2NDMFlow []byte
 //go:embed fixtures/api_v2_netpath_response
 var apiV2Netpath []byte
 
-//go:embed fixtures/api_v2_telemetry_response
-var apiV2Teleemtry []byte
+//go:embed fixtures/api_v2_agenthealth_response
+var apiV2AgentHealth []byte
 
 func NewServer(handler http.Handler) *httptest.Server {
 	handlerWitHeader := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +78,46 @@ func NewServer(handler http.Handler) *httptest.Server {
 	})
 
 	return httptest.NewServer(handlerWitHeader)
+}
+
+// newSeriesServer answers each series endpoint with its own body. getMetric fetches
+// /api/v1/series, /api/v2/series and /api/intake/metrics/v3/series in a single call, and each
+// aggregator only understands its own wire format, so a server that replies with one shared
+// body would hand two of the three something they cannot parse.
+func newSeriesServer(byEndpoint map[string][]byte) *httptest.Server {
+	return NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := byEndpoint[r.URL.Query().Get("endpoint")]; ok {
+			w.Write(body)
+			return
+		}
+		w.Write([]byte(`{"payloads":[]}`))
+	}))
+}
+
+// newRawPayloadsResponse renders one uncompressed payload as a /fakeintake/payloads response.
+func newRawPayloadsResponse(t *testing.T, contentType string, data []byte) []byte {
+	t.Helper()
+
+	response, err := json.Marshal(api.APIFakeIntakePayloadsRawGETResponse{
+		Payloads: []api.Payload{{
+			Timestamp:   time.Now(),
+			Data:        data,
+			ContentType: contentType,
+		}},
+	})
+	require.NoError(t, err)
+	return response
+}
+
+func newAgentDiscoveryPayloadData(t *testing.T, payloads ...*agentdiscovery.AgentDiscoveryPayload) []byte {
+	t.Helper()
+
+	data, err := proto.Marshal(&agentdiscovery.AgentDiscoveryPayloadBatch{
+		Payloads: payloads,
+		HostId:   "test-host",
+	})
+	require.NoError(t, err)
+	return data
 }
 
 func TestClient(t *testing.T) {
@@ -86,7 +131,7 @@ func TestClient(t *testing.T) {
 					Data: []byte(r.URL.Path),
 				},
 				{
-					Data: []byte(fmt.Sprintf("%d", len(routes))),
+					Data: []byte(strconv.Itoa(len(routes))),
 				},
 				{
 					Data: []byte(routes[0]),
@@ -139,9 +184,7 @@ func TestClient(t *testing.T) {
 	})
 
 	t.Run("getMetric", func(t *testing.T) {
-		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Write(apiV2SeriesResponse)
-		}))
+		ts := newSeriesServer(map[string][]byte{metricsEndpoint: apiV2SeriesResponse})
 		defer ts.Close()
 
 		client := NewClient(ts.URL)
@@ -151,10 +194,22 @@ func TestClient(t *testing.T) {
 		assert.Empty(t, aggregator.FilterByTags(metrics, []string{"totoro"}))
 	})
 
+	t.Run("getMetric merges the v1 series endpoint", func(t *testing.T) {
+		body := `{"series":[{"metric":"e2e.v1.gauge","points":[[1697177070,3]],"tags":["version:7.46.0"],"host":"my-host","type":"gauge","interval":10}]}`
+		ts := newSeriesServer(map[string][]byte{
+			metricsV1Endpoint: newRawPayloadsResponse(t, "application/json", []byte(body)),
+		})
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		metrics, err := client.getMetric("e2e.v1.gauge")
+		require.NoError(t, err)
+		require.Len(t, metrics, 1)
+		assert.NotEmpty(t, aggregator.FilterByTags(metrics, []string{"version:7.46.0"}))
+	})
+
 	t.Run("FilterMetrics", func(t *testing.T) {
-		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Write(apiV2SeriesResponse)
-		}))
+		ts := newSeriesServer(map[string][]byte{metricsEndpoint: apiV2SeriesResponse})
 		defer ts.Close()
 
 		client := NewClient(ts.URL)
@@ -571,6 +626,84 @@ func TestClient(t *testing.T) {
 		assert.Empty(t, ndmPayload.Subnet)
 	})
 
+	t.Run("getAgentDiscoveryPayloads", func(t *testing.T) {
+		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			payloads := []api.Payload{
+				{
+					Data: newAgentDiscoveryPayloadData(t, &agentdiscovery.AgentDiscoveryPayload{
+						Integration: "redisdb",
+						Runtime:     "docker",
+						RuntimeId:   "abc123",
+						ConfigFiles: []*agentdiscovery.AgentDiscoveryConfigFile{
+							{
+								Path:          "/usr/local/etc/redis/redis.conf",
+								Content:       []byte("port 6379\n"),
+								PayloadFormat: agentdiscovery.AgentDiscoveryConfigFilePayloadFormat_PAYLOAD_FORMAT_REDIS_CONF,
+							},
+						},
+					}),
+				},
+			}
+			resp, err := json.Marshal(api.APIFakeIntakePayloadsRawGETResponse{
+				Payloads: payloads,
+			})
+			require.NoError(t, err)
+			w.Write(resp)
+		}))
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		err := client.getAgentDiscoveryPayloads()
+		require.NoError(t, err)
+		assert.True(t, client.agentDiscoveryAggregator.ContainsPayloadName("redisdb:docker:abc123"))
+	})
+
+	t.Run("GetAgentDiscoveryPayloads", func(t *testing.T) {
+		ingestionTime := time.Unix(1_723_456_789, 123_000_000).UTC()
+		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			payloads := []api.Payload{
+				{
+					Data:        []byte("{}"),
+					Encoding:    "application/json",
+					ContentType: "application/json",
+				},
+				{
+					Data: newAgentDiscoveryPayloadData(t, &agentdiscovery.AgentDiscoveryPayload{
+						Integration:        "redisdb",
+						Runtime:            "docker",
+						RuntimeId:          "abc123",
+						IngestionTimestamp: timestamppb.New(ingestionTime),
+						ConfigFiles: []*agentdiscovery.AgentDiscoveryConfigFile{
+							{
+								Path:          "/usr/local/etc/redis/redis.conf",
+								Content:       []byte("port 6379\n"),
+								PayloadFormat: agentdiscovery.AgentDiscoveryConfigFilePayloadFormat_PAYLOAD_FORMAT_REDIS_CONF,
+							},
+						},
+					}),
+				},
+			}
+			resp, err := json.Marshal(api.APIFakeIntakePayloadsRawGETResponse{
+				Payloads: payloads,
+			})
+			require.NoError(t, err)
+			w.Write(resp)
+		}))
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		payloads, err := client.GetAgentDiscoveryPayloads()
+		require.NoError(t, err)
+		require.Len(t, payloads, 1)
+		assert.Equal(t, "redisdb", payloads[0].Integration)
+		assert.Equal(t, "test-host", payloads[0].HostID)
+		assert.Equal(t, "abc123", payloads[0].RuntimeID)
+		assert.Equal(t, ingestionTime, payloads[0].IngestionTimestamp)
+		require.Len(t, payloads[0].ConfigFiles, 1)
+		assert.Equal(t, "/usr/local/etc/redis/redis.conf", payloads[0].ConfigFiles[0].Path)
+		assert.Equal(t, agentdiscovery.AgentDiscoveryConfigFilePayloadFormat_PAYLOAD_FORMAT_REDIS_CONF, payloads[0].ConfigFiles[0].PayloadFormat)
+	})
+
 	t.Run("getNDMFlows", func(t *testing.T) {
 		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Write(apiV2NDMFlow)
@@ -639,17 +772,6 @@ func TestClient(t *testing.T) {
 		assert.True(t, client.netpathAggregator.ContainsPayloadName("api.datadoghq.eu:443 TCP"))
 	})
 
-	t.Run("getServiceDiscoveries", func(t *testing.T) {
-		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Write(apiV2Teleemtry)
-		}))
-		defer ts.Close()
-
-		client := NewClient(ts.URL)
-		err := client.getServiceDiscoveries()
-		require.NoError(t, err)
-	})
-
 	t.Run("test strict fakeintakeid check mode", func(t *testing.T) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -698,6 +820,94 @@ func TestClient(t *testing.T) {
 		require.NoError(t, err)
 		_, err = client.get("fakeintake/health")
 		require.NoError(t, err)
+	})
+
+	t.Run("getAgentHealth", func(t *testing.T) {
+		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Write(apiV2AgentHealth)
+		}))
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		err := client.getAgentHealth()
+		require.NoError(t, err)
+		assert.True(t, client.agentHealthAggregator.ContainsPayloadName("test-hostname"))
+		assert.False(t, client.agentHealthAggregator.ContainsPayloadName("totoro"))
+	})
+
+	t.Run("GetAgentHealth", func(t *testing.T) {
+		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Write(apiV2AgentHealth)
+		}))
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		healthPayloads, err := client.GetAgentHealth()
+		require.NoError(t, err)
+		require.Len(t, healthPayloads, 1)
+
+		payload := healthPayloads[0]
+		assert.Equal(t, "test-hostname", payload.Host.Hostname)
+		assert.Equal(t, "7.50.0", payload.Host.GetAgentVersion())
+		assert.Equal(t, "agent-health-issues", payload.EventType)
+		assert.Len(t, payload.Issues, 1)
+
+		issue, ok := payload.Issues["check-id-123"]
+		require.True(t, ok)
+		assert.Equal(t, "docker-permissions-issue", issue.Id)
+		assert.Equal(t, "Docker Permissions Issue", issue.IssueName)
+		assert.Equal(t, "Docker socket permissions error", issue.Title)
+		assert.Equal(t, "permissions", issue.Category)
+		assert.Equal(t, healthplatform.IssueSeverity_ISSUE_SEVERITY_HIGH, issue.Severity)
+		assert.Contains(t, issue.Tags, "os:linux")
+		assert.Contains(t, issue.Tags, "docker:installed")
+	})
+
+	t.Run("getAgentTelemetryLogs", func(t *testing.T) {
+		payload := `{"request_type":"agent-logs","payload":{"logs":[{"level":"ERROR","stack_trace":"main.main()","tracer_time":1234567890,"count":3,"is_crash":false,"message":""}]}}`
+		response, err := json.Marshal(api.APIFakeIntakePayloadsRawGETResponse{
+			Payloads: []api.Payload{
+				{Data: []byte(payload), Encoding: "application/json"},
+			},
+		})
+		require.NoError(t, err)
+
+		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Write(response)
+		}))
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		err = client.getAgentTelemetryLogs()
+		require.NoError(t, err)
+		assert.True(t, client.agentTelemetryLogAggregator.ContainsPayloadName("agent-errortracking"))
+		assert.False(t, client.agentTelemetryLogAggregator.ContainsPayloadName("totoro"))
+	})
+
+	t.Run("GetAgentTelemetryLogs", func(t *testing.T) {
+		payload := `{"request_type":"agent-logs","payload":{"logs":[{"level":"ERROR","stack_trace":"main.main()","tracer_time":1234567890,"count":3,"is_crash":false,"message":""}]}}`
+		response, err := json.Marshal(api.APIFakeIntakePayloadsRawGETResponse{
+			Payloads: []api.Payload{
+				{Data: []byte(payload), Encoding: "application/json"},
+			},
+		})
+		require.NoError(t, err)
+
+		ts := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Write(response)
+		}))
+		defer ts.Close()
+
+		client := NewClient(ts.URL)
+		logs, err := client.GetAgentTelemetryLogs()
+		require.NoError(t, err)
+		require.Len(t, logs, 1)
+		assert.Equal(t, "ERROR", logs[0].Level)
+		assert.Equal(t, "main.main()", logs[0].StackTrace)
+		assert.Equal(t, int64(1234567890), logs[0].TracerTime)
+		assert.Equal(t, 3, logs[0].Count)
+		assert.False(t, logs[0].IsCrash)
+		assert.Empty(t, logs[0].Message)
 	})
 
 }

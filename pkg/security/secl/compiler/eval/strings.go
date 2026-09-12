@@ -18,6 +18,11 @@ import (
 type StringCmpOpts struct {
 	CaseInsensitive        bool
 	PathSeparatorNormalize bool
+	Sanitize               func(kind FieldValueType, pattern string) (string, error)
+}
+
+func (o StringCmpOpts) IsDefault() bool {
+	return o.Sanitize == nil && !o.CaseInsensitive && !o.PathSeparatorNormalize
 }
 
 // DefaultStringCmpOpts defines the default comparison options
@@ -50,7 +55,7 @@ func (s *StringValues) AppendFieldValue(value FieldValue) {
 func (s *StringValues) Compile(opts StringCmpOpts) error {
 	for _, value := range s.fieldValues {
 		// fast path for scalar value without specific comparison behavior
-		if opts == DefaultStringCmpOpts && value.Type == ScalarValueType {
+		if opts.IsDefault() && value.Type == ScalarValueType {
 			str := value.Value.(string)
 			s.scalars = append(s.scalars, str)
 		} else {
@@ -204,9 +209,9 @@ func (g *GlobStringMatcher) Matches(value string) bool {
 	return g.glob.Matches(value)
 }
 
-// Contains returns whether the pattern contains the value
-func (g *GlobStringMatcher) Contains(value string) bool {
-	return g.glob.Contains(value)
+// IsPrefix returns whether the pattern is a prefix of the value
+func (g *GlobStringMatcher) IsPrefix(value string) bool {
+	return g.glob.IsPrefix(value)
 }
 
 // PatternStringMatcher defines a pattern matcher
@@ -219,7 +224,7 @@ type PatternStringMatcher struct {
 func (p *PatternStringMatcher) Compile(pattern string, caseInsensitive bool) error {
 	// ** are not allowed in normal patterns
 	if strings.Contains(pattern, "**") {
-		return fmt.Errorf("`**` is not allowed in patterns")
+		return errors.New("`**` is not allowed in patterns")
 	}
 
 	p.pattern = newPatternElement(pattern)
@@ -263,8 +268,66 @@ func (s *ScalarStringMatcher) Matches(value string) bool {
 	return s.value == value
 }
 
+// CaptureStringMatcher extracts a single capture group out of a value. Unlike the
+// StringMatcher implementations it is not used to match values, but to pull a
+// substring out of them, and is therefore compiled from a regexp with at least one
+// capture group.
+type CaptureStringMatcher struct {
+	pattern string
+	re      *regexp.Regexp
+}
+
+// Compile a capture pattern. The pattern must be a valid regular expression holding
+// at least one capture group, as only the first one is ever extracted.
+func (c *CaptureStringMatcher) Compile(pattern string) error {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return err
+	}
+
+	if re.NumSubexp() < 1 {
+		return errors.New("no capture group")
+	}
+
+	c.pattern = pattern
+	c.re = re
+
+	return nil
+}
+
+// String implements the stringer interface
+func (c *CaptureStringMatcher) String() string {
+	return c.pattern
+}
+
+// Capture returns the content of the first capture group, and whether the pattern
+// matched the value at all. A value that doesn't match, or that matches without the
+// first group participating, returns false.
+func (c *CaptureStringMatcher) Capture(value string) (string, bool) {
+	// FindStringSubmatchIndex is used over FindStringSubmatch to avoid allocating a
+	// slice of strings for every group of the pattern
+	indexes := c.re.FindStringSubmatchIndex(value)
+	if indexes == nil || indexes[2] < 0 {
+		return "", false
+	}
+
+	// slicing would share the backing array of the whole field value, keeping it alive
+	// for as long as the captured value is stored. Captures end up in variables that
+	// can be inherited across a process tree and outlive the event by a long time, so
+	// a small artifact must not pin the path it was extracted from.
+	return strings.Clone(value[indexes[2]:indexes[3]]), true
+}
+
 // NewStringMatcher returns a new string matcher
 func NewStringMatcher(kind FieldValueType, pattern string, opts StringCmpOpts) (StringMatcher, error) {
+	if opts.Sanitize != nil {
+		var err error
+		pattern, err = opts.Sanitize(kind, pattern)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	switch kind {
 	case PatternValueType:
 		var matcher PatternStringMatcher

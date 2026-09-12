@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && linux_bpf
+//go:build linux && bpf
 
 // Package main holds main related files
 package main
@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"cmp"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -420,5 +421,5 @@ outer:
 func computeCacheKey(b []byte) string {
 	h := sha256.New()
 	h.Write(b)
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }

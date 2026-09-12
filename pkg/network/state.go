@@ -13,12 +13,12 @@ import (
 
 	"go4.org/intern"
 
-	telemetryComponent "github.com/DataDog/datadog-agent/comp/core/telemetry"
+	telemetryComponent "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/pkg/network/dns"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols"
 	"github.com/DataDog/datadog-agent/pkg/network/slice"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -28,35 +28,37 @@ var (
 
 // Telemetry
 var stateTelemetry = struct {
-	closedConnDropped      *telemetry.StatCounterWrapper
-	connDropped            *telemetry.StatCounterWrapper
-	statsUnderflows        *telemetry.StatCounterWrapper
-	statsCookieCollisions  *telemetry.StatCounterWrapper
-	timeSyncCollisions     *telemetry.StatCounterWrapper
-	dnsStatsDropped        *telemetry.StatCounterWrapper
-	httpStatsDropped       *telemetry.StatCounterWrapper
-	http2StatsDropped      *telemetry.StatCounterWrapper
-	kafkaStatsDropped      *telemetry.StatCounterWrapper
-	postgresStatsDropped   *telemetry.StatCounterWrapper
-	redisStatsDropped      *telemetry.StatCounterWrapper
-	dnsPidCollisions       *telemetry.StatCounterWrapper
-	incomingDirectionFixes telemetry.Counter
-	outgoingDirectionFixes telemetry.Counter
+	closedConnDropped      *telemetryComponent.StatCounterWrapper
+	connDropped            *telemetryComponent.StatCounterWrapper
+	statsUnderflows        *telemetryComponent.StatCounterWrapper
+	statsCookieCollisions  *telemetryComponent.StatCounterWrapper
+	timeSyncCollisions     *telemetryComponent.StatCounterWrapper
+	dnsStatsDropped        *telemetryComponent.StatCounterWrapper
+	httpStatsDropped       *telemetryComponent.StatCounterWrapper
+	http2StatsDropped      *telemetryComponent.StatCounterWrapper
+	kafkaStatsDropped      *telemetryComponent.StatCounterWrapper
+	postgresStatsDropped   *telemetryComponent.StatCounterWrapper
+	redisStatsDropped      *telemetryComponent.StatCounterWrapper
+	dnsPidCollisions       *telemetryComponent.StatCounterWrapper
+	windowsLingeringFlows  *telemetryComponent.StatCounterWrapper
+	incomingDirectionFixes telemetryComponent.Counter
+	outgoingDirectionFixes telemetryComponent.Counter
 }{
-	telemetry.NewStatCounterWrapper(stateModuleName, "closed_conn_dropped", []string{"ip_proto"}, "Counter measuring the number of dropped closed connections"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "conn_dropped", []string{}, "Counter measuring the number of closed connections"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "stats_underflows", []string{}, "Counter measuring the number of stats underflows"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "stats_cookie_collisions", []string{}, "Counter measuring the number of stats cookie collisions"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "time_sync_collisions", []string{}, "Counter measuring the number of time sync collisions"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "dns_stats_dropped", []string{}, "Counter measuring the number of DNS stats dropped"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "http_stats_dropped", []string{}, "Counter measuring the number of http stats dropped"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "http2_stats_dropped", []string{}, "Counter measuring the number of http2 stats dropped"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "kafka_stats_dropped", []string{}, "Counter measuring the number of kafka stats dropped"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "postgres_stats_dropped", []string{}, "Counter measuring the number of postgres stats dropped"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "redis_stats_dropped", []string{}, "Counter measuring the number of redis stats dropped"),
-	telemetry.NewStatCounterWrapper(stateModuleName, "dns_pid_collisions", []string{}, "Counter measuring the number of DNS PID collisions"),
-	telemetry.NewCounter(stateModuleName, "incoming_direction_fixes", []string{}, "Counter measuring the number of udp direction fixes for incoming connections"),
-	telemetry.NewCounter(stateModuleName, "outgoing_direction_fixes", []string{}, "Counter measuring the number of udp/tcp direction fixes for outgoing connections"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "closed_conn_dropped", []string{"ip_proto"}, "Counter measuring the number of dropped closed connections"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "conn_dropped", []string{}, "Counter measuring the number of closed connections"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "stats_underflows", []string{}, "Counter measuring the number of stats underflows"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "stats_cookie_collisions", []string{}, "Counter measuring the number of stats cookie collisions"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "time_sync_collisions", []string{}, "Counter measuring the number of time sync collisions"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "dns_stats_dropped", []string{}, "Counter measuring the number of DNS stats dropped"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "http_stats_dropped", []string{}, "Counter measuring the number of http stats dropped"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "http2_stats_dropped", []string{}, "Counter measuring the number of http2 stats dropped"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "kafka_stats_dropped", []string{}, "Counter measuring the number of kafka stats dropped"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "postgres_stats_dropped", []string{}, "Counter measuring the number of postgres stats dropped"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "redis_stats_dropped", []string{}, "Counter measuring the number of redis stats dropped"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "dns_pid_collisions", []string{}, "Counter measuring the number of DNS PID collisions"),
+	telemetryComponent.NewStatCounterWrapper(telemetryimpl.GetCompatComponent(), stateModuleName, "windows_lingering_flows", []string{}, "Counter measuring flows that were already reported closed but are still being re-reported with failures by the Windows NPM driver (lingering openFlows bug)"),
+	telemetryimpl.GetCompatComponent().NewCounter(stateModuleName, "incoming_direction_fixes", []string{}, "Counter measuring the number of udp direction fixes for incoming connections"),
+	telemetryimpl.GetCompatComponent().NewCounter(stateModuleName, "outgoing_direction_fixes", []string{}, "Counter measuring the number of udp/tcp direction fixes for outgoing connections"),
 }
 
 const (
@@ -109,7 +111,7 @@ type State interface {
 	StoreClosedConnection(connection *ConnectionStats)
 
 	// GetStats returns a map of statistics about the current network state
-	GetStats() map[string]interface{}
+	GetStats() map[string]any
 
 	// DumpState returns a map with the current network state for a client ID
 	DumpState(clientID string) map[string]interface{}
@@ -134,6 +136,7 @@ type lastStateTelemetry struct {
 	postgresStatsDropped  int64
 	redisStatsDropped     int64
 	dnsPidCollisions      int64
+	windowsLingeringFlows int64
 }
 
 const minClosedCapacity = 1024
@@ -241,6 +244,7 @@ func (c *client) Reset() {
 	}
 
 	c.closed.conns = c.closed.conns[:0]
+	c.closed.emptyStart = 0
 	c.closed.byCookie = make(map[StatCookie]int)
 	c.dnsStats = make(dns.StatsByKeyByNameByType)
 	c.usmDelta.Reset()
@@ -266,12 +270,13 @@ type networkState struct {
 	maxRedisStats               int
 	enableConnectionRollup      bool
 	processEventConsumerEnabled bool
+	dnsMonitoringPorts          []int
 
 	localResolver LocalResolver
 }
 
 // NewState creates a new network state
-func NewState(_ telemetryComponent.Component, clientExpiry time.Duration, maxClosedConns uint32, maxClientStats, maxDNSStats, maxHTTPStats, maxKafkaStats, maxPostgresStats, maxRedisStats int, enableConnectionRollup bool, processEventConsumerEnabled bool) State {
+func NewState(_ telemetryComponent.Component, clientExpiry time.Duration, maxClosedConns uint32, maxClientStats, maxDNSStats, maxHTTPStats, maxKafkaStats, maxPostgresStats, maxRedisStats int, enableConnectionRollup bool, processEventConsumerEnabled bool, dnsMonitoringPorts []int) State {
 	ns := &networkState{
 		clients:                     map[string]*client{},
 		clientExpiry:                clientExpiry,
@@ -285,6 +290,7 @@ func NewState(_ telemetryComponent.Component, clientExpiry time.Duration, maxClo
 		enableConnectionRollup:      enableConnectionRollup,
 		localResolver:               NewLocalResolver(processEventConsumerEnabled),
 		processEventConsumerEnabled: processEventConsumerEnabled,
+		dnsMonitoringPorts:          dnsMonitoringPorts,
 	}
 
 	if ns.enableConnectionRollup && !processEventConsumerEnabled {
@@ -372,7 +378,7 @@ func (ns *networkState) GetDelta(
 		ns.storeDNSStats(dnsStats)
 	}
 
-	aggr := newConnectionAggregator((len(closed)+len(active))/2, ns.enableConnectionRollup, ns.processEventConsumerEnabled, client.dnsStats)
+	aggr := newConnectionAggregator((len(closed)+len(active))/2, ns.enableConnectionRollup, ns.processEventConsumerEnabled, client.dnsStats, ns.dnsMonitoringPorts)
 	active = filterConnections(active, func(c *ConnectionStats) bool {
 		return !aggr.Aggregate(c)
 	})
@@ -443,6 +449,7 @@ func (ns *networkState) logTelemetry() {
 	postgresStatsDroppedDelta := stateTelemetry.postgresStatsDropped.Load() - ns.lastTelemetry.postgresStatsDropped
 	redisStatsDroppedDelta := stateTelemetry.redisStatsDropped.Load() - ns.lastTelemetry.redisStatsDropped
 	dnsPidCollisionsDelta := stateTelemetry.dnsPidCollisions.Load() - ns.lastTelemetry.dnsPidCollisions
+	windowsLingeringFlowsDelta := stateTelemetry.windowsLingeringFlows.Load() - ns.lastTelemetry.windowsLingeringFlows
 
 	// Flush log line if any metric is non-zero
 	if connDroppedDelta > 0 || closedConnDroppedDelta > 0 || dnsStatsDroppedDelta > 0 || httpStatsDroppedDelta > 0 ||
@@ -470,17 +477,20 @@ func (ns *networkState) logTelemetry() {
 
 	// debug metrics that aren't useful for customers to see
 	if statsCookieCollisionsDelta > 0 || statsUnderflowsDelta > 0 ||
-		timeSyncCollisionsDelta > 0 || dnsPidCollisionsDelta > 0 {
+		timeSyncCollisionsDelta > 0 || dnsPidCollisionsDelta > 0 ||
+		windowsLingeringFlowsDelta > 0 {
 		s := "State telemetry debug: "
 		s += " [%d stats cookie collisions]"
 		s += " [%d stats underflows]"
 		s += " [%d time sync collisions]"
 		s += " [%d DNS pid collisions]"
+		s += " [%d Windows lingering flows suppressed]"
 		log.Debugf(s,
 			statsCookieCollisionsDelta,
 			statsUnderflowsDelta,
 			timeSyncCollisionsDelta,
 			dnsPidCollisionsDelta,
+			windowsLingeringFlowsDelta,
 		)
 	}
 
@@ -496,6 +506,7 @@ func (ns *networkState) logTelemetry() {
 	ns.lastTelemetry.postgresStatsDropped = stateTelemetry.postgresStatsDropped.Load()
 	ns.lastTelemetry.redisStatsDropped = stateTelemetry.redisStatsDropped.Load()
 	ns.lastTelemetry.dnsPidCollisions = stateTelemetry.dnsPidCollisions.Load()
+	ns.lastTelemetry.windowsLingeringFlows = stateTelemetry.windowsLingeringFlows.Load()
 }
 
 // RegisterClient registers a client before it first gets stream of data.
@@ -693,7 +704,6 @@ func (ns *networkState) mergeConnections(id string, active []ConnectionStats) (_
 
 		ns.updateConnWithStats(client, cookie, closedConn)
 
-		//nolint:gosimple // TODO(NET) Fix gosimple linter
 		if closedConn.Last.IsZero() {
 			// not reporting an "empty" connection
 			return false
@@ -738,6 +748,8 @@ func (ns *networkState) updateConnWithStats(client *client, cookie StatCookie, c
 			c.Monotonic = c.Monotonic.Max(sts)
 			last, _ = c.Monotonic.Sub(sts)
 		}
+
+		dropStaleFlowFailures(c, sts, last)
 
 		c.Last = c.Last.Add(last)
 		client.stats[cookie] = c.Monotonic
@@ -792,11 +804,11 @@ func (ns *networkState) RemoveConnections(conns []*ConnectionStats) {
 }
 
 // GetStats returns a map of statistics about the current network state
-func (ns *networkState) GetStats() map[string]interface{} {
+func (ns *networkState) GetStats() map[string]any {
 	ns.Lock()
 	defer ns.Unlock()
 
-	clientInfo := map[string]interface{}{}
+	clientInfo := map[string]any{}
 	for id, c := range ns.clients {
 		clientInfo[id] = map[string]int{
 			"stats":              len(c.stats),
@@ -805,7 +817,7 @@ func (ns *networkState) GetStats() map[string]interface{} {
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"clients": clientInfo,
 		"telemetry": map[string]int64{
 			"closed_conn_dropped": stateTelemetry.closedConnDropped.Load(),
@@ -1029,14 +1041,16 @@ type connectionAggregator struct {
 	dnsStats                    dns.StatsByKeyByNameByType
 	enablePortRollups           bool
 	processEventConsumerEnabled bool
+	dnsMonitoringPorts          []int
 }
 
-func newConnectionAggregator(size int, enablePortRollups, processEventConsumerEnabled bool, dnsStats dns.StatsByKeyByNameByType) *connectionAggregator {
+func newConnectionAggregator(size int, enablePortRollups, processEventConsumerEnabled bool, dnsStats dns.StatsByKeyByNameByType, dnsMonitoringPorts []int) *connectionAggregator {
 	return &connectionAggregator{
 		conns:                       make(map[aggregationKey][]*aggregateConnection, size),
 		dnsStats:                    dnsStats,
 		enablePortRollups:           enablePortRollups,
 		processEventConsumerEnabled: processEventConsumerEnabled,
+		dnsMonitoringPorts:          dnsMonitoringPorts,
 	}
 }
 
@@ -1127,7 +1141,7 @@ func (a *connectionAggregator) canAggregateProtocolStack(p1, p2 protocols.Stack)
 }
 
 func (a *connectionAggregator) dns(c *ConnectionStats) map[dns.Hostname]map[dns.QueryType]dns.Stats {
-	key, isDNS := DNSKey(c)
+	key, isDNS := DNSKey(c, a.dnsMonitoringPorts)
 	if !isDNS {
 		return nil
 	}

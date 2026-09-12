@@ -8,12 +8,11 @@ package fipstest
 
 import (
 	"fmt"
-	"os"
 	"path"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awsHostWindows "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/host/windows"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awsHostWindows "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host/windows"
 	"github.com/DataDog/datadog-agent/test/new-e2e/tests/windows"
 	windowsCommon "github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common"
 	windowsAgent "github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common/agent"
@@ -48,16 +47,15 @@ func TestFIPSAgentAltDir(t *testing.T) {
 
 func (s *fipsAgentSuite) SetupSuite() {
 	// Default to using FIPS Agent package
-	if _, set := windowsAgent.LookupFlavorFromEnv(); !set {
-		os.Setenv(windowsAgent.PackageFlavorEnvVar, "fips")
-	}
+	var err error
+	s.AgentPackage, err = windowsAgent.GetPackageFromEnv(windowsAgent.WithFlavor("fips"))
+	s.Require().NoError(err)
 
 	s.BaseAgentInstallerSuite.SetupSuite()
 	// SetupSuite needs to defer CleanupOnSetupFailure() if what comes after BaseSuite.SetupSuite() can fail.
 	defer s.CleanupOnSetupFailure()
 
 	host := s.Env().RemoteHost
-	var err error
 
 	// Enable FIPS mode before installing the Agent to make sure that works
 	err = windowsCommon.EnableFIPSMode(host)
@@ -106,12 +104,12 @@ func (s *fipsAgentSuite) TestOpenSSLPaths() {
 	// assert openssl winctx registry keys exist
 	// https://github.com/openssl/openssl/blob/master/NOTES-WINDOWS.md#installation-directories
 	expectedOpenSSLPaths := map[string]string{
-		"OPENSSLDIR": fmt.Sprintf(`%sembedded3\ssl`, s.installPath),
-		"ENGINESDIR": fmt.Sprintf(`%sembedded3\lib\engines-3`, s.installPath),
-		"MODULESDIR": fmt.Sprintf(`%sembedded3\lib\ossl-modules`, s.installPath),
+		"OPENSSLDIR": s.installPath + "embedded3\\ssl",
+		"ENGINESDIR": s.installPath + "embedded3\\lib\\engines-3",
+		"MODULESDIR": s.installPath + "embedded3\\lib\\ossl-modules",
 	}
 	// TODO: How to configure the version of OpenSSL?
-	opensslVersion := "3.4"
+	opensslVersion := "3.5"
 	keyPath := fmt.Sprintf(`HKLM:\SOFTWARE\Wow6432Node\OpenSSL-%s-datadog-fips-agent`, opensslVersion)
 	exists, err := windowsCommon.RegistryKeyExists(host, keyPath)
 	require.NoError(s.T(), err)

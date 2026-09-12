@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package tracer
 
@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	manager "github.com/DataDog/ebpf-manager"
@@ -21,7 +22,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
-	telemetryComp "github.com/DataDog/datadog-agent/comp/core/telemetry"
+	telemetryComp "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/bytecode"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/maps"
@@ -33,9 +35,9 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/network/ebpf/probes"
 	"github.com/DataDog/datadog-agent/pkg/network/netlink"
 	"github.com/DataDog/datadog-agent/pkg/network/tracer/offsetguess"
+	"github.com/DataDog/datadog-agent/pkg/network/usm/buildmode"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
 	ebpfkernel "github.com/DataDog/datadog-agent/pkg/security/ebpf/kernel"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel/netns"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -46,24 +48,29 @@ var zero uint32
 
 var tuplePool = ddsync.NewDefaultTypedPool[netebpf.ConntrackTuple]()
 
-const ebpfConntrackerModuleName = "network_tracer__ebpf_conntracker"
+const (
+	ebpfConntrackerModuleName = "network_tracer__ebpf_conntracker"
+
+	// maxActive configures the maximum number of instances of the kretprobe-probed functions handled simultaneously.
+	maxActive = 512
+)
 
 var defaultBuckets = []float64{10, 25, 50, 75, 100, 250, 500, 1000, 10000}
 
 var conntrackerTelemetry = struct {
-	getsDuration        telemetry.Histogram
-	unregistersDuration telemetry.Histogram
-	getsTotal           telemetry.Counter
-	unregistersTotal    telemetry.Counter
+	getsDuration        telemetryComp.Histogram
+	unregistersDuration telemetryComp.Histogram
+	getsTotal           telemetryComp.Counter
+	unregistersTotal    telemetryComp.Counter
 	registersTotal      *prometheus.Desc
-	lastRegisters       uint64
+	lastRegisters       atomic.Uint64
 }{
-	telemetry.NewHistogram(ebpfConntrackerModuleName, "gets_duration_nanoseconds", []string{}, "Histogram measuring the time spent retrieving connection tuples from the EBPF map", defaultBuckets),
-	telemetry.NewHistogram(ebpfConntrackerModuleName, "unregisters_duration_nanoseconds", []string{}, "Histogram measuring the time spent deleting connection tuples from the EBPF map", defaultBuckets),
-	telemetry.NewCounter(ebpfConntrackerModuleName, "gets_total", []string{}, "Counter measuring the total number of attempts to get connection tuples from the EBPF map"),
-	telemetry.NewCounter(ebpfConntrackerModuleName, "unregisters_total", []string{}, "Counter measuring the total number of attempts to delete connection tuples from the EBPF map"),
+	telemetryimpl.GetCompatComponent().NewHistogram(ebpfConntrackerModuleName, "gets_duration_nanoseconds", []string{}, "Histogram measuring the time spent retrieving connection tuples from the EBPF map", defaultBuckets),
+	telemetryimpl.GetCompatComponent().NewHistogram(ebpfConntrackerModuleName, "unregisters_duration_nanoseconds", []string{}, "Histogram measuring the time spent deleting connection tuples from the EBPF map", defaultBuckets),
+	telemetryimpl.GetCompatComponent().NewCounter(ebpfConntrackerModuleName, "gets_total", []string{}, "Counter measuring the total number of attempts to get connection tuples from the EBPF map"),
+	telemetryimpl.GetCompatComponent().NewCounter(ebpfConntrackerModuleName, "unregisters_total", []string{}, "Counter measuring the total number of attempts to delete connection tuples from the EBPF map"),
 	prometheus.NewDesc(ebpfConntrackerModuleName+"__registers_total", "Counter measuring the total number of attempts to update/create connection tuples in the EBPF map", nil, nil),
-	0,
+	atomic.Uint64{},
 }
 
 type ebpfConntracker struct {
@@ -82,6 +89,7 @@ type ebpfConntracker struct {
 var ebpfConntrackerCORECreator func(cfg *config.Config) (*manager.Manager, error) = getCOREConntracker
 var ebpfConntrackerRCCreator func(cfg *config.Config) (*manager.Manager, error) = getRCConntracker
 var ebpfConntrackerPrebuiltCreator func(cfg *config.Config) (*manager.Manager, error) = getPrebuiltConntracker
+var verifyKernelFuncs = ddebpf.VerifyKernelFuncs
 
 // NewEBPFConntracker creates a netlink.Conntracker that monitor conntrack NAT entries via eBPF
 func NewEBPFConntracker(cfg *config.Config, telemetrycomp telemetryComp.Component) (netlink.Conntracker, error) {
@@ -404,44 +412,115 @@ func (e *ebpfConntracker) Collect(ch chan<- prometheus.Metric) {
 	if err := e.telemetryMap.Lookup(&zero, ebpfTelemetry); err != nil {
 		log.Tracef("error retrieving the telemetry struct: %s", err)
 	} else {
-		delta := ebpfTelemetry.Registers - conntrackerTelemetry.lastRegisters
-		conntrackerTelemetry.lastRegisters = ebpfTelemetry.Registers
+		delta := computeRegistersDelta(ebpfTelemetry.Registers)
 		ch <- prometheus.MustNewConstMetric(conntrackerTelemetry.registersTotal, prometheus.CounterValue, float64(delta))
 	}
 }
 
-func getManager(cfg *config.Config, buf io.ReaderAt, opts manager.Options) (*manager.Manager, error) {
+// computeRegistersDelta atomically computes the delta between the current
+// and last-seen register count, and updates the last-seen value. Safe to
+// call concurrently (e.g. when two Prometheus Gather ticks overlap).
+func computeRegistersDelta(currentRegisters uint64) uint64 {
+	for {
+		last := conntrackerTelemetry.lastRegisters.Load()
+		if currentRegisters <= last {
+			return 0
+		}
+		if conntrackerTelemetry.lastRegisters.CompareAndSwap(last, currentRegisters) {
+			return currentRegisters - last
+		}
+	}
+}
+
+func getManager(cfg *config.Config, buf io.ReaderAt, opts manager.Options, buildMode buildmode.Type) (*manager.Manager, error) {
+	conntrackMaps := []*manager.Map{
+		{Name: probes.ConntrackMap},
+		{Name: probes.ConntrackTelemetryMap},
+	}
+
+	conntrackProbes := []*manager.Probe{
+		{
+			ProbeIdentificationPair: manager.ProbeIdentificationPair{
+				EBPFFuncName: probes.ConntrackFillInfo,
+				UID:          "conntracker",
+			},
+			MatchFuncName: "^ctnetlink_fill_info(\\.constprop\\.0)?$",
+		},
+	}
+
+	// Determine which probe(s) to use based on buildMode, kernel version and availability
+	// - prebuilt or kernel version < 4.11: alternate probes are not supported, use default probe
+	// - CO-RE/runtime compiled: use default probe if available, otherwise fall back to alternate probes
+	useDefaultProbe := true
+	alternateProbesSupported, err := ebpfConntrackerAlternateProbesSupportedOnKernel()
+	if err != nil {
+		return nil, fmt.Errorf("could not check if ebpf conntracker alternate probes are supported on kernel: %w", err)
+	}
+	if buildMode != buildmode.Prebuilt && alternateProbesSupported {
+		missing, err := verifyKernelFuncs("__nf_conntrack_hash_insert")
+		if err != nil {
+			return nil, fmt.Errorf("error verifying kernel function for conntracker: %s", err)
+		}
+		if len(missing) > 0 {
+			useDefaultProbe = false
+			log.Info("__nf_conntrack_hash_insert not available")
+		}
+	}
+
+	if useDefaultProbe {
+		log.Infof("using __nf_conntrack_hash_insert probe for conntracker (buildMode %s)", buildMode)
+		conntrackProbes = append(conntrackProbes, &manager.Probe{
+			ProbeIdentificationPair: manager.ProbeIdentificationPair{
+				EBPFFuncName: probes.ConntrackHashInsert,
+				UID:          "conntracker",
+			},
+		})
+	} else {
+		log.Infof("using __nf_conntrack_confirm and nf_conntrack_hash_check_insert probes for conntracker (buildMode %s)", buildMode)
+		conntrackMaps = append(conntrackMaps, &manager.Map{Name: probes.ConntrackArgsMap})
+		conntrackProbes = append(conntrackProbes,
+			&manager.Probe{
+				ProbeIdentificationPair: manager.ProbeIdentificationPair{
+					EBPFFuncName: probes.ConntrackConfirmReturn,
+					UID:          "conntracker",
+				},
+			},
+			&manager.Probe{
+				ProbeIdentificationPair: manager.ProbeIdentificationPair{
+					EBPFFuncName: probes.ConntrackConfirm,
+					UID:          "conntracker",
+				},
+			},
+			&manager.Probe{
+				ProbeIdentificationPair: manager.ProbeIdentificationPair{
+					EBPFFuncName: probes.ConntrackHashCheckInsertReturn,
+					UID:          "conntracker",
+				},
+			},
+			&manager.Probe{
+				ProbeIdentificationPair: manager.ProbeIdentificationPair{
+					EBPFFuncName: probes.ConntrackHashCheckInsert,
+					UID:          "conntracker",
+				},
+			},
+		)
+	}
+
 	mgr := ddebpf.NewManagerWithDefault(&manager.Manager{
-		Maps: []*manager.Map{
-			{Name: probes.ConntrackMap},
-			{Name: probes.ConntrackTelemetryMap},
-		},
+		Maps:     conntrackMaps,
 		PerfMaps: []*manager.PerfMap{},
-		Probes: []*manager.Probe{
-			{
-				ProbeIdentificationPair: manager.ProbeIdentificationPair{
-					EBPFFuncName: probes.ConntrackHashInsert,
-					UID:          "conntracker",
-				},
-			},
-			{
-				ProbeIdentificationPair: manager.ProbeIdentificationPair{
-					EBPFFuncName: probes.ConntrackFillInfo,
-					UID:          "conntracker",
-				},
-				MatchFuncName: "^ctnetlink_fill_info(\\.constprop\\.0)?$",
-			},
-		},
+		Probes:   conntrackProbes,
 	}, "conntrack", &ebpftelemetry.ErrorsTelemetryModifier{})
 
 	opts.DefaultKprobeAttachMethod = manager.AttachKprobeWithPerfEventOpen
 	if cfg.AttachKprobesWithKprobeEventsABI {
 		opts.DefaultKprobeAttachMethod = manager.AttachKprobeWithKprobeEvents
 	}
+	opts.DefaultKProbeMaxActive = maxActive
 
 	pid, err := kernel.RootNSPID()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get system-probe pid in root pid namespace")
+		return nil, errors.New("failed to get system-probe pid in root pid namespace")
 	}
 
 	opts.ConstantEditors = append(opts.ConstantEditors, manager.ConstantEditor{
@@ -505,7 +584,7 @@ func getPrebuiltConntracker(cfg *config.Config) (*manager.Manager, error) {
 	}
 
 	opts := manager.Options{ConstantEditors: constants}
-	return getManager(cfg, buf, opts)
+	return getManager(cfg, buf, opts, buildmode.Prebuilt)
 }
 
 func ebpfPrebuiltConntrackerSupportedOnKernel() (bool, error) {
@@ -532,6 +611,18 @@ func ebpfCOREConntrackerSupportedOnKernel() (bool, error) {
 	return false, nil
 }
 
+func ebpfConntrackerAlternateProbesSupportedOnKernel() (bool, error) {
+	kv, err := ebpfkernel.NewKernelVersion()
+	if err != nil {
+		return false, fmt.Errorf("could not get kernel version: %s", err)
+	}
+
+	if kv.Code >= ebpfkernel.Kernel4_11 {
+		return true, nil
+	}
+	return false, nil
+}
+
 func getRCConntracker(cfg *config.Config) (*manager.Manager, error) {
 	buf, err := getRuntimeCompiledConntracker(cfg)
 	if err != nil {
@@ -539,7 +630,7 @@ func getRCConntracker(cfg *config.Config) (*manager.Manager, error) {
 	}
 	defer buf.Close()
 
-	return getManager(cfg, buf, manager.Options{})
+	return getManager(cfg, buf, manager.Options{}, buildmode.RuntimeCompiled)
 }
 
 func getCOREConntracker(cfg *config.Config) (*manager.Manager, error) {
@@ -551,13 +642,28 @@ func getCOREConntracker(cfg *config.Config) (*manager.Manager, error) {
 		return nil, errCOREConntrackerUnsupported
 	}
 
+	alternateProbesSupported, err := ebpfConntrackerAlternateProbesSupportedOnKernel()
+	if err != nil {
+		return nil, fmt.Errorf("could not check if alternate probes are supported on kernel: %w", err)
+	}
+
 	var m *manager.Manager
 	err = ddebpf.LoadCOREAsset(netebpf.ModuleFileName("conntrack", cfg.BPFDebug), func(ar bytecode.AssetReader, o manager.Options) error {
 		o.ConstantEditors = append(o.ConstantEditors,
+			boolConst("tcpv4_enabled", cfg.CollectTCPv4Conns),
+			boolConst("udpv4_enabled", cfg.CollectUDPv4Conns),
 			boolConst("tcpv6_enabled", cfg.CollectTCPv6Conns),
 			boolConst("udpv6_enabled", cfg.CollectUDPv6Conns),
 		)
-		m, err = getManager(cfg, ar, o)
+		if !alternateProbesSupported {
+			o.ExcludedFunctions = append(o.ExcludedFunctions,
+				probes.ConntrackConfirm,
+				probes.ConntrackConfirmReturn,
+				probes.ConntrackHashCheckInsert,
+				probes.ConntrackHashCheckInsertReturn,
+			)
+		}
+		m, err = getManager(cfg, ar, o, buildmode.CORE)
 		return err
 	})
 	return m, err

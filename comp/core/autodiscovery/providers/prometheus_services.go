@@ -17,8 +17,10 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
+	providerTypes "github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/types"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
@@ -66,7 +68,7 @@ type PrometheusServicesConfigProvider struct {
 }
 
 // NewPrometheusServicesConfigProvider returns a new Prometheus ConfigProvider connected to kube apiserver
-func NewPrometheusServicesConfigProvider(*pkgconfigsetup.ConfigurationProviders, *telemetry.Store) (ConfigProvider, error) {
+func NewPrometheusServicesConfigProvider(*constants.ConfigurationProviders, *telemetry.Store) (providerTypes.ConfigProvider, error) {
 	// Using GetAPIClient (no wait) as Client should already be initialized by Cluster Agent main entrypoint before
 	ac, err := apiserver.GetAPIClient()
 	if err != nil {
@@ -145,6 +147,11 @@ func (p *PrometheusServicesConfigProvider) Collect(_ context.Context) ([]integra
 	var configs []integration.Config
 	for _, svc := range services {
 		for _, check := range p.checks {
+			if check.AD != nil && check.AD.HasContainerNamesFilter() {
+				log.Tracef("Skipping check with kubernetes_container_names for service %s/%s", svc.Namespace, svc.Name)
+				continue
+			}
+
 			if !check.IsIncluded(svc.Annotations) {
 				log.Tracef("Service %s/%s does not have matching annotations, skipping", svc.Namespace, svc.Name)
 				continue
@@ -250,7 +257,7 @@ func (p *PrometheusServicesConfigProvider) invalidateIfChanged(old, obj interfac
 	}
 
 	// Compare annotations
-	if p.promAnnotationsDiffer(castedObj.GetAnnotations(), castedOld.GetAnnotations()) {
+	if promAnnotationsDiffer(p.checks, castedObj.GetAnnotations(), castedOld.GetAnnotations()) {
 		log.Trace("Invalidating configs on service change")
 		p.setUpToDate(false)
 		return
@@ -289,35 +296,13 @@ func (p *PrometheusServicesConfigProvider) invalidateIfChangedEndpoints(old, obj
 	defer p.Unlock()
 	if found := p.monitoredEndpoints[endpointsID]; found {
 		// Invalidate only when subsets change
-		p.upToDate = equality.Semantic.DeepEqual(castedObj.Subsets, castedOld.Subsets)
-	}
-}
-
-// promAnnotationsDiffer returns whether a service update corresponds to a config invalidation
-func (p *PrometheusServicesConfigProvider) promAnnotationsDiffer(first, second map[string]string) bool {
-	for _, annotation := range types.PrometheusStandardAnnotations {
-		if first[annotation] != second[annotation] {
-			return true
+		if !equality.Semantic.DeepEqual(castedObj.Subsets, castedOld.Subsets) {
+			p.upToDate = false
 		}
 	}
-
-	for _, check := range p.checks {
-		for k := range check.AD.GetIncludeAnnotations() {
-			if first[k] != second[k] {
-				return true
-			}
-		}
-		for k := range check.AD.GetExcludeAnnotations() {
-			if first[k] != second[k] {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // GetConfigErrors is not implemented for the PrometheusServicesConfigProvider
-func (p *PrometheusServicesConfigProvider) GetConfigErrors() map[string]ErrorMsgSet {
-	return make(map[string]ErrorMsgSet)
+func (p *PrometheusServicesConfigProvider) GetConfigErrors() map[string]providerTypes.ErrorMsgSet {
+	return make(map[string]providerTypes.ErrorMsgSet)
 }

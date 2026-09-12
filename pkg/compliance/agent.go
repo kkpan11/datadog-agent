@@ -11,25 +11,24 @@ package compliance
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"math/rand"
-	"net/http"
-	"net/url"
-	"strconv"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/process"
 
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/compliance/aptconfig"
 	"github.com/DataDog/datadog-agent/pkg/compliance/dbconfig"
 	"github.com/DataDog/datadog-agent/pkg/compliance/k8sconfig"
 	"github.com/DataDog/datadog-agent/pkg/compliance/metrics"
+	"github.com/DataDog/datadog-agent/pkg/compliance/types"
 	"github.com/DataDog/datadog-agent/pkg/compliance/utils"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
@@ -88,9 +87,9 @@ type AgentOptions struct {
 	// enabled.
 	EnabledConfigurationExporters []ConfigurationExporter
 
-	// SysProbeClient is the HTTP client to allow the execution of benchmarks
-	// from system-probe. see: cmd/system-probe/modules/compliance.go
-	SysProbeClient *http.Client
+	// SysProbeClient is the possibly remote client to allow the execution of benchmarks
+	// from system-probe.
+	SysProbeClient SysProbeClient
 }
 
 // ConfigurationExporter is an enum type defining all configuration export
@@ -115,6 +114,8 @@ const (
 type Agent struct {
 	telemetrySender telemetry.SimpleTelemetrySender
 	wmeta           workloadmeta.Component
+	filterStore     workloadfilter.Component
+	hostname        string
 	opts            AgentOptions
 
 	telemetry  *telemetry.ContainersTelemetry
@@ -131,19 +132,46 @@ func xccdfEnabled() bool {
 	return pkgconfigsetup.Datadog().GetBool("compliance_config.xccdf.enabled") || pkgconfigsetup.Datadog().GetBool("compliance_config.host_benchmarks.enabled")
 }
 
-var defaultSECLRuleFilter = sync.OnceValues(newSECLRuleFilter)
+var initSECRulerFilter sync.Once
+var seclRuleFilterValue *seclRuleFilter
+var seclRuleFilterError error
 
 // MakeDefaultRuleFilter implements the default filtering of benchmarks' rules. It
 // will exclude rules based on the evaluation context / environment running
 // the benchmark.
-func MakeDefaultRuleFilter() RuleFilter {
-	isK8s := env.IsKubernetes()
+func MakeDefaultRuleFilter(hostname string) RuleFilter {
+	hostroot := os.Getenv("HOST_ROOT")
+	return makeDefaultRuleFilter(hostname, env.IsKubernetes, func() string {
+		return getKubeletCRIRuntime(context.Background(), hostroot)
+	})
+}
+
+// makeDefaultRuleFilter is the testable inner helper; injected functions let
+// tests drive isK8s and the CRI runtime without touching the host.
+func makeDefaultRuleFilter(hostname string, isK8sFn func() bool, kubeletCRIFn func() string) RuleFilter {
+	isK8s := isK8sFn()
 	xccdfEnabled := xccdfEnabled()
+
+	var kubeletCRIOnce sync.Once
+	var kubeletCRI string
+	resolveCRI := func() string {
+		kubeletCRIOnce.Do(func() {
+			kubeletCRI = kubeletCRIFn()
+		})
+		return kubeletCRI
+	}
 
 	return func(r *Rule) bool {
 		if isK8s {
 			if r.SkipOnK8s {
 				return false
+			}
+			// GKE COS ships dockerd alongside containerd; CIS Docker doesn't
+			// apply when the kubelet's CRI is not Docker. Unknown => fail open.
+			if r.HasScope(DockerScope) {
+				if cri := resolveCRI(); cri != "" && cri != criRuntimeDocker {
+					return false
+				}
 			}
 		} else {
 			if r.HasScope(KubernetesNodeScope) || r.HasScope(KubernetesClusterScope) {
@@ -154,13 +182,15 @@ func MakeDefaultRuleFilter() RuleFilter {
 			return false
 		}
 		if len(r.Filters) > 0 {
-			seclRuleFilter, err := defaultSECLRuleFilter()
-			if err != nil {
-				log.Errorf("failed to apply rule filters: %s", err)
+			initSECRulerFilter.Do(func() {
+				seclRuleFilterValue, seclRuleFilterError = newSECLRuleFilter(hostname)
+			})
+			if seclRuleFilterError != nil {
+				log.Errorf("failed to apply rule filters: %s", seclRuleFilterError)
 				return false
 			}
 
-			accepted, err := seclRuleFilter.isRuleAccepted(r.Filters)
+			accepted, err := seclRuleFilterValue.isRuleAccepted(r.Filters)
 			if err != nil {
 				log.Errorf("failed to apply rule filters: %s", err)
 				return false
@@ -174,7 +204,7 @@ func MakeDefaultRuleFilter() RuleFilter {
 }
 
 // NewAgent returns a new compliance agent.
-func NewAgent(telemetrySender telemetry.SimpleTelemetrySender, wmeta workloadmeta.Component, opts AgentOptions) *Agent {
+func NewAgent(telemetrySender telemetry.SimpleTelemetrySender, wmeta workloadmeta.Component, filterStore workloadfilter.Component, hostname string, opts AgentOptions) *Agent {
 	if opts.ConfigDir == "" {
 		panic("compliance: missing agent configuration directory")
 	}
@@ -190,7 +220,7 @@ func NewAgent(telemetrySender telemetry.SimpleTelemetrySender, wmeta workloadmet
 	if opts.CheckIntervalLowPriority <= 0 {
 		opts.CheckIntervalLowPriority = defaultCheckIntervalLowPriority
 	}
-	defaultRuleFilter := MakeDefaultRuleFilter()
+	defaultRuleFilter := MakeDefaultRuleFilter(hostname)
 	if ruleFilter := opts.RuleFilter; ruleFilter != nil {
 		opts.RuleFilter = func(r *Rule) bool { return defaultRuleFilter(r) && ruleFilter(r) }
 	} else {
@@ -199,6 +229,8 @@ func NewAgent(telemetrySender telemetry.SimpleTelemetrySender, wmeta workloadmet
 	return &Agent{
 		telemetrySender: telemetrySender,
 		wmeta:           wmeta,
+		filterStore:     filterStore,
+		hostname:        hostname,
 		opts:            opts,
 		statuses:        make(map[string]*CheckStatus),
 	}
@@ -206,7 +238,7 @@ func NewAgent(telemetrySender telemetry.SimpleTelemetrySender, wmeta workloadmet
 
 // Start starts the compliance agent.
 func (a *Agent) Start() error {
-	telemetry, err := telemetry.NewContainersTelemetry(a.telemetrySender, a.wmeta)
+	telemetry, err := telemetry.NewContainersTelemetry(a.telemetrySender, a.wmeta, a.filterStore.GetContainerComplianceFilters())
 	if err != nil {
 		log.Errorf("could not start containers telemetry: %v", err)
 		return err
@@ -417,7 +449,7 @@ func (a *Agent) runKubernetesConfigurationsExport(ctx context.Context) {
 }
 
 func (a *Agent) runAptConfigurationExport(ctx context.Context) {
-	seclRuleFilter, err := newSECLRuleFilter()
+	seclRuleFilter, err := newSECLRuleFilter(a.hostname)
 	if err != nil {
 		log.Errorf("failed to run apt configuration export: %v", err)
 		return
@@ -479,40 +511,14 @@ func (a *Agent) runDBConfigurationsExport(ctx context.Context) {
 
 func (a *Agent) reportDBConfigurationFromSystemProbe(ctx context.Context, containerID utils.ContainerID, pid int32) error {
 	if a.opts.SysProbeClient == nil {
-		return fmt.Errorf("system-probe socket client was not created")
+		return errors.New("system-probe socket client was not created")
 	}
 
-	qs := make(url.Values)
-	qs.Add("pid", strconv.FormatInt(int64(pid), 10))
-	sysProbeComplianceModuleURL := &url.URL{
-		Scheme:   "http",
-		Host:     "unix",
-		Path:     "/compliance/dbconfig",
-		RawQuery: qs.Encode(),
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sysProbeComplianceModuleURL.String(), nil)
+	resource, err := a.opts.SysProbeClient.FetchDBConfig(ctx, pid)
 	if err != nil {
 		return err
 	}
 
-	resp, err := a.opts.SysProbeClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("error running cross-container benchmark: %s", resp.Status)
-	}
-
-	var resource *dbconfig.DBResource
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(body, &resource); err != nil {
-		return err
-	}
 	if resource != nil {
 		dbResourceLog := NewResourceLog(a.opts.Hostname+"_"+string(containerID), resource.Type, resource.Config)
 		dbResourceLog.Container = &CheckContainerMeta{
@@ -524,11 +530,11 @@ func (a *Agent) reportDBConfigurationFromSystemProbe(ctx context.Context, contai
 }
 
 type procGroup struct {
-	key         string
+	key         types.ResourceType
 	containerID utils.ContainerID
 }
 
-func groupProcesses(procs []*process.Process, getKey func(*process.Process) (string, bool)) map[procGroup]*process.Process {
+func groupProcesses(procs []*process.Process, getKey func(*process.Process) (types.ResourceType, bool)) map[procGroup]*process.Process {
 	groups := make(map[procGroup]*process.Process)
 	for _, proc := range procs {
 		key, ok := getKey(proc)
@@ -569,18 +575,21 @@ func (a *Agent) reportCheckEvents(eventsTTL time.Duration, events ...*CheckEvent
 	eventsExpireAt := time.Now().Add(2 * eventsTTL).Truncate(1 * time.Second)
 	for _, event := range events {
 		event.ExpireAt = &eventsExpireAt
+		// Mutate event fully before updateEvent() publishes it into a.statuses.
+		if event.Result != CheckSkipped {
+			if a.wmeta != nil && event.Container != nil {
+				if ctnr, _ := a.wmeta.GetContainer(event.Container.ContainerID); ctnr != nil {
+					event.Container.ImageID = ctnr.Image.ID
+					event.Container.ImageName = ctnr.Image.Name
+					event.Container.ImageTag = ctnr.Image.Tag
+				}
+			}
+			event.K8SManaged = a.k8sManaged
+		}
 		a.updateEvent(event)
 		if event.Result == CheckSkipped {
 			continue
 		}
-		if a.wmeta != nil && event.Container != nil {
-			if ctnr, _ := a.wmeta.GetContainer(event.Container.ContainerID); ctnr != nil {
-				event.Container.ImageID = ctnr.Image.ID
-				event.Container.ImageName = ctnr.Image.Name
-				event.Container.ImageTag = ctnr.Image.Tag
-			}
-		}
-		event.K8SManaged = a.k8sManaged
 		a.opts.Reporter.ReportEvent(event)
 	}
 }
@@ -602,12 +611,14 @@ func (a *Agent) runTelemetry(ctx context.Context) {
 	}
 }
 
-func (a *Agent) getChecksStatus() interface{} {
+func (a *Agent) getChecksStatus() []*CheckStatus {
 	a.statusesMu.RLock()
 	defer a.statusesMu.RUnlock()
 	statuses := make([]*CheckStatus, 0, len(a.statuses))
 	for _, status := range a.statuses {
-		statuses = append(statuses, status)
+		// Copy under the lock: callers marshal the result without holding it.
+		statusCopy := *status
+		statuses = append(statuses, &statusCopy)
 	}
 	return statuses
 }
@@ -651,7 +662,9 @@ func (a *Agent) updateEvent(event *CheckEvent) {
 	if !ok || status == nil {
 		log.Errorf("check for rule=%s was not registered in checks monitor statuses", event.RuleID)
 	} else {
-		status.LastEvent = event
+		// Publish a copy: callers must not be able to mutate it afterwards.
+		eventCopy := *event
+		status.LastEvent = &eventCopy
 	}
 }
 

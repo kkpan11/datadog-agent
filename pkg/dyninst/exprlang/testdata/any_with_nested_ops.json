@@ -1,0 +1,32 @@
+{
+  "type": "any",
+  "operation": "",
+  "left": {
+    "type": "unsupported",
+    "operation": "getmember",
+    "argument": [
+      {
+        "Ref": "self"
+      },
+      "collectionField"
+    ],
+    "error": ""
+  },
+  "right": {
+    "type": "unsupported",
+    "operation": "startsWith",
+    "argument": [
+      {
+        "getmember": [
+          {
+            "ref": "@it"
+          },
+          "name"
+        ]
+      },
+      "foo"
+    ],
+    "error": ""
+  },
+  "error": ""
+}

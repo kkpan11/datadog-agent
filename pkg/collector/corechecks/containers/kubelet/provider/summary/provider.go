@@ -11,7 +11,7 @@ package summary
 import (
 	"context"
 	"regexp"
-	"runtime"
+	"strings"
 	"time"
 
 	kubeletv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
@@ -19,10 +19,12 @@ import (
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/utils"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmetafilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/util/workloadmeta"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/kubelet/common"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/kubelet"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -34,15 +36,17 @@ const (
 
 // Provider provides the data collected from the `/stats/summary` Kubelet endpoint
 type Provider struct {
-	filter                *containers.Filter
 	config                *common.KubeletConfig
+	podFilter             workloadfilter.FilterBundle
+	containerFilter       workloadfilter.FilterBundle
 	store                 workloadmeta.Component
 	tagger                tagger.Component
 	defaultRateFilterList []*regexp.Regexp
 }
 
 // NewProvider is created by filter, config and workloadmeta
-func NewProvider(filter *containers.Filter,
+func NewProvider(
+	filterStore workloadfilter.Component,
 	config *common.KubeletConfig,
 	store workloadmeta.Component,
 	tagger tagger.Component,
@@ -54,8 +58,9 @@ func NewProvider(filter *containers.Filter,
 	} //default enabled_rates
 
 	return &Provider{
-		filter:                filter,
 		config:                config,
+		podFilter:             filterStore.GetPodSharedMetricFilters(),
+		containerFilter:       filterStore.GetContainerSharedMetricFilters(),
 		store:                 store,
 		tagger:                tagger,
 		defaultRateFilterList: defaultRateFilterList,
@@ -71,14 +76,7 @@ func (p *Provider) Provide(kc kubelet.KubeUtilInterface, sender sender.Sender) e
 		return err
 	}
 
-	useStatsAsSource := false
-	if p.config.UseStatsSummaryAsSource == nil {
-		if runtime.GOOS == "windows" {
-			useStatsAsSource = true
-		}
-	} else {
-		useStatsAsSource = *p.config.UseStatsSummaryAsSource
-	}
+	useStatsAsSource := common.UseStatsSummaryAsSource(p.config)
 
 	rateFilterList := p.defaultRateFilterList
 	if len(p.config.EnabledRates) > 0 {
@@ -106,18 +104,40 @@ func (p *Provider) Provide(kc kubelet.KubeUtilInterface, sender sender.Sender) e
 				podStats.PodRef.Namespace, podStats.PodRef.Name, podStats.PodRef.UID)
 			continue
 		}
-		//  Query to check whether a Kubernetes namespace should be excluded.
-		if p.filter.IsExcluded(nil, "", "", podStats.PodRef.Namespace) {
+
+		podUID := podStats.PodRef.UID
+		podData, err := p.store.GetKubernetesPod(podUID) //from workloadmeta store
+		if err != nil || podData == nil {
+			if !pkgconfigsetup.Datadog().GetBool("kubelet_use_api_server") {
+				log.Infof("Couldn't get pod data from workloadmeta store, error = %v ", err)
+				continue
+			}
+			// Edge case for static pods when kubelet_use_api_server is enabled.
+			// Workloadmeta gets pod data from the API server which uses the canonical
+			// pod UID (e.g., 85a6cc02-4460-4f8a-b5f0-...), but /stats/summary comes
+			// from kubelet which uses the mirror pod hash (e.g., 9b3c1a2d4e5f...).
+			// We detect mirror hashes by checking if the UID lacks dashes (canonical
+			// UUIDs have dashes, mirror hashes don't), then fall back to name/namespace lookup.
+			if !strings.Contains(podUID, "-") {
+				podData, err = p.store.GetKubernetesPodByName(podStats.PodRef.Name, podStats.PodRef.Namespace)
+				if err != nil || podData == nil {
+					log.Infof("Couldn't get static pod data from workloadmeta store for pod %s/%s (uid=%s) with kubelet_use_api_server enabled, error = %v",
+						podStats.PodRef.Namespace, podStats.PodRef.Name, podStats.PodRef.UID, err)
+					continue
+				}
+				podUID = podData.ID
+			} else {
+				log.Infof("Couldn't get pod data from workloadmeta store, error = %v ", err)
+				continue
+			}
+		}
+
+		if p.podFilter.IsExcluded(workloadmetafilter.CreatePod(podData)) {
 			continue
 		}
 
-		podData, err := p.store.GetKubernetesPod(podStats.PodRef.UID) //from workloadmeta store
-		if err != nil || podData == nil {
-			log.Infof("Couldn't get pod data from workloadmeta store, error = %v ", err)
-			continue
-		}
 		if podData.Phase == "Running" || podData.Phase == "Pending" {
-			p.processPodStats(sender, podStats, useStatsAsSource, rateFilterList)
+			p.processPodStats(sender, podStats, podUID, useStatsAsSource, rateFilterList)
 		}
 		p.processContainerStats(sender, podStats, podData, useStatsAsSource)
 	}
@@ -150,13 +170,14 @@ func (p *Provider) processSystemStats(sender sender.Sender,
 
 func (p *Provider) processPodStats(sender sender.Sender,
 	podStats *kubeletv1alpha1.PodStats,
+	podUID string,
 	useStatsAsSource bool,
 	rateFilterList []*regexp.Regexp) {
 	if podStats == nil {
 		return
 	}
 
-	entityID := types.NewEntityID(types.KubernetesPodUID, podStats.PodRef.UID)
+	entityID := types.NewEntityID(types.KubernetesPodUID, podUID)
 	podTags, _ := p.tagger.Tag(entityID,
 		types.OrchestratorCardinality)
 
@@ -203,9 +224,14 @@ func (p *Provider) processContainerStats(sender sender.Sender,
 		!useStatsAsSource {
 		return
 	}
-	containerData := make(map[string]*workloadmeta.OrchestratorContainer)
-	for i := range podData.Containers {
-		containerData[podData.Containers[i].Name] = &podData.Containers[i]
+	// Include init and ephemeral containers so /stats/summary covers them
+	// when use_stats_summary_as_source is on. Without this, the cAdvisor
+	// transformers dropped by the kubelet check (issue #50544) leave those
+	// containers without CPU/memory/filesystem metrics.
+	allContainers := podData.GetAllContainers()
+	containerData := make(map[string]*workloadmeta.OrchestratorContainer, len(allContainers))
+	for i := range allContainers {
+		containerData[allContainers[i].Name] = &allContainers[i]
 	}
 	for idx := range podStats.Containers {
 		containerStats := &podStats.Containers[idx]
@@ -222,10 +248,10 @@ func (p *Provider) processContainerStats(sender sender.Sender,
 				podStats.PodRef.Namespace, podStats.PodRef.Name, containerName)
 			continue
 		}
-		if p.filter.IsExcluded(nil,
-			containerName,
-			ctr.Image.Name,
-			podStats.PodRef.Namespace) {
+		ctr.Name = containerName
+
+		filterableContainer := workloadmetafilter.CreateContainerFromOrch(ctr, workloadmetafilter.CreatePod(podData))
+		if p.containerFilter.IsExcluded(filterableContainer) {
 			continue
 		}
 		tags, err := p.tagger.Tag(types.NewEntityID(types.ContainerID, ctr.ID), types.HighCardinality)

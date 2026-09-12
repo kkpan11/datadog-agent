@@ -15,56 +15,65 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/cmd/agent/common/misconfig"
-	"github.com/DataDog/datadog-agent/comp/agent/autoexit"
-	"github.com/DataDog/datadog-agent/comp/agent/autoexit/autoexitimpl"
+	autoexit "github.com/DataDog/datadog-agent/comp/agent/autoexit/def"
+	autoexitfx "github.com/DataDog/datadog-agent/comp/agent/autoexit/fx"
 	"github.com/DataDog/datadog-agent/comp/core"
+	agenttelemetryfx "github.com/DataDog/datadog-agent/comp/core/agenttelemetry/fx"
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/configsync/configsyncimpl"
+	configstreamconsumer "github.com/DataDog/datadog-agent/comp/core/configstreamconsumer/def"
+	configstreamconsumerfx "github.com/DataDog/datadog-agent/comp/core/configstreamconsumer/fx"
+	configsync "github.com/DataDog/datadog-agent/comp/core/configsync/def"
+	configsyncfx "github.com/DataDog/datadog-agent/comp/core/configsync/fx"
+	fxinstrumentation "github.com/DataDog/datadog-agent/comp/core/fxinstrumentation/fx"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
 	logcomp "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/pid"
-	"github.com/DataDog/datadog-agent/comp/core/pid/pidimpl"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	"github.com/DataDog/datadog-agent/comp/core/settings"
-	"github.com/DataDog/datadog-agent/comp/core/settings/settingsimpl"
+	pid "github.com/DataDog/datadog-agent/comp/core/pid/def"
+	pidimpl "github.com/DataDog/datadog-agent/comp/core/pid/impl"
+	remoteagentfx "github.com/DataDog/datadog-agent/comp/core/remoteagent/fx-process"
+	settings "github.com/DataDog/datadog-agent/comp/core/settings/def"
+	settingsfx "github.com/DataDog/datadog-agent/comp/core/settings/fx"
 	"github.com/DataDog/datadog-agent/comp/core/status"
 	coreStatusImpl "github.com/DataDog/datadog-agent/comp/core/status/statusimpl"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/sysprobeconfigimpl"
+	sysprobeconfig "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
+	sysprobeconfigimpl "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/impl"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	remoteTaggerfx "github.com/DataDog/datadog-agent/comp/core/tagger/fx-remote"
-	taggerTypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	remoteWorkloadfilterfx "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-remote"
 	wmcatalogremote "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/catalog-remote"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafx "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx"
-	compstatsd "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/eventplatformimpl"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatformreceiver/eventplatformreceiverimpl"
-	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl/utils"
+	compstatsd "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd/def"
+	compstatsdFx "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd/fx"
+	eventplatform "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/def"
+	eventplatformfx "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/fx"
+	eventplatformreceiverimpl "github.com/DataDog/datadog-agent/comp/forwarder/eventplatformreceiver/impl"
+	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/impl/utils"
 	"github.com/DataDog/datadog-agent/comp/networkpath"
+	remotetraceroute "github.com/DataDog/datadog-agent/comp/networkpath/traceroute/fx-remote"
 	"github.com/DataDog/datadog-agent/comp/process"
-	"github.com/DataDog/datadog-agent/comp/process/agent"
-	"github.com/DataDog/datadog-agent/comp/process/apiserver"
-	"github.com/DataDog/datadog-agent/comp/process/expvars"
-	"github.com/DataDog/datadog-agent/comp/process/hostinfo"
-	"github.com/DataDog/datadog-agent/comp/process/profiler"
-	"github.com/DataDog/datadog-agent/comp/process/status/statusimpl"
+	agent "github.com/DataDog/datadog-agent/comp/process/agent/def"
+	apiserver "github.com/DataDog/datadog-agent/comp/process/apiserver/def"
+	expvars "github.com/DataDog/datadog-agent/comp/process/expvars/def"
+	"github.com/DataDog/datadog-agent/comp/process/hostinfo/def"
+	profiler "github.com/DataDog/datadog-agent/comp/process/profiler/def"
+	processstatusfx "github.com/DataDog/datadog-agent/comp/process/status/fx"
 	"github.com/DataDog/datadog-agent/comp/process/types"
 	rdnsquerierfx "github.com/DataDog/datadog-agent/comp/rdnsquerier/fx"
 	remoteconfig "github.com/DataDog/datadog-agent/comp/remote-config"
-	"github.com/DataDog/datadog-agent/comp/remote-config/rcclient"
-	"github.com/DataDog/datadog-agent/pkg/api/security"
+	rcclient "github.com/DataDog/datadog-agent/comp/remote-config/rcclient/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/python"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
-	"github.com/DataDog/datadog-agent/pkg/config/model"
 	commonsettings "github.com/DataDog/datadog-agent/pkg/config/settings"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
 	"github.com/DataDog/datadog-agent/pkg/process/metadata/workloadmeta/collector"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
 	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
+	"github.com/DataDog/datadog-agent/pkg/process/util/coreagent"
 	"github.com/DataDog/datadog-agent/pkg/util/coredump"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
-	"github.com/DataDog/datadog-agent/pkg/util/fxutil/logging"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/version"
 )
@@ -97,6 +106,7 @@ func runApp(ctx context.Context, globalParams *GlobalParams) error {
 		Checks       []types.CheckComponent `group:"check"`
 		Syscfg       sysprobeconfig.Component
 		Config       config.Component
+		RCClient     rcclient.Component
 		WorkloadMeta workloadmeta.Component
 	}
 	app := fx.New(
@@ -107,7 +117,6 @@ func runApp(ctx context.Context, globalParams *GlobalParams) error {
 					sysprobeconfigimpl.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath),
 				),
 				ConfigParams: config.NewAgentParams(globalParams.ConfFilePath, config.WithExtraConfFiles(globalParams.ExtraConfFilePath), config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-				SecretParams: secrets.NewEnabledParams(),
 				LogParams:    DaemonLogParams,
 			},
 		),
@@ -128,17 +137,19 @@ func runApp(ctx context.Context, globalParams *GlobalParams) error {
 		fx.Populate(&appInitDeps),
 
 		// Provide core components
-		core.Bundle(),
+		core.Bundle(core.WithSecrets()),
+		hostnameimpl.Module(),
 
 		// Provide process agent bundle so fx knows where to find components
 		process.Bundle(),
 
 		eventplatformreceiverimpl.Module(),
-		eventplatformimpl.Module(eventplatformimpl.NewDefaultParams()),
+		eventplatformfx.Module(eventplatform.NewDefaultParams()),
 
 		// Provides the rdnssquerier module
 		rdnsquerierfx.Module(),
 
+		remotetraceroute.Module(),
 		// Provide network path bundle
 		networkpath.Bundle(),
 
@@ -146,20 +157,20 @@ func runApp(ctx context.Context, globalParams *GlobalParams) error {
 		remoteconfig.Bundle(),
 
 		// Provide status modules
-		statusimpl.Module(),
+		processstatusfx.Module(),
 		coreStatusImpl.Module(),
 
 		// Provide statsd client module
-		compstatsd.Module(),
+		compstatsdFx.Module(),
 		fx.Provide(func(config config.Component, statsd compstatsd.Component) (ddgostatsd.ClientInterface, error) {
-			return statsd.CreateForHostPort(pkgconfigsetup.GetBindHost(config), config.GetInt("dogstatsd_port"))
+			return statsd.CreateForHostPort(configutils.GetBindHost(config), config.GetInt("dogstatsd_port"))
 		}),
 
 		// Provide configsync module
-		configsyncimpl.Module(configsyncimpl.NewDefaultParams()),
+		configsyncfx.Module(configsync.NewDefaultParams()),
 
 		// Provide autoexit module
-		autoexitimpl.Module(),
+		autoexitfx.Module(),
 
 		// Provide the corresponding workloadmeta Params to configure the catalog
 		wmcatalogremote.GetCatalog(),
@@ -169,25 +180,36 @@ func runApp(ctx context.Context, globalParams *GlobalParams) error {
 			AgentType: workloadmeta.Remote,
 		}),
 
-		remoteTaggerfx.Module(tagger.RemoteParams{
-			RemoteTarget: func(c config.Component) (string, error) {
-				return fmt.Sprintf(":%v", c.GetInt("cmd_port")), nil
-			},
-			RemoteTokenFetcher: func(c config.Component) func() (string, error) {
-				return func() (string, error) {
-					return security.FetchAuthToken(c)
-				}
-			},
-			RemoteFilter: taggerTypes.NewMatchAllFilter(),
-		}),
+		// Provide workloadfilter module
+		remoteWorkloadfilterfx.Module(),
+
+		remoteTaggerfx.Module(tagger.NewRemoteParams()),
 
 		// Provides specific features to our own fx wrapper (logging, lifecycle, shutdowner)
 		fxutil.FxAgentBase(),
-		logging.EnableFxLoggingOnDebug[logcomp.Component](),
+		fxinstrumentation.Module(),
 
 		// Set the pid file path
 		fx.Supply(pidimpl.NewParams(globalParams.PidFilePath)),
-
+		fx.Provide(func(c config.Component) settings.Params {
+			return settings.Params{
+				Settings: map[string]settings.RuntimeSetting{
+					"log_level":                      commonsettings.NewLogLevelRuntimeSetting(),
+					"runtime_mutex_profile_fraction": commonsettings.NewRuntimeMutexProfileFraction(),
+					"runtime_block_profile_rate":     commonsettings.NewRuntimeBlockProfileRate(),
+					"internal_profiling_goroutines":  commonsettings.NewProfilingGoroutines(),
+					"internal_profiling_period":      commonsettings.NewProfilingPeriod(),
+					"internal_profiling":             commonsettings.NewProfilingRuntimeSetting("internal_profiling", "process-agent"),
+				},
+				Config: c,
+			}
+		}),
+		settingsfx.Module(),
+		ipcfx.ModuleReadWrite(),
+		remoteagentfx.Module(),
+		fx.Supply(configstreamconsumer.NewParams("process-agent", globalParams.ConfFilePath)),
+		configstreamconsumerfx.Module(),
+		agenttelemetryfx.Module(),
 		// Set `HOST_PROC` and `HOST_SYS` environment variables
 		fx.Invoke(SetHostMountEnv),
 
@@ -212,26 +234,12 @@ func runApp(ctx context.Context, globalParams *GlobalParams) error {
 			}
 			return nil
 		}),
-		fx.Provide(func(c config.Component) settings.Params {
-			return settings.Params{
-				Settings: map[string]settings.RuntimeSetting{
-					"log_level":                      commonsettings.NewLogLevelRuntimeSetting(),
-					"runtime_mutex_profile_fraction": commonsettings.NewRuntimeMutexProfileFraction(),
-					"runtime_block_profile_rate":     commonsettings.NewRuntimeBlockProfileRate(),
-					"internal_profiling_goroutines":  commonsettings.NewProfilingGoroutines(),
-					"internal_profiling":             commonsettings.NewProfilingRuntimeSetting("internal_profiling", "process-agent"),
-				},
-				Config: c,
-			}
-		}),
-		settingsimpl.Module(),
-		ipcfx.ModuleReadWrite(),
 	)
 
 	err := app.Start(ctx)
 	if err != nil {
 		if errors.Is(err, errAgentDisabled) {
-			if !shouldStayAlive(appInitDeps.Config) {
+			if !shouldStayAlive() {
 				log.Info("process-agent is not enabled, exiting...")
 				return nil
 			}
@@ -273,8 +281,10 @@ type miscDeps struct {
 	Syscfg       sysprobeconfig.Component
 	HostInfo     hostinfo.Component
 	WorkloadMeta workloadmeta.Component
+	FilterStore  workloadfilter.Component
 	Logger       logcomp.Component
 	Tagger       tagger.Component
+	IPC          ipc.Component
 }
 
 // initMisc initializes modules that cannot, or have not yet been componetized.
@@ -289,9 +299,9 @@ func initMisc(deps miscDeps) error {
 	// Since the tagger depends on the workloadmeta collector, we can not make the tagger a dependency of workloadmeta as it would create a circular dependency.
 	// TODO: (component) - once we remove the dependency of workloadmeta component from the tagger component
 	// we can include the tagger as part of the workloadmeta component.
-	proccontainers.InitSharedContainerProvider(deps.WorkloadMeta, deps.Tagger)
+	proccontainers.InitSharedContainerProvider(deps.WorkloadMeta, deps.Tagger, deps.FilterStore)
 
-	processCollectionServer := collector.NewProcessCollector(deps.Config, deps.Syscfg)
+	processCollectionServer := collector.NewProcessCollector(deps.Config, deps.Syscfg, deps.IPC.GetTLSServerConfig())
 
 	// TODO(components): still unclear how the initialization of workloadmeta
 	//                   store and tagger should be performed.
@@ -319,11 +329,13 @@ func initMisc(deps miscDeps) error {
 }
 
 // shouldStayAlive determines whether the process agent should stay alive when no checks are running.
-// This can happen when the checks are running on the core agent but a process agent container is
-// still brought up. The process-agent is kept alive to prevent crash loops.
-func shouldStayAlive(cfg model.Reader) bool {
-	if env.IsKubernetes() && cfg.GetBool("process_config.run_in_core_agent.enabled") {
-		log.Warn("The process-agent is staying alive to prevent crash loops due to the checks running on the core agent. Thus, the process-agent is idle. Update your Helm chart or Datadog Operator to the latest version to prevent this (https://docs.datadoghq.com/containers/kubernetes/installation/).")
+// In Kubernetes, the Helm chart may deploy a process-agent container even when process checks run
+// in the core agent. The process-agent stays alive idle to prevent the container from crash-looping.
+// TODO: remove this once the Helm chart no longer deploys the process-agent container when
+// runInCoreAgent is enabled (the chart's doNotCheckTag logic prevents automatic detection).
+func shouldStayAlive() bool {
+	if env.IsKubernetes() && coreagent.ProcessChecksRunInCoreAgent() {
+		log.Error("The process-agent is idle: process checks run in the core agent. Update your Helm chart or Datadog Operator to the latest version to prevent this (https://docs.datadoghq.com/containers/kubernetes/installation/).")
 		return true
 	}
 

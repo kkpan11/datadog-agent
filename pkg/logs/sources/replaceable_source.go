@@ -3,7 +3,6 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2022-present Datadog, Inc.
 
-//nolint:revive // TODO(AML) Fix revive linter
 package sources
 
 import (
@@ -39,7 +38,7 @@ func (r *ReplaceableSource) Replace(source *LogSource) {
 func (r *ReplaceableSource) Status() *status.LogStatus {
 	r.RLock()
 	defer r.RUnlock()
-	return r.source.Status
+	return r.source.Status()
 }
 
 // Config gets the underlying config

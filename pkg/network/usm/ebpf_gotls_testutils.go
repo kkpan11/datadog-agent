@@ -3,12 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2022-present Datadog, Inc.
 
-//go:build linux_bpf && test
+//go:build linux && bpf && test
 
 package usm
 
 import (
 	"errors"
+	"testing"
+	"time"
 )
 
 // SetGoTLSExcludeSelf sets the GoTLSExcludeSelf configuration.
@@ -19,4 +21,13 @@ func SetGoTLSExcludeSelf(value bool) error {
 
 	goTLSSpec.Instance.(*goTLSProgram).cfg.GoTLSExcludeSelf = value
 	return nil
+}
+
+// SetGoTLSPeriodicTerminatedProcessesScanInterval sets the interval for the periodic scan of terminated processes in GoTLS.
+func SetGoTLSPeriodicTerminatedProcessesScanInterval(tb testing.TB, interval time.Duration) {
+	originalValue := scanTerminatedProcessesInterval
+	tb.Cleanup(func() {
+		scanTerminatedProcessesInterval = originalValue
+	})
+	scanTerminatedProcessesInterval = interval
 }

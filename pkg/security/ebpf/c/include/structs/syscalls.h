@@ -38,6 +38,7 @@ struct syscall_cache_t {
     struct dentry_resolver_input_t resolver;
     s64 retval;
     enum TAIL_CALL_PROG_TYPE prog_type;
+    u32 sample_cookie;
 
     union {
         struct {
@@ -75,6 +76,15 @@ struct syscall_cache_t {
         } rename;
 
         struct {
+            int resource;
+            u64 rlim_cur;
+            u64 rlim_max;
+            u32 pid;
+            struct process_context_t target_process;
+            struct cgroup_context_t target_cgroup;
+        } setrlimit;
+
+        struct {
             struct dentry *dentry;
             struct path *path;
             struct file_t file;
@@ -97,11 +107,19 @@ struct syscall_cache_t {
             struct mount *parent;
             struct dentry *mountpoint_dentry;
             u32 bind_src_mount_id;
+            u64 mount_id_unique;
+            u64 parent_mount_id_unique;
+            u64 bind_src_mount_id_unique;
+
             // populated from collected
             const char *fstype;
             struct path_key_t root_key;
             struct path_key_t mountpoint_key;
             dev_t device;
+            int clone_mnt_ctr;
+            int source;
+            u64 ns_inum;
+            u64 unshare_flags;
         } mount;
 
         struct {
@@ -131,13 +149,16 @@ struct syscall_cache_t {
             struct args_envs_t envs;
             struct args_envs_parsing_context_t args_envs_ctx;
             struct span_context_t span_context;
+            struct go_labels_context_t go_labels;
             struct linux_binprm_t linux_binprm;
-            u8 is_parsed;
+            u32 is_through_symlink;
         } exec;
 
         struct {
-            u32 is_thread;
-            u32 is_kthread;
+            u64 flags;
+            u32 is_thread: 1;
+            u32 is_kthread : 1;
+            u32 parent_pid;
         } fork;
 
         struct {
@@ -206,6 +227,7 @@ struct syscall_cache_t {
             u32 file_found;
             u32 pipe_entry_flag;
             u32 pipe_exit_flag;
+            u64 pid_tgid;
         } splice;
 
         struct {
@@ -222,6 +244,7 @@ struct syscall_cache_t {
             u16 port;
             u16 protocol;
             u64 pid_tgid;
+            struct sock *sk;
         } connect;
 
          struct {
@@ -229,6 +252,13 @@ struct syscall_cache_t {
             u16 family;
             u16 port;
         } accept;
+
+        struct {
+            u16 domain;
+            u16 type;
+            u16 protocol;
+            u64 pid_tgid;
+        } socket;
 
         struct {
             struct dentry *dentry;
@@ -247,6 +277,28 @@ struct syscall_cache_t {
         struct {
             u32 action;
         } sysctl;
+
+        struct {
+            short socket_type;
+            u16 socket_family;
+            unsigned short filter_len;
+            u16 socket_protocol;
+            int filter_size_to_send;
+            int level;
+            int optname;
+            u32 truncated;
+            struct sock_fprog *fprog;
+        } setsockopt;
+        struct {
+            int option;
+            u32 name_size_to_send;
+            u32 name_truncated;
+            char name[MAX_PRCTL_NAME_LEN + 1];
+        } prctl;
+
+        struct {
+            char suffix[TRACER_MEMFD_SUFFIX_LEN];
+        } tracer_memfd_create;
     };
 };
 

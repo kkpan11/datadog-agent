@@ -20,6 +20,7 @@ from invoke import task
 from invoke.exceptions import Exit
 
 from tasks.build_tags import ALL_TAGS, UNIT_TEST_TAGS, get_default_build_tags
+from tasks.libs.build.bazel import bazel, bazel_not_found_message
 from tasks.libs.common.color import color_message
 from tasks.libs.common.git import check_uncommitted_changes
 from tasks.libs.common.go import download_go_dependencies
@@ -28,15 +29,18 @@ from tasks.libs.common.user_interactions import yes_no_question
 from tasks.libs.common.utils import TimedOperationResult, get_build_flags, timed
 from tasks.licenses import get_licenses_list
 from tasks.modules import generate_dummy_package
+from tasks.schema.generate import schema_codegen
 
 GOOS_MAPPING = {
     "win32": "windows",
     "linux": "linux",
     "darwin": "darwin",
+    "aix": "aix",
 }
 GOARCH_MAPPING = {
     "x64": "amd64",
     "arm64": "arm64",
+    "ppc64": "ppc64",
 }
 
 
@@ -52,6 +56,7 @@ def run_golangci_lint(
     verbose=False,
     golangci_lint_kwargs="",
     headless_mode: bool = False,
+    recursive: bool = True,
 ):
     if isinstance(targets, str):
         # when this function is called from the command line, targets are passed
@@ -65,39 +70,40 @@ def run_golangci_lint(
     # Always add `test` tags while linting as test files are also linted
     tags.extend(UNIT_TEST_TAGS)
 
-    _, _, env = get_build_flags(ctx, rtloader_root=rtloader_root, headless_mode=headless_mode)
-    verbosity = "-v" if verbose else ""
-    # we split targets to reduce memory usage
-    results = []
-    time_results = []
-    for target in targets:
+    _, _, env = get_build_flags(
+        ctx,
+        rtloader_root=rtloader_root,
+        headless_mode=headless_mode,
+        include_python="python" in tags,
+    )
 
-        def lint_module(target):
-            if not headless_mode:
-                print(f"running golangci on {target}")
-            concurrency_arg = "" if concurrency is None else f"--concurrency {concurrency}"
-            tags_arg = " ".join(sorted(set(tags)))
-            timeout_arg_value = "25m0s" if not timeout else f"{timeout}m0s"
-            res = ctx.run(
-                f'golangci-lint run {verbosity} --timeout {timeout_arg_value} {concurrency_arg} --build-tags "{tags_arg}" --path-prefix "{base_path}" {golangci_lint_kwargs} {target}/...',
-                env=env,
-                warn=True,
-            )
-            # early stop on SIGINT: exit code is 128 + signal number, SIGINT is 2, so 130
-            # for some reason this becomes -2 here
-            if res is not None and (res.exited == -2 or res.exited == 130):
-                raise KeyboardInterrupt()
-            return res
-
-        target_path = Path(base_path) / target
-        result, time_result = TimedOperationResult.run(
-            lint_module, target_path, 'Lint ' + target_path.as_posix(), target=target
-        )
-
-        results.append(result)
-        time_results.append(time_result)
-
-    return results, time_results
+    tags_arg = ",".join(sorted(set(tags)))
+    timeout_arg_value = "25m0s" if not timeout else f"{timeout}m0s"
+    # Compose the targets string for the command
+    target_patterns = [t if t.endswith("/...") else f"{t}/..." for t in targets] if recursive else targets
+    targets_str = " ".join(target_patterns)
+    cmd = ["run"]
+    if verbose:
+        cmd.append("-v")
+    cmd += ["--timeout", timeout_arg_value]
+    if concurrency is not None:
+        cmd += ["--concurrency", str(concurrency)]
+    cmd += ["--build-tags", tags_arg, "--path-prefix", base_path] + golangci_lint_kwargs.split() + target_patterns
+    if not headless_mode:
+        print(f"running golangci-lint on: {targets_str}")
+    result, time_result = TimedOperationResult.run(
+        lambda: bazel(
+            "run",
+            *(f"--run_env={k}={v}" for k, v in env.items()),
+            "//internal/tools:golangci-lint",
+            "--",
+            *cmd,
+            ignore_errors=True,
+        ),
+        "golangci-lint",
+        f"Lint {targets_str}",
+    )
+    return [result], [time_result]
 
 
 @task
@@ -257,9 +263,11 @@ def raise_if_errors(errors_found, suggestion_msg=None):
         raise Exit(message=message)
 
 
-def check_valid_mods(ctx):
+def _check_valid_mods():
     errors_found = []
     for mod in get_default_modules().values():
+        if mod.path == ".":
+            continue
         pattern = os.path.join(mod.full_path(), '*.go')
         if not glob.glob(pattern):
             errors_found.append(f"module {mod.import_path} does not contain *.go source files, so it is not a package")
@@ -269,7 +277,7 @@ def check_valid_mods(ctx):
 
 @task
 def check_mod_tidy(ctx, test_folder="testmodule"):
-    check_valid_mods(ctx)
+    _check_valid_mods()
     with generate_dummy_package(ctx, test_folder) as dummy_folder:
         errors_found = []
         ctx.run("go work sync")
@@ -295,6 +303,9 @@ def check_mod_tidy(ctx, test_folder="testmodule"):
             if mod.independent:
                 ctx.run(f"go run ./internal/tools/independent-lint/independent.go --path={mod.full_path()}")
 
+        # TODO: remove once Bazel is used to build the Agent
+        schema_codegen(ctx)
+
         with ctx.cd(dummy_folder):
             ctx.run("go mod tidy")
             res = ctx.run("go build main.go", warn=True)
@@ -315,8 +326,11 @@ def tidy_all(ctx):
 
 @task
 def tidy(ctx, verbose: bool = False):
-    check_valid_mods(ctx)
+    _check_valid_mods()
+    (_bazel_tidy if shutil.which("bazel") else _go_only_tidy)(ctx, verbose)
 
+
+def _go_only_tidy(ctx, verbose: bool):
     ctx.run("go work sync")
 
     if os.name != 'nt':  # not windows
@@ -340,6 +354,23 @@ def tidy(ctx, verbose: bool = False):
     for promise in promises:
         promise.join()
 
+    print("Done - " + bazel_not_found_message("orange"), file=sys.stderr)
+
+
+def _bazel_tidy(ctx, verbose: bool):
+    # 1. deps/go.MODULE.bazel ↺ (prune stale use_repo declarations to not hinder next `bazel` commands)
+    bazel("mod", "--ui_event_filters=-DEBUG", "tidy")  # inhibit `No sum for … found` (go_mod_tidy_all will fix it)
+    # 2. go.work + **/go.mod -> **/go.mod (sync each workspace module's deps to the workspace build list)
+    bazel("run", "//:go", "work", "sync")
+    # 3. **/*.go + **/go.mod -> **/go.mod, **/go.sum (reconcile each module's requirements with its actual imports)
+    bazel("run", "//:go_mod_tidy_all", *(("--", "-x") if verbose else ()))
+    # 4. go.work + **/go.mod -> deps/go.MODULE.bazel (update use_repo declarations)
+    bazel("mod", "tidy")
+    # 5. deps/go.MODULE.bazel + /BUILD.bazel + **/*.go + **/go.mod -> **/BUILD.bazel (infer build rules from Go source)
+    bazel("run", "//:gazelle")
+    # 6. regenerate agent payload version file from go.mod
+    bazel("run", "//tasks:write_agent_payload_version")
+
 
 @task(autoprint=True)
 def version(_):
@@ -349,7 +380,7 @@ def version(_):
 @task
 def check_go_version(ctx):
     go_version_output = ctx.run('go version')
-    # result is like "go version go1.24.3 linux/amd64"
+    # result is like "go version go1.26.7 linux/amd64"
     running_go_version = go_version_output.stdout.split(' ')[2]
 
     with open(".go-version") as f:
@@ -378,7 +409,9 @@ def go_fix(ctx, fix=None):
 def get_deps(ctx, path):
     with ctx.cd(path):
         # Might fail if no mod tidy
-        deps: list[str] = ctx.run("go list -deps ./...", hide=True, warn=True).stdout.strip().splitlines()
+        deps: list[str] = (
+            ctx.run("go list -buildvcs=false -deps ./...", hide=True, warn=True).stdout.strip().splitlines()
+        )
         prefix = 'github.com/DataDog/datadog-agent/'
         deps = [
             dep.removeprefix(prefix)

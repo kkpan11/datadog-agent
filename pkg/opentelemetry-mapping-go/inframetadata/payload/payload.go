@@ -10,7 +10,10 @@
 package payload
 
 import (
+	"encoding/json"
+
 	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/inframetadata/gohai"
+	"github.com/DataDog/datadog-agent/pkg/serializer/marshaler"
 )
 
 // HostMetadata includes metadata about the host tags,
@@ -77,6 +80,9 @@ type Meta struct {
 
 	// HostAliases are other available host names
 	HostAliases []string `json:"host_aliases,omitempty"`
+
+	// CCRID
+	CanonicalCloudResourceID string `json:"ccrid,omitempty"`
 }
 
 // NewEmpty creates a new HostMetadata with empty fields.
@@ -89,4 +95,26 @@ func NewEmpty() HostMetadata {
 		Payload:   gohai.NewEmpty(),
 		Processes: &gohai.ProcessesPayload{},
 	}
+}
+
+// MarshalJSON implements the JSONMarshaler.MarshalJSON interface
+func (p *HostMetadata) MarshalJSON() ([]byte, error) {
+	// use an alias to avoid infinite recursion while serializing
+	type PayloadAlias HostMetadata
+
+	return json.Marshal((*PayloadAlias)(p))
+}
+
+var _ marshaler.JSONMarshaler = (*HostMetadata)(nil)
+
+// Clone performs a deep clone of a HostMetadata struct.
+func (p *HostMetadata) Clone() (p2 HostMetadata, err error) {
+	var marshaled []byte
+	marshaled, err = json.Marshal(p)
+	if err != nil {
+		return
+	}
+	p2 = NewEmpty()
+	err = json.Unmarshal(marshaled, &p2)
+	return
 }

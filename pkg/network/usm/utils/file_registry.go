@@ -127,6 +127,9 @@ var (
 	// ErrPathIsAlreadyRegistered is the error resulting if the
 	// path is already in the file registry.
 	ErrPathIsAlreadyRegistered = errors.New("path is already registered")
+
+	// ErrProcessDoesNotExist is the error resulting if the process does not exist anymore.
+	ErrProcessDoesNotExist = errors.New("process does not exist")
 )
 
 // UnknownAttachmentError is an error that is not one of the expected errors, a
@@ -143,6 +146,12 @@ func (e *UnknownAttachmentError) Error() string {
 
 func (e *UnknownAttachmentError) Unwrap() error {
 	return e.Err
+}
+
+// IsUnknownAttachmentError returns true if the error is an UnknownAttachmentError
+func IsUnknownAttachmentError(err error) bool {
+	var unknownErr *UnknownAttachmentError
+	return errors.As(err, &unknownErr)
 }
 
 // NewUnknownAttachmentError creates a new `UnknownAttachmentError` instance wrapping
@@ -179,6 +188,13 @@ func (r *FileRegistry) Register(namespacedPath string, pid uint32, activationCB,
 
 	path, err := NewFilePath(r.procRoot, namespacedPath, pid)
 	if err != nil {
+		// Distinguish errors between "process does not exist anymore" and "file is not found"
+		// by checking if the process root directory exists.
+		processRoot := fmt.Sprintf("%s/%d", r.procRoot, pid)
+		if _, statErr := os.Stat(processRoot); statErr != nil {
+			return ErrProcessDoesNotExist
+		}
+
 		return NewUnknownAttachmentError(fmt.Errorf("error creating file path for PID %d: %w", pid, err))
 	}
 
@@ -223,8 +239,8 @@ func (r *FileRegistry) Register(namespacedPath string, pid uint32, activationCB,
 			return err
 		}
 
-		// short living process would be hard to catch and will failed when we try to open the library
-		// so let's failed silently
+		// short living process would be hard to catch and will fail when we try to open the library
+		// so let's fail silently
 		if errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -435,7 +451,7 @@ type registryTelemetry struct {
 func newRegistryTelemetry(programName string) registryTelemetry {
 	metricGroup := telemetry.NewMetricGroup(
 		"usm.file_registry",
-		fmt.Sprintf("program:%s", programName),
+		"program:"+programName,
 		telemetry.OptPrometheus,
 	)
 

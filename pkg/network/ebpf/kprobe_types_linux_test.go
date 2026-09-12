@@ -12,6 +12,10 @@ func TestCgoAlignment_ConnTuple(t *testing.T) {
 	ebpftest.TestCgoAlignment[ConnTuple](t)
 }
 
+func TestCgoAlignment_TCPEventStats(t *testing.T) {
+	ebpftest.TestCgoAlignment[TCPEventStats](t)
+}
+
 func TestCgoAlignment_TCPStats(t *testing.T) {
 	ebpftest.TestCgoAlignment[TCPStats](t)
 }
@@ -30,10 +34,6 @@ func TestCgoAlignment_SkpConn(t *testing.T) {
 
 func TestCgoAlignment_PidTs(t *testing.T) {
 	ebpftest.TestCgoAlignment[PidTs](t)
-}
-
-func TestCgoAlignment_Batch(t *testing.T) {
-	ebpftest.TestCgoAlignment[Batch](t)
 }
 
 func TestCgoAlignment_Telemetry(t *testing.T) {
@@ -70,4 +70,24 @@ func TestCgoAlignment_TLSTags(t *testing.T) {
 
 func TestCgoAlignment_TLSTagsWrapper(t *testing.T) {
 	ebpftest.TestCgoAlignment[TLSTagsWrapper](t)
+}
+
+func TestCgoAlignment_CertItem(t *testing.T) {
+	ebpftest.TestCgoAlignment[CertItem](t)
+}
+
+func TestCgoAlignment_CertSerial(t *testing.T) {
+	ebpftest.TestCgoAlignment[CertSerial](t)
+}
+
+func TestCgoAlignment_CertDomain(t *testing.T) {
+	ebpftest.TestCgoAlignment[CertDomain](t)
+}
+
+func TestCgoAlignment_CertValidity(t *testing.T) {
+	ebpftest.TestCgoAlignment[CertValidity](t)
+}
+
+func TestCgoAlignment_SSLHandshakeState(t *testing.T) {
+	ebpftest.TestCgoAlignment[SSLHandshakeState](t)
 }

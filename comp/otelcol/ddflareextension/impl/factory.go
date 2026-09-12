@@ -12,10 +12,13 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/confignet"
 	"go.opentelemetry.io/collector/extension"
 	"go.opentelemetry.io/collector/otelcol"
 
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	"github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/impl/internal/metadata"
+	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
 
 const (
@@ -28,24 +31,16 @@ type ddExtensionFactory struct {
 	factories              *otelcol.Factories
 	configProviderSettings otelcol.ConfigProviderSettings
 	byoc                   bool
-}
-
-// isOCB returns true if extension was built with OCB
-func (f *ddExtensionFactory) isOCB() bool {
-	return f.factories == nil
-}
-
-// NewFactory creates a factory for Datadog Flare Extension for use with OCB and OSS Collector
-func NewFactory() extension.Factory {
-	return &ddExtensionFactory{}
+	ipcComp                option.Option[ipc.Component]
 }
 
 // NewFactoryForAgent creates a factory for Datadog Flare Extension for use with Agent
-func NewFactoryForAgent(factories *otelcol.Factories, configProviderSettings otelcol.ConfigProviderSettings, byoc bool) extension.Factory {
+func NewFactoryForAgent(factories *otelcol.Factories, configProviderSettings otelcol.ConfigProviderSettings, ipcComp option.Option[ipc.Component], byoc bool) extension.Factory {
 	return &ddExtensionFactory{
 		factories:              factories,
 		configProviderSettings: configProviderSettings,
 		byoc:                   byoc,
+		ipcComp:                ipcComp,
 	}
 }
 
@@ -56,7 +51,7 @@ func (f *ddExtensionFactory) CreateExtension(ctx context.Context, set extension.
 		configProviderSettings: f.configProviderSettings,
 	}
 	config.HTTPConfig = cfg.(*Config).HTTPConfig
-	return NewExtension(ctx, config, set.TelemetrySettings, set.BuildInfo, !f.isOCB(), f.byoc)
+	return NewComponent(ctx, config, set.TelemetrySettings, set.BuildInfo, f.ipcComp, true, f.byoc)
 }
 
 // Create creates a new instance of the Datadog Flare Extension, as of v0.112.0 or later
@@ -66,13 +61,16 @@ func (f *ddExtensionFactory) Create(ctx context.Context, set extension.Settings,
 		configProviderSettings: f.configProviderSettings,
 	}
 	config.HTTPConfig = cfg.(*Config).HTTPConfig
-	return NewExtension(ctx, config, set.TelemetrySettings, set.BuildInfo, !f.isOCB(), f.byoc)
+	return NewComponent(ctx, config, set.TelemetrySettings, set.BuildInfo, f.ipcComp, true, f.byoc)
 }
 
 func (f *ddExtensionFactory) CreateDefaultConfig() component.Config {
 	return &Config{
 		HTTPConfig: &confighttp.ServerConfig{
-			Endpoint: fmt.Sprintf("localhost:%d", defaultHTTPPort),
+			NetAddr: confignet.AddrConfig{
+				Endpoint:  fmt.Sprintf("localhost:%d", defaultHTTPPort),
+				Transport: confignet.TransportTypeTCP,
+			},
 		},
 	}
 }

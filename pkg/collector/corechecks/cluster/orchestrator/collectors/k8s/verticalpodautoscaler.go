@@ -8,10 +8,11 @@
 package k8s
 
 import (
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors"
 	k8sProcessors "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/processors/k8s"
-	"github.com/DataDog/datadog-agent/pkg/config/utils"
+	utilTypes "github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/util"
 	"github.com/DataDog/datadog-agent/pkg/orchestrator"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 
@@ -23,9 +24,9 @@ import (
 )
 
 // NewVerticalPodAutoscalerCollectorVersions builds the group of collector versions.
-func NewVerticalPodAutoscalerCollectorVersions(metadataAsTags utils.MetadataAsTags) collectors.CollectorVersions {
+func NewVerticalPodAutoscalerCollectorVersions(tagger tagger.Component) collectors.CollectorVersions {
 	return collectors.NewCollectorVersions(
-		NewVerticalPodAutoscalerCollector(metadataAsTags),
+		NewVerticalPodAutoscalerCollector(tagger),
 	)
 }
 
@@ -39,27 +40,22 @@ type VerticalPodAutoscalerCollector struct {
 
 // NewVerticalPodAutoscalerCollector creates a new collector for the Kubernetes
 // VerticalPodAutoscaler resource.
-func NewVerticalPodAutoscalerCollector(metadataAsTags utils.MetadataAsTags) *VerticalPodAutoscalerCollector {
-	resourceType := getResourceType(vpaName, vpaVersion)
-	labelsAsTags := metadataAsTags.GetResourcesLabelsAsTags()[resourceType]
-	annotationsAsTags := metadataAsTags.GetResourcesAnnotationsAsTags()[resourceType]
-
+func NewVerticalPodAutoscalerCollector(tagger tagger.Component) *VerticalPodAutoscalerCollector {
 	return &VerticalPodAutoscalerCollector{
 		metadata: &collectors.CollectorMetadata{
 			IsDefaultVersion:                     true,
-			IsStable:                             true,
-			IsMetadataProducer:                   true,
 			IsManifestProducer:                   true,
+			IsMetadataProducer:                   true,
+			IsStable:                             true,
 			SupportsManifestBuffering:            true,
-			Name:                                 vpaName,
-			Kind:                                 kubernetes.VerticalPodAutoscalerKind,
-			NodeType:                             orchestrator.K8sVerticalPodAutoscaler,
-			Version:                              vpaVersion,
-			LabelsAsTags:                         labelsAsTags,
-			AnnotationsAsTags:                    annotationsAsTags,
 			SupportsTerminatedResourceCollection: true,
+			Group:                                utilTypes.VpaGroup,
+			Kind:                                 kubernetes.VerticalPodAutoscalerKind,
+			Name:                                 utilTypes.VpaName,
+			Version:                              utilTypes.VpaVersion,
+			NodeType:                             orchestrator.K8sVerticalPodAutoscaler,
 		},
-		processor: processors.NewProcessor(new(k8sProcessors.VerticalPodAutoscalerHandlers)),
+		processor: processors.NewProcessor(k8sProcessors.NewVerticalPodAutoscalerHandlers(tagger)),
 	}
 }
 

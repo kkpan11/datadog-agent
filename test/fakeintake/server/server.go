@@ -77,11 +77,13 @@ type Server struct {
 	urlMutex sync.RWMutex
 	url      string
 
-	storeDriver string
-	store       serverstore.Store
+	store serverstore.Store
 
 	responseOverridesMutex    sync.RWMutex
 	responseOverridesByMethod map[string]map[string]httpResponse
+
+	par *parServerState
+	rc  *rcServerState
 }
 
 // NewServer creates a new fakeintake server and starts it on localhost:port
@@ -98,7 +100,6 @@ func NewServer(options ...Option) *Server {
 		server: http.Server{
 			Addr: "0.0.0.0:0",
 		},
-		storeDriver:     "memory",
 		forwardEndpoint: "https://app.datadoghq.com",
 		// Source: https://docs.datadoghq.com/api/latest/logs/
 		logForwardEndpoint: "https://agent-http-intake.logs.datadoghq.com",
@@ -108,7 +109,8 @@ func NewServer(options ...Option) *Server {
 		opt(fi)
 	}
 
-	fi.store = serverstore.NewStore(fi.storeDriver)
+	fi.store = serverstore.NewStore()
+	fi.par = &parServerState{results: make(map[string]*api.PARTaskResult)}
 	registry := prometheus.NewRegistry()
 
 	storeMetrics := fi.store.GetInternalMetrics()
@@ -131,6 +133,37 @@ func NewServer(options ...Option) *Server {
 	mux.HandleFunc("/fakeintake/flushPayloads", fi.handleFlushPayloads)
 
 	mux.HandleFunc("/fakeintake/configure/override", fi.handleConfigureOverride)
+
+	// PAR (Private Action Runner) enrollment and OPMS simulation.
+	mux.HandleFunc("/api/unstable/on_prem_runners", fi.handlePAREnroll)
+	mux.HandleFunc("/api/unstable/on_prem_runners/api_key_only", fi.handlePAREnroll)
+	mux.HandleFunc("/api/v2/on-prem-management-service/workflow-tasks/dequeue", fi.handlePARDequeue)
+	mux.HandleFunc("/api/v2/on-prem-management-service/workflow-tasks/publish-task-update", fi.handlePARPublish)
+	mux.HandleFunc("/api/v2/on-prem-management-service/runner/health-check", fi.handlePARHealthCheck)
+	mux.HandleFunc("/api/v2/on-prem-management-service/workflow-tasks/heartbeat", fi.handlePARHeartbeat)
+	// PAR test control endpoints — used by the test process to drive tasks and read results.
+	mux.HandleFunc("/fakeintake/par/enqueue", fi.handlePAREnqueue)
+	mux.HandleFunc("/fakeintake/par/result", fi.handlePARResult)
+	mux.HandleFunc("/fakeintake/par/flush", fi.handlePARFlush)
+	mux.HandleFunc("/fakeintake/par/stats", fi.handlePARStats)
+	mux.HandleFunc("/fakeintake/par/signing-key", fi.handlePARSetSigningKey)
+
+	// Remote Config — only meaningful when WithRemoteConfig is set; handlers
+	// no-op with 404 otherwise.
+	if fi.rc != nil {
+		if err := fi.initRC(); err != nil {
+			log.Printf("Remote Config: init failed, disabling: %v", err)
+			fi.rc = nil
+		}
+	}
+	mux.HandleFunc("/api/v0.1/configurations", fi.handleRCConfigurations)
+	mux.HandleFunc("/api/v0.1/org", fi.handleRCOrg)
+	mux.HandleFunc("/api/v0.1/status", fi.handleRCStatus)
+	mux.HandleFunc("/fakeintake/rc/config", fi.handleRCAddConfig)
+	mux.HandleFunc("/fakeintake/rc/expiration", fi.handleRCSetExpiration)
+	mux.HandleFunc("/fakeintake/rc/configs", fi.handleRCListConfigs)
+	mux.HandleFunc("/fakeintake/rc/config/", fi.handleRCDeleteConfig)
+	mux.HandleFunc("/fakeintake/rc/stats", fi.handleRCStats)
 
 	mux.HandleFunc("/debug/lastAPIKey/", fi.handleGetLastAPIKey)
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -171,17 +204,6 @@ func WithAddress(addr string) Option {
 // If the port is 0, a port number is automatically chosen
 func WithPort(port int) Option {
 	return WithAddress(fmt.Sprintf("0.0.0.0:%d", port))
-}
-
-// WithStoreDriver changes the store driver used by the server
-func WithStoreDriver(driver string) func(*Server) {
-	return func(fi *Server) {
-		if fi.IsRunning() {
-			log.Println("Fake intake is already running. Stop it and try again to change the store driver.")
-			return
-		}
-		fi.storeDriver = driver
-	}
 }
 
 // WithReadyChannel assign a boolean channel to get notified when the server is ready
@@ -296,7 +318,7 @@ func (fi *Server) IsRunning() bool {
 // Stop Gracefully stop the http server
 func (fi *Server) Stop() error {
 	if !fi.IsRunning() {
-		return fmt.Errorf("server not running")
+		return errors.New("server not running")
 	}
 	defer close(fi.shutdown)
 	defer fi.store.Close()
@@ -427,6 +449,7 @@ func (fi *Server) handleDatadogPostRequest(w http.ResponseWriter, req *http.Requ
 		writeHTTPResponse(w, response)
 		return nil
 	}
+	collectTime := fi.clock.Now().UTC() // record before I/O to cut down on variability
 	payload, err := io.ReadAll(req.Body)
 	if err != nil {
 		log.Printf("Error reading body: %v", err.Error())
@@ -447,7 +470,7 @@ func (fi *Server) handleDatadogPostRequest(w http.ResponseWriter, req *http.Requ
 	contentType := req.Header.Get("Content-Type")
 
 	apiKey := fi.extractDatadogAPIKey(req)
-	err = fi.store.AppendPayload(req.URL.Path, apiKey, payload, encoding, contentType, fi.clock.Now().UTC())
+	err = fi.store.AppendPayload(req.URL.Path, apiKey, payload, encoding, contentType, collectTime)
 	if err != nil {
 		log.Printf("Error adding payload to store: %v", err)
 		response := buildErrorResponse(err)
@@ -535,7 +558,7 @@ func (fi *Server) handleGetPayloads(w http.ResponseWriter, req *http.Request) {
 		}
 		jsonResp, err = json.Marshal(resp)
 	} else {
-		writeHTTPResponse(w, buildErrorResponse(fmt.Errorf("invalid route parameter")))
+		writeHTTPResponse(w, buildErrorResponse(errors.New("invalid route parameter")))
 		return
 	}
 

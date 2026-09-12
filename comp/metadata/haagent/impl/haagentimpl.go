@@ -8,8 +8,6 @@ package haagentimpl
 
 import (
 	"encoding/json"
-	"fmt"
-	"maps"
 	"net/http"
 	"sync"
 	"time"
@@ -22,13 +20,16 @@ import (
 	httputils "github.com/DataDog/datadog-agent/pkg/util/http"
 )
 
-type haAgentMetadata = map[string]interface{}
+type haAgentMetadata struct {
+	Enabled bool   `json:"enabled"`
+	State   string `json:"state"`
+}
 
 // Payload handles the JSON unmarshalling of the metadata payload
 type Payload struct {
-	Hostname  string          `json:"hostname"`
-	Timestamp int64           `json:"timestamp"`
-	Metadata  haAgentMetadata `json:"ha_agent_metadata"`
+	Hostname  string           `json:"hostname"`
+	Timestamp int64            `json:"timestamp"`
+	Metadata  *haAgentMetadata `json:"ha_agent_metadata"`
 }
 
 // MarshalJSON serialization a Payload to JSON
@@ -37,20 +38,13 @@ func (p *Payload) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*PayloadAlias)(p))
 }
 
-// SplitPayload implements marshaler.AbstractMarshaler#SplitPayload.
-//
-// In this case, the payload can't be split any further.
-func (p *Payload) SplitPayload(_ int) ([]marshaler.AbstractMarshaler, error) {
-	return nil, fmt.Errorf("could not split inventories agent payload any more, payload is too big for intake")
-}
-
 type haagentimpl struct {
 	util.InventoryPayload
 
 	conf     config.Component
 	log      log.Component
 	m        sync.Mutex
-	data     haAgentMetadata
+	data     *haAgentMetadata
 	hostname string
 	haAgent  haagentcomp.Component
 }
@@ -59,13 +53,14 @@ func (i *haagentimpl) refreshMetadata() {
 	isEnabled := i.haAgent.Enabled()
 
 	if !isEnabled {
-		i.log.Infof("HA Agent Metadata unavailable as HA Agent is disabled")
 		i.data = nil
 		return
 	}
 
-	i.data["enabled"] = isEnabled
-	i.data["state"] = string(i.haAgent.GetState())
+	i.data = &haAgentMetadata{
+		Enabled: isEnabled,
+		State:   string(i.haAgent.GetState()),
+	}
 }
 
 func (i *haagentimpl) getPayload() marshaler.JSONMarshaler {
@@ -91,15 +86,22 @@ func (i *haagentimpl) writePayloadAsJSON(w http.ResponseWriter, _ *http.Request)
 	w.Write(scrubbed)
 }
 
-// Get returns a copy of the agent metadata. Useful to be incorporated in the status page.
-func (i *haagentimpl) Get() haAgentMetadata {
+// Get returns a copy of the agent metadata, refreshed live. Useful to be incorporated in the status page.
+//
+// It recomputes the metadata on every call rather than returning the value cached by the periodic
+// inventory collector (which can be up to MaxInterval stale), since the status page is expected to
+// reflect the agent's current HA state, not a snapshot from the last metadata submission.
+func (i *haagentimpl) Get() *haAgentMetadata {
 	i.m.Lock()
 	defer i.m.Unlock()
+	i.refreshMetadata()
 	return i.getDataCopy()
 }
 
-func (i *haagentimpl) getDataCopy() haAgentMetadata {
-	data := haAgentMetadata{}
-	maps.Copy(data, i.data)
-	return data
+func (i *haagentimpl) getDataCopy() *haAgentMetadata {
+	if i.data == nil {
+		return nil
+	}
+	dataCopy := *i.data
+	return &dataCopy
 }

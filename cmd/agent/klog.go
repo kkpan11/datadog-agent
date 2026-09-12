@@ -13,7 +13,6 @@ import (
 	"strconv"
 
 	"github.com/DataDog/datadog-agent/pkg/util/log"
-	klogv1 "k8s.io/klog"
 	klogv2 "k8s.io/klog/v2"
 )
 
@@ -27,6 +26,12 @@ func init() {
 	klogv2.InitFlags(flagset)
 
 	var err error
+
+	// Opt into fixed stderrthreshold behavior (kubernetes/klog#212).
+	err = flagset.Set("legacy_stderr_threshold_behavior", "false")
+	if err != nil {
+		panic(fmt.Sprintf("unable to set flag: %s", err))
+	}
 
 	// logtostderr is true by default, and when enabled promotes all logs
 	// to ERROR when collected by the agent, so we disable it
@@ -53,6 +58,5 @@ func init() {
 	// out of the log instead of having an output for each severity. having
 	// an output just for the lowest level captures the logs on all enabled
 	// severities just once.
-	klogv1.SetOutputBySeverity("INFO", log.NewKlogRedirectLogger(6))
 	klogv2.SetOutputBySeverity("INFO", log.NewKlogRedirectLogger(7))
 }

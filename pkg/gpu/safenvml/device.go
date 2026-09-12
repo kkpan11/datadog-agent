@@ -8,10 +8,13 @@
 package safenvml
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // SafeDevice represents a safe wrapper around NVML device operations.
@@ -22,10 +25,14 @@ type SafeDevice interface {
 	GetArchitecture() (nvml.DeviceArchitecture, error)
 	// GetAttributes returns the attributes of the device
 	GetAttributes() (nvml.DeviceAttributes, error)
+	// GetBAR1MemoryInfo returns BAR1 memory information of the device
+	GetBAR1MemoryInfo() (nvml.BAR1Memory, error)
 	// GetClockInfo returns the current clock speed for the given clock type
 	GetClockInfo(clockType nvml.ClockType) (uint32, error)
 	// GetComputeRunningProcesses returns the list of compute processes running on the device
 	GetComputeRunningProcesses() ([]nvml.ProcessInfo, error)
+	// GetRunningProcessDetailList returns the list of running processes on the device
+	GetRunningProcessDetailList() (nvml.ProcessDetailList, error)
 	// GetCudaComputeCapability returns the CUDA compute capability of the device
 	GetCudaComputeCapability() (int, int, error)
 	// GetCurrentClocksThrottleReasons returns the current clock throttle reasons bitmask
@@ -36,11 +43,20 @@ type SafeDevice interface {
 	GetEncoderUtilization() (uint32, uint32, error)
 	// GetFanSpeed returns the fan speed percentage
 	GetFanSpeed() (uint32, error)
+	// GetFanSpeed_v2 returns the fan speed percentage for the given fan index
+	GetFanSpeed_v2(fanIndex int) (uint32, error)
 	// GetFieldValues returns the values for the specified fields
 	GetFieldValues(values []nvml.FieldValue) error
+	// ReadWritePRM_v1 performs a raw PRM read or write with TLV data.
+	//nolint:revive // Maintaining consistency with go-nvml API naming
+	ReadWritePRM_v1(buffer *nvml.PRMTLV_v1) error
 	// GetGpuInstanceId returns the GPU instance ID for MIG devices
 	//nolint:revive // Maintaining consistency with go-nvml API naming
 	GetGpuInstanceId() (int, error)
+	// GetGpuInstanceProfileInfo returns the profile info for the given GPU instance profile ID
+	GetGpuInstanceProfileInfo(profile int) (nvml.GpuInstanceProfileInfo, error)
+	// GetGpuFabricInfo returns the NVLink fabric information for the device.
+	GetGpuFabricInfo() (nvml.GpuFabricInfo_v2, error)
 	// GetIndex returns the index of the device
 	GetIndex() (int, error)
 	// GetMaxClockInfo returns the maximum clock speed for the given clock type
@@ -51,6 +67,8 @@ type SafeDevice interface {
 	GetMemoryBusWidth() (uint32, error)
 	// GetMemoryInfo returns memory information of the device
 	GetMemoryInfo() (nvml.Memory, error)
+	// GetMemoryInfoV2 returns extended memory information of the device (includes reserved memory)
+	GetMemoryInfoV2() (nvml.Memory_v2, error)
 	// GetMigDeviceHandleByIndex returns the MIG device handle at the given index
 	GetMigDeviceHandleByIndex(index int) (SafeDevice, error)
 	// GetMigMode returns the MIG mode of the device
@@ -59,18 +77,36 @@ type SafeDevice interface {
 	GetName() (string, error)
 	// GetNvLinkState returns the state of the specified NVLink
 	GetNvLinkState(link int) (nvml.EnableState, error)
+	// GetNvLinkVersion returns the version of the specified NVLink.
+	GetNvLinkVersion(link int) (int, error)
 	// GetNumGpuCores returns the number of GPU cores in the device
 	GetNumGpuCores() (int, error)
+	// GetNumFans returns the number of fans in the device
+	GetNumFans() (int, error)
+	// GetPciInfo returns PCI information of the device
+	GetPciInfo() (nvml.PciInfo, error)
 	// GetPcieThroughput returns the PCIe throughput in bytes/sec
 	GetPcieThroughput(counter nvml.PcieUtilCounter) (uint32, error)
+	// GetCurrPcieLinkGeneration returns the current PCIe generation
+	GetCurrPcieLinkGeneration() (int, error)
+	// GetMaxPcieLinkGeneration returns the max PCIe generation
+	GetMaxPcieLinkGeneration() (int, error)
+	// GetCurrPcieLinkWidth returns the current PCIe link width
+	GetCurrPcieLinkWidth() (int, error)
+	// GetMaxPcieLinkWidth returns the max PCIe link width
+	GetMaxPcieLinkWidth() (int, error)
 	// GetPerformanceState returns the current performance state
 	GetPerformanceState() (nvml.Pstates, error)
 	// GetPowerManagementLimit returns the power management limit in milliwatts
 	GetPowerManagementLimit() (uint32, error)
 	// GetPowerUsage returns the power usage in milliwatts
 	GetPowerUsage() (uint32, error)
+	// GetProcessUtilization returns process utilization samples since the given timestamp
+	GetProcessUtilization(lastSeenTimestamp uint64) ([]nvml.ProcessUtilizationSample, error)
 	// GetRemappedRows returns the remapped rows information
 	GetRemappedRows() (int, int, bool, bool, error)
+	// GetRepairStatus returns the ECC repair status flags for the device.
+	GetRepairStatus() (nvml.RepairStatus, error)
 	// GetSamples returns samples for the specified counter type
 	GetSamples(samplingType nvml.SamplingType, lastSeenTimestamp uint64) (nvml.ValueType, []nvml.Sample, error)
 	// GetTemperature returns the current temperature
@@ -81,16 +117,48 @@ type SafeDevice interface {
 	GetUUID() (string, error)
 	// GetUtilizationRates returns the utilization rates for the device
 	GetUtilizationRates() (nvml.Utilization, error)
+	// GpmQueryDeviceSupport returns true if the device supports GPM
+	GpmQueryDeviceSupport() (nvml.GpmSupport, error)
+	// GpmSampleGet gets a sample for GPM
+	GpmSampleGet(sample nvml.GpmSample) error
+	// GpmMigSampleGet gets a sample for GPM for a MIG device
+	GpmMigSampleGet(migInstanceID int, sample nvml.GpmSample) error
 	// IsMigDeviceHandle returns true if the device is a MIG device or false for a physical device
 	IsMigDeviceHandle() (bool, error)
+	// GetVirtualizationMode returns the virtualization mode of the device
+	GetVirtualizationMode() (nvml.GpuVirtualizationMode, error)
+	// GetSupportedEventTypes returns a bitmask of all supported device events
+	GetSupportedEventTypes() (uint64, error)
+	// RegisterEvents registers the device for events to be waited in the given set
+	RegisterEvents(evtTypes uint64, evtSet nvml.EventSet) error
+	// GetMemoryErrorCounter retrieves the requested memory error counter for the device.
+	GetMemoryErrorCounter(errorType nvml.MemoryErrorType, eccCounterType nvml.EccCounterType, memoryLocation nvml.MemoryLocation) (uint64, error)
+	// GetSramEccErrorStatus retrieves the detailed SRAM ECC error status for the device.
+	GetSramEccErrorStatus() (nvml.EccSramErrorStatus, error)
+}
+
+// DeviceEventData holds basic information about a device event
+type DeviceEventData struct {
+	DeviceUUID        string
+	EventType         uint64
+	EventData         uint64
+	GPUInstanceID     uint32
+	ComputeInstanceID uint32
 }
 
 // DeviceInfo holds common cached properties for a GPU device
 type DeviceInfo struct {
-	SMVersion uint32
-	UUID      string
-	Name      string
-	CoreCount int
+	SMVersion          uint32
+	UUID               string
+	Name               string
+	CoreCount          int
+	Architecture       nvml.DeviceArchitecture
+	VirtualizationMode nvml.GpuVirtualizationMode
+
+	// NVLinkLinkCount is the number of NVLink links available on the device.
+	NVLinkLinkCount int
+	// NVLinkVersion is the version reported by the device's NVLink links.
+	NVLinkVersion string
 
 	// Index of the device in the host. For MIG devices, this is the index of the MIG device in the parent device.
 	Index int
@@ -129,6 +197,9 @@ type MIGDevice struct {
 
 	// Parent is the physical device that this MIG device belongs to
 	Parent *PhysicalDevice
+
+	// MIGInstanceID is the instance ID of the MIG device
+	MIGInstanceID int
 }
 
 var _ Device = &MIGDevice{}
@@ -155,11 +226,9 @@ func NewPhysicalDevice(dev nvml.Device) (*PhysicalDevice, error) {
 		return nil, fmt.Errorf("error filling basic data from NVML: %w", err)
 	}
 
-	major, minor, err := device.SafeDevice.GetCudaComputeCapability()
-	if err != nil {
-		return nil, fmt.Errorf("error getting CUDA compute capability: %w", err)
+	if err := device.fillPhysicalDeviceData(safeDev); err != nil {
+		return nil, fmt.Errorf("error filling physical device data: %w", err)
 	}
-	device.SMVersion = uint32(major*10 + minor)
 
 	migEnabled, _, err := safeDev.GetMigMode()
 	if err == nil && migEnabled == nvml.DEVICE_MIG_ENABLE {
@@ -172,12 +241,30 @@ func NewPhysicalDevice(dev nvml.Device) (*PhysicalDevice, error) {
 			return nil, err
 		}
 
-		// If the device is MIG enabled, we need to sum the memory and core count of all its children
-		// because the corresponding APIs we use below return "UNKNOWN_ERROR"
-		for _, migChild := range device.MIGChildren {
-			device.Memory += migChild.Memory
-			device.CoreCount += migChild.CoreCount
+		// If the device is MIG enabled, we cannot know the memory and core
+		// count of the device directly. However, we can query one of the MIG
+		// profiles, and see how many of them fit into the device. An important
+		// thing to note is that this can return a lower number of cores than
+		// what the device without MIG reports, at least in A100 devices.
+		// There's no official documentation that mentions why this is, but
+		// there are references to some compute instances being "reserved" for
+		// other purposes in NVIDIA's official docs: For example,
+		// https://docs.nvidia.com/datacenter/tesla/mig-user-guide/concepts.html
+		// mentions that memory slices are "one eighth" of the total memory,
+		// while compute slices are "one seventh". In both cases, it's mentioned
+		// that it's "roughly" that partition.
+		//
+		// However, it's still a reasonable approximation, specially because
+		// using the instance profiles will give us the total capacity available
+		// to MIG instances, without reporting cores that can never be used when
+		// MIG is enabled.
+		profileInfo, err := device.SafeDevice.GetGpuInstanceProfileInfo(0)
+		if err != nil {
+			return nil, fmt.Errorf("error getting MIG device profile info: %w", err)
 		}
+
+		device.Memory = uint64(profileInfo.MemorySizeMB) * 1024 * 1024 * uint64(profileInfo.InstanceCount)
+		device.CoreCount = int(profileInfo.MultiprocessorCount) * int(profileInfo.InstanceCount) * coresPerMultiprocessor(device.Architecture)
 	} else {
 		cores, err := device.SafeDevice.GetNumGpuCores()
 		if err != nil {
@@ -222,6 +309,16 @@ func (d *PhysicalDevice) fillMigChildren() error {
 		// for MIG devices.
 		migChildDevice.SMVersion = d.SMVersion
 		migChildDevice.Parent = d
+		migChildDevice.Architecture = d.Architecture
+		// MIG slices do not have NVLink ports; keep the parent's protocol version for tags.
+		migChildDevice.NVLinkVersion = d.NVLinkVersion
+		migChildDevice.CoreCount *= coresPerMultiprocessor(d.Architecture)
+
+		gpuInstanceID, err := migChildDevice.GetGpuInstanceId()
+		if err != nil {
+			return fmt.Errorf("error getting MIG device GPU instance ID: %w", err)
+		}
+		migChildDevice.MIGInstanceID = gpuInstanceID
 
 		d.MIGChildren = append(d.MIGChildren, migChildDevice)
 	}
@@ -279,4 +376,126 @@ func (d *DeviceInfo) fillBasicDataFromNVML(dev SafeDevice) error {
 	}
 
 	return nil
+}
+
+// fillPhysicalDeviceData fills the device info for a physical device using NVML APIs
+func (d *DeviceInfo) fillPhysicalDeviceData(dev SafeDevice) error {
+	arch, err := dev.GetArchitecture()
+	if err != nil {
+		return fmt.Errorf("error getting physical device architecture: %w", err)
+	}
+	d.Architecture = arch
+
+	major, minor, err := dev.GetCudaComputeCapability()
+	if err != nil {
+		return fmt.Errorf("error getting CUDA compute capability: %w", err)
+	}
+	d.SMVersion = uint32(major*10 + minor)
+
+	if virtualizationMode, err := dev.GetVirtualizationMode(); err == nil {
+		d.VirtualizationMode = virtualizationMode
+	} else if logLimiter.ShouldLog() {
+		log.Warnf("cannot get virtualization mode: %v", err)
+	}
+
+	d.fillNVLinkDataFromNVML(dev)
+
+	return nil
+}
+
+func (d *DeviceInfo) fillNVLinkDataFromNVML(dev SafeDevice) {
+	fields := []nvml.FieldValue{{FieldId: nvml.FI_DEV_NVLINK_LINK_COUNT}}
+	if err := dev.GetFieldValues(fields); err != nil {
+		if logLimiter.ShouldLog() {
+			log.Warnf("cannot get NVLink link count: %v", err)
+		}
+		return
+	}
+	if ret := nvml.Return(fields[0].NvmlReturn); ret != nvml.SUCCESS {
+		if logLimiter.ShouldLog() {
+			log.Warnf("cannot get NVLink link count: %s", nvml.ErrorString(ret))
+		}
+		return
+	}
+
+	linkCount, err := nvmlFieldValueToInt(fields[0])
+	if err != nil {
+		if logLimiter.ShouldLog() {
+			log.Warnf("cannot parse NVLink link count: %v", err)
+		}
+		return
+	}
+	if linkCount < 0 {
+		if logLimiter.ShouldLog() {
+			log.Warnf("NVLink link count %d is negative", linkCount)
+		}
+		return
+	}
+
+	d.NVLinkLinkCount = linkCount
+	for link := range d.NVLinkLinkCount {
+		version, err := dev.GetNvLinkVersion(link)
+		if err != nil {
+			if logLimiter.ShouldLog() {
+				log.Warnf("cannot get NVLink version for link %d: %v", link, err)
+			}
+			continue
+		}
+
+		if d.NVLinkVersion == "" {
+			d.NVLinkVersion = nvlinkVersionString(version)
+		} else if d.NVLinkVersion != nvlinkVersionString(version) && logLimiter.ShouldLog() {
+			log.Warnf("NVLink version %s for link %d differs from version %s reported by another link", nvlinkVersionString(version), link, d.NVLinkVersion)
+		}
+	}
+}
+
+func nvmlFieldValueToInt(fv nvml.FieldValue) (int, error) {
+	switch nvml.ValueType(fv.ValueType) {
+	case nvml.VALUE_TYPE_UNSIGNED_INT:
+		return int(binary.LittleEndian.Uint32(fv.Value[:4])), nil
+	case nvml.VALUE_TYPE_UNSIGNED_LONG, nvml.VALUE_TYPE_UNSIGNED_LONG_LONG:
+		value := binary.LittleEndian.Uint64(fv.Value[:])
+		if value > uint64(^uint(0)>>1) {
+			return 0, fmt.Errorf("NVLink field value %d exceeds maximum integer value", value)
+		}
+		return int(value), nil
+	case nvml.VALUE_TYPE_SIGNED_INT:
+		return int(int32(binary.LittleEndian.Uint32(fv.Value[:4]))), nil
+	case nvml.VALUE_TYPE_SIGNED_LONG_LONG:
+		return int(int64(binary.LittleEndian.Uint64(fv.Value[:]))), nil
+	default:
+		return 0, fmt.Errorf("unsupported NVML value type %d", fv.ValueType)
+	}
+}
+
+func nvlinkVersionString(version int) string {
+	switch version {
+	case 1:
+		return "1.0"
+	case 2:
+		return "2.0"
+	case 3:
+		return "2.2"
+	case 4:
+		return "3.0"
+	case 5:
+		return "3.1"
+	case 6:
+		return "4.0"
+	case 7:
+		return "5.0"
+	default:
+		return fmt.Sprintf("unknown_%d", version)
+	}
+}
+
+// coresPerMultiprocessor returns the number of cores per multiprocessor for a given SM version. It's a fallback
+// for MIG-enabled devices where the API doesn't work. For that reason, it only returns values for SM versions
+// that support MIG
+func coresPerMultiprocessor(arch nvml.DeviceArchitecture) int {
+	if arch <= nvml.DEVICE_ARCH_AMPERE {
+		return 64
+	}
+	return 128
 }

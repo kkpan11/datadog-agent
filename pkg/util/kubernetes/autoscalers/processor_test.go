@@ -8,6 +8,7 @@
 package autoscalers
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -16,7 +17,7 @@ import (
 	"time"
 
 	datadogclientmock "github.com/DataDog/datadog-agent/comp/autoscaling/datadogclient/mock"
-	telemetryComponent "github.com/DataDog/datadog-agent/comp/core/telemetry"
+	telemetryComponent "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/custommetrics"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
@@ -218,7 +219,7 @@ func TestProcessor_UpdateExternalMetrics(t *testing.T) {
 	}
 	datadogClientComp := datadogclientmock.New(t).Comp
 	datadogClientComp.SetQueryMetricsFunc(func(int64, int64, string) ([]datadog.Series, error) {
-		return nil, fmt.Errorf("API error 400 Bad Request: {\"error\": [\"Rate limit of 300 requests in 3600 seconds reqchec.\"]}")
+		return nil, errors.New("API error 400 Bad Request: {\"error\": [\"Rate limit of 300 requests in 3600 seconds reqchec.\"]}")
 	})
 
 	hpaCl := &Processor{datadogClient: datadogClientComp, externalMaxAge: testMaxAge, parallelQueries: testParallelQueries}
@@ -364,7 +365,7 @@ func TestValidateExternalMetricsBatching(t *testing.T) {
 					// Error will be under the format:
 					// Error: Error while executing metric query avg:foo-56{foo:bar}.rollup(30),avg:foo-93{foo:bar}.rollup(30),[...],avg:foo-64{foo:bar}.rollup(30),avg:foo-81{foo:bar}.rollup(30): Networking Error, timeout!!!
 					// In the logs, we will be able to see which bundle failed, but for the tests, we can't know which routine will finish first (and therefore have `bc == 1`), so we only check the error returned by the Datadog Servers.
-					return nil, fmt.Errorf("networking Error, timeout")
+					return nil, errors.New("networking Error, timeout")
 				}
 				return tt.out, nil
 			})
@@ -591,7 +592,7 @@ func TestUpdateRateLimiting(t *testing.T) {
 				Period: 3600,
 				Reset:  11,
 			},
-			error: fmt.Errorf("strconv.Atoi: parsing \"\": invalid syntax"),
+			error: errors.New("strconv.Atoi: parsing \"\": invalid syntax"),
 		},
 		{
 			desc: "Missing headers case",
@@ -606,7 +607,7 @@ func TestUpdateRateLimiting(t *testing.T) {
 				Period: 3600,
 			},
 			// Although several headers are missing, the Aggregate will only return 1 error as they are the same
-			error: fmt.Errorf("strconv.Atoi: parsing \"\": invalid syntax"),
+			error: errors.New("strconv.Atoi: parsing \"\": invalid syntax"),
 		},
 	}
 
@@ -674,6 +675,9 @@ func (m *mockGauge) Sub(value float64, tagsValue ...string) {
 func (m *mockGauge) Delete(tagsValue ...string) {
 	delete(m.values, strings.Join(tagsValue, ","))
 }
+
+// DeletePartialMatch does nothing
+func (m *mockGauge) DeletePartialMatch(_ map[string]string) {}
 
 func (*mockGauge) WithValues(_ ...string) telemetryComponent.SimpleGauge       { return nil }
 func (*mockGauge) WithTags(_ map[string]string) telemetryComponent.SimpleGauge { return nil }

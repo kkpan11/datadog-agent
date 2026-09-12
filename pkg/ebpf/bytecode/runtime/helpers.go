@@ -3,13 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package runtime
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -94,7 +95,7 @@ func getAvailableHelpers(kernelHeaders []string) ([]string, error) {
 		lastLine = scanner.Bytes()
 	}
 	if len(lastLine) == 0 {
-		return nil, fmt.Errorf("empty output")
+		return nil, errors.New("empty output")
 	}
 
 	funcs := strings.Split(string(lastLine), ", ")

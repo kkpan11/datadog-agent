@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "dispatcher",
+    srcs = [
+        "dispatcher.go",
+        "message.go",
+    ],
+    importpath = "github.com/DataDog/datadog-agent/pkg/dyninst/dispatcher",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+    deps = select({
+        "@rules_go//go/platform:android": [
+            "//pkg/dyninst/ir",
+            "//pkg/dyninst/output",
+            "//pkg/util/log",
+            "@com_github_cilium_ebpf//ringbuf",
+        ],
+        "@rules_go//go/platform:linux": [
+            "//pkg/dyninst/ir",
+            "//pkg/dyninst/output",
+            "//pkg/util/log",
+            "@com_github_cilium_ebpf//ringbuf",
+        ],
+        "//conditions:default": [],
+    }),
+)

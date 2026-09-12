@@ -18,15 +18,18 @@ import (
 
 	"github.com/DataDog/datadog-agent/cmd/agent/command"
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/autodiscoveryimpl"
+	adcmock "github.com/DataDog/datadog-agent/comp/core/autodiscovery/mock"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/scheduler"
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/secrets/secretsimpl"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretsmock "github.com/DataDog/datadog-agent/comp/core/secrets/mock"
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
+	taggermock "github.com/DataDog/datadog-agent/comp/core/tagger/mock"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
-	"github.com/DataDog/datadog-agent/pkg/logs/processor"
+	"github.com/DataDog/datadog-agent/comp/logs-library/processor"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
@@ -72,6 +75,14 @@ func CreateTestFile(tempDir string, fileName string, fileContent string) *os.Fil
 	return file
 }
 
+type testDeps struct {
+	fx.In
+	AC          adcmock.Mock
+	WMeta       workloadmeta.Component
+	TaggerComp  taggermock.Mock
+	FilterStore workloadfilter.Component
+}
+
 func TestRunAnalyzeLogs(t *testing.T) {
 	tempDir := "tmp"
 	defer os.RemoveAll(tempDir)
@@ -114,13 +125,14 @@ Auto-discovery IDs:
 	config := config.NewMock(t)
 
 	adsched := scheduler.NewController()
-	ac := fxutil.Test[autodiscovery.Mock](t,
-		fx.Supply(autodiscoveryimpl.MockParams{Scheduler: adsched}),
-		secretsimpl.MockModule(),
-		autodiscoveryimpl.MockModule(),
+	deps := fxutil.Test[testDeps](t,
+		fx.Supply(adcmock.MockParams{Scheduler: adsched}),
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		adcmock.MockModule(),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 		core.MockBundle(),
 		taggerfxmock.MockModule(),
+		workloadfilterfxmock.MockModule(),
 	)
 
 	// Set CLI params
@@ -128,7 +140,7 @@ Auto-discovery IDs:
 		LogConfigPath:  tempConfigFile.Name(),
 		CoreConfigPath: tempConfigFile.Name(),
 	}
-	outputChan, launcher, pipelineProvider, err := runAnalyzeLogsHelper(cliParams, config, ac)
+	outputChan, launcher, pipelineProvider, err := runAnalyzeLogsHelper(cliParams, config, deps.AC)
 	assert.Nil(t, err)
 	expectedOutput := []string{
 		"=== apm check ===",
@@ -151,7 +163,7 @@ Auto-discovery IDs:
 		err := json.Unmarshal(msg.GetContent(), &parsedMessage)
 		assert.NoError(t, err)
 
-		assert.Equal(t, parsedMessage.Message, expectedOutput[i])
+		assert.Equal(t, parsedMessage.Message.String(), expectedOutput[i])
 	}
 
 	launcher.Stop()
@@ -175,7 +187,7 @@ func TestRunAnalyzeLogsInvalidConfig(t *testing.T) {
       - type: exclude_at_match
         name: exclude_random
         pattern: "datadog-agent"
-      
+
 `, tempLogFile.Name())
 	tempConfigFile := CreateTestFile(tempDir, "config.yaml", invalidConfig)
 	assert.NotNil(t, tempConfigFile)
@@ -185,13 +197,14 @@ func TestRunAnalyzeLogsInvalidConfig(t *testing.T) {
 	config := config.NewMock(t)
 
 	adsched := scheduler.NewController()
-	ac := fxutil.Test[autodiscovery.Mock](t,
-		fx.Supply(autodiscoveryimpl.MockParams{Scheduler: adsched}),
-		secretsimpl.MockModule(),
-		autodiscoveryimpl.MockModule(),
+	deps := fxutil.Test[testDeps](t,
+		fx.Supply(adcmock.MockParams{Scheduler: adsched}),
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		adcmock.MockModule(),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 		core.MockBundle(),
 		taggerfxmock.MockModule(),
+		workloadfilterfxmock.MockModule(),
 	)
 
 	// Set CLI params
@@ -199,6 +212,6 @@ func TestRunAnalyzeLogsInvalidConfig(t *testing.T) {
 		LogConfigPath:  tempConfigFile.Name(),
 		CoreConfigPath: tempConfigFile.Name(),
 	}
-	_, _, _, err := runAnalyzeLogsHelper(cliParams, config, ac)
+	_, _, _, err := runAnalyzeLogsHelper(cliParams, config, deps.AC)
 	assert.Error(t, err)
 }

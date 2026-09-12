@@ -21,7 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/avast/retry-go/v4"
+	"github.com/cenkalti/backoff/v7"
 	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/DataDog/datadog-agent/pkg/security/proto/ebpfless"
@@ -63,17 +63,20 @@ type Opts struct {
 type CWSPtracerCtx struct {
 	Tracer
 
-	opts         *Opts
-	wg           sync.WaitGroup
-	cancel       context.Context
-	cancelFnc    context.CancelFunc
-	containerID  containerutils.ContainerID
-	probeAddr    string
-	client       net.Conn
-	clientReady  chan bool
-	msgDataChan  chan []byte
-	helloMsg     *ebpfless.Message
-	processCache *ProcessCache
+	opts                *Opts
+	wg                  sync.WaitGroup
+	cancel              context.Context
+	cancelFnc           context.CancelFunc
+	containerID         containerutils.ContainerID
+	cgroupID            containerutils.CGroupID
+	probeAddr           string
+	client              net.Conn
+	clientReady         chan bool
+	msgDataChan         chan []byte
+	helloMsg            *ebpfless.Message
+	processCache        *ProcessCache
+	traceesReported     []int
+	stopSignalForwarder func()
 }
 
 type syscallHandlerFunc func(tracer *Tracer, process *Process, msg *ebpfless.SyscallMsg, regs syscall.PtraceRegs, disableStats bool) error
@@ -132,15 +135,9 @@ func initConn(probeAddr string, nbAttempts uint) (net.Conn, error) {
 		return nil, err
 	}
 
-	var client net.Conn
-	err = retry.Do(func() error {
-		client, err = net.DialTCP("tcp", nil, tcpAddr)
-		return err
-	}, retry.Delay(time.Second), retry.Attempts(nbAttempts))
-	if err != nil {
-		return nil, err
-	}
-	return client, nil
+	return backoff.Retry(context.Background(), func() (net.Conn, error) {
+		return net.DialTCP("tcp", nil, tcpAddr)
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(time.Second)), backoff.WithMaxTries(nbAttempts))
 }
 
 func (ctx *CWSPtracerCtx) connectClient() error {
@@ -212,7 +209,7 @@ func (ctx *CWSPtracerCtx) waitClientToBeReady() error {
 	for {
 		select {
 		case <-ctx.cancel.Done():
-			return fmt.Errorf("Exiting")
+			return errors.New("Exiting")
 		case ready := <-ctx.clientReady:
 			if !ready {
 				time.Sleep(time.Second)
@@ -244,7 +241,7 @@ func (ctx *CWSPtracerCtx) sendMessagesLoop() error {
 	for {
 		select {
 		case <-ctx.cancel.Done():
-			return fmt.Errorf("Exiting")
+			return errors.New("Exiting")
 		case data := <-ctx.msgDataChan:
 			if err := ctx.sendMsgData(data); err != nil {
 				logger.Debugf("error sending msg: %v", err)
@@ -284,7 +281,6 @@ func registerSyscallHandlers() (map[int]syscallHandler, []string) {
 	handlers := make(map[int]syscallHandler)
 	syscalls := registerFIMHandlers(handlers)
 	syscalls = append(syscalls, registerProcessHandlers(handlers)...)
-	syscalls = append(syscalls, registerERPCHandlers(handlers)...)
 	syscalls = append(syscalls, registerNetworkHandlers(handlers)...)
 	return handlers, syscalls
 }
@@ -306,6 +302,10 @@ func (ctx *CWSPtracerCtx) initCtxCommon() error {
 	if err != nil {
 		logger.Errorf("Retrieve container ID from proc failed: %v\n", err)
 	}
+	ctx.cgroupID, err = getCurrentProcCGroupID()
+	if err != nil {
+		logger.Errorf("Retrieve cgroup ID from proc failed: %v\n", err)
+	}
 	containerCtx, err := newContainerContext(ctx.containerID)
 	if err != nil {
 		return err
@@ -323,6 +323,7 @@ func (ctx *CWSPtracerCtx) initCtxCommon() error {
 			Mode:             ctx.opts.mode,
 			NSID:             getNSID(),
 			ContainerContext: containerCtx,
+			CGroupID:         ctx.cgroupID,
 			EntrypointArgs:   ctx.Args,
 		},
 	}
@@ -333,7 +334,7 @@ func (ctx *CWSPtracerCtx) initCtxCommon() error {
 
 func initCWSPtracerWrapp(args []string, envs []string, probeAddr string, opts Opts) (*CWSPtracerCtx, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("an executable is required")
+		return nil, errors.New("an executable is required")
 	}
 	entry, err := checkEntryPoint(args[0])
 	if err != nil {
@@ -400,6 +401,9 @@ func initCWSPtracerAttach(pids []int, probeAddr string, opts Opts) (*CWSPtracerC
 func (ctx *CWSPtracerCtx) CWSCleanup() {
 	ctx.cancelFnc()
 	ctx.wg.Wait()
+	if ctx.stopSignalForwarder != nil {
+		ctx.stopSignalForwarder()
+	}
 	close(ctx.msgDataChan)
 	close(ctx.clientReady)
 }

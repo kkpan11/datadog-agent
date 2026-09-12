@@ -21,13 +21,15 @@ import (
 
 // Stats represents the node counts in an activity dump
 type Stats struct {
-	ProcessNodes int64
-	FileNodes    int64
-	DNSNodes     int64
-	SocketNodes  int64
-	IMDSNodes    int64
-	SyscallNodes int64
-	FlowNodes    int64
+	ProcessNodes    int64
+	FileNodes       int64
+	DNSNodes        int64
+	SocketNodes     int64
+	IMDSNodes       int64
+	SyscallNodes    int64
+	FlowNodes       int64
+	CapabilityNodes int64
+	SizeBytes       int64
 
 	counts map[model.EventType]*statsPerEventType
 }
@@ -76,25 +78,37 @@ func (stats *Stats) ApproximateSize() int64 {
 	total += stats.IMDSNodes * int64(unsafe.Sizeof(IMDSNode{}))
 	total += stats.SyscallNodes * int64(unsafe.Sizeof(SyscallNode{}))
 	total += stats.FlowNodes * int64(unsafe.Sizeof(FlowNode{}))
+	total += stats.CapabilityNodes * int64(unsafe.Sizeof(CapabilityNode{}))
 	return total
+}
+
+// HeapSize returns the tree's tracked estimated heap footprint in bytes (strings, slice
+// backings, map buckets, struct headers). Used by V2 callers for max-size checks and
+// the profile_size RAM metric.
+func (stats *Stats) HeapSize() int64 {
+	if stats.SizeBytes == 0 {
+		return stats.ApproximateSize()
+	}
+	return stats.SizeBytes
 }
 
 // SendStats sends metrics to Datadog
 func (stats *Stats) SendStats(client statsd.ClientInterface, treeType string) error {
-	treeTypeTag := fmt.Sprintf("tree_type:%s", treeType)
+	treeTypeTag := "tree_type:" + treeType
 
+	tags := []string{treeTypeTag, "", ""}
 	for evtType, count := range stats.counts {
-		evtTypeTag := fmt.Sprintf("event_type:%s", evtType)
+		evtTypeTag := "event_type:" + evtType.String()
 
-		tags := []string{evtTypeTag, treeTypeTag}
+		tags[1] = evtTypeTag
 		if value := count.processedCount.Swap(0); value > 0 {
-			if err := client.Count(metrics.MetricActivityDumpEventProcessed, int64(value), tags, 1.0); err != nil {
+			if err := client.Count(metrics.MetricActivityDumpEventProcessed, int64(value), tags[:1], 1.0); err != nil {
 				return fmt.Errorf("couldn't send %s metric: %w", metrics.MetricActivityDumpEventProcessed, err)
 			}
 		}
 
 		for generationType, count := range count.addedCount {
-			tags := []string{evtTypeTag, generationType.Tag(), treeTypeTag}
+			tags[2] = generationType.Tag()
 			if value := count.Swap(0); value > 0 {
 				if err := client.Count(metrics.MetricActivityDumpEventAdded, int64(value), tags, 1.0); err != nil {
 					return fmt.Errorf("couldn't send %s metric: %w", metrics.MetricActivityDumpEventAdded, err)
@@ -103,7 +117,7 @@ func (stats *Stats) SendStats(client statsd.ClientInterface, treeType string) er
 		}
 
 		for reason, count := range count.droppedCount {
-			tags := []string{evtTypeTag, fmt.Sprintf("reason:%s", reason), treeTypeTag}
+			tags[2] = reason.Tag()
 			if value := count.Swap(0); value > 0 {
 				if err := client.Count(metrics.MetricActivityDumpEventDropped, int64(value), tags, 1.0); err != nil {
 					return fmt.Errorf("couldn't send %s metric: %w", metrics.MetricActivityDumpEventDropped, err)

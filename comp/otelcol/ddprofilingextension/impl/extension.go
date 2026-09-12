@@ -8,10 +8,9 @@ package ddprofilingextensionimpl
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net/http"
-	"runtime/debug"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -19,61 +18,81 @@ import (
 	ddprofilingextensiondef "github.com/DataDog/datadog-agent/comp/otelcol/ddprofilingextension/def"
 	traceagent "github.com/DataDog/datadog-agent/comp/trace/agent/def"
 
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes/source"
+	"github.com/DataDog/dd-trace-go/v2/profiler"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension"
-	"gopkg.in/DataDog/dd-trace-go.v1/profiler"
 )
 
 var (
-	_                    extension.Extension = (*ddExtension)(nil)
-	_                    component.Config    = (*Config)(nil)
-	defaultEndpoint                          = "7501"
-	errAPIKeyMissing                         = errors.New("API key is required for ddprofiling extension")
-	additionalTagsHeader                     = "X-Datadog-Additional-Tags"
+	_               extension.Extension = (*ddExtension)(nil)
+	_               component.Config    = (*Config)(nil)
+	defaultEndpoint                     = "7501"
+)
+
+const (
+	ddServiceEnvVar = "DD_SERVICE"
+	ddEnvEnvVar     = "DD_ENV"
+	ddVersionEnvVar = "DD_VERSION"
+	// ddUnixSocketEnvVar mirrors the <component>.internal_profiling.unix_socket
+	// setting every other agent process exposes. It is read as an env var, not
+	// only as a config key, so that a collector config carrying it still parses
+	// on agent builds that predate unix_socket -- the collector rejects unknown
+	// config keys outright, which would otherwise make this un-A/B-able.
+	ddUnixSocketEnvVar = "DD_OTELCOLLECTOR_INTERNAL_PROFILING_UNIX_SOCKET"
 )
 
 // ddExtension is a basic OpenTelemetry Collector extension.
 type ddExtension struct {
 	extension.Extension // Embed base Extension for common functionality.
 
-	cfg            *Config // Extension configuration.
-	info           component.BuildInfo
-	traceAgent     traceagent.Component
-	server         *http.Server
-	log            corelog.Component
-	sourceProvider source.Provider
+	cfg        *Config // Extension configuration.
+	info       component.BuildInfo
+	traceAgent traceagent.Component
+	server     *http.Server
+	// log is nil when the extension is built by NewFactory (standalone mode),
+	// which is given no agent components. Every use must be nil-checked.
+	log       corelog.Component
+	agentMode bool
 }
 
-// NewExtension creates a new instance of the extension.
-func NewExtension(cfg *Config, info component.BuildInfo, traceAgent traceagent.Component, log corelog.Component, sourceProvider source.Provider) (ddprofilingextensiondef.Component, error) {
+// NewComponent creates a new instance of the extension.
+func NewComponent(cfg *Config, info component.BuildInfo, traceAgent traceagent.Component, log corelog.Component) (ddprofilingextensiondef.Component, error) {
 	return &ddExtension{
-		cfg:            cfg,
-		info:           info,
-		traceAgent:     traceAgent,
-		log:            log,
-		sourceProvider: sourceProvider,
+		cfg:        cfg,
+		info:       info,
+		traceAgent: traceAgent,
+		log:        log,
+		agentMode:  traceAgent != nil,
 	}, nil
 }
 
 func (e *ddExtension) Start(_ context.Context, host component.Host) error {
-	// OTEL AGENT
-	if e.traceAgent != nil {
-		return e.startForOTelAgent(host)
+	if e.agentMode {
+		return e.startForAgent(host)
 	}
-	// OCB
-	return e.startForOCB()
+	return e.startForStandalone()
 }
 
-func (e *ddExtension) startForOTelAgent(host component.Host) error {
+func (e *ddExtension) startForAgent(host component.Host) error {
+	profilerOptions := e.buildProfilerOptions()
+
+	// A unix socket is a complete substitute for the local forwarding server:
+	// profiles go straight to the trace agent listening on the socket, so there
+	// is nothing left for the server to forward. Skip starting it rather than
+	// leaving an idle listener on port 7501.
+	if socket := e.unixSocket(); socket != "" {
+		if e.log != nil {
+			e.log.Info("DD Profiling Extension sending profiles over unix socket: " + socket)
+		}
+		return profiler.Start(append(profilerOptions, profiler.WithUDS(socket))...)
+	}
+
 	// start server that handles profiles
 	err := e.newServer()
 	if err != nil {
 		return err
 	}
 	go e.startServer(host)
-
-	profilerOptions := e.buildProfilerOptions()
 
 	// agent
 	profilerOptions = append(profilerOptions, profiler.WithAgentAddr("localhost:"+e.endpoint()))
@@ -83,77 +102,16 @@ func (e *ddExtension) startForOTelAgent(host component.Host) error {
 	)
 }
 
-type headerTransport struct {
-	wrapped http.RoundTripper
-	headers map[string]string
-}
-
-func (m *headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	for k, v := range m.headers {
-		r.Header.Add(k, v)
-	}
-	return m.wrapped.RoundTrip(r)
-}
-
-func (e *ddExtension) startForOCB() error {
+func (e *ddExtension) startForStandalone() error {
 	profilerOptions := e.buildProfilerOptions()
-
-	if string(e.cfg.API.Key) == "" {
-		return errAPIKeyMissing
+	// A socket and a TCP address are two ways of naming the same trace agent, so
+	// only one can apply. The socket wins: it is the more specific of the two.
+	if socket := e.unixSocket(); socket != "" {
+		profilerOptions = append(profilerOptions, profiler.WithUDS(socket))
+	} else if e.cfg.AgentAddr != "" {
+		profilerOptions = append(profilerOptions, profiler.WithAgentAddr(e.cfg.AgentAddr))
 	}
-	// agentless
-	profilerOptions = append(profilerOptions,
-		profiler.WithAgentlessUpload(),
-		profiler.WithAPIKey(string(e.cfg.API.Key)),
-	)
-
-	if string(e.cfg.API.Site) != "" {
-		profilerOptions = append(profilerOptions, profiler.WithSite(string(e.cfg.API.Site)))
-	}
-
-	source, err := e.sourceProvider.Source(context.Background())
-	if err != nil {
-		return err
-	}
-
-	var tags strings.Builder
-	// agent_version is required by profiling backend. Use version of comp/trace/agent/def, and fallback to 7.64.0.
-	agentVersion := "7.64.0"
-	buildInfo, ok := debug.ReadBuildInfo()
-	if ok {
-		for _, module := range buildInfo.Deps {
-			if module.Path == "github.com/DataDog/datadog-agent/comp/trace/agent/def" {
-				agentVersion = module.Version
-			}
-		}
-	}
-	tags.WriteString(fmt.Sprintf("agent_version:%s", agentVersion))
-	tags.WriteString(",source:oss-ddprofilingextension")
-	if e.cfg.ProfilerOptions.Env != "" {
-		tags.WriteString(fmt.Sprintf(",default_env:%s", e.cfg.ProfilerOptions.Env))
-	}
-
-	if source.Kind == "host" {
-		profilerOptions = append(profilerOptions, profiler.WithHostname(source.Identifier))
-		tags.WriteString(fmt.Sprintf(",host:%s", source.Identifier))
-	}
-
-	if source.Kind == "task_arn" {
-		tags.WriteString(fmt.Sprintf(",orchestrator:fargate_ecs,task_arn:%s", source.Identifier))
-	}
-
-	cl := new(http.Client)
-	cl.Transport = &headerTransport{
-		wrapped: http.DefaultTransport,
-		headers: map[string]string{
-			additionalTagsHeader: tags.String(),
-		},
-	}
-	profilerOptions = append(profilerOptions, profiler.WithHTTPClient(cl))
-
-	return profiler.Start(
-		profilerOptions...,
-	)
+	return profiler.Start(profilerOptions...)
 }
 
 func (e *ddExtension) buildProfilerOptions() []profiler.Option {
@@ -179,18 +137,24 @@ func (e *ddExtension) buildProfilerOptions() []profiler.Option {
 
 	if e.cfg.ProfilerOptions.Service != "" {
 		profilerOptions = append(profilerOptions, profiler.WithService(e.cfg.ProfilerOptions.Service))
+	} else if service, ok := nonBlankEnv(ddServiceEnvVar); ok {
+		profilerOptions = append(profilerOptions, profiler.WithService(service))
 	} else {
 		profilerOptions = append(profilerOptions, profiler.WithService(e.info.Command))
 	}
 
 	if e.cfg.ProfilerOptions.Version != "" {
 		profilerOptions = append(profilerOptions, profiler.WithVersion(e.cfg.ProfilerOptions.Version))
+	} else if version, ok := nonBlankEnv(ddVersionEnvVar); ok {
+		profilerOptions = append(profilerOptions, profiler.WithVersion(version))
 	} else {
 		profilerOptions = append(profilerOptions, profiler.WithVersion(e.info.Version))
 	}
 
 	if e.cfg.ProfilerOptions.Env != "" {
 		profilerOptions = append(profilerOptions, profiler.WithEnv(e.cfg.ProfilerOptions.Env))
+	} else if env, ok := nonBlankEnv(ddEnvEnvVar); ok {
+		profilerOptions = append(profilerOptions, profiler.WithEnv(env))
 	}
 
 	if e.cfg.ProfilerOptions.Period > 0 {
@@ -200,13 +164,48 @@ func (e *ddExtension) buildProfilerOptions() []profiler.Option {
 	return profilerOptions
 }
 
-func (e *ddExtension) Shutdown(ctx context.Context) error {
-	// stop profiler
-	profiler.Stop()
-
-	if e.traceAgent != nil {
-		// stop server
-		return e.server.Shutdown(ctx)
+// unixSocket returns the unix socket profiles should be sent to, preferring the
+// config key over the environment.
+//
+// It also returns "" when a socket is configured on a platform that has no use
+// for one. Callers then take the address-based path they would have taken had
+// the setting been absent, so a socket carried in a config or an environment
+// shared across a mixed fleet degrades to HTTP on Windows rather than pointing
+// the profiler at a path nothing serves.
+func (e *ddExtension) unixSocket() string {
+	socket, source := e.cfg.UnixSocket, "the unix_socket setting"
+	if socket == "" {
+		if fromEnv, ok := nonBlankEnv(ddUnixSocketEnvVar); ok {
+			socket, source = fromEnv, ddUnixSocketEnvVar
+		}
 	}
-	return nil
+	if socket == "" {
+		return ""
+	}
+	if !hasUnixSocketSupport() {
+		if e.log != nil {
+			e.log.Warn("DD Profiling Extension ignoring " + source + ": no trace agent profiling socket is " +
+				"available on " + runtime.GOOS + ", falling back to sending profiles over HTTP")
+		}
+		return ""
+	}
+	return socket
+}
+
+func nonBlankEnv(key string) (string, bool) {
+	value, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", false
+	}
+	return value, true
+}
+
+func (e *ddExtension) Shutdown(ctx context.Context) error {
+	profiler.Stop()
+	if e.server == nil {
+		// Standalone mode sends directly to an external trace-agent and does not
+		// start the local forwarding server used in bundled mode.
+		return nil
+	}
+	return e.server.Shutdown(ctx)
 }

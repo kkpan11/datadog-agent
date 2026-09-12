@@ -15,7 +15,7 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/tagger/origindetection"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/tagstore"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	coretelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry"
+	coretelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	taggertypes "github.com/DataDog/datadog-agent/pkg/tagger/types"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
@@ -109,14 +109,14 @@ func (f *fakeTagger) Tag(entityID types.EntityID, cardinality types.TagCardinali
 	return f.tagger.Tag(entityID, cardinality)
 }
 
+// TagWithCompleteness calls tagger.TagWithCompleteness().
+func (f *fakeTagger) TagWithCompleteness(entityID types.EntityID, cardinality types.TagCardinality) ([]string, bool, error) {
+	return f.tagger.TagWithCompleteness(entityID, cardinality)
+}
+
 // GenerateContainerIDFromOriginInfo calls tagger.GenerateContainerIDFromOriginInfo().
 func (f *fakeTagger) GenerateContainerIDFromOriginInfo(originInfo origindetection.OriginInfo) (string, error) {
 	return f.tagger.GenerateContainerIDFromOriginInfo(originInfo)
-}
-
-// AccumulateTagsFor calls tagger.AccumulateTagsFor().
-func (f *fakeTagger) AccumulateTagsFor(entityID types.EntityID, cardinality types.TagCardinality, tb tagset.TagsAccumulator) error {
-	return f.tagger.AccumulateTagsFor(entityID, cardinality, tb)
 }
 
 // Standard calls tagger.Standard().

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package ebpftest
 
@@ -24,6 +24,7 @@ func TestBuildModeConstants(t *testing.T) {
 		assert.False(t, cfg.AllowPrebuiltFallback)
 		assert.False(t, cfg.AllowRuntimeCompiledFallback)
 
+		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_CO_RE"))
 		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_FENTRY"))
 		assert.Equal(t, "false", os.Getenv("DD_ENABLE_EBPFLESS"))
 
@@ -35,6 +36,7 @@ func TestBuildModeConstants(t *testing.T) {
 		assert.False(t, cfg.EnableCORE)
 		assert.False(t, cfg.AllowPrebuiltFallback)
 		assert.False(t, cfg.AllowRuntimeCompiledFallback)
+		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_CO_RE"))
 		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_FENTRY"))
 		assert.Equal(t, "false", os.Getenv("DD_ENABLE_EBPFLESS"))
 
@@ -46,6 +48,7 @@ func TestBuildModeConstants(t *testing.T) {
 		assert.True(t, cfg.EnableCORE)
 		assert.False(t, cfg.AllowPrebuiltFallback)
 		assert.False(t, cfg.AllowRuntimeCompiledFallback)
+		assert.Equal(t, "true", os.Getenv("DD_NETWORK_CONFIG_ENABLE_CO_RE"))
 		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_FENTRY"))
 		assert.Equal(t, "false", os.Getenv("DD_ENABLE_EBPFLESS"))
 
@@ -57,6 +60,7 @@ func TestBuildModeConstants(t *testing.T) {
 		assert.True(t, cfg.EnableCORE)
 		assert.False(t, cfg.AllowPrebuiltFallback)
 		assert.False(t, cfg.AllowRuntimeCompiledFallback)
+		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_CO_RE"))
 		assert.Equal(t, "true", os.Getenv("DD_NETWORK_CONFIG_ENABLE_FENTRY"))
 		assert.Equal(t, "false", os.Getenv("DD_ENABLE_EBPFLESS"))
 
@@ -68,9 +72,23 @@ func TestBuildModeConstants(t *testing.T) {
 		assert.False(t, cfg.EnableCORE)
 		assert.False(t, cfg.AllowPrebuiltFallback)
 		assert.False(t, cfg.AllowRuntimeCompiledFallback)
+		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_CO_RE"))
 		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_FENTRY"))
 		assert.Equal(t, "true", os.Getenv("DD_ENABLE_EBPFLESS"))
 
 		assert.Equal(t, Ebpfless, GetBuildMode())
+	})
+	TestBuildMode(t, SK, "", func(t *testing.T) {
+		cfg := ebpf.NewConfig()
+		assert.False(t, cfg.EnableRuntimeCompiler)
+		assert.True(t, cfg.EnableCORE)
+		assert.False(t, cfg.AllowPrebuiltFallback)
+		assert.False(t, cfg.AllowRuntimeCompiledFallback)
+		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_CO_RE"))
+		assert.Equal(t, "false", os.Getenv("DD_NETWORK_CONFIG_ENABLE_FENTRY"))
+		assert.Equal(t, "false", os.Getenv("DD_ENABLE_EBPFLESS"))
+		assert.Equal(t, "true", os.Getenv("DD_NETWORK_CONFIG_ENABLE_SK_TRACER"))
+
+		assert.Equal(t, SK, GetBuildMode())
 	})
 }

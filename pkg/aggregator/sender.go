@@ -6,7 +6,7 @@
 package aggregator
 
 import (
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 
@@ -17,6 +17,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
 	"github.com/DataDog/datadog-agent/pkg/serializer/types"
+	"github.com/DataDog/datadog-agent/pkg/util/infratags"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -30,6 +31,7 @@ type RawSender interface {
 // checkSender implements Sender
 type checkSender struct {
 	id                      checkid.ID
+	metricSource            metrics.MetricSource
 	defaultHostname         string
 	defaultHostnameDisabled bool
 	metricStats             stats.SenderStats
@@ -42,6 +44,7 @@ type checkSender struct {
 	orchestratorManifestOut chan<- senderOrchestratorManifest
 	eventPlatformOut        chan<- senderEventPlatformEvent
 	checkTags               []string
+	infraTagger             *infratags.Tagger // nil = no infra mode tagging
 	service                 string
 	noIndex                 bool
 }
@@ -105,6 +108,7 @@ func newCheckSender(
 ) *checkSender {
 	return &checkSender{
 		id:                      id,
+		metricSource:            metrics.CheckNameToMetricSource(checkid.IDToCheckName(id)),
 		defaultHostname:         defaultHostname,
 		itemsOut:                itemsOut,
 		serviceCheckOut:         serviceCheckOut,
@@ -129,6 +133,11 @@ func (s *checkSender) SetCheckCustomTags(tags []string) {
 	s.checkTags = tags
 }
 
+// SetInfraTagger sets the Tagger that appends infra_mode tags to every metric sample.
+func (s *checkSender) SetInfraTagger(tagger *infratags.Tagger) {
+	s.infraTagger = tagger
+}
+
 // SetCheckService appends the service as a tag for metrics, events, and service checks
 // This may be called any number of times, though the only the last call will have an effect
 func (s *checkSender) SetCheckService(service string) {
@@ -138,7 +147,7 @@ func (s *checkSender) SetCheckService(service string) {
 // FinalizeCheckServiceTag appends the service as a tag for metrics, events, and service checks
 func (s *checkSender) FinalizeCheckServiceTag() {
 	if s.service != "" {
-		s.checkTags = append(s.checkTags, fmt.Sprintf("service:%s", s.service))
+		s.checkTags = append(s.checkTags, "service:"+s.service)
 	}
 }
 
@@ -184,6 +193,8 @@ func (s *checkSender) sendMetricSample(
 	timestamp float64,
 ) {
 	tags = append(tags, s.checkTags...)
+	// add infra tags only for metrics
+	tags = s.infraTagger.AppendTags(tags)
 
 	if log.ShouldLog(log.TraceLvl) {
 		log.Trace(mType.String(), " sample: ", metric, ": ", value, " for hostname: ", hostname, " tags: ", tags)
@@ -203,7 +214,7 @@ func (s *checkSender) sendMetricSample(
 		Timestamp:       timestamp,
 		FlushFirstValue: flushFirstValue,
 		NoIndex:         s.noIndex || noIndex,
-		Source:          metrics.CheckNameToMetricSource(checkid.IDToCheckName(s.id)),
+		Source:          s.metricSource,
 	}
 
 	if hostname == "" && !s.defaultHostnameDisabled {
@@ -262,20 +273,48 @@ func (s *checkSender) Histogram(metric string, value float64, hostname string, t
 	s.sendMetricSample(metric, value, hostname, tags, metrics.HistogramType, false, false, 0)
 }
 
-// HistogramBucket should be called to directly send raw buckets to be submitted as distribution metrics
+// HistogramBucket should be called to send pre-aggregated histogram observations as a sketch,
+// providing compact, aggregatable representation for histograms with bounded error.
+//
+// value is the number of observations that fall between lowerBound and upperBound. Observations
+// will be spread proportionally over a range of sketch buckets.
+//
+// lowerBound and upperBound specify the range of observations counted by the bucket. To record
+// number of observations for a discrete number (e.g. a count itself), use the same value for both
+// bounds.
+//
+// monotonic flag indicates that value increases monotonically between calls, and a separate delta
+// for each bucket will be computed. First value for each bucket will not be reported because no
+// previous value to compute from, unless flushFirstValue is supplied (e.g. if caller knows that the
+// histogram started from zero recently).
 func (s *checkSender) HistogramBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool) {
-	tags = append(tags, s.checkTags...)
+	s.sendHistogramBucket(metric, value, lowerBound, upperBound, monotonic, hostname, tags, flushFirstValue, true)
+}
 
-	log.Tracef(
-		"Histogram Bucket %s submitted: %v [%f-%f] monotonic: %v for host %s tags: %v",
-		metric,
-		value,
-		lowerBound,
-		upperBound,
-		monotonic,
-		hostname,
-		tags,
-	)
+// OpenmetricsBucket should be called to directly send raw buckets to be submitted as distribution metrics.
+// It assumes a single bucket per (metric name, tags) context, as produced by Openmetrics/Prometheus
+// integrations that encode bucket bounds in the `lower_bound` tag.
+func (s *checkSender) OpenmetricsBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool) {
+	s.sendHistogramBucket(metric, value, lowerBound, upperBound, monotonic, hostname, tags, flushFirstValue, false)
+}
+
+func (s *checkSender) sendHistogramBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue, multipleBuckets bool) {
+	tags = append(tags, s.checkTags...)
+	// add infra tags only for metrics (same as sendMetricSample)
+	tags = s.infraTagger.AppendTags(tags)
+
+	if log.ShouldLog(log.TraceLvl) {
+		log.Tracef(
+			"Histogram Bucket %s submitted: %v [%f-%f] monotonic: %v for host %s tags: %v",
+			metric,
+			value,
+			lowerBound,
+			upperBound,
+			monotonic,
+			hostname,
+			tags,
+		)
+	}
 
 	histogramBucket := &metrics.HistogramBucket{
 		Name:            metric,
@@ -287,6 +326,7 @@ func (s *checkSender) HistogramBucket(metric string, value int64, lowerBound, up
 		Tags:            tags,
 		Timestamp:       timeNowNano(),
 		FlushFirstValue: flushFirstValue,
+		MultipleBuckets: multipleBuckets,
 	}
 
 	if hostname == "" && !s.defaultHostnameDisabled {
@@ -313,9 +353,10 @@ func (s *checkSender) Distribution(metric string, value float64, hostname string
 // GaugeWithTimestamp reports a new gauge value to the intake with the given timestamp.
 // Gauge time series measure a simple value over time.
 // Unlike Gauge(), each submitted value will be passed to the intake as is, without aggregation. Each time series can have only one value per timestamp.
+// The timestamp is in seconds since epoch (accepts fractional seconds)
 func (s *checkSender) GaugeWithTimestamp(metric string, value float64, hostname string, tags []string, timestamp float64) error {
 	if timestamp <= 0 {
-		return fmt.Errorf("invalid timestamp")
+		return errors.New("invalid timestamp")
 	}
 	s.sendMetricSample(metric, value, hostname, tags, metrics.GaugeWithTimestampType, false, false, timestamp)
 	return nil
@@ -324,9 +365,10 @@ func (s *checkSender) GaugeWithTimestamp(metric string, value float64, hostname 
 // CountWithTimestamp reports a new count value to the intake with the given timestamp.
 // Count time series measure how many times something happened in some time period.
 // Unlike Count(), each submitted value will be passed to the intake as is, without aggregation. Each time series can have only one value per timestamp.
+// The timestamp is in seconds since epoch (accepts fractional seconds)
 func (s *checkSender) CountWithTimestamp(metric string, value float64, hostname string, tags []string, timestamp float64) error {
 	if timestamp <= 0 {
-		return fmt.Errorf("invalid timestamp")
+		return errors.New("invalid timestamp")
 	}
 	s.sendMetricSample(metric, value, hostname, tags, metrics.CountWithTimestampType, false, false, timestamp)
 	return nil
@@ -340,7 +382,9 @@ func (s *checkSender) SendRawServiceCheck(sc *servicecheck.ServiceCheck) {
 
 // ServiceCheck submits a service check
 func (s *checkSender) ServiceCheck(checkName string, status servicecheck.ServiceCheckStatus, hostname string, tags []string, message string) {
-	log.Trace("Service check submitted: ", checkName, ": ", status.String(), " for hostname: ", hostname, " tags: ", tags)
+	if log.ShouldLog(log.TraceLvl) {
+		log.Trace("Service check submitted: ", checkName, ": ", status.String(), " for hostname: ", hostname, " tags: ", tags)
+	}
 	serviceCheck := servicecheck.ServiceCheck{
 		CheckName: checkName,
 		Status:    status,
@@ -365,7 +409,9 @@ func (s *checkSender) ServiceCheck(checkName string, status servicecheck.Service
 func (s *checkSender) Event(e event.Event) {
 	e.Tags = append(e.Tags, s.checkTags...)
 
-	log.Trace("Event submitted: ", e.Title, " for hostname: ", e.Host, " tags: ", e.Tags)
+	if log.ShouldLog(log.TraceLvl) {
+		log.Trace("Event submitted: ", e.Title, " for hostname: ", e.Host, " tags: ", e.Tags)
+	}
 
 	if e.Host == "" && !s.defaultHostnameDisabled {
 		e.Host = s.defaultHostname
@@ -415,7 +461,7 @@ func (sp *checkSenderPool) getSender(id checkid.ID) (sender.Sender, error) {
 	if sender, ok := sp.senders[id]; ok {
 		return sender, nil
 	}
-	return nil, fmt.Errorf("Sender not found")
+	return nil, errors.New("Sender not found")
 }
 
 func (sp *checkSenderPool) mkSender(id checkid.ID) (sender.Sender, error) {

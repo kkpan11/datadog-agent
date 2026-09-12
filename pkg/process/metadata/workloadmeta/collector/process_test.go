@@ -7,21 +7,24 @@ package collector
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/benbjohnson/clock"
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 
-	"github.com/DataDog/datadog-agent/comp/core"
-	compcfg "github.com/DataDog/datadog-agent/comp/core/config"
+	"github.com/DataDog/datadog-agent/comp/core/config"
+	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
 	workloadmetamock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/mock"
@@ -31,6 +34,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/process/procutil"
 	"github.com/DataDog/datadog-agent/pkg/process/procutil/mocks"
 	proccontainersmock "github.com/DataDog/datadog-agent/pkg/process/util/containers/mocks"
+	"github.com/DataDog/datadog-agent/pkg/process/util/coreagent"
 	pbgo "github.com/DataDog/datadog-agent/pkg/proto/pbgo/process"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/testutil"
@@ -49,10 +53,10 @@ type collectorTest struct {
 	mockProvider *proccontainersmock.MockContainerProvider
 }
 
-func acquireStream(t *testing.T, port int) pbgo.ProcessEntityStream_StreamEntitiesClient {
+func acquireStream(t *testing.T, port int, tlsConfig *tls.Config) pbgo.ProcessEntityStream_StreamEntitiesClient {
 	t.Helper()
 
-	cc, err := grpc.Dial(fmt.Sprintf("localhost:%v", port), grpc.WithTransportCredentials(insecure.NewCredentials())) //nolint:staticcheck // TODO (ASC) fix grpc.Dial is deprecated
+	cc, err := grpc.Dial(fmt.Sprintf("localhost:%v", port), grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))) //nolint:staticcheck // TODO (ASC) fix grpc.Dial is deprecated
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = cc.Close()
@@ -80,22 +84,24 @@ func setUpCollectorTest(t *testing.T) *collectorTest {
 	port, err := testutil.FindTCPPort()
 	require.NoError(t, err)
 
-	overrides := map[string]interface{}{
-		"process_config.language_detection.grpc_port":              port,
-		"workloadmeta.remote_process_collector.enabled":            true,
-		"workloadmeta.local_process_collector.collection_interval": 15 * time.Second,
-	}
+	ipcMock := ipcmock.New(t)
 
 	store := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
-		core.MockBundle(),
-		fx.Replace(compcfg.MockParams{Overrides: overrides}),
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		fx.Provide(func() config.Component {
+			return config.NewMockWithOverrides(t, map[string]interface{}{
+				"process_config.language_detection.grpc_port":              port,
+				"workloadmeta.remote_process_collector.enabled":            true,
+				"workloadmeta.local_process_collector.collection_interval": 15 * time.Second,
+			})
+		}),
 		fx.Supply(context.Background()),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 	))
 
 	// pass actual config component
 	wlmExtractor := workloadmetaExtractor.NewWorkloadMetaExtractor(store.GetConfig())
-	grpcServer := workloadmetaExtractor.NewGRPCServer(store.GetConfig(), wlmExtractor)
+	grpcServer := workloadmetaExtractor.NewGRPCServer(store.GetConfig(), wlmExtractor, ipcMock.GetTLSServerConfig())
 
 	mockProcessData, probe := checks.NewProcessDataWithMockProbe(t)
 	mockProcessData.Register(wlmExtractor)
@@ -123,7 +129,7 @@ func setUpCollectorTest(t *testing.T) *collectorTest {
 		probe:        probe,
 		clock:        mockClock,
 		store:        store,
-		stream:       acquireStream(t, port),
+		stream:       acquireStream(t, port, ipcMock.GetTLSClientConfig()),
 		mockProvider: mockProvider,
 	}
 }
@@ -167,14 +173,15 @@ func TestProcessCollector(t *testing.T) {
 	assert.Equal(t, testCid, evt.ContainerID)
 }
 
-// Assert that the collector is only enabled if the process check is disabled and
-// the remote process collector is enabled.
+// Assert that the collector is only enabled if the process check is disabled,
+// the remote process collector is enabled, and process checks are not running in the core agent.
+// On Linux, process checks always run in the core agent, so the collector is always disabled.
 func TestEnabled(t *testing.T) {
 	type testCase struct {
-		name                                                                           string
-		processCollectionEnabled, remoteProcessCollectorEnabled, runInCoreAgentEnabled bool
-		expectEnabled                                                                  bool
-		flavor                                                                         string
+		name                                                    string
+		processCollectionEnabled, remoteProcessCollectorEnabled bool
+		expectEnabled                                           bool
+		flavor                                                  string
 	}
 
 	testCases := []testCase{
@@ -182,7 +189,6 @@ func TestEnabled(t *testing.T) {
 			name:                          "process check enabled",
 			processCollectionEnabled:      true,
 			remoteProcessCollectorEnabled: false,
-			runInCoreAgentEnabled:         false,
 			flavor:                        flavor.ProcessAgent,
 			expectEnabled:                 false,
 		},
@@ -190,25 +196,17 @@ func TestEnabled(t *testing.T) {
 			name:                          "remote collector disabled",
 			processCollectionEnabled:      false,
 			remoteProcessCollectorEnabled: false,
-			runInCoreAgentEnabled:         false,
 			flavor:                        flavor.ProcessAgent,
 			expectEnabled:                 false,
 		},
 		{
-			name:                          "collector enabled",
+			name:                          "collector conditions met",
 			processCollectionEnabled:      false,
 			remoteProcessCollectorEnabled: true,
-			runInCoreAgentEnabled:         false,
 			flavor:                        flavor.ProcessAgent,
-			expectEnabled:                 true,
-		},
-		{
-			name:                          "collector enabled but in core agent",
-			processCollectionEnabled:      false,
-			remoteProcessCollectorEnabled: true,
-			runInCoreAgentEnabled:         true,
-			flavor:                        flavor.ProcessAgent,
-			expectEnabled:                 false,
+			// On Linux, always disabled because process checks run in core agent.
+			// On other platforms, enabled.
+			expectEnabled: !coreagent.ProcessChecksRunInCoreAgent(),
 		},
 	}
 
@@ -217,9 +215,8 @@ func TestEnabled(t *testing.T) {
 			setFlavor(t, tc.flavor)
 
 			cfg := configmock.New(t)
-			cfg.SetWithoutSource("process_config.process_collection.enabled", tc.processCollectionEnabled)
-			cfg.SetWithoutSource("language_detection.enabled", tc.remoteProcessCollectorEnabled)
-			cfg.SetWithoutSource("process_config.run_in_core_agent.enabled", tc.runInCoreAgentEnabled)
+			cfg.SetInTest("process_config.process_collection.enabled", tc.processCollectionEnabled)
+			cfg.SetInTest("language_detection.enabled", tc.remoteProcessCollectorEnabled)
 
 			assert.Equal(t, tc.expectEnabled, Enabled(cfg))
 		})

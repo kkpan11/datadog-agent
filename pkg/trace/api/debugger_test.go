@@ -6,7 +6,6 @@
 package api
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -81,9 +80,28 @@ func TestDebuggerProxyHandler(t *testing.T) {
 		assert.NoError(t, err)
 		conf := getConf()
 		conf.Hostname = "myhost"
-		conf.DebuggerDiagnosticsProxy.DDURL = srv.URL
+		conf.DebuggerIntakeProxy.DDURL = srv.URL
 		receiver := newTestReceiverFromConfig(conf)
 		receiver.debuggerDiagnosticsProxyHandler().ServeHTTP(httptest.NewRecorder(), req)
+		assert.True(t, called, "request not proxied")
+	})
+
+	t.Run("ok_v2_intake_proxy", func(t *testing.T) {
+		var called bool
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+			ddtags := req.URL.Query().Get("ddtags")
+			assert.False(t, strings.Contains(ddtags, "orchestrator"), "ddtags should not contain orchestrator: %v", ddtags)
+			assert.Equal(t, "host:myhost,default_env:test,agent_version:v1", ddtags)
+			called = true
+		}))
+		defer srv.Close()
+		req, err := http.NewRequest("POST", "/some/path", nil)
+		assert.NoError(t, err)
+		conf := getConf()
+		conf.Hostname = "myhost"
+		conf.DebuggerIntakeProxy.DDURL = srv.URL
+		receiver := newTestReceiverFromConfig(conf)
+		receiver.debuggerV2IntakeProxyHandler().ServeHTTP(httptest.NewRecorder(), req)
 		assert.True(t, called, "request not proxied")
 	})
 
@@ -98,7 +116,7 @@ func TestDebuggerProxyHandler(t *testing.T) {
 			called = true
 		}))
 		defer srv.Close()
-		req, err := http.NewRequest("POST", fmt.Sprintf("/some/path?ddtags=%s", tooLongString), nil)
+		req, err := http.NewRequest("POST", "/some/path?ddtags="+tooLongString, nil)
 		assert.NoError(t, err)
 		conf := getConf()
 		conf.Hostname = "myhost"
@@ -114,11 +132,11 @@ func TestDebuggerProxyHandler(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
 			ddtags := req.URL.Query().Get("ddtags")
 			assert.False(t, strings.Contains(ddtags, "orchestrator"), "ddtags should not contain orchestrator: %v", ddtags)
-			assert.Equal(t, fmt.Sprintf("host:myhost,default_env:test,agent_version:v1,%s", extraTag), ddtags)
+			assert.Equal(t, "host:myhost,default_env:test,agent_version:v1,"+extraTag, ddtags)
 			numCalls.Add(1)
 		}))
 		defer srv.Close()
-		req, err := http.NewRequest("POST", fmt.Sprintf("/some/path?ddtags=%s", extraTag), nil)
+		req, err := http.NewRequest("POST", "/some/path?ddtags="+extraTag, nil)
 		assert.NoError(t, err)
 		conf := getConf()
 		conf.Hostname = "myhost"
@@ -143,6 +161,7 @@ func TestDebuggerProxyHandler(t *testing.T) {
 		req, err := http.NewRequest("POST", "/some/path", nil)
 		assert.NoError(t, err)
 		conf := newTestReceiverConfig()
+		conf.DebuggerLogsEnabled = true
 		conf.Hostname = "myhost"
 		conf.FargateOrchestrator = "orchestrator"
 		conf.DebuggerProxy.DDURL = srv.URL
@@ -156,6 +175,7 @@ func TestDebuggerProxyHandler(t *testing.T) {
 		assert.NoError(t, err)
 		rec := httptest.NewRecorder()
 		conf := newTestReceiverConfig()
+		conf.DebuggerLogsEnabled = true
 		conf.Site = "asd:\r\n"
 		r := newTestReceiverFromConfig(conf)
 		r.debuggerLogsProxyHandler().ServeHTTP(rec, req)
@@ -273,9 +293,80 @@ func TestDebuggerProxyHandler(t *testing.T) {
 	})
 }
 
+func TestDebuggerProxyLogsDisabled(t *testing.T) {
+	t.Run("logs_proxy_drops_when_disabled", func(t *testing.T) {
+		var called bool
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			called = true
+		}))
+		defer srv.Close()
+		req, err := http.NewRequest("POST", "/some/path", strings.NewReader("body"))
+		assert.NoError(t, err)
+		conf := getConf()
+		conf.DebuggerLogsEnabled = false
+		conf.DebuggerProxy.DDURL = srv.URL
+		receiver := newTestReceiverFromConfig(conf)
+		rec := httptest.NewRecorder()
+		receiver.debuggerLogsProxyHandler().ServeHTTP(rec, req)
+		assert.False(t, called, "request should not be proxied when logs are disabled")
+		assert.Equal(t, http.StatusOK, rec.Result().StatusCode)
+	})
+
+	t.Run("v2_intake_proxy_drops_when_disabled", func(t *testing.T) {
+		var called bool
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			called = true
+		}))
+		defer srv.Close()
+		req, err := http.NewRequest("POST", "/some/path", strings.NewReader("body"))
+		assert.NoError(t, err)
+		conf := getConf()
+		conf.DebuggerLogsEnabled = false
+		conf.DebuggerIntakeProxy.DDURL = srv.URL
+		receiver := newTestReceiverFromConfig(conf)
+		rec := httptest.NewRecorder()
+		receiver.debuggerV2IntakeProxyHandler().ServeHTTP(rec, req)
+		assert.False(t, called, "request should not be proxied when logs are disabled")
+		assert.Equal(t, http.StatusOK, rec.Result().StatusCode)
+	})
+
+	t.Run("drains_body_when_disabled", func(t *testing.T) {
+		req, err := http.NewRequest("POST", "/some/path", strings.NewReader(strings.Repeat("x", 1024)))
+		assert.NoError(t, err)
+		conf := getConf()
+		conf.DebuggerLogsEnabled = false
+		receiver := newTestReceiverFromConfig(conf)
+		rec := httptest.NewRecorder()
+		receiver.debuggerV2IntakeProxyHandler().ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Result().StatusCode)
+		// Body must be fully consumed so large uploads get a clean 200 instead of a connection reset.
+		remaining, err := io.ReadAll(req.Body)
+		assert.NoError(t, err)
+		assert.Empty(t, remaining, "handler must drain the request body")
+	})
+
+	t.Run("bounds_body_drain_when_disabled", func(t *testing.T) {
+		req, err := http.NewRequest("POST", "/some/path", strings.NewReader(strings.Repeat("x", 1024)))
+		assert.NoError(t, err)
+		conf := getConf()
+		conf.DebuggerLogsEnabled = false
+		conf.MaxRequestBytes = 10
+		receiver := newTestReceiverFromConfig(conf)
+		rec := httptest.NewRecorder()
+		receiver.debuggerV2IntakeProxyHandler().ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Result().StatusCode)
+		// The drain must stop at MaxRequestBytes so we never wait on an unbounded body.
+		remaining, err := io.ReadAll(req.Body)
+		assert.NoError(t, err)
+		assert.Len(t, remaining, 1024-10, "handler must bound the drain to MaxRequestBytes")
+	})
+}
+
 func getConf() *traceconfig.AgentConfig {
 	conf := newTestReceiverConfig()
 	conf.DebuggerProxy.AdditionalEndpoints = make(map[string][]string)
+	conf.DebuggerIntakeProxy.AdditionalEndpoints = make(map[string][]string)
+	conf.DebuggerLogsEnabled = true
 	conf.DefaultEnv = "test"
 	conf.Hostname = "myhost"
 	conf.AgentVersion = "v1"

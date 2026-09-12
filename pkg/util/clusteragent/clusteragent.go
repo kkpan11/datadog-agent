@@ -8,7 +8,6 @@ package clusteragent
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	nativeerrors "errors"
 	"fmt"
@@ -16,12 +15,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
 
 	"github.com/DataDog/datadog-agent/pkg/api/security"
+	pkgapiutil "github.com/DataDog/datadog-agent/pkg/api/util"
 	apiv1 "github.com/DataDog/datadog-agent/pkg/clusteragent/api/v1"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
@@ -56,13 +57,26 @@ type Metadata struct {
 	Labels      map[string]string
 }
 
-// DCAClientInterface  is required to query the API of Datadog cluster agent
+// NodeSystemInfo is the subset of NodeSystemInfo from k8s.io/api/core/v1
+type NodeSystemInfo struct {
+	KernelVersion           string
+	OSImage                 string
+	ContainerRuntimeVersion string
+	KubeletVersion          string
+	OperatingSystem         string
+	Architecture            string
+}
+
+// DCAClientInterface is required to query the API of Datadog cluster agent
 type DCAClientInterface interface {
 	Version(withRefresh bool) version.Version
 	ClusterAgentAPIEndpoint() string
 
 	GetNodeLabels(nodeName string) (map[string]string, error)
 	GetNodeAnnotations(nodeName string, filter ...string) (map[string]string, error)
+	GetNodeInfo(nodeName string, filter ...string) (*NodeSystemInfo, error)
+
+	GetNodeUID(nodeName string) (string, error)
 	GetNamespaceLabels(nsName string) (map[string]string, error)
 	GetNamespaceMetadata(nsName string) (*Metadata, error)
 	GetPodsMetadataForNode(nodeName string) (apiv1.NamespacesPodsStringsSet, error)
@@ -90,6 +104,10 @@ type DCAClient struct {
 	clusterAgentVersion    version.Version // Version of the cluster-agent we're connected to
 	clusterAgentAPIClient  *http.Client
 	leaderClient           *leaderClient
+
+	// reconnectHandlerOnce ensures startReconnectHandler is only ever started once for
+	// this DCAClient, even if init() runs concurrently (e.g. via overlapping retries).
+	reconnectHandlerOnce sync.Once
 }
 
 // resetGlobalClusterAgentClient is a helper to remove the current DCAClient global
@@ -99,7 +117,7 @@ func resetGlobalClusterAgentClient() {
 }
 
 // GetClusterAgentClient returns or init the DCAClient
-func GetClusterAgentClient() (DCAClientInterface, error) {
+func GetClusterAgentClient() (*DCAClient, error) {
 	if globalClusterAgentClient == nil {
 		globalClusterAgentClient = &DCAClient{}
 		globalClusterAgentClient.initRetry.SetupRetrier(&retry.Config{ //nolint:errcheck
@@ -120,7 +138,7 @@ func GetClusterAgentClient() (DCAClientInterface, error) {
 func (c *DCAClient) init() error {
 	var err error
 
-	c.clusterAgentAPIEndpoint, err = utils.GetClusterAgentEndpoint()
+	endpoint, err := utils.GetClusterAgentEndpoint()
 	if err != nil {
 		return err
 	}
@@ -130,17 +148,31 @@ func (c *DCAClient) init() error {
 		return err
 	}
 
-	c.clusterAgentAPIRequestHeaders = http.Header{}
-	c.clusterAgentAPIRequestHeaders.Set(authorizationHeaderKey, fmt.Sprintf("Bearer %s", authToken))
+	headers := http.Header{}
+	headers.Set(authorizationHeaderKey, "Bearer "+authToken)
 	podIP := pkgconfigsetup.Datadog().GetString("clc_runner_host")
-	c.clusterAgentAPIRequestHeaders.Set(RealIPHeader, podIP)
+	headers.Set(RealIPHeader, podIP)
+
+	// init() can run concurrently with readers (buildURL/doQuery/ClusterAgentAPIEndpoint)
+	// via GetClusterAgentClient retries racing with ClusterChecksConfigProvider.IsUpToDate.
+	// Guard the endpoint and request headers with the same lock that protects the
+	// HTTP client and version (see #54638); build the values on locals first so we
+	// don't hold the lock while doing config lookups.
+	c.clusterAgentClientLock.Lock()
+	c.clusterAgentAPIEndpoint = endpoint
+	c.clusterAgentAPIRequestHeaders = headers
+	c.clusterAgentClientLock.Unlock()
 
 	if err := c.initHTTPClient(); err != nil {
 		return err
 	}
 
-	// Run DCA connection refresh
-	c.startReconnectHandler(time.Duration(pkgconfigsetup.Datadog().GetInt64("cluster_agent.client_reconnect_period_seconds")) * time.Second)
+	// Run DCA connection refresh. Guarded by a sync.Once so that concurrent calls to
+	// init() (e.g. overlapping retries from GetClusterAgentClient) don't spawn multiple
+	// reconnect-handler goroutines racing on this DCAClient's state.
+	c.reconnectHandlerOnce.Do(func() {
+		c.startReconnectHandler(time.Duration(pkgconfigsetup.Datadog().GetInt64("cluster_agent.client_reconnect_period_seconds")) * time.Second)
+	})
 
 	log.Infof("Successfully connected to the Datadog Cluster Agent %s", c.clusterAgentVersion.String())
 	return nil
@@ -166,6 +198,13 @@ func (c *DCAClient) startReconnectHandler(reconnectPeriod time.Duration) {
 
 func (c *DCAClient) initHTTPClient() error {
 	var err error
+
+	// Get Cross Node Client TLS Config
+	tlsConfig, err := pkgapiutil.GetCrossNodeClientTLSConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get cross-node client TLS config: %w", err)
+	}
+
 	// Copy of http.DefaulTransport with adapted settings
 	clusterAgentAPIClient := &http.Client{
 		Transport: &http.Transport{
@@ -175,7 +214,7 @@ func (c *DCAClient) initHTTPClient() error {
 				KeepAlive: 20 * time.Second,
 			}).DialContext,
 			ForceAttemptHTTP2:     false,
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig:       tlsConfig,
 			TLSHandshakeTimeout:   5 * time.Second,
 			MaxConnsPerHost:       1,
 			MaxIdleConnsPerHost:   1,
@@ -187,9 +226,11 @@ func (c *DCAClient) initHTTPClient() error {
 	}
 
 	// We need to have a client to perform `GetVersion`, only happens during the first call
+	c.clusterAgentClientLock.Lock()
 	if c.clusterAgentAPIClient == nil {
 		c.clusterAgentAPIClient = clusterAgentAPIClient
 	}
+	c.clusterAgentClientLock.Unlock()
 
 	// Validate the cluster-agent client by checking the version
 	clusterAgentVersion, err := c.getVersion()
@@ -238,6 +279,8 @@ func (c *DCAClient) Version(withRefresh bool) version.Version {
 
 // ClusterAgentAPIEndpoint returns the Agent API Endpoint URL as a string
 func (c *DCAClient) ClusterAgentAPIEndpoint() string {
+	c.clusterAgentClientLock.RLock()
+	defer c.clusterAgentClientLock.RUnlock()
 	return c.clusterAgentAPIEndpoint
 }
 
@@ -247,7 +290,17 @@ func (c *DCAClient) buildURL(useLeaderClient bool, path string) string {
 		return c.leaderClient.buildURL(path)
 	}
 
+	c.clusterAgentClientLock.RLock()
+	defer c.clusterAgentClientLock.RUnlock()
 	return c.clusterAgentAPIEndpoint + "/" + path
+}
+
+// requestHeaders returns a copy of the request headers safe to mutate. It takes the
+// read lock so it doesn't race with init() rebuilding the headers.
+func (c *DCAClient) requestHeaders() http.Header {
+	c.clusterAgentClientLock.RLock()
+	defer c.clusterAgentClientLock.RUnlock()
+	return c.clusterAgentAPIRequestHeaders.Clone()
 }
 
 // TODO: remove when we drop compatibility with older Agents, see end of `init()`
@@ -269,7 +322,7 @@ func (c *DCAClient) doQuery(ctx context.Context, path, method string, body io.Re
 	if err != nil {
 		return nil, fmt.Errorf("unable to build request during query to: %s, err: %w", url, err)
 	}
-	req.Header = c.clusterAgentAPIRequestHeaders
+	req.Header = c.requestHeaders()
 
 	client := c.httpClient(useLeaderClient)
 	resp, err := client.Do(req)
@@ -351,6 +404,20 @@ func (c *DCAClient) GetNamespaceLabels(nsName string) (map[string]string, error)
 	return result, err
 }
 
+// GetNodeUID returns the node UID from the Cluster Agent.
+func (c *DCAClient) GetNodeUID(nodeName string) (string, error) {
+	var result map[string]string
+
+	err := c.doJSONQuery(context.TODO(), "api/v1/uid/node/"+nodeName, "GET", nil, &result, false)
+	log.Debugf("GetNodeUID from DCA for node '%s': %v", nodeName, result)
+
+	if err != nil {
+		log.Debugf("Error getting node UID from DCA: %v", err)
+		return "", err
+	}
+	return result["uid"], nil
+}
+
 // GetNamespaceMetadata returns the namespace metadata from the Cluster Agent.
 func (c *DCAClient) GetNamespaceMetadata(nsName string) (*Metadata, error) {
 	var result Metadata
@@ -362,7 +429,7 @@ func (c *DCAClient) GetNamespaceMetadata(nsName string) (*Metadata, error) {
 func (c *DCAClient) GetNodeAnnotations(nodeName string, filter ...string) (map[string]string, error) {
 	var result map[string]string
 
-	base := fmt.Sprintf("api/v1/annotations/node/%s", nodeName)
+	base := "api/v1/annotations/node/" + nodeName
 	path, err := buildQueryList(base, "filter", filter)
 	if err != nil {
 		return result, err
@@ -370,6 +437,19 @@ func (c *DCAClient) GetNodeAnnotations(nodeName string, filter ...string) (map[s
 
 	err = c.doJSONQuery(context.TODO(), path, "GET", nil, &result, false)
 	return result, err
+}
+
+// GetNodeInfo returns the node system info from the Cluster Agent.
+func (c *DCAClient) GetNodeInfo(nodeName string, filter ...string) (*NodeSystemInfo, error) {
+	ni := NodeSystemInfo{}
+	base := "api/v1/info/node/" + nodeName
+	path, err := buildQueryList(base, "filter", filter)
+	if err != nil {
+		return nil, err
+	}
+
+	err = c.doJSONQuery(context.TODO(), path, "GET", nil, &ni, false)
+	return &ni, err
 }
 
 // GetCFAppsMetadataForNode returns the CF application tags from the Cluster Agent.
@@ -462,13 +542,18 @@ func buildQueryList(path string, key string, list []string) (string, error) {
 
 	encodedKey := url.QueryEscape(key)
 
+	var builder strings.Builder
+	builder.WriteString(path)
 	for i, val := range list {
 		encodedVal := url.QueryEscape(val)
 		if i == 0 {
-			path = path + fmt.Sprintf("?%s=%s", encodedKey, encodedVal) // first parameter starts with a ?
+			builder.WriteString("?") // first parameter starts with a ?
 		} else {
-			path = path + fmt.Sprintf("&%s=%s", encodedKey, encodedVal) // the rest start with &
+			builder.WriteString("&") // the rest start with &
 		}
+		builder.WriteString(encodedKey)
+		builder.WriteString("=")
+		builder.WriteString(encodedVal)
 	}
-	return path, nil
+	return builder.String(), nil
 }

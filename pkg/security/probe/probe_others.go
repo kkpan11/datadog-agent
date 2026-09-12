@@ -17,6 +17,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/secl/containerutils"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
+	"github.com/DataDog/datadog-agent/pkg/security/utils"
 )
 
 // PlatformProbe represents the no-op platform probe on unsupported platforms
@@ -42,7 +43,7 @@ func (p *Probe) AddEventHandler(_ EventHandler) error {
 }
 
 // AddCustomEventHandler set the probe event handler
-func (p *Probe) AddCustomEventHandler(_ model.EventType, _ CustomEventHandler) error {
+func (p *Probe) AddCustomEventHandler(_ CustomEventHandler) error {
 	return nil
 }
 
@@ -52,12 +53,17 @@ func (p *Probe) NewRuleSet(_ map[eval.EventType]bool) *rules.RuleSet {
 }
 
 // ApplyRuleSet setup the probes for the provided set of rules and returns the policy report.
-func (p *Probe) ApplyRuleSet(_ *rules.RuleSet) (*kfilters.FilterReport, error) {
-	return nil, nil
+func (p *Probe) ApplyRuleSet(_ *rules.RuleSet) (*kfilters.FilterReport, bool, error) {
+	return nil, false, nil
 }
 
 // OnNewRuleSetLoaded resets statistics and states once a new rule set is loaded
 func (p *Probe) OnNewRuleSetLoaded(_ *rules.RuleSet) {
+}
+
+// ShouldEvaluateDiscarders returns whether discarder evaluation should proceed for the given event
+func (p *Probe) ShouldEvaluateDiscarders(_ *model.Event) bool {
+	return false
 }
 
 // OnNewDiscarder is called when a new discarder is found. We currently don't generate discarders on Windows.
@@ -67,6 +73,11 @@ func (p *Probe) OnNewDiscarder(_ *rules.RuleSet, _ *model.Event, _ eval.Field, _
 // GetService returns the service name from the process tree
 func (p *Probe) GetService(_ *model.Event) string {
 	return ""
+}
+
+// GetScrubber returns the event scrubber
+func (p *Probe) GetScrubber() *utils.Scrubber {
+	return nil
 }
 
 // GetEventTags returns the event tags
@@ -79,6 +90,10 @@ func (p *Probe) IsNetworkEnabled() bool {
 	return p.Config.Probe.NetworkEnabled
 }
 
+// ReplayEvents replays the events from the rule set
+func (p *Probe) ReplayEvents() {
+}
+
 // IsNetworkRawPacketEnabled returns whether network raw packet is enabled
 func (p *Probe) IsNetworkRawPacketEnabled() bool {
 	return p.IsNetworkEnabled() && p.Config.Probe.NetworkRawPacketEnabled
@@ -87,6 +102,11 @@ func (p *Probe) IsNetworkRawPacketEnabled() bool {
 // IsNetworkFlowMonitorEnabled returns whether the network flow monitor is enabled
 func (p *Probe) IsNetworkFlowMonitorEnabled() bool {
 	return p.IsNetworkEnabled() && p.Config.Probe.NetworkFlowMonitorEnabled
+}
+
+// IsCapabilitiesMonitoringEnabled returns whether capabilities monitoring is enabled
+func (p *Probe) IsCapabilitiesMonitoringEnabled() bool {
+	return p.Config.Probe.CapabilitiesMonitoringEnabled
 }
 
 // IsActivityDumpEnabled returns whether activity dump is enabled
@@ -112,6 +132,9 @@ func (p *Probe) RefreshUserCache(_ containerutils.ContainerID) error {
 // HandleActions executes the actions of a triggered rule
 func (p *Probe) HandleActions(_ *rules.Rule, _ eval.Event) {}
 
+// EnrichRuleEvent is a no-op on unsupported platforms
+func (p *Probe) EnrichRuleEvent(_ *model.Event) {}
+
 // EnableEnforcement sets the enforcement mode
 func (p *Probe) EnableEnforcement(_ bool) {}
 
@@ -123,3 +146,6 @@ func (p *Probe) GetAgentContainerContext() *events.AgentContainerContext {
 // Walk iterates through the entire tree and call the provided callback on each entry
 func (p *Probe) Walk(_ func(*model.ProcessCacheEntry)) {
 }
+
+// SendCustomEventKillAction is a no-op on unsupported platforms (remediation custom events are Linux-only).
+func (p *Probe) SendCustomEventKillAction(_ model.ActionReport, _ []string) {}

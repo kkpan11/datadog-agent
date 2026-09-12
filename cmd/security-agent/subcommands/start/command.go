@@ -15,6 +15,7 @@ import (
 	_ "net/http/pprof" // Blank import used because this isn't directly used in this file
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,44 +26,54 @@ import (
 
 	"github.com/DataDog/datadog-agent/cmd/security-agent/api"
 	"github.com/DataDog/datadog-agent/cmd/security-agent/command"
-	"github.com/DataDog/datadog-agent/cmd/security-agent/subcommands/compliance"
-	"github.com/DataDog/datadog-agent/comp/agent/autoexit"
-	"github.com/DataDog/datadog-agent/comp/agent/autoexit/autoexitimpl"
+	autoexit "github.com/DataDog/datadog-agent/comp/agent/autoexit/def"
+	autoexitfx "github.com/DataDog/datadog-agent/comp/agent/autoexit/fx"
 	"github.com/DataDog/datadog-agent/comp/core"
+	agenttelemetryfx "github.com/DataDog/datadog-agent/comp/core/agenttelemetry/fx"
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/configsync/configsyncimpl"
+	configstreamconsumer "github.com/DataDog/datadog-agent/comp/core/configstreamconsumer/def"
+	configstreamconsumerfx "github.com/DataDog/datadog-agent/comp/core/configstreamconsumer/fx"
+	configsync "github.com/DataDog/datadog-agent/comp/core/configsync/def"
+	configsyncfx "github.com/DataDog/datadog-agent/comp/core/configsync/fx"
+	fxinstrumentation "github.com/DataDog/datadog-agent/comp/core/fxinstrumentation/fx"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/remotehostnameimpl"
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/pid"
-	"github.com/DataDog/datadog-agent/comp/core/pid/pidimpl"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	"github.com/DataDog/datadog-agent/comp/core/settings"
-	"github.com/DataDog/datadog-agent/comp/core/settings/settingsimpl"
+	pid "github.com/DataDog/datadog-agent/comp/core/pid/def"
+	pidimpl "github.com/DataDog/datadog-agent/comp/core/pid/impl"
+	remoteagentfx "github.com/DataDog/datadog-agent/comp/core/remoteagent/fx-securityagent"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	settings "github.com/DataDog/datadog-agent/comp/core/settings/def"
+	settingsfx "github.com/DataDog/datadog-agent/comp/core/settings/fx"
 	"github.com/DataDog/datadog-agent/comp/core/status"
 	"github.com/DataDog/datadog-agent/comp/core/status/statusimpl"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig"
-	"github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/sysprobeconfigimpl"
+	sysprobeconfig "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
+	sysprobeconfigimpl "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/impl"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	remoteTaggerfx "github.com/DataDog/datadog-agent/comp/core/tagger/fx-remote"
-	taggerTypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	remoteWorkloadfilterfx "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-remote"
 	wmcatalog "github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/catalog-remote"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafx "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/statsd"
+	statsd "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd/def"
+	statsdFx "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd/fx"
 	logscompression "github.com/DataDog/datadog-agent/comp/serializer/logscompression/def"
 	logscompressionfx "github.com/DataDog/datadog-agent/comp/serializer/logscompression/fx"
-	"github.com/DataDog/datadog-agent/pkg/api/security"
 	"github.com/DataDog/datadog-agent/pkg/collector/python"
-	pkgCompliance "github.com/DataDog/datadog-agent/pkg/compliance"
+	"github.com/DataDog/datadog-agent/pkg/compliance"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	commonsettings "github.com/DataDog/datadog-agent/pkg/config/settings"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
+	ddruntime "github.com/DataDog/datadog-agent/pkg/runtime"
 	"github.com/DataDog/datadog-agent/pkg/security/agent"
-	"github.com/DataDog/datadog-agent/pkg/security/utils/hostnameutils"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
 	"github.com/DataDog/datadog-agent/pkg/util/coredump"
+	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	"github.com/DataDog/datadog-agent/pkg/util/profiling"
 	"github.com/DataDog/datadog-agent/pkg/util/startstop"
@@ -95,40 +106,31 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 				fx.Supply(core.BundleParams{
 					ConfigParams:         config.NewSecurityAgentParams(params.ConfigFilePaths, config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
 					SysprobeConfigParams: sysprobeconfigimpl.NewParams(sysprobeconfigimpl.WithSysProbeConfFilePath(globalParams.SysProbeConfFilePath), sysprobeconfigimpl.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
-					SecretParams:         secrets.NewEnabledParams(),
-					LogParams:            log.ForDaemon(command.LoggerName, "security_agent.log_file", pkgconfigsetup.DefaultSecurityAgentLogFile),
+					LogParams:            log.ForDaemon(command.LoggerName, "security_agent.log_file", defaultpaths.GetDefaultSecurityAgentLogFile()),
 				}),
-				core.Bundle(),
-				statsd.Module(),
+				core.Bundle(core.WithSecrets()),
+				remotehostnameimpl.Module(),
+				statsdFx.Module(),
 				// workloadmeta setup
 				wmcatalog.GetCatalog(),
 				workloadmetafx.Module(workloadmeta.Params{
 					AgentType: workloadmeta.Remote,
 				}),
-				remoteTaggerfx.Module(tagger.RemoteParams{
-					RemoteTarget: func(c config.Component) (string, error) {
-						return fmt.Sprintf(":%v", c.GetInt("cmd_port")), nil
-					},
-					RemoteTokenFetcher: func(c config.Component) func() (string, error) {
-						return func() (string, error) {
-							return security.FetchAuthToken(c)
-						}
-					},
-					RemoteFilter: taggerTypes.NewMatchAllFilter(),
-				}),
+				remoteWorkloadfilterfx.Module(),
+				remoteTaggerfx.Module(tagger.NewRemoteParams()),
 				fx.Provide(func() startstop.Stopper {
 					return startstop.NewSerialStopper()
 				}),
 				fx.Provide(func(config config.Component, statsd statsd.Component) (ddgostatsd.ClientInterface, error) {
-					return statsd.CreateForHostPort(pkgconfigsetup.GetBindHost(config), config.GetInt("dogstatsd_port"))
+					return statsd.CreateForHostPort(configutils.GetBindHost(config), config.GetInt("dogstatsd_port"))
 				}),
-				fx.Provide(func(stopper startstop.Stopper, log log.Component, config config.Component, statsdClient ddgostatsd.ClientInterface, wmeta workloadmeta.Component, compression logscompression.Component) (status.InformationProvider, *agent.RuntimeSecurityAgent, error) {
-					hostnameDetected, err := hostnameutils.GetHostnameWithContextAndFallback(context.TODO())
+				fx.Provide(func(stopper startstop.Stopper, log log.Component, config config.Component, statsdClient ddgostatsd.ClientInterface, compression logscompression.Component, hostname hostnameinterface.Component, secretsComp secrets.Component) (status.InformationProvider, *agent.RuntimeSecurityAgent, error) {
+					hostnameDetected, err := hostname.Get(context.TODO())
 					if err != nil {
 						return status.NewInformationProvider(nil), nil, err
 					}
 
-					runtimeAgent, err := agent.StartRuntimeSecurity(log, config, hostnameDetected, stopper, statsdClient, wmeta, compression)
+					runtimeAgent, err := agent.StartRuntimeSecurity(log, config, hostnameDetected, stopper, statsdClient, compression, secretsComp)
 					if err != nil {
 						return status.NewInformationProvider(nil), nil, err
 					}
@@ -140,14 +142,25 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					// TODO - components: Do not remove runtimeAgent ref until "github.com/DataDog/datadog-agent/pkg/security/agent" is a component so they're not GCed
 					return status.NewInformationProvider(runtimeAgent.StatusProvider()), runtimeAgent, nil
 				}),
-				fx.Provide(func(stopper startstop.Stopper, log log.Component, config config.Component, statsdClient ddgostatsd.ClientInterface, sysprobeconfig sysprobeconfig.Component, wmeta workloadmeta.Component, compression logscompression.Component) (status.InformationProvider, *pkgCompliance.Agent, error) {
-					hostnameDetected, err := hostnameutils.GetHostnameWithContextAndFallback(context.TODO())
+				fx.Provide(func(stopper startstop.Stopper, log log.Component, config config.Component, statsdClient ddgostatsd.ClientInterface, sysprobeconfig sysprobeconfig.Component, wmeta workloadmeta.Component, filterStore workloadfilter.Component, compression logscompression.Component, hostname hostnameinterface.Component, secretsComp secrets.Component) (status.InformationProvider, *compliance.Agent, error) {
+					// Check if compliance should run in system-probe instead
+					if config.GetBool("compliance_config.run_in_system_probe") {
+						log.Info("compliance_config.run_in_system_probe is enabled, compliance will run in system-probe")
+						return status.NewInformationProvider(nil), nil, nil
+					}
+
+					hostnameDetected, err := hostname.Get(context.TODO())
 					if err != nil {
 						return status.NewInformationProvider(nil), nil, err
 					}
 
+					var sysProbeClient compliance.SysProbeClient
+					if cfg := sysprobeconfig.SysProbeObject(); cfg != nil && cfg.SocketAddress != "" {
+						sysProbeClient = compliance.NewRemoteSysProbeClient(cfg.SocketAddress)
+					}
+
 					// start compliance security agent
-					complianceAgent, err := compliance.StartCompliance(log, config, sysprobeconfig, hostnameDetected, stopper, statsdClient, wmeta, compression)
+					complianceAgent, err := compliance.StartCompliance(log, config, hostnameDetected, stopper, statsdClient, wmeta, filterStore, compression, sysProbeClient, secretsComp)
 					if err != nil {
 						return status.NewInformationProvider(nil), nil, err
 					}
@@ -165,20 +178,23 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 					},
 				),
 				statusimpl.Module(),
-				configsyncimpl.Module(configsyncimpl.NewDefaultParams()),
-				autoexitimpl.Module(),
+				configsyncfx.Module(configsync.NewDefaultParams()),
+				autoexitfx.Module(),
 				fx.Supply(pidimpl.NewParams(params.pidfilePath)),
 				fx.Provide(func(c config.Component) settings.Params {
 					return settings.Params{
-						Settings: map[string]settings.RuntimeSetting{
-							"log_level": commonsettings.NewLogLevelRuntimeSetting(),
-						},
-						Config: c,
+						Settings: RuntimeSettings(),
+						Config:   c,
 					}
 				}),
-				settingsimpl.Module(),
+				settingsfx.Module(),
 				logscompressionfx.Module(),
 				ipcfx.ModuleReadWrite(),
+				remoteagentfx.Module(),
+				fxinstrumentation.Module(),
+				fx.Supply(configstreamconsumer.NewParams("security-agent", params.ConfigFilePaths[0])),
+				configstreamconsumerfx.Module(),
+				agenttelemetryfx.Module(),
 			)
 		},
 	}
@@ -195,6 +211,15 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 // injected instance.
 func start(log log.Component, config config.Component, secrets secrets.Component, _ statsd.Component, _ sysprobeconfig.Component, telemetry telemetry.Component, statusComponent status.Component, _ pid.Component, _ autoexit.Component, settings settings.Component, wmeta workloadmeta.Component, ipc ipc.Component) error {
 	defer StopAgent(log)
+
+	// prepare go runtime
+	ddruntime.SetMaxProcs()
+
+	if config.GetBool("security_agent.disable_thp") {
+		if err := ddruntime.DisableTransparentHugePages(); err != nil {
+			log.Warnf("cannot disable transparent huge pages, performance may be degraded: %s", err)
+		}
+	}
 
 	err := RunAgent(log, config, secrets, telemetry, statusComponent, settings, wmeta, ipc)
 	if errors.Is(err, ErrAllComponentsDisabled) || errors.Is(err, errNoAPIKeyConfigured) {
@@ -254,7 +279,17 @@ func RunAgent(log log.Component, config config.Component, secrets secrets.Compon
 	}
 
 	// Check if we have at least one component to start based on config
-	if !config.GetBool("compliance_config.enabled") && !config.GetBool("runtime_security_config.enabled") {
+	// Check if security-agent should run compliance
+	complianceEnabled := config.GetBool("compliance_config.enabled")
+	complianceRunInSystemProbe := config.GetBool("compliance_config.run_in_system_probe")
+	securityAgentShouldRunCompliance := complianceEnabled && !complianceRunInSystemProbe
+
+	// Check if security-agent should run CWS (runtime security)
+	cwsEnabled := config.GetBool("runtime_security_config.enabled")
+	cwsDirectSendFromSystemProbe := config.GetBool("runtime_security_config.direct_send_from_system_probe")
+	securityAgentShouldRunCWS := cwsEnabled && !cwsDirectSendFromSystemProbe
+
+	if !securityAgentShouldRunCompliance && !securityAgentShouldRunCWS {
 		log.Infof("All security-agent components are deactivated, exiting")
 
 		// A sleep is necessary so that sysV doesn't think the agent has failed
@@ -301,7 +336,7 @@ func RunAgent(log log.Component, config config.Component, secrets secrets.Compon
 	}
 
 	if err := setupInternalProfiling(config); err != nil {
-		return log.Errorf("Error while setuping internal profiling, exiting: %v", err)
+		return log.Errorf("Error while setting up internal profiling, exiting: %v", err)
 	}
 
 	log.Infof("Datadog Security Agent is now running.")
@@ -337,48 +372,119 @@ func StopAgent(log log.Component) {
 	log.Info("See ya!")
 }
 
+// secAgentConfigPrefix is the config namespace for the security-agent.
+const secAgentConfigPrefix = "security_agent."
+
+func secAgentKey(sub string) string {
+	return secAgentConfigPrefix + sub
+}
+
+// buildProfilingSettings builds the internal profiling settings for the security-agent from its
+// configuration. It is the single source of truth shared by the boot-time setupInternalProfiling
+// path and the runtime internal_profiling setting, so enabling profiling on demand produces the
+// same profiler configuration as enabling it at boot (site, env, TRACE_AGENT_URL forwarding,
+// period, etc.).
+func buildProfilingSettings(config config.Component) profiling.Settings {
+	cfgSite := config.GetString(secAgentKey("internal_profiling.site"))
+	cfgURL := config.GetString(secAgentKey("internal_profiling.profile_dd_url"))
+
+	// check if TRACE_AGENT_URL is set, in which case, forward the profiles to the trace agent
+	var site string
+	if traceAgentURL := os.Getenv("TRACE_AGENT_URL"); len(traceAgentURL) > 0 {
+		site = fmt.Sprintf(profiling.ProfilingLocalURLTemplate, traceAgentURL)
+	} else {
+		site = fmt.Sprintf(profiling.ProfilingURLTemplate, cfgSite)
+		if cfgURL != "" {
+			site = cfgURL
+		}
+	}
+
+	tags := config.GetStringSlice(secAgentKey("internal_profiling.extra_tags"))
+	tags = append(tags, fmt.Sprintf("version:%v", version.AgentVersion))
+	tags = append(tags, "__dd_internal_profiling:datadog-agent")
+
+	return profiling.Settings{
+		ProfilingURL:         site,
+		Env:                  config.GetString(secAgentKey("internal_profiling.env")),
+		Service:              "security-agent",
+		Period:               config.GetDuration(secAgentKey("internal_profiling.period")),
+		CPUDuration:          config.GetDuration(secAgentKey("internal_profiling.cpu_duration")),
+		MutexProfileFraction: config.GetInt(secAgentKey("internal_profiling.mutex_profile_fraction")),
+		BlockProfileRate:     config.GetInt(secAgentKey("internal_profiling.block_profile_rate")),
+		WithGoroutineProfile: config.GetBool(secAgentKey("internal_profiling.enable_goroutine_stacktraces")),
+		WithBlockProfile:     config.GetBool(secAgentKey("internal_profiling.enable_block_profiling")),
+		WithMutexProfile:     config.GetBool(secAgentKey("internal_profiling.enable_mutex_profiling")),
+		WithDeltaProfiles:    config.GetBool(secAgentKey("internal_profiling.delta_profiles")),
+		Socket:               config.GetString(secAgentKey("internal_profiling.unix_socket")),
+		Tags:                 tags,
+	}
+}
+
 func setupInternalProfiling(config config.Component) error {
 	if config.GetBool(secAgentKey("internal_profiling.enabled")) {
-		cfgSite := config.GetString(secAgentKey("internal_profiling.site"))
-		cfgURL := config.GetString(secAgentKey("internal_profiling.profile_dd_url"))
-
-		// check if TRACE_AGENT_URL is set, in which case, forward the profiles to the trace agent
-		var site string
-		if traceAgentURL := os.Getenv("TRACE_AGENT_URL"); len(traceAgentURL) > 0 {
-			site = fmt.Sprintf(profiling.ProfilingLocalURLTemplate, traceAgentURL)
-		} else {
-			site = fmt.Sprintf(profiling.ProfilingURLTemplate, cfgSite)
-			if cfgURL != "" {
-				site = cfgURL
-			}
-		}
-
-		tags := config.GetStringSlice(secAgentKey("internal_profiling.extra_tags"))
-		tags = append(tags, fmt.Sprintf("version:%v", version.AgentVersion))
-		tags = append(tags, "__dd_internal_profiling:datadog-agent")
-
-		profSettings := profiling.Settings{
-			ProfilingURL:         site,
-			Env:                  config.GetString(secAgentKey("internal_profiling.env")),
-			Service:              "security-agent",
-			Period:               config.GetDuration(secAgentKey("internal_profiling.period")),
-			CPUDuration:          config.GetDuration(secAgentKey("internal_profiling.cpu_duration")),
-			MutexProfileFraction: config.GetInt(secAgentKey("internal_profiling.mutex_profile_fraction")),
-			BlockProfileRate:     config.GetInt(secAgentKey("internal_profiling.block_profile_rate")),
-			WithGoroutineProfile: config.GetBool(secAgentKey("internal_profiling.enable_goroutine_stacktraces")),
-			WithBlockProfile:     config.GetBool(secAgentKey("internal_profiling.enable_block_profiling")),
-			WithMutexProfile:     config.GetBool(secAgentKey("internal_profiling.enable_mutex_profiling")),
-			WithDeltaProfiles:    config.GetBool(secAgentKey("internal_profiling.delta_profiles")),
-			Socket:               config.GetString(secAgentKey("internal_profiling.unix_socket")),
-			Tags:                 tags,
-		}
-
-		return profiling.Start(profSettings)
+		return profiling.Start(buildProfilingSettings(config))
 	}
 
 	return nil
 }
 
-func secAgentKey(sub string) string {
-	return fmt.Sprintf("security_agent.%s", sub)
+// profilingRuntimeSetting toggles the security-agent internal profiler at runtime. It reuses
+// buildProfilingSettings so the runtime configuration matches the boot-time path exactly, rather
+// than going through the generic ProfilingRuntimeSetting which reads a different set of config keys.
+type profilingRuntimeSetting struct{}
+
+func (profilingRuntimeSetting) Name() string { return "internal_profiling" }
+
+func (profilingRuntimeSetting) Description() string {
+	return "Enable or disable security-agent internal profiling at runtime (accepts true, false, or restart)."
+}
+
+func (profilingRuntimeSetting) Hidden() bool { return true }
+
+func (profilingRuntimeSetting) Get(config config.Component) (interface{}, error) {
+	return config.GetBool(secAgentKey("internal_profiling.enabled")), nil
+}
+
+func (s profilingRuntimeSetting) Set(config config.Component, v interface{}, source model.Source) error {
+	if str, ok := v.(string); ok && strings.ToLower(str) == "restart" {
+		if err := s.Set(config, false, source); err != nil {
+			return err
+		}
+		return s.Set(config, true, source)
+	}
+
+	enable, err := commonsettings.GetBool(v)
+	if err != nil {
+		return fmt.Errorf("unsupported type for internal_profiling runtime setting: %w", err)
+	}
+
+	if enable {
+		if err := profiling.Start(buildProfilingSettings(config)); err != nil {
+			return err
+		}
+		config.Set(secAgentKey("internal_profiling.enabled"), true, source)
+	} else {
+		profiling.Stop()
+		config.Set(secAgentKey("internal_profiling.enabled"), false, source)
+	}
+
+	return nil
+}
+
+// RuntimeSettings returns all runtime settings exposed by the security-agent, keyed by setting
+// name. It is the single source of truth shared by the start subcommand and the Windows service
+// entrypoint, so both expose the same `security-agent config set ...` controls and cannot drift
+// per-platform.
+func RuntimeSettings() map[string]settings.RuntimeSetting {
+	goroutines := commonsettings.NewProfilingGoroutines()
+	goroutines.ConfigPrefix = secAgentConfigPrefix
+	period := commonsettings.NewProfilingPeriod()
+	period.ConfigPrefix = secAgentConfigPrefix
+
+	return map[string]settings.RuntimeSetting{
+		"log_level":                     commonsettings.NewLogLevelRuntimeSetting(),
+		"internal_profiling":            profilingRuntimeSetting{},
+		"internal_profiling_goroutines": goroutines,
+		"internal_profiling_period":     period,
+	}
 }

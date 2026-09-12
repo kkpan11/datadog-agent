@@ -13,89 +13,93 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
+	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/sbom"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
-	"github.com/DataDog/datadog-agent/pkg/util/trivy/walker"
+	"github.com/DataDog/ddtrivy"
 
-	"github.com/aquasecurity/trivy/pkg/fanal/applier"
-	local "github.com/aquasecurity/trivy/pkg/fanal/artifact/container"
 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
+// errLayerCountMismatch means the overlayfs mount (or the docker / crio
+// equivalent) exposed a different number of layer paths than the image
+// config has diff_ids. They are 1:1 by the OCI spec, so a divergence
+// means an upstream invariant broke and we refuse to scan rather than
+// guess a pairing.
+var errLayerCountMismatch = errors.New("overlayfs mount layer count does not match image config")
+
+// fakeContainer adapts a pre-paired set of LayerPaths into the
+// ftypes.Container surface Trivy expects. It carries imgMeta separately
+// so the CRI-O wrapper can read its History entries for ConfigFile().
 type fakeContainer struct {
-	layerIDs   []string
-	imgMeta    *workloadmeta.ContainerImageMetadata
-	layerPaths []string
+	imgMeta *workloadmeta.ContainerImageMetadata
+	layers  []ftypes.LayerPath
+}
+
+// newFakeContainer wraps an already-paired LayerPath slice. The caller
+// builds each {DiffID, Digest, Path} triple; this constructor does no
+// further validation, so any desync here came from the caller.
+func newFakeContainer(layers []ftypes.LayerPath, imgMeta *workloadmeta.ContainerImageMetadata) *fakeContainer {
+	return &fakeContainer{imgMeta: imgMeta, layers: layers}
+}
+
+// diffIDs returns the DiffIDs of c's layers in image-config (bottom-up) order.
+func (c *fakeContainer) diffIDs() []string {
+	out := make([]string, len(c.layers))
+	for i, l := range c.layers {
+		out[i] = l.DiffID
+	}
+	return out
 }
 
 func (c *fakeContainer) LayerByDiffID(hash string) (ftypes.LayerPath, error) {
-	for i, layer := range c.layerIDs {
-		diffID, _ := v1.NewHash(layer)
-		if diffID.String() == hash {
-			return ftypes.LayerPath{
-				DiffID: diffID.String(),
-				Path:   c.layerPaths[i],
-				Digest: c.imgMeta.Layers[i].Digest,
-			}, nil
+	for _, layer := range c.layers {
+		if layer.DiffID == hash {
+			return layer, nil
 		}
 	}
 	return ftypes.LayerPath{}, errors.New("not found")
 }
 
 func (c *fakeContainer) LayerByDigest(hash string) (ftypes.LayerPath, error) {
-	for i, layer := range c.layerIDs {
-		diffID, _ := v1.NewHash(layer)
-		if hash == c.imgMeta.Layers[i].Digest {
-			return ftypes.LayerPath{
-				DiffID: diffID.String(),
-				Path:   c.layerPaths[i],
-				Digest: c.imgMeta.Layers[i].Digest,
-			}, nil
+	for _, layer := range c.layers {
+		if layer.Digest == hash {
+			return layer, nil
 		}
 	}
 	return ftypes.LayerPath{}, errors.New("not found")
 }
 
-func (c *fakeContainer) Layers() (layers []ftypes.LayerPath) {
-	for i, layer := range c.layerIDs {
-		diffID, _ := v1.NewHash(layer)
-		layers = append(layers, ftypes.LayerPath{
-			DiffID: diffID.String(),
-			Path:   c.layerPaths[i],
-			Digest: c.imgMeta.Layers[i].Digest,
-		})
-	}
-
-	return layers
+func (c *fakeContainer) Layers() []ftypes.LayerPath {
+	return slices.Clone(c.layers)
 }
 
-func (c *Collector) scanOverlayFS(ctx context.Context, layers []string, ctr ftypes.Container, imgMeta *workloadmeta.ContainerImageMetadata, scanOptions sbom.ScanOptions) (sbom.Report, error) {
-	cache, err := c.GetCache()
-	if err != nil {
-		return nil, err
+func (c *Collector) scanOverlayFS(ctx context.Context, layers []string, ctr ftypes.Container, imgMeta *workloadmeta.ContainerImageMetadata, scanOptions sbom.ScanOptions) (*Report, error) {
+	var cache CacheWithCleaner
+	if pkgconfigsetup.Datadog().GetBool("sbom.container_image.overlayfs_disable_cache") {
+		cache = newMemoryCache()
+	} else {
+		globalCache, err := c.GetCache()
+		if err != nil {
+			return nil, err
+		}
+		cache = globalCache
 	}
 
 	if cache == nil {
 		return nil, errors.New("failed to get cache for scan")
 	}
 
-	containerArtifact, err := local.NewArtifact(ctr, cache, walker.NewFSWalker(), getDefaultArtifactOption(scanOptions))
-	if err != nil {
-		return nil, err
-	}
-
 	log.Debugf("Generating SBOM for image %s using overlayfs %+v", imgMeta.ID, layers)
 
-	trivyReport, err := c.scan(ctx, containerArtifact, applier.NewApplier(cache))
+	artifactOptions := getDefaultArtifactOption(scanOptions)
+	trivyReport, err := ddtrivy.ScanOverlays(ctx, artifactOptions, cache, ctr)
 	if err != nil {
-		if imgMeta != nil {
-			return nil, fmt.Errorf("unable to marshal report to sbom format for image %s, err: %w", imgMeta.ID, err)
-		}
-		return nil, fmt.Errorf("unable to marshal report to sbom format, err: %w", err)
+		return nil, fmt.Errorf("unable to scan overlayfs image, err: %w", err)
 	}
 
-	return c.buildReport(trivyReport, imgMeta.ID), nil
+	return c.buildReport(trivyReport, imgMeta.ID)
 }

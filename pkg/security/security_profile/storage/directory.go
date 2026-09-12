@@ -11,6 +11,7 @@ package storage
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -64,6 +65,14 @@ func createDir(dir string) error {
 func fileHasProfileExtension(path string) bool {
 	format, err := config.ParseStorageFormat(filepath.Ext(path))
 	return err == nil && format == config.Profile
+}
+
+// profileNameFromFile returns the profile name encoded in a storage filename. Persist writes
+// files as "<name>.<format>" (with an optional ".gz" suffix), so the name is the filename with
+// those extensions stripped. Used to attribute an on-disk file back to its profile selector.
+func profileNameFromFile(filename string) string {
+	filename = strings.TrimSuffix(filename, ".gz")
+	return strings.TrimSuffix(filename, filepath.Ext(filename))
 }
 
 type profileFile struct {
@@ -138,6 +147,15 @@ func NewDirectory(directoryPath string, maxProfiles int) (*Directory, error) {
 			seclog.Warnf("failed to load profile from file [%s]: %s", file.path, err)
 			continue
 		}
+		if pProto.Metadata == nil {
+			seclog.Warnf("profile loaded from file [%s] has no metadata", file.path)
+			continue
+		}
+		if pProto.Selector == nil {
+			seclog.Warnf("profile loaded from file [%s] has no selector", file.path)
+			continue
+		}
+
 		profiles.Add(pProto.Metadata.Name, &profileEntry{
 			selector:  cgroupModel.ProtoToWorkloadSelector(pProto.Selector),
 			filePaths: []string{file.path},
@@ -167,28 +185,34 @@ func (d *Directory) Persist(request config.StorageRequest, p *profile.Profile, r
 
 	filePath := filepath.Join(d.directoryPath, filename)
 
+	tmpFilePath := filePath + ".tmp"
+
 	if err := createDir(d.directoryPath); err != nil {
 		return err
 	}
 
-	file, err := os.Create(filePath)
+	file, err := os.Create(tmpFilePath)
 	if err != nil {
-		return fmt.Errorf("couldn't persist to file [%s]: %w", filePath, err)
+		return fmt.Errorf("couldn't persist to file [%s]: %w", tmpFilePath, err)
 	}
 	defer file.Close()
 
 	// set output file access mode
-	if err := os.Chmod(filePath, 0400); err != nil {
-		return fmt.Errorf("couldn't set mod for file [%s]: %w", filePath, err)
+	if err := file.Chmod(0400); err != nil {
+		return fmt.Errorf("couldn't set mod for file [%s]: %w", file.Name(), err)
 	}
 
 	// persist data to disk
 	if _, err := file.Write(raw.Bytes()); err != nil {
-		return fmt.Errorf("couldn't write to file [%s]: %w", filePath, err)
+		return fmt.Errorf("couldn't write to file [%s]: %w", file.Name(), err)
 	}
 
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("could not close file [%s]: %w", file.Name(), err)
+	}
+
+	if err := os.Rename(tmpFilePath, filePath); err != nil {
+		return fmt.Errorf("couldn't rename file from [%s] to [%s]: %w", tmpFilePath, filePath, err)
 	}
 
 	seclog.Infof("[%s] file for [%s] written at: [%s]", request.Format, p.GetSelectorStr(), filePath)
@@ -211,11 +235,11 @@ func (d *Directory) Persist(request config.StorageRequest, p *profile.Profile, r
 // Load loads the profile for the provided selector if it exists
 func (d *Directory) Load(wls *cgroupModel.WorkloadSelector, p *profile.Profile) (bool, error) {
 	if wls == nil {
-		return false, fmt.Errorf("no selector was provided")
+		return false, errors.New("no selector was provided")
 	}
 
 	if p == nil {
-		return false, fmt.Errorf("no profile was provided")
+		return false, errors.New("no profile was provided")
 	}
 
 	d.profilesLock.RLock()
@@ -237,6 +261,45 @@ func (d *Directory) Load(wls *cgroupModel.WorkloadSelector, p *profile.Profile) 
 	}
 
 	return false, nil
+}
+
+// SizesBySelector returns the on-disk size in bytes used by each stored profile, keyed by
+// workload selector. It walks the directory and attributes every storage-format file to the
+// selector of the profile it belongs to (matched by file name), so all persisted formats of a
+// profile (e.g. .profile + .json) are summed together.
+func (d *Directory) SizesBySelector() map[cgroupModel.WorkloadSelector]int64 {
+	d.profilesLock.RLock()
+	selectorByName := make(map[string]cgroupModel.WorkloadSelector, d.profiles.Len())
+	for _, name := range d.profiles.Keys() {
+		if entry, ok := d.profiles.Peek(name); ok {
+			selectorByName[name] = entry.selector
+		}
+	}
+	d.profilesLock.RUnlock()
+
+	result := make(map[cgroupModel.WorkloadSelector]int64, len(selectorByName))
+	files, err := os.ReadDir(d.directoryPath)
+	if err != nil {
+		seclog.Warnf("couldn't list files in %s, %s metric may be inaccurate: %v", d.directoryPath, metrics.MetricSecurityProfileV2ProfileSize, err)
+		return result
+	}
+
+	for _, file := range files {
+		if _, err := config.ParseStorageFormat(filepath.Ext(file.Name())); err != nil {
+			continue
+		}
+		selector, ok := selectorByName[profileNameFromFile(file.Name())]
+		if !ok {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(d.directoryPath, file.Name()))
+		if err != nil {
+			continue
+		}
+		result[selector] += info.Size()
+	}
+
+	return result
 }
 
 // GetStorageType returns the storage type

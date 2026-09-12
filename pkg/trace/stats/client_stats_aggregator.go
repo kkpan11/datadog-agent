@@ -6,6 +6,11 @@
 package stats
 
 import (
+	"errors"
+	"fmt"
+	"math"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/version"
@@ -28,10 +33,13 @@ const (
 	bucketDuration       = 2 * time.Second
 	clientBucketDuration = 10 * time.Second
 	oldestBucketStart    = 20 * time.Second
+
+	maxRelativeAccuracy = 0.5 // a mapping above this bound is treated as malformed
 )
 
 var (
 	ddsketchMapping, _ = mapping.NewLogarithmicMapping(relativeAccuracy)
+	logger             = log.NewThrottled(5, 10*time.Second) // no more than 5 messages every 10 seconds
 )
 
 // ClientStatsAggregator aggregates client stats payloads on buckets of bucketDuration
@@ -57,13 +65,20 @@ type ClientStatsAggregator struct {
 	exit chan struct{}
 	done chan struct{}
 
+	exitWG sync.WaitGroup
+	mu     sync.Mutex
+
 	statsd statsd.ClientInterface
 }
 
 // NewClientStatsAggregator initializes a new aggregator ready to be started
 func NewClientStatsAggregator(conf *config.AgentConfig, writer Writer, statsd statsd.ClientInterface) *ClientStatsAggregator {
+	flushInterval := conf.ClientStatsFlushInterval
+	if flushInterval == 0 { // default to 2s if not set to ensure users of this outside the agent aren't broken by this change
+		flushInterval = 2 // bucketDuration
+	}
 	c := &ClientStatsAggregator{
-		flushTicker:   time.NewTicker(time.Second),
+		flushTicker:   time.NewTicker(flushInterval),
 		In:            make(chan *pb.ClientStatsPayload, 10),
 		buckets:       make(map[int64]*bucket, 20),
 		conf:          conf,
@@ -81,17 +96,33 @@ func NewClientStatsAggregator(conf *config.AgentConfig, writer Writer, statsd st
 
 // Start starts the aggregator.
 func (a *ClientStatsAggregator) Start() {
+	// 2 goroutines: aggregation and flushing
+	a.exitWG.Add(2)
+
+	// aggregation goroutine
 	go func() {
 		defer watchdog.LogOnPanic(a.statsd)
+		defer a.exitWG.Done()
+		for {
+			select {
+			case input := <-a.In:
+				a.add(time.Now(), input)
+			case <-a.exit:
+				return
+			}
+		}
+	}()
+
+	// flushing goroutine
+	go func() {
+		defer watchdog.LogOnPanic(a.statsd)
+		defer a.exitWG.Done()
 		for {
 			select {
 			case t := <-a.flushTicker.C:
 				a.flushOnTime(t)
-			case input := <-a.In:
-				a.add(time.Now(), input)
 			case <-a.exit:
 				a.flushAll()
-				close(a.done)
 				return
 			}
 		}
@@ -102,25 +133,34 @@ func (a *ClientStatsAggregator) Start() {
 func (a *ClientStatsAggregator) Stop() {
 	close(a.exit)
 	a.flushTicker.Stop()
-	<-a.done
+	a.exitWG.Wait()
 }
 
 // flushOnTime flushes all buckets up to flushTs, except the last one.
 func (a *ClientStatsAggregator) flushOnTime(now time.Time) {
-	flushTs := alignAggTs(now.Add(bucketDuration - oldestBucketStart))
-	for t := a.oldestTs; t.Before(flushTs); t = t.Add(bucketDuration) {
-		if b, ok := a.buckets[t.Unix()]; ok {
-			a.flush(b.aggregationToPayloads())
-			delete(a.buckets, t.Unix())
-		}
-	}
-	a.oldestTs = flushTs
+	a.flush(now, false)
 }
 
+// flushAll flushes all buckets, typically called on agent shutdown.
 func (a *ClientStatsAggregator) flushAll() {
-	for _, b := range a.buckets {
-		a.flush(b.aggregationToPayloads())
+	a.flush(time.Now(), true)
+}
+
+func (a *ClientStatsAggregator) flush(now time.Time, force bool) {
+	flushTs := alignAggTs(now.Add(bucketDuration - oldestBucketStart))
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for ts, b := range a.buckets {
+		if !force && !flushTs.After(b.ts) {
+			continue
+		}
+		log.Debugf("css aggregator: flushing bucket %d", ts)
+		a.flushPayloads(b.aggregationToPayloads())
+		delete(a.buckets, ts)
 	}
+	a.oldestTs = flushTs
 }
 
 // getAggregationBucketTime returns unix time at which we aggregate the bucket.
@@ -138,11 +178,24 @@ func (a *ClientStatsAggregator) getAggregationBucketTime(now, bs time.Time) time
 
 // add takes a new ClientStatsPayload and aggregates its stats in the internal buckets.
 func (a *ClientStatsAggregator) add(now time.Time, p *pb.ClientStatsPayload) {
+	// A malformed payload must not take down the trace-agent.
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			length := runtime.Stack(buf, false)
+			logger.Error("Recovered from panic aggregating client stats, dropping payload: %v\n%s", r, buf[:length])
+		}
+	}()
+
 	// populate container tags data on the payload
 	a.setVersionDataFromContainerTags(p)
 	p.ProcessTagsHash = processTagsHash(p.ProcessTags)
 	// compute the PayloadAggregationKey, common for all buckets within the payload
-	payloadAggKey := newPayloadAggregationKey(p.Env, p.Hostname, p.Version, p.ContainerID, p.GitCommitSha, p.ImageTag, p.ProcessTagsHash)
+	payloadAggKey := newPayloadAggregationKey(p.Env, p.Hostname, p.Version, p.ContainerID, p.GitCommitSha, p.ImageTag, p.Lang, p.ProcessTagsHash, p.Service)
+
+	// acquire lock over shared data
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	for _, clientBucket := range p.Stats {
 		clientBucketStart := time.Unix(0, int64(clientBucket.Start))
@@ -161,7 +214,7 @@ func (a *ClientStatsAggregator) add(now time.Time, p *pb.ClientStatsPayload) {
 	}
 }
 
-func (a *ClientStatsAggregator) flush(p []*pb.ClientStatsPayload) {
+func (a *ClientStatsAggregator) flushPayloads(p []*pb.ClientStatsPayload) {
 	if len(p) == 0 {
 		return
 	}
@@ -177,21 +230,24 @@ func (a *ClientStatsAggregator) flush(p []*pb.ClientStatsPayload) {
 
 func (a *ClientStatsAggregator) setVersionDataFromContainerTags(p *pb.ClientStatsPayload) {
 	// No need to go any further if we already have the information in the payload.
-	if p.ImageTag != "" && p.GitCommitSha != "" {
+	if p.ImageTag != "" && p.GitCommitSha != "" && p.Version != "" {
 		return
 	}
 	if p.ContainerID != "" {
 		cTags, err := a.conf.ContainerTags(p.ContainerID)
 		if err != nil {
-			log.Error("Client stats aggregator is unable to resolve container ID (%s) to container tags: %v", p.ContainerID, err)
+			log.Errorf("Client stats aggregator is unable to resolve container ID (%s) to container tags: %v", p.ContainerID, err)
 		} else {
-			gitCommitSha, imageTag := version.GetVersionDataFromContainerTags(cTags)
+			gitCommitSha, imageTag, appVersion := version.GetVersionDataFromContainerTags(cTags)
 			// Only override if the payload's original values were empty strings.
 			if p.ImageTag == "" {
 				p.ImageTag = imageTag
 			}
 			if p.GitCommitSha == "" {
 				p.GitCommitSha = gitCommitSha
+			}
+			if p.Version == "" {
+				p.Version = appVersion
 			}
 		}
 	}
@@ -230,13 +286,14 @@ func (b *bucket) aggregateStatsBucket(sb *pb.ClientStatsBucket, payloadAggKey Pa
 		agg, ok := payloadAgg[aggKey]
 		if !ok {
 			agg = &aggregatedStats{
-				hits:               gs.Hits,
-				topLevelHits:       gs.TopLevelHits,
-				errors:             gs.Errors,
-				duration:           gs.Duration,
-				peerTags:           gs.PeerTags,
-				okDistributionRaw:  gs.OkSummary,    // store encoded version only
-				errDistributionRaw: gs.ErrorSummary, // store encoded version only
+				hits:                 gs.Hits,
+				topLevelHits:         gs.TopLevelHits,
+				errors:               gs.Errors,
+				duration:             gs.Duration,
+				peerTags:             gs.PeerTags,
+				additionalMetricTags: gs.AdditionalMetricTags,
+				okDistributionRaw:    gs.OkSummary,    // store encoded version only
+				errDistributionRaw:   gs.ErrorSummary, // store encoded version only
 			}
 			payloadAgg[aggKey] = agg
 			continue
@@ -249,22 +306,12 @@ func (b *bucket) aggregateStatsBucket(sb *pb.ClientStatsBucket, payloadAggKey Pa
 		agg.duration += gs.Duration
 
 		// Decode, if needed, the raw ddsketches from the first payload that reached the bucket
-		if agg.okDistributionRaw != nil {
-			sketch, err := decodeSketch(agg.okDistributionRaw)
-			if err != nil {
-				log.Error("Unable to decode OK distribution ddsketch: %v", err)
-			} else {
-				agg.okDistribution = normalizeSketch(sketch)
-			}
+		if len(agg.okDistributionRaw) > 0 {
+			agg.okDistribution = decodeAndNormalize(agg.okDistributionRaw)
 			agg.okDistributionRaw = nil
 		}
-		if agg.errDistributionRaw != nil {
-			sketch, err := decodeSketch(agg.errDistributionRaw)
-			if err != nil {
-				log.Error("Unable to decode Error distribution ddsketch: %v", err)
-			} else {
-				agg.errDistribution = normalizeSketch(sketch)
-			}
+		if len(agg.errDistributionRaw) > 0 {
+			agg.errDistribution = decodeAndNormalize(agg.errDistributionRaw)
 			agg.errDistributionRaw = nil
 		}
 
@@ -272,13 +319,13 @@ func (b *bucket) aggregateStatsBucket(sb *pb.ClientStatsBucket, payloadAggKey Pa
 		if sketch, err := mergeSketch(agg.okDistribution, gs.OkSummary); err == nil {
 			agg.okDistribution = sketch
 		} else {
-			log.Error("Unable to merge OK distribution ddsketch: %v", err)
+			logger.Error("Unable to merge OK distribution ddsketch: %v", err)
 		}
 
 		if sketch, err := mergeSketch(agg.errDistribution, gs.ErrorSummary); err == nil {
 			agg.errDistribution = sketch
 		} else {
-			log.Error("Unable to merge Error distribution ddsketch: %v", err)
+			logger.Error("Unable to merge Error distribution ddsketch: %v", err)
 		}
 	}
 }
@@ -301,14 +348,17 @@ func (b *bucket) aggregationToPayloads() []*pb.ClientStatsPayload {
 				Start:    uint64(b.ts.UnixNano()),
 				Duration: uint64(clientBucketDuration.Nanoseconds()),
 				Stats:    groupedStats,
-			}}
+			},
+		}
 		res = append(res, &pb.ClientStatsPayload{
 			Hostname:        payloadKey.Hostname,
 			Env:             payloadKey.Env,
 			Version:         payloadKey.Version,
 			ImageTag:        payloadKey.ImageTag,
+			Lang:            payloadKey.Lang,
 			GitCommitSha:    payloadKey.GitCommitSha,
 			ContainerID:     payloadKey.ContainerID,
+			Service:         payloadKey.BaseService,
 			Stats:           clientBuckets,
 			ProcessTagsHash: payloadKey.ProcessTagsHash,
 			ProcessTags:     b.processTags[payloadKey.ProcessTagsHash],
@@ -339,26 +389,30 @@ func exporGroupedStats(aggrKey BucketsAggregationKey, stats *aggregatedStats) (*
 		}
 	}
 	return &pb.ClientGroupedStats{
-		Service:        aggrKey.Service,
-		Name:           aggrKey.Name,
-		SpanKind:       aggrKey.SpanKind,
-		Resource:       aggrKey.Resource,
-		HTTPStatusCode: aggrKey.StatusCode,
-		Type:           aggrKey.Type,
-		Synthetics:     aggrKey.Synthetics,
-		IsTraceRoot:    aggrKey.IsTraceRoot,
-		GRPCStatusCode: aggrKey.GRPCStatusCode,
-		PeerTags:       stats.peerTags,
-		TopLevelHits:   stats.topLevelHits,
-		Hits:           stats.hits,
-		Errors:         stats.errors,
-		Duration:       stats.duration,
-		OkSummary:      okSummary,
-		ErrorSummary:   errSummary,
+		Service:              aggrKey.Service,
+		Name:                 aggrKey.Name,
+		SpanKind:             aggrKey.SpanKind,
+		Resource:             aggrKey.Resource,
+		HTTPStatusCode:       aggrKey.StatusCode,
+		Type:                 aggrKey.Type,
+		Synthetics:           aggrKey.Synthetics,
+		ServiceSource:        aggrKey.ServiceSource,
+		IsTraceRoot:          aggrKey.IsTraceRoot,
+		GRPCStatusCode:       aggrKey.GRPCStatusCode,
+		HTTPMethod:           aggrKey.HTTPMethod,
+		HTTPEndpoint:         aggrKey.HTTPEndpoint,
+		PeerTags:             stats.peerTags,
+		AdditionalMetricTags: stats.additionalMetricTags,
+		TopLevelHits:         stats.topLevelHits,
+		Hits:                 stats.hits,
+		Errors:               stats.errors,
+		Duration:             stats.duration,
+		OkSummary:            okSummary,
+		ErrorSummary:         errSummary,
 	}, nil
 }
 
-func newPayloadAggregationKey(env, hostname, version, cid, gitCommitSha, imageTag string, processTagsHash uint64) PayloadAggregationKey {
+func newPayloadAggregationKey(env, hostname, version, cid, gitCommitSha, imageTag, lang string, processTagsHash uint64, baseService string) PayloadAggregationKey {
 	return PayloadAggregationKey{
 		Env:             env,
 		Hostname:        hostname,
@@ -366,7 +420,9 @@ func newPayloadAggregationKey(env, hostname, version, cid, gitCommitSha, imageTa
 		ContainerID:     cid,
 		GitCommitSha:    gitCommitSha,
 		ImageTag:        imageTag,
+		Lang:            lang,
 		ProcessTagsHash: processTagsHash,
+		BaseService:     baseService,
 	}
 }
 
@@ -379,11 +435,17 @@ func newBucketAggregationKey(b *pb.ClientGroupedStats) BucketsAggregationKey {
 		Type:           b.Type,
 		Synthetics:     b.Synthetics,
 		StatusCode:     b.HTTPStatusCode,
+		ServiceSource:  b.ServiceSource,
 		GRPCStatusCode: b.GRPCStatusCode,
 		IsTraceRoot:    b.IsTraceRoot,
+		HTTPMethod:     b.HTTPMethod,
+		HTTPEndpoint:   b.HTTPEndpoint,
 	}
 	if tags := b.GetPeerTags(); len(tags) > 0 {
 		k.PeerTagsHash = tagsFnvHash(tags)
+	}
+	if tags := b.GetAdditionalMetricTags(); len(tags) > 0 {
+		k.AdditionalMetricTagsHash = tagsFnvHash(tags)
 	}
 	return k
 }
@@ -393,6 +455,7 @@ type aggregatedStats struct {
 	// aggregated counts
 	hits, topLevelHits, errors, duration uint64
 	peerTags                             []string
+	additionalMetricTags                 []string
 
 	// aggregated DDSketches
 	okDistribution, errDistribution *ddsketch.DDSketch
@@ -405,7 +468,7 @@ type aggregatedStats struct {
 
 // mergeSketch take an existing DDSketch, and merges a second one, decoding its contents
 func mergeSketch(s1 *ddsketch.DDSketch, raw []byte) (*ddsketch.DDSketch, error) {
-	if raw == nil {
+	if len(raw) == 0 {
 		return s1, nil
 	}
 
@@ -413,7 +476,15 @@ func mergeSketch(s1 *ddsketch.DDSketch, raw []byte) (*ddsketch.DDSketch, error) 
 	if err != nil {
 		return s1, err
 	}
-	s2 = normalizeSketch(s2)
+	s2, err = normalizeSketch(s2)
+	if err != nil {
+		return s1, err
+	}
+	// A rejected sketch leaves nothing to merge. MergeWith dereferences its
+	// argument's index mapping, so it must never be reached with a nil sketch.
+	if s2 == nil {
+		return s1, nil
+	}
 
 	if s1 == nil {
 		return s2, nil
@@ -425,13 +496,56 @@ func mergeSketch(s1 *ddsketch.DDSketch, raw []byte) (*ddsketch.DDSketch, error) 
 	return s1, nil
 }
 
-func normalizeSketch(s *ddsketch.DDSketch) *ddsketch.DDSketch {
+// validMapping reports whether m is well formed.
+func validMapping(m mapping.IndexMapping) bool {
+	if m == nil {
+		return false
+	}
+	minValue, maxValue := m.MinIndexableValue(), m.MaxIndexableValue()
+	if math.IsNaN(minValue) || math.IsNaN(maxValue) {
+		return false
+	}
+	if minValue <= 0 || maxValue <= minValue || math.IsInf(maxValue, 0) {
+		return false
+	}
+	accuracy := m.RelativeAccuracy()
+	return !math.IsNaN(accuracy) && accuracy > 0 && accuracy < maxRelativeAccuracy
+}
+
+// normalizeSketch re-maps s onto the agent's canonical mapping.
+func normalizeSketch(s *ddsketch.DDSketch) (*ddsketch.DDSketch, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if s.IndexMapping == nil {
+		return nil, errors.New("sketch has no index mapping")
+	}
 	if s.IndexMapping.Equals(ddsketchMapping) {
 		// already normalized
-		return s
+		return s, nil
+	}
+	if !validMapping(s.IndexMapping) {
+		return nil, fmt.Errorf("refusing to normalize sketch with degenerate index mapping (relative accuracy %g, indexable range [%g, %g])",
+			s.IndexMapping.RelativeAccuracy(), s.IndexMapping.MinIndexableValue(), s.IndexMapping.MaxIndexableValue())
 	}
 
-	return s.ChangeMapping(ddsketchMapping, store.NewCollapsingLowestDenseStore(maxNumBins), store.NewCollapsingLowestDenseStore(maxNumBins), 1)
+	return s.ChangeMapping(ddsketchMapping, store.NewCollapsingLowestDenseStore(maxNumBins), store.NewCollapsingLowestDenseStore(maxNumBins), 1), nil
+}
+
+// decodeAndNormalize decodes a raw client sketch and re-maps it onto the agent's
+// canonical mapping, returning nil if either step fails.
+func decodeAndNormalize(raw []byte) *ddsketch.DDSketch {
+	sketch, err := decodeSketch(raw)
+	if err != nil {
+		logger.Error("Unable to decode distribution ddsketch: %v", err)
+		return nil
+	}
+	sketch, err = normalizeSketch(sketch)
+	if err != nil {
+		logger.Error("Unable to normalize distribution ddsketch: %v", err)
+		return nil
+	}
+	return sketch
 }
 
 func decodeSketch(data []byte) (*ddsketch.DDSketch, error) {

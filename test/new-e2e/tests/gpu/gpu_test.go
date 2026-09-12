@@ -11,24 +11,26 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/test-infra-definitions/components/os"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/os"
 
 	"github.com/DataDog/datadog-agent/pkg/util/testutil/flake"
 	"github.com/DataDog/datadog-agent/test/fakeintake/aggregator"
 	"github.com/DataDog/datadog-agent/test/fakeintake/client"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client/agentclient"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client/agentclient"
 )
 
 var devMode = flag.Bool("devmode", false, "enable dev mode")
@@ -50,9 +52,21 @@ const (
 	gpuSystemUbuntu1804Driver430 systemName = "ubuntu1804-430"
 	gpuSystemUbuntu1804Driver510 systemName = "ubuntu1804-510"
 	defaultGpuSystem             systemName = gpuSystemUbuntu2204
+	defaultCudaVersion           string     = "12.4.1"
+	oldCudaVersion               string     = "10.2"
+)
 
-	cuda12DockerImage    = "669783387624.dkr.ecr.us-east-1.amazonaws.com/dockerhub/nvidia/cuda:12.6.3-base-ubuntu22.04"
-	pytorch19DockerImage = "669783387624.dkr.ecr.us-east-1.amazonaws.com/dockerhub/pytorch/pytorch:1.9.0-cuda10.2-cudnn7-runtime"
+var dockerRegistry = func() string {
+	reg, _ := runner.GetProfile().ParamStore().GetWithDefault(parameters.ImagePullRegistry, "")
+	if reg != "" {
+		return strings.SplitN(reg, ",", 2)[0] + "/dockerhub"
+	}
+	return "docker.io"
+}()
+
+var (
+	cuda12DockerImage    = fmt.Sprintf("%s/nvidia/cuda:%s-base-ubuntu22.04", dockerRegistry, defaultCudaVersion)
+	pytorch19DockerImage = fmt.Sprintf("%s/pytorch/pytorch:1.9.0-cuda%s-cudnn7-runtime", dockerRegistry, oldCudaVersion)
 )
 
 // gpuSystems is a map of AMIs for different Ubuntu versions
@@ -64,6 +78,7 @@ var gpuSystems = map[systemName]systemData{
 		hasEcrCredentialsHelper:      false, // needs to be installed from the repos
 		hasAllNVMLCriticalAPIs:       true,  // 22.04 has all the critical APIs
 		supportsSystemProbeComponent: true,
+		cudaVersion:                  defaultCudaVersion,
 	},
 	gpuSystemUbuntu1804Driver430: {
 		ami:                          "ami-0cd4aa4912d788419",
@@ -72,6 +87,7 @@ var gpuSystems = map[systemName]systemData{
 		hasEcrCredentialsHelper:      true,                 // already installed in the AMI, as it's not present in the 18.04 repos
 		hasAllNVMLCriticalAPIs:       false,                // DeviceGetNumGpuCores is missing for this version of the driver,
 		supportsSystemProbeComponent: false,
+		cudaVersion:                  oldCudaVersion,
 	},
 	gpuSystemUbuntu1804Driver510: {
 		ami:                          "ami-0cbf114f88ec230fe",
@@ -80,20 +96,12 @@ var gpuSystems = map[systemName]systemData{
 		hasEcrCredentialsHelper:      true,                 // already installed in the AMI, as it's not present in the 18.04 repos
 		hasAllNVMLCriticalAPIs:       true,                 // 510 driver has all the critical APIs
 		supportsSystemProbeComponent: false,
+		cudaVersion:                  oldCudaVersion,
 	},
 }
 
 func dockerImageName() string {
 	return fmt.Sprintf("%s:%s", vectorAddDockerImg, *imageTag)
-}
-
-func mandatoryMetricTagRegexes() []*regexp.Regexp {
-	regexes := make([]*regexp.Regexp, 0, len(mandatoryMetricTags))
-	for _, tag := range mandatoryMetricTags {
-		regexes = append(regexes, regexp.MustCompile(fmt.Sprintf("%s:.*", tag)))
-	}
-
-	return regexes
 }
 
 type gpuHostSuite struct {
@@ -156,7 +164,10 @@ func runGpuHostSuite(t *testing.T, gpuSystem systemName) {
 
 func (s *gpuHostSuite) SetupSuite() {
 	// The base suite needs the capabilities struct, so set it before calling the base SetupSuite
-	s.caps = &hostCapabilities{&s.BaseSuite}
+	s.caps = &hostCapabilities{
+		suite:             &s.BaseSuite,
+		containerIDToName: make(map[string]string),
+	}
 	s.gpuBaseSuite.SetupSuite()
 }
 
@@ -167,6 +178,7 @@ type gpuK8sSuite struct {
 // TestGPUK8sSuiteUbuntu2204 runs tests for the VM interface to ensure its implementation is correct.
 // Not to be run in parallel, as some tests wait until the checks are available.
 func TestGPUK8sSuiteUbuntu2204(t *testing.T) {
+	flake.Mark(t)
 	runGpuK8sSuite(t, gpuSystemUbuntu2204)
 }
 
@@ -217,7 +229,10 @@ func runGpuK8sSuite(t *testing.T, gpuSystem systemName) {
 
 func (s *gpuK8sSuite) SetupSuite() {
 	// The base suite needs the capabilities struct, so set it before calling the base SetupSuite
-	s.caps = &kubernetesCapabilities{&s.BaseSuite}
+	s.caps = &kubernetesCapabilities{
+		suite:          &s.BaseSuite,
+		containerToJob: make(map[string]string),
+	}
 	s.gpuBaseSuite.SetupSuite()
 }
 
@@ -271,10 +286,10 @@ func (s *gpuK8sSuite) AfterTest(suiteName, testName string) {
 
 // runCudaDockerWorkload runs a CUDA workload in a Docker container and returns the container ID
 func (v *gpuBaseSuite[Env]) runCudaDockerWorkload() string {
-	// Configure some defaults
-	vectorSize := 50000
-	numLoops := 100      // Loop extra times to ensure the kernel runs for a bit
-	waitTimeSeconds := 5 // Give enough time to our monitor to hook the probes
+	// Configure some defaults. Big vector size and number of loops to ensure the kernel runs for a bit
+	vectorSize := 2000000
+	numLoops := 10000000
+	waitTimeSeconds := 30 // Give enough time to our monitor to hook the probes and for workloadmeta to detect containers
 	binary := "/usr/local/bin/cuda-basic"
 	args := []string{binary, strconv.Itoa(vectorSize), strconv.Itoa(numLoops), strconv.Itoa(waitTimeSeconds)}
 
@@ -292,23 +307,25 @@ func (v *gpuBaseSuite[Env]) TestGPUCheckIsEnabled() {
 
 	// Note that the GPU check should be enabled by autodiscovery, so it can take some time to be enabled
 	v.EventuallyWithT(func(c *assert.CollectT) {
-		statusOutput := v.caps.Agent().Status(agentclient.WithArgs([]string{"collector", "--json"}))
+		statusOutput, err := v.caps.Agent().StatusWithError(agentclient.WithArgs([]string{"collector", "--json"}))
+		require.NoError(c, err, "failed to get agent collector status")
 
 		// Keep only the second-to-last line of the output, which is the JSON status. The rest is standard error
 		// TODO: Make the status command return stdout/stderr separately
 		statusLines := strings.Split(statusOutput.Content, "\n")
-		assert.Greater(c, len(statusLines), 1, "status output should have at least 2 lines")
+		require.Greater(c, len(statusLines), 1, "status output should have at least 2 lines")
 		jsonStatus := statusLines[len(statusLines)-2]
 
 		var status collectorStatus
-		err := json.Unmarshal([]byte(jsonStatus), &status)
+		err = json.Unmarshal([]byte(jsonStatus), &status)
+		require.NoError(c, err, "failed to unmarshal agent status")
+		require.Contains(c, status.RunnerStats.Checks, "gpu", "gpu check should be enabled")
 
-		assert.NoError(c, err, "failed to unmarshal agent status")
-		assert.Contains(c, status.RunnerStats.Checks, "gpu")
+		v.T().Logf("gpu check status: %+v", status.RunnerStats.Checks["gpu"])
 
 		gpuCheckStatus := status.RunnerStats.Checks["gpu"]
-		assert.Equal(c, gpuCheckStatus.LastError, "")
-	}, 2*time.Minute, 10*time.Second)
+		require.Equal(c, gpuCheckStatus.LastError, "")
+	}, 5*time.Minute, 10*time.Second)
 }
 
 func (v *gpuBaseSuite[Env]) TestGPUSysprobeEndpointIsResponding() {
@@ -332,16 +349,12 @@ func (v *gpuBaseSuite[Env]) TestLimitMetricsAreReported() {
 		v.T().Skip("skipping test as system does not have all the critical NVML APIs")
 	}
 
-	if !v.systemData.supportsSystemProbeComponent {
-		v.T().Skip("skipping test as system does not support the system-probe component")
-	}
-
 	v.EventuallyWithT(func(c *assert.CollectT) {
 		metricNames := []string{"gpu.core.limit", "gpu.memory.limit"}
 		for _, metricName := range metricNames {
-			metrics, err := v.caps.FakeIntake().Client().FilterMetrics(metricName, client.WithMetricValueHigherThan(0), client.WithMatchingTags[*aggregator.MetricSeries](mandatoryMetricTagRegexes()))
+			metrics, err := v.caps.FakeIntake().Client().FilterMetrics(metricName, client.WithMetricValueHigherThan(0))
 			assert.NoError(c, err)
-			assert.Greater(c, len(metrics), 0, "no '%s' with value higher than 0 yet", metricName)
+			assertMetricsHaveExpectedTagKeys(c, metrics, mandatoryMetricTags, metricName)
 		}
 	}, 5*time.Minute, 10*time.Second)
 }
@@ -355,21 +368,33 @@ func (v *gpuBaseSuite[Env]) TestVectorAddProgramDetected() {
 		v.T().Skip("skipping test as system does not support the system-probe component")
 	}
 
-	flake.Mark(v.T())
-	_ = v.runCudaDockerWorkload()
+	// Docker access to GPUs is flaky sometimes. We haven't been able to reproduce why this happens, but it
+	// seems it's always the same error code.
+	flake.MarkOnLog(v.T(), errMsgNoCudaCapableDevice)
+	flake.MarkOnLog(v.T(), "error code CUDA-capable device(s) is/are busy or unavailable")
+	containerID := v.runCudaDockerWorkload()
 
+	expectedTags := v.caps.ExpectedWorkloadTags()
+	expectedTags = append(expectedTags, mandatoryMetricTags...)
 	v.EventuallyWithT(func(c *assert.CollectT) {
+		// Check for workload errors first
+		err := v.caps.CheckWorkloadErrors(containerID)
+		assert.NoError(c, err, "workload job should not have errors")
+
 		// We are not including "gpu.memory", as that represents the "current
 		// memory usage" and that might be zero at the time it's checked
-		metricNames := []string{"gpu.core.usage"}
+		metricToExpectedTags := map[string][]string{
+			"gpu.process.core.usage": append(expectedTags, "pid"),
+			"gpu.sm_active":          expectedTags,
+		}
 
 		var usageMetricTags []string
-		for _, metricName := range metricNames {
-			metrics, err := v.caps.FakeIntake().Client().FilterMetrics(metricName, client.WithMetricValueHigherThan(0), client.WithMatchingTags[*aggregator.MetricSeries](mandatoryMetricTagRegexes()))
+		for metricName, metricExpectedTags := range metricToExpectedTags {
+			metrics, err := v.caps.FakeIntake().Client().FilterMetrics(metricName, client.WithMetricValueHigherThan(0))
 			assert.NoError(c, err)
-			assert.Greater(c, len(metrics), 0, "no '%s' with value higher than 0 yet", metricName)
+			assertMetricsHaveExpectedTagKeys(c, metrics, metricExpectedTags, metricName)
 
-			if metricName == "gpu.core.usage" && len(metrics) > 0 {
+			if metricName == "gpu.process.core.usage" && len(metrics) > 0 {
 				usageMetricTags = metrics[0].Tags
 			}
 		}
@@ -403,16 +428,12 @@ func (v *gpuBaseSuite[Env]) TestNvmlMetricsPresent() {
 		for _, metric := range metrics {
 			// We don't care about values, as long as the metrics are there. Values come from NVML
 			// so we cannot control that.
-			var options []client.MatchOpt[*aggregator.MetricSeries]
-			if metric.deviceSpecific {
-				// device-specific metrics should be tagged with device tags
-				options = append(options, client.WithMatchingTags[*aggregator.MetricSeries](mandatoryMetricTagRegexes()))
-			}
-
-			metrics, err := v.caps.FakeIntake().Client().FilterMetrics(metric.name, options...)
+			metrics, err := v.caps.FakeIntake().Client().FilterMetrics(metric.name)
 			assert.NoError(c, err)
 
-			assert.Greater(c, len(metrics), 0, "no metric '%s' found", metric.name)
+			if metric.deviceSpecific {
+				assertMetricsHaveExpectedTagKeys(c, metrics, mandatoryMetricTags, metric.name)
+			}
 		}
 	}, 5*time.Minute, 10*time.Second)
 }
@@ -428,7 +449,7 @@ func (v *gpuBaseSuite[Env]) TestWorkloadmetaHasGPUs() {
 		status, err := v.caps.Agent().WorkloadList()
 		assert.NoError(c, err)
 		out = status.Content
-		assert.Contains(c, out, "=== Entity gpu sources(merged):[runtime] id: ")
+		assert.Contains(c, out, "=== Entity gpu sources(merged):[nvml] id: ")
 	}, 30*time.Second, 1*time.Second)
 
 	if v.T().Failed() {
@@ -446,4 +467,46 @@ func (v *gpuBaseSuite[Env]) TestZZAgentDidNotRestart() {
 		finalCount := v.caps.GetRestartCount(service)
 		v.Assert().Equal(initialCount, finalCount, "Service %s restarted during test suite", service)
 	}
+}
+
+func assertMetricsHaveExpectedTagKeys(c *assert.CollectT, metrics []*aggregator.MetricSeries, expectedTagKeys []string, metricName string) bool {
+	smallestMissingTagSet := expectedTagKeys
+
+	if !assert.Greater(c, len(metrics), 0, "no metric values found for metric %s", metricName) {
+		// Don't follow with the rest of the assertions in the function, but
+		// also don't use require so that the caller of the function can
+		// continue with other assertions.
+		return false
+	}
+
+	missingTags := make(map[string]bool)
+	for _, metric := range metrics {
+		for _, expectedTagKey := range expectedTagKeys {
+			missingTags[expectedTagKey] = true
+		}
+
+		for _, tag := range metric.GetTags() {
+			tagParts := strings.SplitN(tag, ":", 2)
+			if len(tagParts) == 2 {
+				tagKey := tagParts[0]
+
+				if _, ok := missingTags[tagKey]; ok {
+					missingTags[tagKey] = false
+				}
+			}
+		}
+
+		missingTagSet := []string{}
+		for tagKey, isMissing := range missingTags {
+			if isMissing {
+				missingTagSet = append(missingTagSet, tagKey)
+			}
+		}
+
+		if len(missingTagSet) < len(smallestMissingTagSet) {
+			smallestMissingTagSet = missingTagSet
+		}
+	}
+
+	return assert.Empty(c, smallestMissingTagSet, "no metric %s found with expected tag keys %v. The closest tagset we got had the following missing tag keys: %v", metricName, expectedTagKeys, smallestMissingTagSet)
 }

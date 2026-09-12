@@ -5,62 +5,79 @@
 
 //go:build linux && nvml
 
+// Package gpu contains gpu core-check implementation.
 package gpu
 
 import (
+	"errors"
 	"fmt"
-
-	"gopkg.in/yaml.v2"
-
-	"github.com/hashicorp/go-multierror"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
-	taggertypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
+	"github.com/DataDog/datadog-agent/comp/healthplatform/issues/gpuenvironment"
+	healthplatformstore "github.com/DataDog/datadog-agent/comp/healthplatform/store/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
-	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/gpu/model"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/gpu/nvidia"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	agenterrors "github.com/DataDog/datadog-agent/pkg/errors"
+	gpuconfig "github.com/DataDog/datadog-agent/pkg/gpu/config"
+	"github.com/DataDog/datadog-agent/pkg/gpu/containers"
 	ddnvml "github.com/DataDog/datadog-agent/pkg/gpu/safenvml"
-	ddmetrics "github.com/DataDog/datadog-agent/pkg/metrics"
-	sysprobeclient "github.com/DataDog/datadog-agent/pkg/system-probe/api/client"
-	sysconfig "github.com/DataDog/datadog-agent/pkg/system-probe/config"
-	"github.com/DataDog/datadog-agent/pkg/util/common"
-	gpuutil "github.com/DataDog/datadog-agent/pkg/util/gpu"
+	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
 
 const (
-	gpuMetricsNs          = "gpu."
-	metricNameCoreUsage   = gpuMetricsNs + "core.usage"
-	metricNameCoreLimit   = gpuMetricsNs + "core.limit"
-	metricNameMemoryUsage = gpuMetricsNs + "memory.usage"
-	metricNameMemoryLimit = gpuMetricsNs + "memory.limit"
+	gpuMetricsNs = "gpu."
 )
+
+// logLimitCheck is used to limit the number of times we log messages about streams and cuda events, as that can be very verbose
+var logLimitCheck = log.NewLogLimit(20, 10*time.Minute)
+
+var _ check.IssueAwareCheck = (*Check)(nil)
 
 // Check represents the GPU check that will be periodically executed via the Run() function
 type Check struct {
 	core.CheckBase
-	config         *CheckConfig                // config for the check
-	sysProbeClient *sysprobeclient.CheckClient // sysProbeClient is used to communicate with system probe
-	activeMetrics  map[model.StatsKey]bool     // activeMetrics is a set of metrics that have been seen in the current check run
-	collectors     []nvidia.Collector          // collectors for NVML metrics
-	tagger         tagger.Component            // Tagger instance to add tags to outgoing metrics
-	telemetry      *checkTelemetry             // Telemetry component to emit internal telemetry
-	wmeta          workloadmeta.Component      // Workloadmeta store to get the list of containers
-	deviceTags     map[string][]string         // deviceTags is a map of device UUID to tags
-	deviceCache    ddnvml.DeviceCache          // deviceCache is a cache of GPU devices
+	collectors          []nvidia.Collector               // collectors for NVML metrics
+	excludedDeviceUUIDs map[string]struct{}              // excludedDeviceUUIDs contains normalized device UUIDs whose metrics should not be collected
+	tagger              tagger.Component                 // Tagger instance to add tags to outgoing metrics
+	telemetry           *checkTelemetry                  // Internal telemetry metrics for the check
+	wmeta               workloadmeta.Component           // Workloadmeta store to get the list of containers
+	deviceTags          map[string][]string              // deviceTags is a map of device UUID to tags
+	deviceCache         ddnvml.DeviceCache               // deviceCache is a cache of GPU devices
+	spCache             *nvidia.SystemProbeCache         // spCache holds system-probe GPU process metrics
+	prmCache            *nvidia.PRMCache                 // prmCache holds system-probe privileged NVLink metrics
+	gpuConfig           *gpuconfig.Config                // gpuConfig is shared with the system-probe GPU module
+	deviceEvtGatherer   *nvidia.DeviceEventsGatherer     // deviceEvtGatherer asynchronously listens for device events and gathers them
+	workloadTagCache    *WorkloadTagCache                // workloadTagCache caches workload tags for GPU metrics
+	containerProvider   proccontainers.ContainerProvider // containerProvider is used as a fallback to get a PID -> CID mapping when workloadmeta does not have the process data
+	rateCalculator      *nvidia.RateCalculator           // rateCalculator calculates the rate of metrics
+	parallelCollectors  bool                             // parallelCollectors controls whether NVML collectors are collected concurrently
+	issueReporter       healthplatformstore.Component    // issueReporter reports GPU health issues to the health platform
 }
 
 type checkTelemetry struct {
-	metricsSent     telemetry.Counter
-	collectorErrors telemetry.Counter
-	activeMetrics   telemetry.Gauge
+	collectorTelemetry *nvidia.CollectorTelemetry // collectorTelemetry holds specific telemetry for the collectors, it will also be passed to the collector dependencies
+	metrics            *checkTelemetryMetrics     // metrics holds the metrics for the check
+	component          telemetry.Component        // telemetry component, used to create the telemetry metrics
+	nvmlState          *ddnvml.NvmlStateTelemetry // nvmlState tracks the state of the NVML library
+}
+
+type checkTelemetryMetrics struct {
+	metricsSent                telemetry.Counter
+	duplicateMetrics           telemetry.Counter
+	activeMetrics              telemetry.Gauge
+	missingContainerGpuMapping telemetry.Counter
+	deviceCount                telemetry.Gauge // emitted as a telemetry metric too in order to send it through COAT
 }
 
 // Factory creates a new check factory
@@ -72,48 +89,114 @@ func Factory(tagger tagger.Component, telemetry telemetry.Component, wmeta workl
 
 func newCheck(tagger tagger.Component, telemetry telemetry.Component, wmeta workloadmeta.Component) check.Check {
 	return &Check{
-		CheckBase:     core.NewCheckBase(CheckName),
-		config:        &CheckConfig{},
-		activeMetrics: make(map[model.StatsKey]bool),
-		tagger:        tagger,
-		telemetry:     newCheckTelemetry(telemetry),
-		wmeta:         wmeta,
-		deviceTags:    make(map[string][]string),
+		CheckBase:           core.NewCheckBase(CheckName),
+		tagger:              tagger,
+		telemetry:           newCheckTelemetry(telemetry),
+		wmeta:               wmeta,
+		deviceTags:          make(map[string][]string),
+		excludedDeviceUUIDs: make(map[string]struct{}),
+		deviceCache:         ddnvml.NewDeviceCache(),
+		rateCalculator:      nvidia.NewRateCalculator(),
 	}
+}
+
+// NewCheck creates a new GPU check instance. This is exported for integration testing.
+func NewCheck(tagger tagger.Component, telemetry telemetry.Component, wmeta workloadmeta.Component) check.Check {
+	return newCheck(tagger, telemetry, wmeta)
+}
+
+// SetContainerProvider sets the container provider on the Check.
+// This is exported for integration testing.
+func (c *Check) SetContainerProvider(provider proccontainers.ContainerProvider) {
+	c.containerProvider = provider
+}
+
+// SetIssueReporter implements check.IssueAwareCheck.
+func (c *Check) SetIssueReporter(reporter healthplatformstore.Component) {
+	c.issueReporter = reporter
 }
 
 func newCheckTelemetry(tm telemetry.Component) *checkTelemetry {
 	return &checkTelemetry{
-		metricsSent:     tm.NewCounter(CheckName, "metrics_sent", []string{"collector"}, "Number of GPU metrics sent"),
-		collectorErrors: tm.NewCounter(CheckName, "collector_errors", []string{"collector"}, "Number of errors from NVML collectors"),
-		activeMetrics:   tm.NewGauge(CheckName, "active_metrics", nil, "Number of active metrics"),
+		metrics:            newCheckTelemetryMetrics(tm),
+		component:          tm,
+		nvmlState:          ddnvml.NewNvmlStateTelemetry(tm),
+		collectorTelemetry: nvidia.NewCollectorTelemetry(tm),
+	}
+}
+
+func newCheckTelemetryMetrics(tm telemetry.Component) *checkTelemetryMetrics {
+	return &checkTelemetryMetrics{
+		metricsSent:                tm.NewCounter(CheckName, "metrics_sent", []string{"collector"}, "Number of GPU metrics sent"),
+		activeMetrics:              tm.NewGauge(CheckName, "active_metrics", nil, "Number of active metrics"),
+		duplicateMetrics:           tm.NewCounter(CheckName, "duplicate_metrics", []string{"device"}, "Number of duplicate metrics removed from NVML collectors due to priority de-duplication"),
+		missingContainerGpuMapping: tm.NewCounter(CheckName, "missing_container_gpu_mapping", []string{"container_name"}, "Number of containers with no matching GPU device"),
+		deviceCount:                tm.NewGauge(CheckName, "device_total", nil, "Number of GPU devices"),
 	}
 }
 
 // Configure parses the check configuration and init the check
-func (c *Check) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string) error {
-	if err := c.CommonConfigure(senderManager, initConfig, config, source); err != nil {
+func (c *Check) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string, provider string) error {
+	// Check if GPU check is enabled (follows SBOM pattern)
+	if !pkgconfigsetup.Datadog().GetBool("gpu.enabled") {
+		return errors.New("GPU check is disabled")
+	}
+
+	if err := c.CommonConfigure(senderManager, initConfig, config, source, provider); err != nil {
 		return err
 	}
 
-	if err := yaml.Unmarshal(config, c.config); err != nil {
-		return fmt.Errorf("invalid gpu check config: %w", err)
+	c.gpuConfig = gpuconfig.New()
+	for _, collectorName := range c.gpuConfig.DisabledCollectors {
+		log.Infof("Collector %s is disabled by configuration", collectorName)
+	}
+	c.excludedDeviceUUIDs = make(map[string]struct{})
+	for _, deviceUUID := range pkgconfigsetup.Datadog().GetStringSlice("gpu.excluded_devices") {
+		c.excludedDeviceUUIDs[strings.ToLower(deviceUUID)] = struct{}{}
+		log.Infof("GPU device %s is excluded by configuration", deviceUUID)
+	}
+	c.parallelCollectors = pkgconfigsetup.Datadog().GetBool("gpu.parallel_collectors")
+	if c.parallelCollectors {
+		log.Infof("Enabled concurrent NVML collector collection")
 	}
 
-	c.sysProbeClient = sysprobeclient.GetCheckClient(pkgconfigsetup.SystemProbe().GetString("system_probe_config.sysprobe_socket"))
-	return nil
-}
-
-func (c *Check) ensureInitDeviceCache() error {
-	if c.deviceCache != nil {
-		return nil
+	if c.containerProvider == nil {
+		// Do not re-set the container provider if it is already set. It would be better to have it as an argument like the tagger and wmeta,
+		// but because it's not componentized yet with FX, we need to do it this way (see service discovery check for a similar pattern).
+		containerProvider, err := proccontainers.GetSharedContainerProvider()
+		if err != nil {
+			// Do not return an error here, as it would prevent the check from running in standalone mode (with `agent check run`)
+			log.Errorf("failed to get shared container provider: %v", err)
+		}
+		c.containerProvider = containerProvider
 	}
 
-	var err error
-	c.deviceCache, err = ddnvml.NewDeviceCache()
+	workloadTagCacheSize := pkgconfigsetup.Datadog().GetInt("gpu.workload_tag_cache_size")
+	workloadTagCache, err := NewWorkloadTagCache(c.tagger, c.wmeta, c.containerProvider, c.telemetry.component, workloadTagCacheSize)
 	if err != nil {
-		return fmt.Errorf("failed to initialize device cache: %w", err)
+		return fmt.Errorf("error creating workload tag cache: %w", err)
 	}
+	c.workloadTagCache = workloadTagCache
+
+	c.spCache = nil
+	c.prmCache = nil
+	var driverEventsSource nvidia.DriverEventsSource
+	if c.gpuConfig.Enabled {
+		if c.gpuConfig.EnableEBPFProbes || c.gpuConfig.PRMEndpointEnabled || c.gpuConfig.DriverEventsEnabled {
+			client := nvidia.NewSystemProbeClient()
+			if c.gpuConfig.EnableEBPFProbes {
+				log.Info("GPU monitoring probe is enabled in system-probe, creating ebpf collectors for all devices")
+				c.spCache = nvidia.NewSystemProbeCache(client)
+			}
+			if c.gpuConfig.PRMEndpointEnabled {
+				c.prmCache = nvidia.NewPRMCache(client)
+			}
+			if c.gpuConfig.DriverEventsEnabled {
+				driverEventsSource = nvidia.NewDriverEventsCache(client)
+			}
+		}
+	}
+	c.deviceEvtGatherer = nvidia.NewDeviceEventsGatherer(driverEventsSource)
 
 	return nil
 }
@@ -121,20 +204,55 @@ func (c *Check) ensureInitDeviceCache() error {
 // ensureInitCollectors initializes the NVML library and the collectors if they are not already initialized.
 // It returns an error if the initialization fails.
 func (c *Check) ensureInitCollectors() error {
-	//TODO: in the future we need to support hot-plugging of GPU devices,
-	// as we currently create a collector per GPU device.
-	// also we map the device tags in this function only once, so new hot-lugged devices won't have the tags
-	if c.collectors != nil {
-		return nil
-	}
-
-	if err := c.ensureInitDeviceCache(); err != nil {
-		return err
-	}
-
-	collectors, err := nvidia.BuildCollectors(&nvidia.CollectorDependencies{DeviceCache: c.deviceCache})
+	// the list of devices can change over time, so grab the latest and:
+	// - remove collectors for the devices that are not present anymore
+	// - collect devices for which a new collector must be added
+	devices, err := c.deviceCache.All()
 	if err != nil {
-		return fmt.Errorf("failed to build NVML collectors: %w", err)
+		return fmt.Errorf("failed to retrieve physical devices: %w", err)
+	}
+	curDevices := map[string]ddnvml.Device{}
+	for _, d := range devices {
+		deviceUUID := d.GetDeviceInfo().UUID
+		if c.isDeviceExcluded(deviceUUID) {
+			continue
+		}
+		curDevices[deviceUUID] = d
+	}
+
+	// discard collectors of devices that are no more available
+	collectors := []nvidia.Collector{}
+	collectorUUIDs := map[string]struct{}{}
+	for _, c := range c.collectors {
+		deviceUUID := c.Device().GetDeviceInfo().UUID
+		if _, ok := curDevices[deviceUUID]; ok {
+			collectors = append(collectors, c)
+			collectorUUIDs[deviceUUID] = struct{}{}
+		}
+	}
+
+	// figure out which devices do not have a collector yet and build new ones accordingly
+	missingDevices := []ddnvml.Device{}
+	for uuid, d := range curDevices {
+		if _, ok := collectorUUIDs[uuid]; !ok {
+			missingDevices = append(missingDevices, d)
+		}
+	}
+	if len(missingDevices) > 0 {
+		newCollectors, err := nvidia.BuildCollectors(
+			missingDevices,
+			&nvidia.CollectorDependencies{
+				DeviceEventsGatherer: c.deviceEvtGatherer,
+				SystemProbeCache:     c.spCache,
+				PRMCache:             c.prmCache,
+				Telemetry:            c.telemetry.collectorTelemetry,
+				Workloadmeta:         c.wmeta,
+				Config:               *c.gpuConfig,
+			})
+		if err != nil {
+			return fmt.Errorf("failed to build NVML collectors: %w", err)
+		}
+		collectors = append(collectors, newCollectors...)
 	}
 
 	c.collectors = collectors
@@ -142,17 +260,43 @@ func (c *Check) ensureInitCollectors() error {
 	return nil
 }
 
+func (c *Check) isDeviceExcluded(deviceUUID string) bool {
+	_, excluded := c.excludedDeviceUUIDs[strings.ToLower(deviceUUID)]
+	return excluded
+}
+
 // Cancel stops the check
 func (c *Check) Cancel() {
+	if err := c.deviceEvtGatherer.Stop(); err != nil {
+		log.Warnf("error stopping event set gatherer: %v", err)
+	}
+
 	if lib, err := ddnvml.GetSafeNvmlLib(); err == nil {
-		_ = lib.Shutdown()
+		if err := lib.Shutdown(); err != nil {
+			log.Warnf("error shutting down NVML lib: %v", err)
+		}
 	}
 
 	c.CheckBase.Cancel()
 }
 
-// Run executes the check
+// Interval returns the scheduling interval for the check. When
+// gpu.collection_interval_override (DD_GPU_COLLECTION_INTERVAL_OVERRIDE) is set to
+// a positive number of seconds it overrides the cadence, taking precedence over
+// the instance's min_collection_interval. Otherwise the check falls back to the
+// instance's min_collection_interval / default.
+func (c *Check) Interval() time.Duration {
+	if iv := pkgconfigsetup.Datadog().GetInt("gpu.collection_interval_override"); iv > 0 {
+		return time.Duration(iv) * time.Second
+	}
+	return c.CheckBase.Interval()
+}
+
+// Run executes the check. Configure must have been called before and returned no errors, otherwise
+// we will panic here as we assume certain components have been initialized.
 func (c *Check) Run() error {
+	currentExecutionTime := time.Now()
+
 	snd, err := c.GetSender()
 	if err != nil {
 		return fmt.Errorf("get metric sender: %w", err)
@@ -160,228 +304,281 @@ func (c *Check) Run() error {
 	// Commit the metrics even in case of an error
 	defer snd.Commit()
 
+	// Check the state of the NVML library for telemetry
+	c.telemetry.nvmlState.Check()
+	c.syncNvmlHealthIssue(c.telemetry.nvmlState.Unavailable(), c.telemetry.nvmlState.LastNvmlInitSuccess())
+
+	if err := c.deviceCache.Refresh(); err != nil {
+		return fmt.Errorf("failed to refresh device cache: %w", err)
+	}
+
+	deviceCount, err := c.deviceCache.Count()
+	if err != nil {
+		if logLimitCheck.ShouldLog() {
+			log.Warnf("failed to get device count: %v", err)
+		}
+		deviceCount = 0
+	}
+	c.telemetry.metrics.deviceCount.Set(float64(deviceCount))
+
+	// Refresh system-probe data before collecting metrics.
+	if c.spCache != nil && c.gpuConfig.EnableEBPFProbes {
+		if err := c.spCache.Refresh(); err != nil && logLimitCheck.ShouldLog() {
+			log.Warnf("error refreshing system-probe stats cache: %v", err)
+			// Continue with NVML-only metrics, SP collectors will return empty metrics
+		}
+	}
+
+	if c.prmCache != nil {
+		if err := c.prmCache.Refresh(); err != nil && logLimitCheck.ShouldLog() {
+			log.Warnf("error refreshing PRM cache: %v", err)
+		}
+	}
+
+	// start device event gatherer if we have not already
+	if !c.deviceEvtGatherer.Started() {
+		if err := c.deviceEvtGatherer.Start(); err != nil {
+			log.Warnf("error starting device events collection: %v", err)
+		}
+	}
+
+	// Attempt refreshing device events
+	if err := c.deviceEvtGatherer.Refresh(currentExecutionTime); err != nil && logLimitCheck.ShouldLog() {
+		log.Warnf("error refreshing device events cache: %v", err)
+		// Might cause empty metrics in collectors depending on device events
+	}
+
+	// Make sure workload tag resolution attempts retrieving the most up to date values.
+	// Stale cache entries (from previous runs) might still be used as a fallback.
+	c.workloadTagCache.MarkStale()
+
 	// build the mapping of GPU devices -> containers to allow tagging device
 	// metrics with the tags of containers that are using them
 	gpuToContainersMap := c.getGPUToContainersMap()
 
-	if err := c.emitSysprobeMetrics(snd, gpuToContainersMap); err != nil {
-		log.Warnf("error while sending sysprobe metrics: %s", err)
-	}
-
-	if err := c.emitNvmlMetrics(snd, gpuToContainersMap); err != nil {
-		log.Warnf("error while sending NVML metrics: %s", err)
+	if err := c.emitMetrics(snd, gpuToContainersMap, currentExecutionTime); err != nil && logLimitCheck.ShouldLog() {
+		log.Warnf("error while sending gpu metrics: %s", err)
 	}
 
 	return nil
 }
 
-func (c *Check) emitSysprobeMetrics(snd sender.Sender, gpuToContainersMap map[string][]*workloadmeta.Container) error {
-	if err := c.ensureInitDeviceCache(); err != nil {
-		return err
+func (c *Check) syncNvmlHealthIssue(unavailable bool, nvmlInitSuccess bool) {
+	if c.issueReporter == nil {
+		return
 	}
 
-	stats, err := sysprobeclient.GetCheck[model.GPUStats](c.sysProbeClient, sysconfig.GPUMonitoringModule)
-	if err != nil {
-		if sysprobeclient.IgnoreStartupError(err) == nil {
-			return nil
+	issueID := gpuHealthIssueID(gpuenvironment.ReasonNvmlUnavailable)
+	if !unavailable {
+		// Only mark the issue as resolved if we had a successful init of the
+		// NVML library. unavailable is only true after a certain amount of
+		// time, so we can't rely on that being false to resolve the issue. For
+		// example, after an agent restart, we would resolve the issue too early
+		// (unavailable will be false at the start) even if the NVML library is
+		// not available still.
+		if nvmlInitSuccess {
+			c.issueReporter.ResolveIssue(issueID)
 		}
-		return fmt.Errorf("cannot get data from system-probe: %w", err)
+		return
 	}
 
-	return c.processSysprobeStats(snd, stats, gpuToContainersMap)
+	context := map[string]string{
+		"reason": gpuenvironment.ReasonNvmlUnavailable,
+	}
+	issue, buildErr := gpuenvironment.NewGPUEnvironmentIssue().BuildIssue(context)
+	if buildErr != nil {
+		log.Warnf("failed to build GPU NVML health issue: %v", buildErr)
+		return
+	}
+	issue.Id = issueID
+
+	if err := c.issueReporter.ReportIssue(issue); err != nil {
+		log.Warnf("failed to report GPU NVML health issue: %v", err)
+	}
 }
 
-func addToActiveEntitiesPerDevice(activeEntitiesPerDevice map[string]common.StringSet, key model.StatsKey, processTags []string) {
-	if _, ok := activeEntitiesPerDevice[key.DeviceUUID]; !ok {
-		activeEntitiesPerDevice[key.DeviceUUID] = common.NewStringSet()
-	}
-
-	for _, t := range processTags {
-		activeEntitiesPerDevice[key.DeviceUUID].Add(t)
-	}
-}
-
-func (c *Check) processSysprobeStats(snd sender.Sender, stats model.GPUStats, gpuToContainersMap map[string][]*workloadmeta.Container) error {
-	sentMetrics := 0
-
-	// Always send telemetry metrics
-	defer func() {
-		c.telemetry.metricsSent.Add(float64(sentMetrics), "system_probe")
-		c.telemetry.activeMetrics.Set(float64(len(c.activeMetrics)))
-	}()
-
-	// Set all metrics to inactive, so we can remove the ones that we don't see
-	// and send the final metrics
-	for key := range c.activeMetrics {
-		c.activeMetrics[key] = false
-	}
-
-	// map each device UUID to the set of tags corresponding to entities (processes) using it
-	activeEntitiesPerDevice := make(map[string]common.StringSet)
-	for _, dev := range c.deviceCache.All() {
-		activeEntitiesPerDevice[dev.GetDeviceInfo().UUID] = common.NewStringSet()
-	}
-
-	// Emit the usage metrics
-	for _, entry := range stats.Metrics {
-		key := entry.Key
-		metrics := entry.UtilizationMetrics
-
-		// Get the tags for this metric. We split it between "process" and "device" tags
-		// so that we can store which processes are using which devices. That way we will later
-		// be able to tag the limit metrics (GPU memory capacity, GPU core count) with the
-		// tags of the processes using them.
-		processTags := c.getProcessTagsForKey(key)
-		deviceTags := c.deviceTags[key.DeviceUUID]
-
-		// Add the process tags to the active entities for the device, using a set to avoid duplicates
-		addToActiveEntitiesPerDevice(activeEntitiesPerDevice, key, processTags)
-
-		allTags := append(processTags, deviceTags...)
-
-		snd.Gauge(metricNameCoreUsage, metrics.UsedCores, "", allTags)
-		snd.Gauge(metricNameMemoryUsage, float64(metrics.Memory.CurrentBytes), "", allTags)
-		sentMetrics += 2
-
-		c.activeMetrics[key] = true
-	}
-
-	// Remove the PIDs that we didn't see in this check, and send a metric with a value
-	// of zero to ensure it's reset and the previous value doesn't linger on for longer than necessary.
-	for key, active := range c.activeMetrics {
-		if !active {
-			processTags := c.getProcessTagsForKey(key)
-			tags := append(processTags, c.deviceTags[key.DeviceUUID]...)
-			snd.Gauge(metricNameMemoryUsage, 0, "", tags)
-			snd.Gauge(metricNameCoreUsage, 0, "", tags)
-			sentMetrics += 2
-
-			// Here we also need to mark these entities as active. If we don't, the limit metrics won't have
-			// the tags and utilization will not be reported for them, as the limit metric won't match
-			addToActiveEntitiesPerDevice(activeEntitiesPerDevice, key, processTags)
-
-			delete(c.activeMetrics, key)
-		}
-	}
-
-	// Now, we report the limit metrics tagged with all the processes that are using them
-	// Use the list of active processes from system-probe instead of the ActivePIDs from the
-	// workloadmeta store, as the latter might not be up-to-date and we want these limit metrics
-	// to match the usage metrics reported above
-	for _, dev := range c.deviceCache.All() {
-		devInfo := dev.GetDeviceInfo()
-		deviceTags := c.deviceTags[devInfo.UUID]
-
-		// Retrieve the tags for all the active processes on this device. This will include pid, container
-		// tags and will enable matching between the usage of an entity and the corresponding limit.
-		activeEntitiesTags := activeEntitiesPerDevice[devInfo.UUID]
-		if activeEntitiesTags == nil {
-			// Might be nil if there are no active processes on this device
-			activeEntitiesTags = common.NewStringSet()
-		}
-
-		// Also, add the tags for all containers that have this GPU allocated. Add to the set to avoid repetitions.
-		// Adding this ensures we correctly report utilization even if some of the GPUs allocated to the container
-		// are not being used.
-		for _, container := range gpuToContainersMap[devInfo.UUID] {
-			for _, tag := range c.getContainerTags(container.EntityID.ID) {
-				activeEntitiesTags.Add(tag)
-			}
-		}
-
-		allTags := append(deviceTags, activeEntitiesTags.GetAll()...)
-
-		snd.Gauge(metricNameCoreLimit, float64(devInfo.CoreCount), "", allTags)
-		snd.Gauge(metricNameMemoryLimit, float64(devInfo.Memory), "", allTags)
-	}
-
-	return nil
-}
-
-// getProcessTagsForKey returns the process-related tags (PID, containerID) for a given key.
-func (c *Check) getProcessTagsForKey(key model.StatsKey) []string {
-	// PID is always added
-	tags := []string{
-		// Per-PID metrics are subject to change due to high cardinality
-		fmt.Sprintf("pid:%d", key.PID),
-	}
-
-	tags = append(tags, c.getContainerTags(key.ContainerID)...)
-
-	return tags
-}
-
-func (c *Check) getContainerTags(containerID string) []string {
-	// Container ID tag will be added or not depending on the tagger configuration
-	containerEntityID := taggertypes.NewEntityID(taggertypes.ContainerID, containerID)
-	containerTags, err := c.tagger.Tag(containerEntityID, taggertypes.ChecksConfigCardinality)
-	if err != nil {
-		log.Errorf("Error collecting container tags for container %s: %s", containerID, err)
-	}
-
-	return containerTags
+func gpuHealthIssueID(reason string) string {
+	return gpuenvironment.IssueID + ":" + reason
 }
 
 func (c *Check) getGPUToContainersMap() map[string][]*workloadmeta.Container {
-	containers := c.wmeta.ListContainersWithFilter(func(cont *workloadmeta.Container) bool {
-		return len(cont.ResolvedAllocatedResources) > 0
-	})
+	allPhysicalDevices, err := c.deviceCache.AllPhysicalDevices()
+	if err != nil {
+		if logLimitCheck.ShouldLog() {
+			log.Warnf("Error getting all physical devices: %s", err)
+		}
+		return nil
+	}
+	gpuToContainers := make(map[string][]*workloadmeta.Container, len(allPhysicalDevices))
 
-	gpuToContainers := make(map[string][]*workloadmeta.Container)
+	for _, container := range c.wmeta.ListContainersWithFilter(containers.HasGPUs) {
+		if containers.IsDatadogAgentContainer(c.wmeta, container) {
+			log.Debugf("Container %s is a Datadog container, skipping for device assignment", container.Name)
+			continue
+		}
 
-	for _, container := range containers {
-		for _, resource := range container.ResolvedAllocatedResources {
-			if gpuutil.IsNvidiaKubernetesResource(resource.Name) {
-				gpuToContainers[resource.ID] = append(gpuToContainers[resource.ID], container)
-			}
+		containerDevices, err := containers.MatchContainerDevices(container, allPhysicalDevices)
+		if err != nil {
+			c.telemetry.metrics.missingContainerGpuMapping.Inc(container.Name)
+		}
+
+		// despite an error, we still might have some devices assigned to the container
+		// we also assume that each device can be assigned to only one container, and we store only the first one
+		for _, device := range containerDevices {
+			deviceID := device.GetDeviceInfo().UUID
+			gpuToContainers[deviceID] = append(gpuToContainers[deviceID], container)
 		}
 	}
 
 	return gpuToContainers
 }
 
-func (c *Check) emitNvmlMetrics(snd sender.Sender, gpuToContainersMap map[string][]*workloadmeta.Container) error {
+type deviceSamplesCollection struct {
+	collectorSamples map[nvidia.CollectorName][]nvidia.Sample
+	totalCount       int
+}
+
+type collectorSamplesCollection struct {
+	name          nvidia.CollectorName
+	deviceUUID    string
+	telemetryTags []string
+	samples       []nvidia.Sample
+	err           error
+	duration      time.Duration
+}
+
+func (c *Check) emitMetrics(snd sender.Sender, gpuToContainersMap map[string][]*workloadmeta.Container, currentExecutionTime time.Time) error {
 	err := c.ensureInitCollectors()
 	if err != nil {
 		return fmt.Errorf("failed to initialize NVML collectors: %w", err)
 	}
 
-	var multiErr error
-	for _, collector := range c.collectors {
-		log.Debugf("Collecting metrics from NVML collector: %s", collector.Name())
-		metrics, collectErr := collector.Collect()
-		if collectErr != nil {
-			c.telemetry.collectorErrors.Add(1, string(collector.Name()))
-			multiErr = multierror.Append(multiErr, fmt.Errorf("collector %s failed. %w", collector.Name(), collectErr))
-		}
+	perDeviceSamples := make(map[string]*deviceSamplesCollection)
 
-		var extraTags []string
-		for _, container := range gpuToContainersMap[collector.DeviceUUID()] {
-			entityID := taggertypes.NewEntityID(taggertypes.ContainerID, container.EntityID.ID)
-			tags, err := c.tagger.Tag(entityID, taggertypes.ChecksConfigCardinality)
-			if err != nil {
-				multiErr = multierror.Append(multiErr, fmt.Errorf("error collecting container tags for GPU %s: %w", collector.DeviceUUID(), err))
-				continue
-			}
-
-			extraTags = append(extraTags, tags...)
-		}
-
-		for _, metric := range metrics {
-			metricName := gpuMetricsNs + metric.Name
-			switch metric.Type {
-			case ddmetrics.CountType:
-				snd.Count(metricName, metric.Value, "", append(c.deviceTags[collector.DeviceUUID()], extraTags...))
-			case ddmetrics.GaugeType:
-				snd.Gauge(metricName, metric.Value, "", append(c.deviceTags[collector.DeviceUUID()], extraTags...))
-			default:
-				multiErr = multierror.Append(multiErr, fmt.Errorf("unsupported metric type %s for metric %s", metric.Type, metricName))
-				continue
-			}
-		}
-
-		c.telemetry.metricsSent.Add(float64(len(metrics)), string(collector.Name()))
+	var collectorResults []collectorSamplesCollection
+	if c.parallelCollectors {
+		collectorResults = collectSamples(c.collectors)
+	} else {
+		collectorResults = collectSamplesSerial(c.collectors)
 	}
 
-	return multiErr
+	var multiErr []error
+	for _, collectorResult := range collectorResults {
+		c.telemetry.collectorTelemetry.CollectionRuns.Inc(collectorResult.telemetryTags...)
+		c.telemetry.collectorTelemetry.Time.Observe(float64(collectorResult.duration.Milliseconds()), collectorResult.telemetryTags...)
+
+		if collectorResult.err != nil {
+			c.telemetry.collectorTelemetry.CollectionErrors.Add(1, collectorResult.telemetryTags...)
+			multiErr = append(multiErr, fmt.Errorf("collector %s failed. %w", collectorResult.name, collectorResult.err))
+		}
+
+		if len(collectorResult.samples) > 0 {
+			deviceUUID := collectorResult.deviceUUID
+			if perDeviceSamples[deviceUUID] == nil {
+				perDeviceSamples[deviceUUID] = &deviceSamplesCollection{
+					collectorSamples: make(map[nvidia.CollectorName][]nvidia.Sample),
+				}
+			}
+			perDeviceSamples[deviceUUID].collectorSamples[collectorResult.name] = collectorResult.samples
+			perDeviceSamples[deviceUUID].totalCount += len(collectorResult.samples)
+		}
+
+		c.telemetry.metrics.metricsSent.Add(float64(len(collectorResult.samples)), string(collectorResult.name))
+	}
+
+	// Iterate through devices to emit their samples.
+	for deviceUUID, deviceData := range perDeviceSamples {
+		deduplicatedSamples := nvidia.RemoveDuplicateSamples(deviceData.collectorSamples)
+		c.telemetry.metrics.duplicateMetrics.Add(float64(deviceData.totalCount-len(deduplicatedSamples)), deviceUUID)
+		deviceContainers := gpuToContainersMap[deviceUUID]
+		deviceTags := c.deviceTags[deviceUUID]
+
+		deduplicatedSamples = c.rateCalculator.ProcessSamples(deduplicatedSamples, currentExecutionTime, deviceUUID)
+
+		for _, sample := range deduplicatedSamples {
+			if err := c.emitSample(sample, snd, currentExecutionTime, deviceContainers, deviceTags); err != nil {
+				multiErr = append(multiErr, fmt.Errorf("error emitting sample %s: %w", sample.Key(), err))
+			}
+		}
+	}
+
+	return errors.Join(multiErr...)
+}
+
+func collectSamplesSerial(collectors []nvidia.Collector) []collectorSamplesCollection {
+	results := make([]collectorSamplesCollection, len(collectors))
+
+	for i, collector := range collectors {
+		results[i] = collectSample(collector)
+	}
+
+	return results
+}
+
+func collectSamples(collectors []nvidia.Collector) []collectorSamplesCollection {
+	results := make([]collectorSamplesCollection, len(collectors))
+
+	var wg sync.WaitGroup
+	wg.Add(len(collectors))
+	for i, collector := range collectors {
+		go func(i int, collector nvidia.Collector) {
+			defer wg.Done()
+			results[i] = collectSample(collector)
+		}(i, collector)
+	}
+	wg.Wait()
+
+	return results
+}
+
+func collectSample(collector nvidia.Collector) (result collectorSamplesCollection) {
+	defer func() {
+		if r := recover(); r != nil {
+			result.err = fmt.Errorf("collector panicked: %v", r)
+			log.Errorf("Recovered from panic in collector %s: %v", result.name, r)
+		}
+	}()
+	result.name = collector.Name()
+	result.deviceUUID = collector.Device().GetDeviceInfo().UUID
+	result.telemetryTags = nvidia.CollectorTelemetryTags(collector)
+	log.Debugf("Collecting samples from NVML collector: %s", result.name)
+	startTime := time.Now()
+	result.samples, result.err = collector.Collect()
+	result.duration = time.Since(startTime)
+	return
+}
+
+func (c *Check) emitSample(sample nvidia.Sample, snd sender.Sender, currentExecutionTime time.Time, deviceContainers []*workloadmeta.Container, deviceTags []string) error {
+	var multiErr []error
+
+	metricWorkloads := sample.AssociatedWorkloads()
+
+	// Metrics with no associated workloads are assumed to apply to all workloads on the device.
+	if len(metricWorkloads) == 0 {
+		for _, deviceContainer := range deviceContainers {
+			metricWorkloads = append(metricWorkloads, deviceContainer.EntityID)
+		}
+	}
+
+	metricTags := []string{}
+	for _, workloadID := range metricWorkloads {
+		tags, err := c.workloadTagCache.GetOrCreateWorkloadTags(workloadID)
+		if err != nil && !agenterrors.IsNotFound(err) { // Only report errors that are not "not found"
+			multiErr = append(multiErr, fmt.Errorf("error collecting workload tags for workload %s of type %s: %w", workloadID.ID, workloadID.Kind, err))
+		}
+
+		// always continue with whatever tags we can get even if there are errors
+		metricTags = append(metricTags, tags...)
+	}
+
+	sample = sample.Clone() // avoid modifying the original sample
+	sample.AppendTags(metricTags)
+	sample.AppendTags(deviceTags)
+
+	err := sample.Emit(gpuMetricsNs, snd, currentExecutionTime)
+	if err != nil {
+		multiErr = append(multiErr, fmt.Errorf("error emitting sample: %w", err))
+	}
+
+	return errors.Join(multiErr...)
 }

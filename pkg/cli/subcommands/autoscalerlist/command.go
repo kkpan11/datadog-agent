@@ -8,8 +8,11 @@ package autoscalerlist
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
 
 	"go.uber.org/fx"
 
@@ -18,10 +21,13 @@ import (
 
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
+	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
+	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/pkg/api/util"
 	autoscalingWorkload "github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	localautoscalingworkload "github.com/DataDog/datadog-agent/pkg/clusteragent/autoscaling/workload/loadstore"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
@@ -29,6 +35,7 @@ import (
 // cliParams are the command-line arguments for this subcommand
 type cliParams struct {
 	GlobalParams
+	localstore bool
 }
 
 // GlobalParams contains the values of agent-global Cobra flags.
@@ -45,7 +52,7 @@ type GlobalParams struct {
 func MakeCommand(globalParamsGetter func() GlobalParams) *cobra.Command {
 	cliParams := &cliParams{}
 
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "autoscaler-list",
 		Short: "Print the autoscaling store content of a running agent",
 		Long:  ``,
@@ -63,15 +70,21 @@ func MakeCommand(globalParamsGetter func() GlobalParams) *cobra.Command {
 					),
 					LogParams: log.ForOneShot(globalParams.LoggerName, "off", true)}),
 				core.Bundle(),
+				ipcfx.ModuleReadOnly(),
 			)
 		},
 	}
+	cmd.Flags().BoolVarP(&cliParams.localstore, "localstore", "l", false, "print autoscaling local fallback metrics store debug info")
+	return cmd
 }
 
-func autoscalerList(_ log.Component, config config.Component, _ *cliParams) error {
-	// Set session token
-	if err := util.SetAuthToken(config); err != nil {
-		return err
+func autoscalerList(_ log.Component, config config.Component, client ipc.HTTPClient, cliParams *cliParams) error {
+	if cliParams.localstore {
+		err := getLocalAutoscalingWorkloadCheck(color.Output, config, client)
+		if err != nil {
+			return fmt.Errorf("error getting localstore debug info: %v", err)
+		}
+		return nil
 	}
 
 	url, err := getAutoscalerURL(config)
@@ -79,30 +92,29 @@ func autoscalerList(_ log.Component, config config.Component, _ *cliParams) erro
 		return err
 	}
 
-	return getAutoscalerList(color.Output, url)
+	return getAutoscalerList(client, color.Output, url)
 }
 
 func getAutoscalerURL(config config.Component) (string, error) {
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(config)
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(config)
 	if err != nil {
 		return "", err
 	}
 
 	var urlstr string
 	if flavor.GetFlavor() == flavor.ClusterAgent {
-		urlstr = fmt.Sprintf("https://%v:%v/autoscaler-list", ipcAddress, config.GetInt("cluster_agent.cmd_port"))
+		addr := net.JoinHostPort(ipcAddress, strconv.Itoa(config.GetInt("cluster_agent.cmd_port")))
+		urlstr = fmt.Sprintf("https://%s/autoscaler-list", addr)
 	} else {
-		return "", fmt.Errorf("running autoscaler-list is only supported on the cluster agent")
+		return "", errors.New("running autoscaler-list is only supported on the cluster agent")
 	}
 
 	return urlstr, nil
 }
 
-func getAutoscalerList(w io.Writer, url string) error {
-	c := util.GetClient()
-
+func getAutoscalerList(client ipc.HTTPClient, w io.Writer, url string) error {
 	// get the autoscaler-list from server
-	r, err := util.DoGet(c, url, util.LeaveConnectionOpen)
+	r, err := client.Get(url, ipchttp.WithLeaveConnectionOpen)
 	if err != nil {
 		if r != nil && string(r) != "" {
 			return fmt.Errorf("the agent ran into an error while getting autoscaler list: %s", string(r))
@@ -111,7 +123,7 @@ func getAutoscalerList(w io.Writer, url string) error {
 	}
 
 	if len(r) == 0 {
-		return fmt.Errorf("no autoscalers found")
+		return errors.New("no autoscalers found")
 	}
 
 	autoscalerDump := autoscalingWorkload.AutoscalersInfo{}
@@ -120,5 +132,36 @@ func getAutoscalerList(w io.Writer, url string) error {
 	}
 
 	autoscalerDump.Print(w)
+	return nil
+}
+
+func getLocalAutoscalingWorkloadCheck(w io.Writer, config config.Component, c ipc.HTTPClient) error {
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(config)
+	if err != nil {
+		return err
+	}
+	addr := net.JoinHostPort(ipcAddress, strconv.Itoa(config.GetInt("cluster_agent.cmd_port")))
+	urlstr := fmt.Sprintf("https://%s/local-autoscaling-check", addr)
+
+	r, err := c.Get(urlstr, ipchttp.WithLeaveConnectionOpen)
+	if err != nil {
+		if r != nil && string(r) != "" {
+			return fmt.Errorf("the agent ran into an error while getting local autoscaling workload entities: %s", string(r))
+		}
+
+		return fmt.Errorf("failed to query the agent (running?): %s", err)
+	}
+
+	var response localautoscalingworkload.LocalWorkloadMetricStoreInfo
+
+	err = json.Unmarshal(r, &response)
+	if err != nil {
+		return fmt.Errorf("error unmarshalling json: %s", err)
+	}
+	if w != color.Output {
+		color.NoColor = true
+	}
+	fmt.Fprintf(w, "\n=== Workload Failover Metric Entity List ===\n")
+	response.Dump(w)
 	return nil
 }

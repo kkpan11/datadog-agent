@@ -8,6 +8,15 @@
 package setup
 
 func initConfig() {
-	InitConfig(Datadog())
-	InitSystemProbeConfig(SystemProbe())
+	cfg := GlobalConfigBuilder()
+	InitConfig(cfg)
+
+	sysprobe := GlobalSystemProbeConfigBuilder()
+	InitSystemProbeConfig(sysprobe)
+}
+
+func fixupInitConfig() {
+	ddcfg := Datadog()
+	fixupInitCommonConfigComponents(ddcfg)
+	fixupInitFullAgentOnlyComponents(ddcfg)
 }

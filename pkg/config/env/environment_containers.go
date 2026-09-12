@@ -43,13 +43,18 @@ func init() {
 	registerFeature(Kubernetes)
 	registerFeature(ECSEC2)
 	registerFeature(ECSFargate)
+	registerFeature(ECSManagedInstances)
 	registerFeature(EKSFargate)
 	registerFeature(KubeOrchestratorExplorer)
+	registerFeature(KubeletConfigOrchestratorCheck)
 	registerFeature(ECSOrchestratorExplorer)
 	registerFeature(CloudFoundry)
 	registerFeature(Podman)
 	registerFeature(PodResources)
+	registerFeature(KubernetesDevicePlugins)
 	registerFeature(NVML)
+	registerFeature(Process)
+	registerFeature(NonstandardCRIRuntime)
 }
 
 // IsAnyContainerFeaturePresent checks if any of known container features is present
@@ -61,12 +66,14 @@ func IsAnyContainerFeaturePresent() bool {
 		IsFeaturePresent(Kubernetes) ||
 		IsFeaturePresent(ECSEC2) ||
 		IsFeaturePresent(ECSFargate) ||
+		IsFeaturePresent(ECSManagedInstances) ||
 		IsFeaturePresent(EKSFargate) ||
 		IsFeaturePresent(CloudFoundry) ||
-		IsFeaturePresent(Podman)
+		IsFeaturePresent(Podman) ||
+		IsFeaturePresent(NonstandardCRIRuntime)
 }
 
-func detectContainerFeatures(features FeatureMap, cfg model.Reader) {
+func detectContainerFeatures(features FeatureMap, cfg model.ReaderWriter) {
 	detectKubernetes(features, cfg)
 	detectDocker(features)
 	detectCriRuntimes(features, cfg)
@@ -74,7 +81,15 @@ func detectContainerFeatures(features FeatureMap, cfg model.Reader) {
 	detectCloudFoundry(features, cfg)
 	detectPodman(features, cfg)
 	detectPodResources(features, cfg)
+	detectDevicePlugins(features, cfg)
 	detectNVML(features, cfg)
+	detectProcess(features)
+}
+
+func detectProcess(features FeatureMap) {
+	if runtime.GOOS == "linux" {
+		features[Process] = struct{}{}
+	}
 }
 
 func detectKubernetes(features FeatureMap, cfg model.Reader) {
@@ -82,6 +97,9 @@ func detectKubernetes(features FeatureMap, cfg model.Reader) {
 		features[Kubernetes] = struct{}{}
 		if cfg.GetBool("orchestrator_explorer.enabled") {
 			features[KubeOrchestratorExplorer] = struct{}{}
+		}
+		if cfg.GetBool("orchestrator_explorer.kubelet_config_check.enabled") {
+			features[KubeletConfigOrchestratorCheck] = struct{}{}
 		}
 	}
 }
@@ -93,7 +111,7 @@ func detectDocker(features FeatureMap) {
 		for _, defaultDockerSocketPath := range getDefaultDockerPaths() {
 			exists, reachable := socket.IsAvailable(defaultDockerSocketPath, socketTimeout)
 			if exists && !reachable {
-				log.Infof("Agent found Docker socket at: %s but socket not reachable (permissions?)", defaultDockerSocketPath)
+				log.Warnf("Agent found Docker socket at: %s but socket not reachable (permissions?)", defaultDockerSocketPath)
 				continue
 			}
 
@@ -111,7 +129,7 @@ func detectDocker(features FeatureMap) {
 }
 
 // detectCriRuntimes checks for both containerd and crio runtimes
-func detectCriRuntimes(features FeatureMap, cfg model.Reader) {
+func detectCriRuntimes(features FeatureMap, cfg model.ReaderWriter) {
 	// CRI Socket - Do not automatically default socket path if the Agent runs in Docker
 	// as we'll very likely discover the containerd instance wrapped by Docker.
 	criSocket := cfg.GetString("cri_socket_path")
@@ -122,7 +140,7 @@ func detectCriRuntimes(features FeatureMap, cfg model.Reader) {
 			// Check default CRI paths
 			criSocket = checkCriSocket(defaultCriPath)
 			if criSocket != "" {
-				model.AddOverride("cri_socket_path", criSocket)
+				cfg.Set("cri_socket_path", criSocket, model.SourceAgentRuntime)
 				// Currently we do not support multiple CRI paths
 				break
 			}
@@ -142,6 +160,8 @@ func detectCriRuntimes(features FeatureMap, cfg model.Reader) {
 			mergeContainerdNamespaces(cfg)
 		} else if strings.Contains(criSocket, "crio") {
 			features[Crio] = struct{}{}
+		} else {
+			features[NonstandardCRIRuntime] = struct{}{}
 		}
 	}
 }
@@ -153,12 +173,12 @@ func checkCriSocket(socketPath string) string {
 		log.Infof("Agent found cri socket at: %s", socketPath)
 		return socketPath
 	} else if exists && !reachable {
-		log.Infof("Agent found cri socket at: %s but socket not reachable (permissions?)", socketPath)
+		log.Warnf("Agent found cri socket at: %s but socket not reachable (permissions?)", socketPath)
 	}
 	return ""
 }
 
-func mergeContainerdNamespaces(cfg model.Reader) {
+func mergeContainerdNamespaces(cfg model.ReaderWriter) {
 	// Merge containerd_namespace with containerd_namespaces
 	namespaces := merge(
 		cfg.GetStringSlice("containerd_namespaces"),
@@ -166,19 +186,15 @@ func mergeContainerdNamespaces(cfg model.Reader) {
 	)
 
 	// Workaround: convert to []interface{}.
-	// The MergeConfigOverride func in "github.com/DataDog/viper" (tested in
-	// v1.10.0) raises an error if we send a []string{} in AddOverride():
-	// "svType != tvType; key=containerd_namespace, st=[]interface {}, tt=[]string, sv=[], tv=[]"
-	// The reason is that when reading from a config file, all the arrays are
-	// considered as []interface{} by Viper, and the merge fails when the types
-	// are different.
+	// Arrays read from a config file are decoded as []interface{}, so setting a []string{}
+	// here could raise a type-mismatch error when the value is merged with the existing one.
 	convertedNamespaces := make([]interface{}, len(namespaces))
 	for i, namespace := range namespaces {
 		convertedNamespaces[i] = namespace
 	}
 
-	model.AddOverride("containerd_namespace", convertedNamespaces)
-	model.AddOverride("containerd_namespaces", convertedNamespaces)
+	cfg.Set("containerd_namespace", convertedNamespaces, model.SourceAgentRuntime)
+	cfg.Set("containerd_namespaces", convertedNamespaces, model.SourceAgentRuntime)
 }
 
 func isCriSupported() bool {
@@ -190,6 +206,15 @@ func isCriSupported() bool {
 func detectAWSEnvironments(features FeatureMap, cfg model.Reader) {
 	if IsECSFargate() {
 		features[ECSFargate] = struct{}{}
+		if cfg.GetBool("orchestrator_explorer.enabled") &&
+			cfg.GetBool("ecs_task_collection_enabled") {
+			features[ECSOrchestratorExplorer] = struct{}{}
+		}
+		return
+	}
+
+	if IsECSManagedInstances() {
+		features[ECSManagedInstances] = struct{}{}
 		if cfg.GetBool("orchestrator_explorer.enabled") &&
 			cfg.GetBool("ecs_task_collection_enabled") {
 			features[ECSOrchestratorExplorer] = struct{}{}
@@ -230,6 +255,27 @@ func detectPodman(features FeatureMap, cfg model.Reader) {
 			return
 		}
 	}
+	// Scan /home/ for rootless Podman installations.
+	detectPodmanInHomeDir("/home", features)
+}
+
+// detectPodmanInHomeDir scans the given base directory for rootless Podman
+// storage directories and sets the Podman feature if any are found.
+func detectPodmanInHomeDir(homeBase string, features FeatureMap) {
+	homeEntries, err := os.ReadDir(homeBase)
+	if err != nil {
+		return
+	}
+	for _, entry := range homeEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		storagePath := path.Join(homeBase, entry.Name(), ".local/share/containers/storage")
+		if _, err := os.Stat(storagePath); err == nil {
+			features[Podman] = struct{}{}
+			return
+		}
+	}
 }
 
 func detectPodResources(features FeatureMap, cfg model.Reader) {
@@ -242,27 +288,62 @@ func detectPodResources(features FeatureMap, cfg model.Reader) {
 		log.Infof("Agent found PodResources socket at %s", socketPath)
 		features[PodResources] = struct{}{}
 	} else if exists && !reachable {
-		log.Infof("Agent found PodResources socket at %s but socket not reachable (permissions?)", socketPath)
+		log.Warnf("Agent found PodResources socket at %s but socket not reachable (permissions?)", socketPath)
 	} else {
 		log.Infof("Agent did not find PodResources socket at %s", socketPath)
 	}
 }
 
+func detectDevicePlugins(features FeatureMap, cfg model.Reader) {
+	// We only check the path from config if the path from config exists (does not have unix:// prefix)
+	socketDir := cfg.GetString("kubernetes_kubelet_deviceplugins_socketdir")
+	if socketDir == "" {
+		return
+	}
+
+	configured := cfg.IsConfigured("kubernetes_kubelet_deviceplugins_socketdir")
+	stat, err := os.Stat(socketDir)
+	if err != nil {
+		if configured {
+			log.Infof("Agent did not find device plugins socket path dir %s: %v", socketDir, err)
+		}
+		return
+	}
+	if !stat.IsDir() {
+		if configured {
+			log.Infof("Agent did not find valid device plugins socket path dir %s", socketDir)
+		}
+		return
+	}
+
+	features[KubernetesDevicePlugins] = struct{}{}
+	log.Infof("Agent found device plugins socket path dir %s", socketDir)
+}
+
 func detectNVML(features FeatureMap, cfg model.Reader) {
-	if !cfg.GetBool("enable_nvml_detection") {
-		return
+	var defaultPaths []string
+	configuredNvmlPath := cfg.GetString("gpu.nvml_lib_path")
+	if configuredNvmlPath == "" {
+		defaultPaths = append(defaultPaths, defaultNVMLLibraryName) // non-absolute path will force dlopen to search for the library in the usual dlopen system paths
+	} else {
+		defaultPaths = append(defaultPaths, configuredNvmlPath)
 	}
 
-	// Use dlopen to search for the library to avoid importing the go-nvml package here,
-	// which is 1MB in size and would increase the agent binary size, when we don't really
-	// need it for anything else.
-	if err := system.CheckLibraryExists(defaultNVMLLibraryName); err != nil {
-		log.Debugf("Agent did not find NVML library: %v", err)
-		return
+	// Add common paths for the NVML library as a fallback, matching the logic in the safenvml package.
+	defaultPaths = append(defaultPaths, getDefaultNvmlPaths()...)
+
+	for _, path := range defaultPaths {
+		// Use dlopen to search for the library to avoid importing the go-nvml package here,
+		// which is 1MB in size and would increase the agent binary size, when we don't really
+		// need it for anything else.
+		if err := system.CheckLibraryExists(path); err == nil {
+			features[NVML] = struct{}{}
+			log.Infof("Agent found NVML library at %s", path)
+			return
+		}
 	}
 
-	features[NVML] = struct{}{}
-	log.Infof("Agent found NVML library")
+	log.Debugf("Agent did not find NVML library in any of the default paths: %v", defaultPaths)
 }
 
 func getHostMountPrefixes() []string {
@@ -312,6 +393,38 @@ func getDefaultPodmanPaths() []string {
 	paths := []string{}
 	for _, prefix := range getHostMountPrefixes() {
 		paths = append(paths, path.Join(prefix, defaultPodmanContainersStoragePath))
+	}
+	return paths
+}
+
+// getDefaultNvmlPaths returns the common paths where the NVML library may be installed.
+// NOTE: This logic is intentionally duplicated in pkg/gpu/safenvml/lib.go
+// (generateDefaultNvmlPaths). We keep it inline here to avoid adding a dependency on
+// pkg/gpu from pkg/config/env, which is imported by nearly every binary in the repo.
+func getDefaultNvmlPaths() []string {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	systemPaths := []string{
+		"/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",                    // default system install
+		"/run/nvidia/driver/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",  // nvidia-gpu-operator install
+		"/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1",                   // default system install on ARM64
+		"/run/nvidia/driver/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1", // nvidia-gpu-operator install on ARM64
+	}
+
+	hostRoot := os.Getenv("HOST_ROOT")
+	if hostRoot == "" {
+		if !IsContainerized() {
+			return systemPaths
+		}
+
+		hostRoot = defaultHostMountPrefix
+	}
+
+	paths := make([]string, 0, len(systemPaths))
+	for _, p := range systemPaths {
+		paths = append(paths, path.Join(hostRoot, p))
 	}
 	return paths
 }

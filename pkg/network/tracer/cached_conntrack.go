@@ -3,13 +3,12 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package tracer
 
 import (
 	"errors"
-	"fmt"
 	"net/netip"
 	"os"
 	"sync"
@@ -128,7 +127,7 @@ func (cache *cachedConntrack) ensureConntrack(ino uint64, pid int) (netlink.Conn
 	defer cache.Unlock()
 
 	if cache.closed {
-		return nil, fmt.Errorf("cache Close has already been called")
+		return nil, errors.New("cache Close has already been called")
 	}
 
 	v, ok := cache.cache.Get(ino)

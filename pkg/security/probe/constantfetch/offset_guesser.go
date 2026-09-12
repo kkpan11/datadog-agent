@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && linux_bpf
+//go:build linux && bpf
 
 // Package constantfetch holds constantfetch related files
 package constantfetch
@@ -161,8 +161,8 @@ func (og *OffsetGuesser) guess(id string) error {
 func (og *OffsetGuesser) AppendSizeofRequest(_, _ string) {
 }
 
-// AppendOffsetofRequest appends an offset request
-func (og *OffsetGuesser) AppendOffsetofRequest(id, _ string, _ ...string) {
+// AppendOffsetofRequestWithFallbacks appends an offset request
+func (og *OffsetGuesser) AppendOffsetofRequestWithFallbacks(id string, _ ...TypeFieldPair) {
 	og.res[id] = ErrorSentinel
 }
 

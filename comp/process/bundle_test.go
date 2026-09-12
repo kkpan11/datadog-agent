@@ -3,6 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+//go:build test
+
 package process
 
 import (
@@ -14,33 +16,46 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/DataDog/datadog-agent/comp/core"
-	configComp "github.com/DataDog/datadog-agent/comp/core/config"
+	"github.com/DataDog/datadog-agent/comp/core/config"
+	delegatedauth "github.com/DataDog/datadog-agent/comp/core/delegatedauth/def"
+	delegatedauthmock "github.com/DataDog/datadog-agent/comp/core/delegatedauth/mock"
+	hostnameimpl "github.com/DataDog/datadog-agent/comp/core/hostname/hostnameimpl"
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets/secretsimpl"
-	"github.com/DataDog/datadog-agent/comp/core/settings/settingsimpl"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretsmock "github.com/DataDog/datadog-agent/comp/core/secrets/mock"
+	settingsmock "github.com/DataDog/datadog-agent/comp/core/settings/mock"
 	"github.com/DataDog/datadog-agent/comp/core/status"
 	coreStatusImpl "github.com/DataDog/datadog-agent/comp/core/status/statusimpl"
+	sysprobeconfig "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/def"
+	sysprobeconfigmock "github.com/DataDog/datadog-agent/comp/core/sysprobeconfig/mock"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	taggerfxmock "github.com/DataDog/datadog-agent/comp/core/tagger/fx-mock"
+	mocktelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/mock"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadfilterfxmock "github.com/DataDog/datadog-agent/comp/core/workloadfilter/fx-mock"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/statsd"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/eventplatformimpl"
-	"github.com/DataDog/datadog-agent/comp/forwarder/eventplatformreceiver/eventplatformreceiverimpl"
-	"github.com/DataDog/datadog-agent/comp/networkpath/npcollector/npcollectorimpl"
-	"github.com/DataDog/datadog-agent/comp/process/runner"
-	"github.com/DataDog/datadog-agent/comp/process/status/statusimpl"
+	statsdimpl "github.com/DataDog/datadog-agent/comp/dogstatsd/statsd/impl"
+	eventplatform "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/def"
+	eventplatformfx "github.com/DataDog/datadog-agent/comp/forwarder/eventplatform/fx"
+	eventplatformreceiverimpl "github.com/DataDog/datadog-agent/comp/forwarder/eventplatformreceiver/impl"
+	npcollectorfx "github.com/DataDog/datadog-agent/comp/networkpath/npcollector/fx"
+	npcollectormock "github.com/DataDog/datadog-agent/comp/networkpath/npcollector/mock"
+	remotetraceroute "github.com/DataDog/datadog-agent/comp/networkpath/traceroute/fx-remote"
+	runner "github.com/DataDog/datadog-agent/comp/process/runner/def"
+	statusimpl "github.com/DataDog/datadog-agent/comp/process/status/fx"
 	"github.com/DataDog/datadog-agent/comp/process/types"
 	rdnsquerier "github.com/DataDog/datadog-agent/comp/rdnsquerier/fx-mock"
 	"github.com/DataDog/datadog-agent/pkg/collector/python"
+	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
 var mockCoreBundleParams = core.BundleParams{
-	ConfigParams: configComp.NewParams("", configComp.WithConfigMissingOK(true)),
-	LogParams:    log.ForOneShot("PROCESS", "trace", false),
+	LogParams: log.ForOneShot("PROCESS", "trace", false),
 }
 
 func TestBundleDependencies(t *testing.T) {
@@ -48,10 +63,11 @@ func TestBundleDependencies(t *testing.T) {
 		fx.Supply(mockCoreBundleParams),
 		fx.Provide(func() types.CheckComponent { return nil }),
 		core.MockBundle(),
+		hostnameimpl.MockModule(),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 		fx.Provide(func() tagger.Component { return taggerfxmock.SetupFakeTagger(t) }),
 		coreStatusImpl.Module(),
-		settingsimpl.MockModule(),
+		settingsmock.MockModule(),
 		statusimpl.Module(),
 		fx.Supply(
 			status.Params{
@@ -60,20 +76,21 @@ func TestBundleDependencies(t *testing.T) {
 		),
 		fx.Provide(func() context.Context { return context.TODO() }),
 		rdnsquerier.MockModule(),
-		npcollectorimpl.MockModule(),
-		statsd.MockModule(),
+		npcollectormock.MockModule(),
+		statsdimpl.MockModule(),
 		fx.Provide(func() ddgostatsd.ClientInterface {
 			return &ddgostatsd.NoOpClient{}
 		}),
-		secretsimpl.MockModule(),
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
 		fx.Provide(func() ipc.Component { return ipcmock.New(t) }),
+		fx.Provide(func(ipcComp ipc.Component) ipc.HTTPClient { return ipcComp.GetClient() }),
 	)
 }
 
 func TestBundleOneShot(t *testing.T) {
 	runCmd := func(r runner.Component) {
 		checks := r.GetProvidedChecks()
-		require.Len(t, checks, 6)
+		require.Len(t, checks, 5)
 
 		var names []string
 		for _, c := range checks {
@@ -84,7 +101,6 @@ func TestBundleOneShot(t *testing.T) {
 			"process",
 			"container",
 			"rtcontainer",
-			"process_events",
 			"connections",
 			"process_discovery",
 		}, names)
@@ -96,21 +112,33 @@ func TestBundleOneShot(t *testing.T) {
 
 			mockCoreBundleParams,
 		),
-		// sets a static hostname to avoid grpc call to get hostname from core-agent
-		fx.Replace(configComp.MockParams{Overrides: map[string]interface{}{
-			"hostname": "testhost",
-		}}),
-		core.MockBundle(),
+		fx.Provide(func() log.Component { return logmock.New(t) }),
+		fx.Provide(func() config.Component {
+			return config.NewMockWithOverrides(t, map[string]interface{}{"hostname": "testhost", "cloud_provider_metadata": []string{}})
+		}),
 		workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 		fx.Provide(func() tagger.Component { return taggerfxmock.SetupFakeTagger(t) }),
 		eventplatformreceiverimpl.Module(),
-		eventplatformimpl.Module(eventplatformimpl.NewDefaultParams()),
+		eventplatformfx.Module(eventplatform.NewDefaultParams()),
 		rdnsquerier.MockModule(),
-		npcollectorimpl.Module(),
-		statsd.MockModule(),
+		remotetraceroute.Module(),
+		npcollectorfx.Module(),
+		statsdimpl.MockModule(),
 		fx.Provide(func() ddgostatsd.ClientInterface {
 			return &ddgostatsd.NoOpClient{}
 		}),
+		fx.Provide(func() ipc.Component { return ipcmock.New(t) }),
+		fx.Provide(func(ipcComp ipc.Component) ipc.HTTPClient { return ipcComp.GetClient() }),
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
+		fx.Provide(func(tb testing.TB) sysprobeconfig.Component { return sysprobeconfigmock.NewMock(tb) }),
+		fxutil.ProvideOptional[sysprobeconfig.Component](),
+		workloadfilterfxmock.MockModule(),
+		fx.Invoke(func(wmeta workloadmeta.Component, tagger tagger.Component, filterStore workloadfilter.Component) {
+			proccontainers.InitSharedContainerProvider(wmeta, tagger, filterStore)
+		}),
+		mocktelemetry.Module(),
+		hostnameimpl.MockModule(),
+		fx.Provide(func() delegatedauth.Component { return delegatedauthmock.New(t) }),
 		Bundle(),
 	)
 	require.NoError(t, err)

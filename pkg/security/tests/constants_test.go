@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && functionaltests && linux_bpf
+//go:build linux && functionaltests && linux && bpf
 
 // Package tests holds tests related files
 package tests
@@ -24,13 +24,11 @@ var BTFHubVsFallbackPossiblyMissingConstants = []string{
 	constantfetch.OffsetNameTaskStructPID,
 	constantfetch.OffsetNameTaskStructPIDLink,
 	constantfetch.OffsetNameDeviceStructNdNet,
-}
-
-var BTFVsFallbackPossiblyMissingConstants = []string{
-	constantfetch.OffsetNameIoKiocbStructCtx,
-	constantfetch.OffsetNameTaskStructPID,
-	constantfetch.OffsetNameTaskStructPIDLink,
-	constantfetch.OffsetNameDeviceStructNdNet,
+	constantfetch.OffsetNameSockStructSKProtocol,
+	// Thread pointer offsets: BTF/BTFHub-only by design. task_struct.thread has
+	// 34 distinct values on amd64 (46 on arm64) across BTFHub
+	constantfetch.OffsetNameTaskStructThread,
+	constantfetch.OffsetNameThreadStructTp,
 }
 
 func TestOctogonConstants(t *testing.T) {

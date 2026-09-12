@@ -34,20 +34,22 @@ func TestWLANOK(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
 
 	wlanCheck.Run()
 
+	// Should emit status metric (OK)
+	mockSender.AssertMetric(t, "Gauge", "system.wlan.status", 0.0, "", expectedTags)
 	mockSender.AssertMetric(t, "Gauge", "system.wlan.rssi", 10.0, "", expectedTags)
 	mockSender.AssertMetric(t, "Gauge", "system.wlan.noise", 20.0, "", expectedTags)
 	mockSender.AssertMetric(t, "Gauge", "system.wlan.txrate", 4.0, "", expectedTags)
@@ -61,20 +63,23 @@ func TestWLANGetInfoError(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
 
 	wlanCheck.Run()
 
-	mockSender.AssertNumberOfCalls(t, "Gauge", 0)
-	mockSender.AssertNumberOfCalls(t, "Count", 0)
+	// Should emit status metric (CRITICAL) and error count metric
+	mockSender.AssertNumberOfCalls(t, "Gauge", 1)
+	mockSender.AssertNumberOfCalls(t, "Count", 1)
+	mockSender.AssertMetric(t, "Gauge", "system.wlan.status", 2.0, "", []string{"status:critical", "reason:ipc_failure"})
+	mockSender.AssertMetric(t, "Count", "system.wlan.check.errors", 1.0, "", []string{"error_type:ipc_failure"})
 }
 
 func TestWLANErrorStoppedSender(t *testing.T) {
@@ -84,18 +89,17 @@ func TestWLANErrorStoppedSender(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.NewStoppedSenderManager()
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 
-	senderManager.Stop(false)
 	err := wlanCheck.Run()
 
-	assert.Equal(t, "demultiplexer is stopped", err.Error())
+	assert.ErrorIs(t, err, mocksender.ErrStoppedSenderManager)
 
 	mockSender.AssertNumberOfCalls(t, "Gauge", 0)
 	mockSender.AssertNumberOfCalls(t, "Count", 0)
@@ -118,14 +122,14 @@ func TestWLANEmptySSIDisUnknown(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:unknown", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:unknown", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -155,14 +159,14 @@ func TestWLANEmptyBSSIDisUnknown(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:unknown", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:unknown", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -192,15 +196,15 @@ func TestWLANEmptyHardwareAddress(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:unknown"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:unknown", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
 
@@ -229,15 +233,15 @@ func TestWLANChannelSwapEventsBasic(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -305,15 +309,15 @@ func TestWLANChannelSwapEventsFromZeroToZeroAndOne(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -376,15 +380,15 @@ func TestWLANChannelSwapEventsWhenSSIDEmptyAndBSSIDIsTheSame(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:unknown", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:unknown", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -447,15 +451,15 @@ func TestWLANChannelSwapEventsUnlessThereIsRoaming(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid-1", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid-1", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -520,15 +524,15 @@ func TestWLANRoamingEvents(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:ssid", "bssid:test-bssid-1", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:ssid", "bssid:test-bssid-1", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -604,15 +608,15 @@ func TestWLANNoRoamingOrChannelSwapEventsWhenDifferentNetwork(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:ssid", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:ssid", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
 
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -773,20 +777,22 @@ func TestWLANNoMetricsWhenWiFiInterfaceInactive(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
 
 	wlanCheck.Run()
 
-	mockSender.AssertNumberOfCalls(t, "Gauge", 0)
+	// Should emit status metric (WARNING) when WiFi interface is inactive
+	mockSender.AssertNumberOfCalls(t, "Gauge", 1)
 	mockSender.AssertNumberOfCalls(t, "Count", 0)
+	mockSender.AssertMetric(t, "Gauge", "system.wlan.status", 1.0, "", []string{"status:warning", "reason:interface_inactive"})
 }
 
 func TestWLANNoiseValidDisabled(t *testing.T) {
@@ -806,12 +812,12 @@ func TestWLANNoiseValidDisabled(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -839,14 +845,14 @@ func TestWLANNoiseValidEnabled(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -874,12 +880,12 @@ func TestWLANReceiveRateValidDisabled(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()
@@ -907,14 +913,14 @@ func TestWLANReceiveRateValid(t *testing.T) {
 	}
 
 	defer func() {
-		getWiFiInfo = GetWiFiInfo
+		getWiFiInfo = nil
 	}()
 
-	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address"}
+	expectedTags := []string{"ssid:test-ssid", "bssid:test-bssid", "mac_address:hardware-address", "status:ok"}
 
 	wlanCheck := new(WLANCheck)
-	senderManager := mocksender.CreateDefaultDemultiplexer()
-	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test")
+	senderManager := mocksender.CreateDefaultDemultiplexer(t)
+	wlanCheck.Configure(senderManager, integration.FakeConfigHash, nil, nil, "test", "provider")
 
 	mockSender := mocksender.NewMockSenderWithSenderManager(wlanCheck.ID(), senderManager)
 	mockSender.SetupAcceptAll()

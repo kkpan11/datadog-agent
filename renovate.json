@@ -1,10 +1,23 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-    "enabledManagers": ["custom.regex", "pre-commit"],
+    "extends": ["config:recommended", "mergeConfidence:all-badges", ":enablePreCommit", "schedule:nonOfficeHours"],
+    "timezone": "Europe/Paris",
+    "updateNotScheduled": false,
+    "ignorePaths": [],
+    "minimumReleaseAge": "7 days",
+    "internalChecksFilter": "strict",
+    "prCreation": "not-pending",
+    "prConcurrentLimit": 20,
     "labels": ["dependencies", "changelog/no-changelog", "qa/no-code-change"],
     "stopUpdatingLabel": "stop-updating",
+    "gitIgnoredAuthors": ["200755185+dd-octo-sts[bot]@users.noreply.github.com"],
     "platformCommit": "enabled",
+    "postUpdateOptions": ["gomodUpdateImportPaths"],
     "packageRules": [
+      {
+        "matchDepNames": ["*"],
+        "prPriority": -1
+      },
       {
         "matchDepNames": ["integrations-core"],
         "changelogUrl": "https://github.com/DataDog/integrations-core/compare/{{currentDigest}}..{{newDigest}}",
@@ -12,65 +25,383 @@
       },
       {
         "matchDepNames": ["omnibus-ruby"],
-        "changelogUrl": "https://github.com/DataDog/omnibus-ruby/compare/{{currentDigest}}..{{newDigest}}"
+        "changelogUrl": "https://github.com/DataDog/omnibus-ruby/compare/{{currentDigest}}..{{newDigest}}",
+        "matchUpdateTypes": ["major", "minor", "patch"],
+        "enabled": false
       },
       {
-        "matchDepNames": ["buildimages"],
-        "changelogUrl": "https://github.com/DataDog/datadog-agent-buildimages/commits/main"
+        "matchDepNames": ["linux-images"],
+        "maxMajorIncrement": 0,
+        "changelogUrl": "https://github.com/DataDog/datadog-agent-buildimages/commits/main",
+        "schedule": ["* 2-6 * * 1-5"]
+      },
+      {
+        "matchDepNames": ["linux-images-devcontainer"],
+        "maxMajorIncrement": 0,
+        "changelogUrl": "https://github.com/DataDog/datadog-agent-buildimages/commits/main",
+        "schedule": ["* 2-6 * * 1-5"]
+      },
+      {
+        "matchDepNames": ["windows-images"],
+        "maxMajorIncrement": 0,
+        "changelogUrl": "https://github.com/DataDog/datadog-agent-buildimages/commits/main",
+        "schedule": ["* 2-6 2 * *"]
+      },
+      {
+        "matchDepNames": ["DataDog/datadog-agent-dev"],
+        "changelogUrl": "https://github.com/DataDog/datadog-agent-dev/releases/tag/v{{newValue}}",
+        "schedule": ["* 1-4 5 6,12 *"]
+      },
+      {
+        "matchManagers": ["custom.regex"],
+        "minimumReleaseAge": null,
+        "prPriority": 10
+      },
+      {
+        "matchManagers": ["github-actions"],
+        "labels": ["dependencies", "dependencies-github-actions", "changelog/no-changelog", "qa/no-code-change"],
+        "groupName": "github-actions",
+        "schedule": ["before 9am on monday"]
+      },
+      {
+        "matchManagers": ["docker-compose"],
+        "matchFileNames": ["**/testdata/**", "**/fixtures/**", "**/testfixtures/**", "pkg/collector/corechecks/oracle/compose/**"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["cargo"],
+        "labels": ["dependencies", "dependencies-cargo", "changelog/no-changelog", "qa/no-code-change"]
+      },
+      {
+        "matchManagers": ["cargo"],
+        "matchDepNames": ["prost", "prost-types", "prost-build", "tonic", "tonic-build", "tonic-prost", "tonic-prost-build", "tonic-reflection", "protoc-gen-prost", "protoc-gen-tonic"],
+        "groupName": "prost/tonic protobuf stack"
+      },
+      {
+        "matchManagers": ["npm"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["gomod"],
+        "labels": ["dependencies", "dependencies-go", "changelog/no-changelog", "qa/no-code-change"]
+      },
+      {
+        "description": "Require Dependency Dashboard approval for major Go dependency updates",
+        "matchManagers": ["gomod"],
+        "matchUpdateTypes": ["major"],
+        "dependencyDashboardApproval": true
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": [
+          "github.com/DataDog/datadog-agent/**",
+          "golang.org/x/**",
+          "go.opentelemetry.io/**",
+          "github.com/open-telemetry/opentelemetry-collector-contrib/**",
+          "github.com/prometheus/prometheus",
+          "github.com/spf13/cast",
+          "github.com/mailru/easyjson"
+        ],
+        "enabled": false
+      },
+      {
+        "description": "Disable Go directives, toolchain (go update is managed independently) or replace (->fork)",
+        "matchManagers": ["gomod"],
+        "matchDepTypes": ["golang", "toolchain", "replace"],
+        "enabled": false
+      },
+      {
+        "description": "Disable when pinned on a commit (->forks)",
+        "matchManagers": ["gomod"],
+        "matchUpdateTypes": ["digest"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["github.com/moby/moby{,/**}"],
+        "groupName": "moby/moby"
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["github.com/twmb/franz-go{,/**}"],
+        "groupName": "franz-go"
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["github.com/uptrace/bun{,/**}"],
+        "groupName": "bun"
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["github.com/DataDog/rshell"],
+        "minimumReleaseAge": null,
+        "prPriority": 10
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["github.com/aws/aws-sdk-go-v2{,/**}"],
+        "groupName": "aws-sdk-go-v2"
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["istio.io/**"],
+        "groupName": "istio"
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["k8s.io/**"],
+        "matchUpdateTypes": ["patch"],
+        "groupName": "k8s-io"
+      },
+      {
+        "matchManagers": ["pyenv"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["maven"],
+        "matchUpdateTypes": ["major", "minor"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["bazelisk"],
+        "matchDepNames": ["*"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["gomod"],
+        "matchDepNames": ["go"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["dockerfile", "docker-compose"],
+        "matchDepNames": ["golang"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["bazel-module"],
+        "labels": ["dependencies", "dependencies-bazel", "changelog/no-changelog", "qa/no-code-change"]
+      },
+      {
+        "matchManagers": ["bazel-module"],
+        "matchDepTypes": ["archive_override", "git_override", "git_repository", "local_path_override"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["bazel-module"],
+        "matchPackageNames": [
+          "package_metadata",
+          "rules_license",
+          "supply_chain_tools"
+        ],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["bazel-module"],
+        "matchDepNames": ["rules_rust", "rules_rust_prost"],
+        "groupName": "rules_rust"
+      },
+      {
+        "matchManagers": ["bundler"],
+        "matchDepNames": ["omnibus"],
+        "enabled": false
+      },
+      {
+        "matchManagers": ["bundler"],
+        "matchDatasources": ["git-refs"],
+        "registryUrls": []
+      },
+      {
+        "matchDepNames": ["FluentAssertions"],
+        "allowedVersions": "(,8.0.0)"
+      },
+      {
+        "matchDepNames": ["WixToolset.Dtf.WindowsInstaller"],
+        "allowedVersions": "(,6.0.0)"
       }
     ],
-    "pre-commit": {
-      "enabled": true,
-      "fileMatch": [".pre-commit-config.yaml"]
-    },
     "customManagers" : [
       {
         "customType": "regex",
-        "fileMatch": [".gitlab-ci.yml"],
+        "managerFilePatterns": [".gitlab-ci.yml"],
         "matchStrings": [
-          "  CI_IMAGE_[^:]*: (?<currentValue>v.*)"
+          "  CI_IMAGE_[^W][^:]*: (?<currentValue>v.*)"
         ],
-        "depNameTemplate": "buildimages",
+        "depNameTemplate": "linux-images",
         "versioningTemplate": "loose",
-        "datasourceTemplate": "custom.buildimages"
+        "datasourceTemplate": "custom.linux-images"
       },
       {
         "customType": "regex",
-        "fileMatch": [".protoc-version"],
+        "managerFilePatterns": [".devcontainer/datadog/default/prebuild-devcontainer.json"],
         "matchStrings": [
-          "(?<currentValue>[0-9]+.[0-9]+)"
+          "\"image\":\\s*\"registry.ddbuild.io/ci/datadog-agent-buildimages/dev-env-workspace:(?<currentValue>v[^\"]+)\""
         ],
-        "depNameTemplate": "protocolbuffers/protobuf",
+        "depNameTemplate": "linux-images-devcontainer",
+        "versioningTemplate": "loose",
+        "datasourceTemplate": "custom.linux-images"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": [".gitlab-ci.yml"],
+        "matchStrings": [
+          "  CI_IMAGE_WIN_[^:]*: (?<currentValue>v.*)"
+        ],
+        "depNameTemplate": "windows-images",
+        "versioningTemplate": "regex:^(ltsc2022-)?v(?<major>\\d+)-.*$",
+        "datasourceTemplate": "custom.windows-images",
+        "extractVersionTemplate": "^(ltsc2022-)?(?<version>.*)$"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": [".dda/version"],
+        "matchStrings": [
+          "(?<currentValue>[0-9]+.[0-9]+.[0-9]+)"
+        ],
+        "depNameTemplate": "DataDog/datadog-agent-dev",
         "datasourceTemplate": "github-releases"
       },
       {
         "customType": "regex",
-        "fileMatch": ["release.json"],
+        "managerFilePatterns": ["test/regression/config.yaml"],
+        "matchStrings": [
+          "  version: (?<currentValue>[0-9]+.[0-9]+.[0-9]+)"
+        ],
+        "depNameTemplate": "DataDog/lading",
+        "datasourceTemplate": "github-releases"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": [
+          "Dockerfiles/agent-ddot/Dockerfile.agent-otel"
+        ],
+        "matchStrings": [
+          "DDA_VERSION=v(?<currentValue>[0-9]+.[0-9]+.[0-9]+)"
+        ],
+        "depNameTemplate": "DataDog/datadog-agent-dev",
+        "datasourceTemplate": "github-releases"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": ["release.json"],
         "matchStrings": [
           "[ ]+\"OMNIBUS_RUBY_VERSION\": \"(?<currentDigest>[a-z0-9]+)\""
         ],
         "currentValueTemplate": "datadog-5.5.0",
         "depNameTemplate": "omnibus-ruby",
         "packageNameTemplate": "https://github.com/DataDog/omnibus-ruby",
-        "datasourceTemplate": "git-refs"
+        "datasourceTemplate": "git-refs",
+        "registryUrlTemplate": ""
       },
       {
         "customType": "regex",
-        "fileMatch": ["release.json"],
+        "managerFilePatterns": ["release.json"],
         "matchStrings": [
           "[ ]+\"INTEGRATIONS_CORE_VERSION\": \"(?<currentDigest>[a-z0-9]+)\""
         ],
         "currentValueTemplate": "master",
         "depNameTemplate": "integrations-core",
         "packageNameTemplate": "https://github.com/DataDog/integrations-core",
-        "datasourceTemplate": "git-refs"
+        "datasourceTemplate": "git-refs",
+        "registryUrlTemplate": ""
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": ["tasks/gpu.py"],
+        "matchStrings": [
+          "GPU_BURNER_VERSION = \"(?<currentDigest>[a-f0-9]{8})\""
+        ],
+        "autoReplaceStringTemplate": "GPU_BURNER_VERSION = \"{{{replace '^(.{8}).*$' '$1' newDigest}}}\"",
+        "currentValueTemplate": "main",
+        "depNameTemplate": "gpu-burner",
+        "packageNameTemplate": "https://github.com/DataDog/gpu-burner",
+        "datasourceTemplate": "git-refs",
+        "registryUrlTemplate": ""
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": [
+          "test/new-e2e/tests/installer/unix/package_definitions.go"
+        ],
+        "matchStrings": [
+          "func pinnedApmInjectVersion\\(\\) string \\{[\\s\\S]*?\\n\\s*return \"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+)\""
+        ],
+        "depNameTemplate": "DataDog/dd-apm-inject",
+        "datasourceTemplate": "custom.dd-apm-inject",
+        "versioningTemplate": "loose"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": [
+          "test/new-e2e/tests/installer/unix/package_definitions.go"
+        ],
+        "matchStrings": [
+          "func pinnedApmLibraryPythonVersion\\(\\) string \\{[\\s\\S]*?\\n\\s*return \"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""
+        ],
+        "depNameTemplate": "DataDog/dd-apm-library-python",
+        "datasourceTemplate": "custom.dd-apm-library-python",
+        "versioningTemplate": "semver"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": [
+          "test/new-e2e/tests/installer/unix/all_packages_test.go"
+        ],
+        "matchStrings": [
+          "collectionVersion = \"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""
+        ],
+        "depNameTemplate": "datadog.dd",
+        "datasourceTemplate": "custom.ansible-galaxy-datadog-dd",
+        "versioningTemplate": "semver"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": ["mise.toml"],
+        "matchStrings": [
+          "\"npm:(?<depName>[^\"]+)\"\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+        ],
+        "datasourceTemplate": "npm",
+        "versioningTemplate": "npm"
+      },
+      {
+        "customType": "regex",
+        "managerFilePatterns": ["mise.toml"],
+        "matchStrings": [
+          "\\bnode\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+        ],
+        "depNameTemplate": "node",
+        "datasourceTemplate": "node",
+        "versioningTemplate": "node"
       }
     ],
     "customDatasources": {
-      "buildimages": {
-        "defaultRegistryUrlTemplate": "https://hub.docker.com/v2/namespaces/datadog/repositories/agent-buildimages-deb_x64/tags",
+      "linux-images": {
+        "defaultRegistryUrlTemplate": "https://hub.docker.com/v2/namespaces/datadog/repositories/agent-buildimages-linux/tags",
         "transformTemplates": [
           "{\"releases\": $map(results, function($v) { {\"version\": $v.name, \"releaseTimestamp\": $v.last_updated } }) }"
+        ]
+      },
+      "windows-images": {
+        "defaultRegistryUrlTemplate": "https://hub.docker.com/v2/namespaces/datadog/repositories/agent-buildimages-windows_x64/tags",
+        "transformTemplates": [
+          "{\"releases\": $map(results, function($v) { {\"version\": $v.name, \"releaseTimestamp\": $v.last_updated } }) }"
+        ]
+      },
+      "dd-apm-inject": {
+        "defaultRegistryUrlTemplate": "https://api.github.com/repos/DataDog/dd-apm-inject/releases",
+        "transformTemplates": [
+          "{\"releases\": $map($, function($v) { {\"version\": $replace($v.tag_name, /^v/, \"\") & \"-1\", \"releaseTimestamp\": $v.published_at, \"isStable\": $not($v.prerelease) } }) }"
+        ]
+      },
+      "ansible-galaxy-datadog-dd": {
+        "defaultRegistryUrlTemplate": "https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/index/datadog/dd/versions/?limit=50",
+        "transformTemplates": [
+          "{\"releases\": $map(data, function($v) { {\"version\": $v.version, \"releaseTimestamp\": $v.created_at } }) }"
+        ]
+      },
+      "dd-apm-library-python": {
+        "defaultRegistryUrlTemplate": "https://api.github.com/repos/DataDog/dd-trace-py/releases",
+        "transformTemplates": [
+          "{\"releases\": $map($, function($v) { {\"version\": $replace($v.tag_name, /^v/, \"\"), \"releaseTimestamp\": $v.published_at, \"isStable\": $not($v.prerelease) } }) }"
         ]
       }
     }

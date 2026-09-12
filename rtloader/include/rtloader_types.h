@@ -35,11 +35,6 @@ typedef enum rtloader_gilstate_e {
     DATADOG_AGENT_RTLOADER_GIL_UNLOCKED
 } rtloader_gilstate_t;
 
-typedef enum {
-    DATADOG_AGENT_RTLOADER_ALLOCATION = 0,
-    DATADOG_AGENT_RTLOADER_FREE,
-} rtloader_mem_ops_t;
-
 typedef void *(*rtloader_malloc_t)(size_t);
 typedef void (*rtloader_free_t)(void *);
 
@@ -145,6 +140,10 @@ typedef double (*cb_get_process_start_time_t)(void);
 typedef char *(*cb_obfuscate_mongodb_string_t)(char *, char **);
 // (check_name, metric_name, metric_value, metric_type)
 typedef void (*cb_emit_agent_telemetry_t)(char *, char *, double, char *);
+// (check_name, report_json, error_message_out)
+typedef void (*cb_report_issue_t)(char *, char *, char **);
+// (issue_id, error_message_out)
+typedef void (*cb_resolve_issue_t)(char *, char **);
 
 // _util
 // (argv, env, stdout, stderr, ret_code, exception)
@@ -155,7 +154,6 @@ typedef void (*cb_get_subprocess_output_t)(char **, char **, char **, char **, i
 // memory
 //
 typedef void (*cb_cgo_free_t)(void *);
-typedef void (*cb_memory_tracker_t)(void *, size_t sz, rtloader_mem_ops_t op);
 
 // tagger
 //

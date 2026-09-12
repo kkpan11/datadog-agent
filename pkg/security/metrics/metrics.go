@@ -6,6 +6,10 @@
 // Package metrics holds metrics related files
 package metrics
 
+import (
+	"strings"
+)
+
 var (
 	// MetricRuntimePrefix is the prefix of the metrics sent by the runtime security module
 	MetricRuntimePrefix = "datadog.runtime_security"
@@ -19,10 +23,21 @@ var (
 	// security-agent was not processing them fast enough
 	// Tags: rule_id
 	MetricEventServerExpired = newRuntimeMetric(".rules.event_server.expired")
-	// MetricProcessEventsServerExpired is the name of the metric used to count the number of process events that
-	// expired because the process-agent was not processing them fast enough
+	// MetricEventServerRetry counts how many times a queued event was scheduled for retry
 	// Tags: -
-	MetricProcessEventsServerExpired = newRuntimeMetric(".event_server.process_events_expired")
+	MetricEventServerRetry = newRuntimeMetric(".rules.event_server.retry")
+	// MetricEventServerSkippedRetry counts retries that were skipped because the queue was at capacity
+	// Tags: -
+	MetricEventServerSkippedRetry = newRuntimeMetric(".rules.event_server.skipped_retry")
+	// MetricEventServerMissingTags counts events that were sent with missing container tags
+	// Tags: -
+	MetricEventServerMissingTags = newRuntimeMetric(".rules.event_server.missing_tags")
+	// MetricEventServerQueueSize is the current number of events waiting in the retry queue
+	// Tags: -
+	MetricEventServerQueueSize = newRuntimeMetric(".rules.event_server.queue_size")
+	// MetricEventServerRetriesBeforeSend is a distribution of the number of retries an event required before being sent
+	// Tags: -
+	MetricEventServerRetriesBeforeSend = newRuntimeMetric(".rules.event_server.retries_before_send")
 
 	// Rate limiter metrics
 
@@ -33,11 +48,9 @@ var (
 	// Tags: rule_id
 	MetricRateLimiterAllow = newRuntimeMetric(".rules.rate_limiter.allow")
 
-	// Rule Suppression metrics
-
-	// MetricRulesSuppressed is the name of the metric used to count the number of auto suppressed events
-	// Tags: rule_id
-	MetricRulesSuppressed = newRuntimeMetric(".rules.suppressed")
+	// MetricRulesNoMatch is the number of events that reached userspace but didn't match any rule
+	// Tags: event_type, category
+	MetricRulesNoMatch = newRuntimeMetric(".rules.no_match")
 
 	// Rule action metrics
 
@@ -70,6 +83,9 @@ var (
 	MetricDentryERPC = newRuntimeMetric(".dentry_resolver.erpc")
 	// MetricDentryCacheSize is the size of the cache
 	MetricDentryCacheSize = newRuntimeMetric(".dentry_resolver.cache_size")
+	// MetricDentryERPCResolutionTimeUs is the counter of eRPC average erpc dentry resolution time in a given instant, in microseconds
+	// Tags: -
+	MetricDentryERPCResolutionTimeUs = newRuntimeMetric(".dentry_resolver.erpc_avg_resolution_time_usec")
 
 	// DNS Resolver metrics
 
@@ -155,16 +171,27 @@ var (
 	// Tags: map, cause
 	MetricPerfBufferInvalidEventsBytes = newRuntimeMetric(".perf_buffer.invalid_events.bytes")
 
+	// Ring buffer user space dispatcher queue metrics
+
+	// MetricEventStreamDispatcherQueueUsage is the number of events currently held in the user space dispatcher queue
+	// Tags: -
+	MetricEventStreamDispatcherQueueUsage = newRuntimeMetric(".event_stream.dispatcher_queue.usage")
+	// MetricEventStreamDispatcherQueueCapacity is the dispatcher queue capacity in bytes
+	// Tags: -
+	MetricEventStreamDispatcherQueueCapacity = newRuntimeMetric(".event_stream.dispatcher_queue.capacity")
+	// MetricEventStreamDispatcherQueueBytes is the number of bytes currently held in the user space dispatcher queue
+	// Tags: -
+	MetricEventStreamDispatcherQueueBytes = newRuntimeMetric(".event_stream.dispatcher_queue.bytes")
+	// MetricEventStreamDispatcherQueueEnqueued is the number of events pushed onto the user space dispatcher queue
+	// Tags: -
+	MetricEventStreamDispatcherQueueEnqueued = newRuntimeMetric(".event_stream.dispatcher_queue.enqueued")
+
 	// Process Resolver metrics
 
 	// MetricProcessResolverCacheSize is the name of the metric used to report the size of the user space
 	// process cache
 	// Tags: -
 	MetricProcessResolverCacheSize = newRuntimeMetric(".process_resolver.cache_size")
-	// MetricProcessResolverReferenceCount is the name of the metric used to report the number of entry cache still
-	// referenced in the process tree
-	// Tags: -
-	MetricProcessResolverReferenceCount = newRuntimeMetric(".process_resolver.reference_count")
 	// MetricProcessResolverMiss is the name of the metric used to report process resolver cache misses
 	// Tags: -
 	MetricProcessResolverMiss = newRuntimeMetric(".process_resolver.miss")
@@ -198,6 +225,54 @@ var (
 	// MetricProcessInodeError is the name of the metric used to report a broken lineage with a inode mismatch
 	// Tags: -
 	MetricProcessInodeError = newRuntimeMetric(".process_resolver.inode_error")
+	// MetricProcessResolverReparentSuccess counts successful process reparenting
+	// Tags: callpath:set_process_context, callpath:do_exit
+	MetricProcessResolverReparentSuccess = newRuntimeMetric(".process_resolver.reparent.success")
+	// MetricProcessResolverReparentFailed counts failed reparenting attempts (e.g. procfs not updated yet)
+	// Tags: callpath:set_process_context, callpath:do_exit
+	MetricProcessResolverReparentFailed = newRuntimeMetric(".process_resolver.reparent.failed")
+	// MetricProcessResolverReparentProcfsSuccess counts successful procfs resolutions of a new parent during reparenting
+	// Tags: -
+	MetricProcessResolverReparentProcfsSuccess = newRuntimeMetric(".process_resolver.reparent.procfs_resolution.success")
+	// MetricProcessResolverReparentProcfsFailed counts failed procfs resolutions of a new parent during reparenting
+	// Tags: -
+	MetricProcessResolverReparentProcfsFailed = newRuntimeMetric(".process_resolver.reparent.procfs_resolution.failed")
+	// MetricProcessResolverProcFallbackLimiterDrop counts procfs fallback resolutions dropped by the rate limiter
+	// Tags: -
+	MetricProcessResolverProcFallbackLimiterDrop = newRuntimeMetric(".process_resolver.proc_fallback_limiter.drop")
+
+	// Span context metrics
+
+	// MetricSpanContextProcessCtxFailed is the counter of OTel process context read failures
+	// Tags: status:queue_full, status:no_process_entry, status:unpublished, status:torn, status:unsupported,
+	//       status:malformed, status:gone, status:unreadable, status:unknown
+	MetricSpanContextProcessCtxFailed = newRuntimeMetric(".span_context.process_ctx.failed")
+	// MetricSpanContextProcessCtxSuccess is the counter of OTel process context read successes
+	// Tags: status:ok
+	MetricSpanContextProcessCtxSuccess = newRuntimeMetric(".span_context.process_ctx.success")
+	// MetricSpanContextResolutionFailed is the counter of per-process span context reader install failures
+	// Tags: reader:otel_tls, reader:go_labels
+	//
+	//       status:not_applicable, status:unsupported, status:malformed, status:map_error, status:gone,
+	//       status:unreadable, status:unknown
+	MetricSpanContextResolutionFailed = newRuntimeMetric(".span_context.resolution.failed")
+	// MetricSpanContextResolutionSuccess is the counter of per-process span context reader install successes
+	// Tags: reader:otel_tls, reader:go_labels
+	//
+	//       status:ok
+	MetricSpanContextResolutionSuccess = newRuntimeMetric(".span_context.resolution.success")
+	// MetricSpanContextEventFailed is the counter of per-event span context fill failures
+	// Tags: reader:otel_tls, reader:go_labels, reader:fill
+	//
+	//       status:no_thread_pointer, status:read_fault, status:torn, status:attrs_read_fault,
+	//       status:map_error, status:stale_id, status:malformed,status:g_not_found, status:map_error,
+	//       status:malformed
+	MetricSpanContextEventFailed = newRuntimeMetric(".span_context.event.failed")
+	// MetricSpanContextEventSuccess is the counter of per-event span context fill successes
+	// Tags: reader:otel_tls, reader:go_labels
+	//
+	//       status:ok
+	MetricSpanContextEventSuccess = newRuntimeMetric(".span_context.event.success")
 
 	// Mount resolver metrics
 
@@ -211,6 +286,18 @@ var (
 	// MetricMountResolverMiss is the counter of unsuccessful mount resolution
 	// Tags: cache, procfs
 	MetricMountResolverMiss = newRuntimeMetric(".mount_resolver.miss")
+	// MetricMountResolverMiss is the counter of unsuccessful procfs mount resolution
+	// Tags: cache, procfs
+	MetricMountResolverProcfsMiss = newRuntimeMetric(".mount_resolver.procfs_miss")
+	// MetricMountResolverProcfsHits is the counter of successful procfs mount resolution
+	// Tags: cache, procfs
+	MetricMountResolverProcfsHits = newRuntimeMetric(".mount_resolver.procfs_hits")
+	// MetricMountResolverDanglingCacheSize is the name of the metric used to report the size of the dangling mount cache
+	// Tags: -
+	MetricMountResolverDanglingCacheSize = newRuntimeMetric(".mount_resolver.dangling_cache_size")
+	// MetricMountResolverPidNsCacheSize is the name of the metric used to report the size of the pid namespace cache
+	// Tags: -
+	MetricMountResolverPidNsCacheSize = newRuntimeMetric(".mount_resolver.pid_ns_cache_size")
 
 	// Activity dump metrics
 
@@ -236,9 +323,6 @@ var (
 	// MetricActivityDumpActiveDumps is the name of the metric used to report the number of active dumps
 	// Tags: -
 	MetricActivityDumpActiveDumps = newRuntimeMetric(".activity_dump.active_dumps")
-	// MetricActivityDumpLoadControllerTriggered is the name of the metric used to report that the ADM load controller reduced the config envelope
-	// Tags:reduction, event_type
-	MetricActivityDumpLoadControllerTriggered = newRuntimeMetric(".activity_dump.load_controller_triggered")
 	// MetricActivityDumpActiveDumpSizeInMemory is the size of an activity dump in memory
 	// Tags: dump_index
 	MetricActivityDumpActiveDumpSizeInMemory = newRuntimeMetric(".activity_dump.size_in_memory")
@@ -298,11 +382,26 @@ var (
 	// MetricCGroupResolverActiveHostWorkloads is the name of the metric used to report the count of active cgroups not corresponding to a container kept in memory
 	// Tags: -
 	MetricCGroupResolverActiveHostWorkloads = newRuntimeMetric(".cgroup_resolver.active_non_containers")
+	// MetricCGroupResolverAddedCgroups is the name of the metric used to report the number of added cgroups
+	// Tags: -
+	MetricCGroupResolverAddedCgroups = newRuntimeMetric(".cgroup_resolver.added_cgroups")
+	// MetricCGroupResolverDeletedCgroups is the name of the metric used to report the number of deleted cgroups
+	// Tags: -
+	MetricCGroupResolverDeletedCgroups = newRuntimeMetric(".cgroup_resolver.deleted_cgroups")
+	// MetricCGroupResolverFallbackSucceed is the name of the metric used to report the number of succeed fallbacks
+	// Tags: -
+	MetricCGroupResolverFallbackSucceed = newRuntimeMetric(".cgroup_resolver.fallback_succeed")
+	// MetricCGroupResolverFallbackFailed is the name of the metric used to report the number of failed fallbacks
+	// Tags: -
+	MetricCGroupResolverFallbackFailed = newRuntimeMetric(".cgroup_resolver.fallback_failed")
+	// MetricCGroupResolverRemainingPids is the name of the metric used to report when a cgroup being delete still has pids
+	// Tags: -
+	MetricCGroupResolverRemainingPids = newRuntimeMetric(".cgroup_resolver.remaining_pids")
 
 	// Security Profile metrics
 
 	// MetricSecurityProfileProfiles is the name of the metric used to report the count of Security Profiles per category
-	// Tags: in_kernel (true or false), anomaly_detection (true or false), auto_suppression (true or false), workload_hardening (true or false)
+	// Tags: in_kernel (true or false), anomaly_detection (true or false), workload_hardening (true or false)
 	MetricSecurityProfileProfiles = newRuntimeMetric(".security_profile.profiles")
 	// MetricSecurityProfileCacheLen is the name of the metric used to report the size of the Security Profile cache
 	// Tags: -
@@ -332,16 +431,25 @@ var (
 	// MetricHashResolverHashCount is the name of the metric used to report the count of hashes generated by the hash
 	// resolver
 	// Tags: event_type, hash
-	MetricHashResolverHashCount = newRuntimeMetric(".hash_resolver.count")
+	MetricHashResolverHashCount = newITRuntimeMetric("hash_resolver", "count")
 	// MetricHashResolverHashMiss is the name of the metric used to report the amount of times we failed to compute a hash
 	// Tags: event_type, reason
-	MetricHashResolverHashMiss = newRuntimeMetric(".hash_resolver.miss")
+	MetricHashResolverHashMiss = newITRuntimeMetric("hash_resolver", "miss")
 	// MetricHashResolverHashCacheHit is the name of the metric used to report the amount of times the cache was used
 	// Tags: event_type
-	MetricHashResolverHashCacheHit = newRuntimeMetric(".hash_resolver.cache_hit")
+	MetricHashResolverHashCacheHit = newITRuntimeMetric("hash_resolver", "cache_hit")
 	// MetricHashResolverHashCacheLen is the name of the metric used to report the count of hashes in cache
 	// Tags: -
-	MetricHashResolverHashCacheLen = newRuntimeMetric(".hash_resolver.cache_len")
+	MetricHashResolverHashCacheLen = newITRuntimeMetric("hash_resolver", "cache_len")
+
+	// File resolver metrics
+
+	// MetricFileResolverCacheHit is the name of the metric used to report file resolver cache hits
+	// Tags: -
+	MetricFileResolverCacheHit = newRuntimeMetric(".file_resolver.cache_hit")
+	// MetricFileResolverCacheMiss is the name of the metric used to report file resolver cache misses
+	// Tags: -
+	MetricFileResolverCacheMiss = newRuntimeMetric(".file_resolver.cache_miss")
 
 	// Namespace resolver metrics
 
@@ -357,6 +465,11 @@ var (
 	// lonely network namespaces.
 	// Tags: -
 	MetricNamespaceResolverLonelyNetworkNamespace = newRuntimeMetric(".namespace_resolver.lonely_netns")
+	// MetricNamespaceResolverError is the name of the metric used to report the count of errors hit by the
+	// NamespaceResolver, mostly while attaching TC classifiers to network devices.
+	// Tags: error_type ('link_not_found', 'no_such_device', 'filter_not_found', 'classifier_exists',
+	// 'queue_full', 'netlink_socket', 'link_list', 'unknown')
+	MetricNamespaceResolverError = newRuntimeMetric(".namespace_resolver.error")
 
 	// Policies
 
@@ -369,6 +482,9 @@ var (
 	// MetricRulesStatus is the name of the metric used to report the rule status
 	// Tags: -
 	MetricRulesStatus = newRuntimeMetric(".rules_status")
+	// MetricSECLTotalVariables tracks the total number of SECL variables
+	// Tags: type ('bool', 'integer', 'string', 'ip', 'strings', 'integers', 'ips'), scope ('global', 'process', 'cgroup', 'container')
+	MetricSECLTotalVariables = newITRuntimeMetric("rule_engine", "total_variables")
 
 	// Enforcement metrics
 
@@ -434,141 +550,130 @@ var (
 	// Tags: consumer_id
 	MetricEventMonitoringEventsDropped = newRuntimeMetric(".event_monitoring.events.dropped")
 
-	// RuntimeMonitor metrics
+	//BPFFilter metrics
 
-	// MetricRuntimeMonitorGoAlloc is the name of the metric used to report the size in bytes of allocated heap objects
+	//MetricBPFFilterTruncated is the name of the metric used to report truncated BPF filter
 	// Tags: -
-	MetricRuntimeMonitorGoAlloc = newRuntimeMetric(".runtime_monitor.go.alloc")
-	// MetricRuntimeMonitorGoTotalAlloc is the name of the metric used to report the cumulative size of bytes allocated
-	// for heap objects
-	// Tags: -
-	MetricRuntimeMonitorGoTotalAlloc = newRuntimeMetric(".runtime_monitor.go.total_alloc")
-	// MetricRuntimeMonitorGoSys is the name of the metric used to report the total size in bytes of memory obtained from
-	// the OS
-	// Tags: -
-	MetricRuntimeMonitorGoSys = newRuntimeMetric(".runtime_monitor.go.sys")
-	// MetricRuntimeMonitorGoLookups is the name of the metric used to report the number of pointer lookups performed by
-	// the runtime
-	// Tags: -
-	MetricRuntimeMonitorGoLookups = newRuntimeMetric(".runtime_monitor.go.lookups")
-	// MetricRuntimeMonitorGoMallocs is the name of the metric used to report the cumulative count of allocated heap
-	// objects
-	// Tags: -
-	MetricRuntimeMonitorGoMallocs = newRuntimeMetric(".runtime_monitor.go.mallocs")
-	// MetricRuntimeMonitorGoFrees is the name of the metric used to report the cumulative count of freed heap objects
-	// Tags: -
-	MetricRuntimeMonitorGoFrees = newRuntimeMetric(".runtime_monitor.go.frees")
-	// MetricRuntimeMonitorGoHeapAlloc is the name of the metric used to report the size in bytes of allocated heap
-	// objects (including reachable and unreachable objects that the garbage collector has not yet freed)
-	// Tags: -
-	MetricRuntimeMonitorGoHeapAlloc = newRuntimeMetric(".runtime_monitor.go.heap_alloc")
-	// MetricRuntimeMonitorGoHeapSys is the name of the metric used to report the size in bytes of heap memory obtained
-	// from the OS. This includes virtual address space that has been reserved but not yet used, as well as virtual
-	// address space for which the physical memory has been returned to the OS after it became unused
-	// Tags: -
-	MetricRuntimeMonitorGoHeapSys = newRuntimeMetric(".runtime_monitor.go.heap_sys")
-	// MetricRuntimeMonitorGoHeapIdle is the name of the metric used to report the size in bytes in idle (unused) spans
-	// Tags: -
-	MetricRuntimeMonitorGoHeapIdle = newRuntimeMetric(".runtime_monitor.go.heap_idle")
-	// MetricRuntimeMonitorGoHeapInuse is the name of the metric used to report the size in bytes in in-use spans
-	// Tags: -
-	MetricRuntimeMonitorGoHeapInuse = newRuntimeMetric(".runtime_monitor.go.heap_inuse")
-	// MetricRuntimeMonitorGoHeapReleased is the name of the metric used to report the size in bytes of physical memory
-	// returned to the OS
-	// Tags: -
-	MetricRuntimeMonitorGoHeapReleased = newRuntimeMetric(".runtime_monitor.go.heap_released")
-	// MetricRuntimeMonitorGoHeapObjects is the name of the metric used to report the number of allocated heap objects
-	// Tags: -
-	MetricRuntimeMonitorGoHeapObjects = newRuntimeMetric(".runtime_monitor.go.heap_objects")
-	// MetricRuntimeMonitorGoStackInuse is the name of the metric used to report the size in bytes of stack spans
-	// Tags: -
-	MetricRuntimeMonitorGoStackInuse = newRuntimeMetric(".runtime_monitor.go.stack_inuse")
-	// MetricRuntimeMonitorGoStackSys is the name of the metric used to report the size in bytes of stack memory obtained
-	// from the OS
-	// Tags: -
-	MetricRuntimeMonitorGoStackSys = newRuntimeMetric(".runtime_monitor.go.stack_sys")
-	// MetricRuntimeMonitorGoMSpanInuse is the name of the metric used to report the size in bytes of allocated mspan
-	// structures
-	// Tags: -
-	MetricRuntimeMonitorGoMSpanInuse = newRuntimeMetric(".runtime_monitor.go.mspan_inuse")
-	// MetricRuntimeMonitorGoMSpanSys is the name of the metric used to report the size in bytes of memory obtained from
-	// the OS for mspan structures
-	// Tags: -
-	MetricRuntimeMonitorGoMSpanSys = newRuntimeMetric(".runtime_monitor.go.mspan_sys")
-	// MetricRuntimeMonitorGoMCacheInuse is the name of the metric used to report the size in bytes of allocated mcache
-	// structures
-	// Tags: -
-	MetricRuntimeMonitorGoMCacheInuse = newRuntimeMetric(".runtime_monitor.go.mcache_inuse")
-	// MetricRuntimeMonitorGoMCacheSys is the name of the metric used to report the size in bytes of memory obtained from
-	// the OS for mcache structures
-	// Tags: -
-	MetricRuntimeMonitorGoMCacheSys = newRuntimeMetric(".runtime_monitor.go.mcache_sys")
-	// MetricRuntimeMonitorGoBuckHashSys is the name of the metric used to report the size in bytes of memory in profiling
-	// bucket hash tables
-	// Tags: -
-	MetricRuntimeMonitorGoBuckHashSys = newRuntimeMetric(".runtime_monitor.go.buck_hash_sys")
-	// MetricRuntimeMonitorGoGCSys is the name of the metric used to report the size in bytes of memory in garbage
-	// collection metadata
-	// Tags: -
-	MetricRuntimeMonitorGoGCSys = newRuntimeMetric(".runtime_monitor.go.gc_sys")
-	// MetricRuntimeMonitorGoOtherSys is the name of the metric used to report the size in bytes of memory in miscellaneous
-	// off-heap runtime allocations
-	// Tags: -
-	MetricRuntimeMonitorGoOtherSys = newRuntimeMetric(".runtime_monitor.go.other_sys")
-	// MetricRuntimeMonitorGoNextGC is the name of the metric used to report the target heap size of the next GC cycle
-	// Tags: -
-	MetricRuntimeMonitorGoNextGC = newRuntimeMetric(".runtime_monitor.go.next_gc")
-	// MetricRuntimeMonitorGoNumGC is the name of the metric used to report the number of completed GC cycles
-	// Tags: -
-	MetricRuntimeMonitorGoNumGC = newRuntimeMetric(".runtime_monitor.go.num_gc")
-	// MetricRuntimeMonitorGoNumForcedGC is the name of the metric used to report the number of GC cycles that were forced
-	// by the application calling the GC function
-	// Tags: -
-	MetricRuntimeMonitorGoNumForcedGC = newRuntimeMetric(".runtime_monitor.go.num_forced_gc")
+	MetricBPFFilterTruncated = newRuntimeMetric(".bpf_filter.truncated")
 
-	// MetricRuntimeMonitorProcRSS is the name of the metric used to report the RSS in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcRSS = newRuntimeMetric(".runtime_monitor.proc.rss")
-	// MetricRuntimeMonitorProcVMS is the name of the metric used to report the VMS in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcVMS = newRuntimeMetric(".runtime_monitor.proc.vms")
-	// MetricRuntimeMonitorProcShared is the name of the metric used to report the shared memory in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcShared = newRuntimeMetric(".runtime_monitor.proc.shared")
-	// MetricRuntimeMonitorProcText is the name of the metric used to report the text memory in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcText = newRuntimeMetric(".runtime_monitor.proc.text")
-	// MetricRuntimeMonitorProcLib is the name of the metric used to report the lib memory in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcLib = newRuntimeMetric(".runtime_monitor.proc.lib")
-	// MetricRuntimeMonitorProcData is the name of the metric used to report the data memory in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcData = newRuntimeMetric(".runtime_monitor.proc.data")
-	// MetricRuntimeMonitorProcDirty is the name of the metric used to report the dirty memory in bytes retrieved from Procfs
-	// Tags: -
-	MetricRuntimeMonitorProcDirty = newRuntimeMetric(".runtime_monitor.proc.dirty")
+	// PrCtl metrics
 
-	// MetricRuntimeCgroupMemoryStatPrefix is the prefix for the metrics collected in the memory.stat cgroup file
+	// MetricNameTruncated is the name of the metric used to report truncated name used in prctl
 	// Tags: -
-	MetricRuntimeCgroupMemoryStatPrefix = newRuntimeMetric(".runtime_monitor.cgroup.memory_stat.")
-	// MetricRuntimeCgroupMemoryUsageInBytes is the name of the metric used to report memory.usage_in_bytes
+	MetricNameTruncated = newRuntimeMetric(".prctl.name_truncated")
+
+	// Security Profile V2 metrics
+
+	// Event Processing metrics
+
+	// MetricSecurityProfileV2EventsReceived is the name of the metric used to report events received by ProcessEvent (after filters)
+	// Tags: source (runtime, replay or related), event_type
+	MetricSecurityProfileV2EventsReceived = newRuntimeMetric(".security_profile_v2.events.received")
+
+	// MetricSecurityProfileV2EventsImmediate is the name of the metric used to report events processed immediately (tags already resolved)
+	// Tags: source (runtime, replay or related), event_type
+	MetricSecurityProfileV2EventsImmediate = newRuntimeMetric(".security_profile_v2.events.immediate")
+
+	// MetricSecurityProfileV2InsertionErrors is the name of the metric used to report activity-tree
+	// insertion failures that are not routine filtering rejections (i.e. unexpected errors).
+	// Tags: event_type, error_type
+	MetricSecurityProfileV2InsertionErrors = newRuntimeMetric(".security_profile_v2.insertion_errors")
+
+	// Tag Resolution metrics
+
+	// MetricSecurityProfileV2TagResolutionEventsQueued is the name of the metric used to report the total events queued waiting for tag resolution
 	// Tags: -
-	MetricRuntimeCgroupMemoryUsageInBytes = newRuntimeMetric(".runtime_monitor.cgroup.memory.usage_in_bytes")
-	// MetricRuntimeCgroupMemoryLimitInBytes is the name of the metric used to report memory.limit_in_bytes
+	MetricSecurityProfileV2TagResolutionEventsQueued = newRuntimeMetric(".security_profile_v2.tag_resolution.events_queued")
+
+	// MetricSecurityProfileV2TagResolutionCgroupsPending is the name of the metric used to report the number of cgroups waiting for tag resolution
 	// Tags: -
-	MetricRuntimeCgroupMemoryLimitInBytes = newRuntimeMetric(".runtime_monitor.cgroup.memory.limit_in_bytes")
-	// MetricRuntimeCgroupMemoryMemSWUsageInBytes is the name of the metric used to report memory.memsw.usage_in_bytes
+	MetricSecurityProfileV2TagResolutionCgroupsPending = newRuntimeMetric(".security_profile_v2.tag_resolution.cgroups_pending")
+
+	// MetricSecurityProfileV2TagResolutionCgroupsResolved is the name of the metric used to report current cgroups with resolved tags (actively profiled)
+	// Tags: - (Gauge)
+	MetricSecurityProfileV2TagResolutionCgroupsResolved = newRuntimeMetric(".security_profile_v2.tag_resolution.cgroups_resolved")
+
+	// MetricSecurityProfileV2TagResolutionEventsDropped is the name of the metric used to report events dropped due to 10s stale timeout
+	// Tags: source (runtime or replay)
+	MetricSecurityProfileV2TagResolutionEventsDropped = newRuntimeMetric(".security_profile_v2.tag_resolution.events_dropped")
+
+	// MetricSecurityProfileV2TagResolutionCgroupsExpired is the name of the metric used to report cgroups cleaned up after 60s without ever resolving tags
 	// Tags: -
-	MetricRuntimeCgroupMemoryMemSWUsageInBytes = newRuntimeMetric(".runtime_monitor.cgroup.memory.memsw_usage_in_bytes")
-	// MetricRuntimeCgroupMemoryMemSWLimitInBytes is the name of the metric used to report memory.memsw.limit_in_bytes
+	MetricSecurityProfileV2TagResolutionCgroupsExpired = newRuntimeMetric(".security_profile_v2.tag_resolution.cgroups_expired")
+
+	// MetricSecurityProfileV2TagResolutionLatency is the name of the metric used to report the time between first event and successful tag resolution
 	// Tags: -
-	MetricRuntimeCgroupMemoryMemSWLimitInBytes = newRuntimeMetric(".runtime_monitor.cgroup.memory.memsw_limit_in_bytes")
-	// MetricRuntimeCgroupMemoryKmemUsageInBytes is the name of the metric used to report memory.kmem.usage_in_bytes
+	MetricSecurityProfileV2TagResolutionLatency = newRuntimeMetric(".security_profile_v2.tag_resolution.latency")
+
+	// Event Processing metrics
+
+	// MetricSecurityProfileV2DisabledProfiles is the name of the metric used to report the amount of disabled profiles in this host
+	// Tags: profile_image_name, profile_image_tag
+	MetricSecurityProfileV2DisabledProfiles = newRuntimeMetric(".security_profile_v2.disabled_profiles")
+
+	// Persistence metrics
+
+	// MetricSecurityProfileV2SizeInBytes is the name of the metric used to report the size of generated security profiles in bytes
+	// Tags: format, storage_type, compression
+	MetricSecurityProfileV2SizeInBytes = newRuntimeMetric(".security_profile_v2.size_in_bytes")
+
+	// MetricSecurityProfileV2PersistedProfiles is the name of the metric used to report the number of profiles that were persisted
+	// Tags: format, storage_type, compression
+	MetricSecurityProfileV2PersistedProfiles = newRuntimeMetric(".security_profile_v2.persisted_profiles")
+
+	// Eviction metrics
+
+	// MetricSecurityProfileV2EvictionRuns is the name of the metric used to report the number of eviction cycles run
 	// Tags: -
-	MetricRuntimeCgroupMemoryKmemUsageInBytes = newRuntimeMetric(".runtime_monitor.cgroup.memory.kmem_usage_in_bytes")
-	// MetricRuntimeCgroupMemoryKmemLimitInBytes is the name of the metric used to report memory.kmem.limit_in_bytes
+	MetricSecurityProfileV2EvictionRuns = newRuntimeMetric(".security_profile_v2.eviction.runs")
+
+	// MetricSecurityProfileV2EvictionNodesEvictedPerProfile is the name of the metric used to report nodes evicted from a specific profile
 	// Tags: -
-	MetricRuntimeCgroupMemoryKmemLimitInBytes = newRuntimeMetric(".runtime_monitor.cgroup.memory.kmem_limit_in_bytes")
+	MetricSecurityProfileV2EvictionNodesEvictedPerProfile = newRuntimeMetric(".security_profile_v2.eviction.nodes_evicted_per_profile")
+
+	// Profile cleanup metrics
+
+	// MetricSecurityProfileV2CleanupProfilesRemoved is the name of the metric used to report profiles removed after cleanup delay
+	// Tags: -
+	MetricSecurityProfileV2CleanupProfilesRemoved = newRuntimeMetric(".security_profile_v2.cleanup.profiles_removed")
+
+	// Sample refresh metrics (cookie-based dedup refresh)
+
+	// MetricSecurityProfileV2SampleRefreshReceived counts HandleSampleRefresh calls
+	// Tags: -
+	MetricSecurityProfileV2SampleRefreshReceived = newRuntimeMetric(".security_profile_v2.sample_refresh.received")
+
+	// MetricSecurityProfileV2SampleRefreshHits counts refresh events where the cookie was found in the LRU
+	// Tags: -
+	MetricSecurityProfileV2SampleRefreshHits = newRuntimeMetric(".security_profile_v2.sample_refresh.hits")
+
+	// MetricSecurityProfileV2SampleRefreshMisses counts refresh events where the cookie was not found (LRU evicted)
+	// Tags: -
+	MetricSecurityProfileV2SampleRefreshMisses = newRuntimeMetric(".security_profile_v2.sample_refresh.misses")
+
+	// MetricSecurityProfileV2ProfileSize is the unified size metric for active security profiles.
+	// Tags: profile_image_name, profile_image_tag, storage (ram|disk).
+	// Note: profile_image_* is used instead of image_* to avoid collision with Datadog's
+	// container auto-tagging (the submitting agent's own image_name gets stamped on metrics).
+	MetricSecurityProfileV2ProfileSize = newRuntimeMetric(".security_profile_v2.profile_size")
+
+	// Event sampling metrics (kernel-side)
+
+	// MetricEventSampleTotal is the name of the metric used to report total events that hit the sampling logic in kernel
+	// Tags: event_type
+	MetricEventSampleTotal = newRuntimeMetric(".event_sample.total")
+
+	// MetricEventSampleSampled is the name of the metric used to report events that were sampled in kernel
+	// Tags: event_type
+	MetricEventSampleSampled = newRuntimeMetric(".event_sample.sampled")
+
+	// MetricSamplingPressureLevel is the name of the metric used to report the current sampling pressure level
+	// Tags: -
+	MetricSamplingPressureLevel = newRuntimeMetric(".event_sample.pressure_level")
+
+	// MetricRawPacketDropped is the name of the metric used to count packets dropped by network_filter actions
+	// Tags: rule_id
+	MetricRawPacketDropped = newRuntimeMetric(".network.raw_packet.dropped")
 )
 
 var (
@@ -598,6 +703,19 @@ var (
 	ProcessSourceKernelMapsTags = []string{KernelMapsTag}
 	// ProcessSourceProcTags is assigned to metrics for process cache entries populated from /proc data
 	ProcessSourceProcTags = []string{ProcFSTag}
+
+	// ReparentCallpathSetProcessContext tags a reparent from the setProcessContext path
+	ReparentCallpathSetProcessContext = "callpath:set_process_context"
+	// ReparentCallpathDoExit tags a reparent from the ApplyExitEntry path (do_exit)
+	ReparentCallpathDoExit = "callpath:do_exit"
+	// ReparentCallpathKernelPPid tags a reparent triggered by a kernel ppid mismatch
+	ReparentCallpathKernelPPid = "callpath:kernel_ppid"
+	// ReparentCallpathRelatedEvent tags a reparent from the related event dispatch path
+	ReparentCallpathRelatedEvent = "callpath:related_event"
+	// ReparentCallpathTargetProcess tags a reparent from target process resolution paths (ptrace tracee, signal/setrlimit target, scoped PID lookup)
+	ReparentCallpathTargetProcess = "callpath:target_process"
+	// AllReparentCallpathTags is the list of all reparent callpath tags
+	AllReparentCallpathTags = []string{ReparentCallpathSetProcessContext, ReparentCallpathDoExit, ReparentCallpathKernelPPid, ReparentCallpathRelatedEvent, ReparentCallpathTargetProcess}
 )
 
 func newRuntimeMetric(name string) string {
@@ -606,4 +724,20 @@ func newRuntimeMetric(name string) string {
 
 func newAgentMetric(name string) string {
 	return MetricAgentPrefix + name
+}
+
+// ITMetric is a struct that represents a metric for internal telemetry
+type ITMetric struct {
+	// Subsystem is the subsystem of the metric, used to group related metrics
+	Subsystem string
+	// Name is the name of the metric, used to identify it
+	Name string
+}
+
+func newITRuntimeMetric(subsystem string, name string) ITMetric {
+	name = strings.ReplaceAll(name, ".", "__")
+	return ITMetric{
+		Subsystem: "runtime_security__" + subsystem,
+		Name:      name,
+	}
 }

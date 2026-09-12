@@ -16,23 +16,27 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	dockerfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/util/docker"
+	workloadmetafilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/util/workloadmeta"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
 	"github.com/DataDog/datadog-agent/pkg/collector/check"
 	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
+	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/agentperformance"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/generic"
 	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/docker"
 	"github.com/DataDog/datadog-agent/pkg/util/hostname"
-	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 )
@@ -61,24 +65,28 @@ type DockerCheck struct {
 	processor                   generic.Processor
 	networkProcessorExtension   *dockerNetworkExtension
 	dockerHostname              string
-	containerFilter             *containers.Filter
 	okExitCodes                 map[int]struct{}
 	collectContainerSizeCounter uint64
 	store                       workloadmeta.Component
+	containerFilter             workloadfilter.FilterBundle
 	tagger                      tagger.Component
+	agentPerformance            *agentperformance.Recorder
 
 	lastEventTime    time.Time
 	eventTransformer eventTransformer
 }
 
 // Factory returns a new docker corecheck factory
-func Factory(store workloadmeta.Component, tagger tagger.Component) option.Option[func() check.Check] {
+func Factory(store workloadmeta.Component, filterStore workloadfilter.Component, tagger tagger.Component, telemetry telemetry.Component) option.Option[func() check.Check] {
+	agentPerformance := agentperformance.NewRecorder(telemetry)
 	return option.New(func() check.Check {
 		return &DockerCheck{
-			CheckBase: core.NewCheckBase(CheckName),
-			instance:  &DockerConfig{},
-			store:     store,
-			tagger:    tagger,
+			CheckBase:        core.NewCheckBase(CheckName),
+			instance:         &DockerConfig{},
+			store:            store,
+			containerFilter:  filterStore.GetContainerSharedMetricFilters(),
+			tagger:           tagger,
+			agentPerformance: agentPerformance,
 		}
 	})
 }
@@ -91,8 +99,8 @@ var defaultFilteredEventTypes = []string{
 }
 
 // Configure parses the check configuration and init the check
-func (d *DockerCheck) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string) error {
-	err := d.CommonConfigure(senderManager, initConfig, config, source)
+func (d *DockerCheck) Configure(senderManager sender.SenderManager, _ uint64, config, initConfig integration.Data, source string, provider string) error {
+	err := d.CommonConfigure(senderManager, initConfig, config, source, provider)
 	if err != nil {
 		return err
 	}
@@ -127,12 +135,7 @@ func (d *DockerCheck) Configure(senderManager sender.SenderManager, _ uint64, co
 		d.eventTransformer = newBundledTransformer(d.dockerHostname, filteredEventTypes, d.tagger)
 	}
 
-	d.containerFilter, err = containers.GetSharedMetricFilter()
-	if err != nil {
-		log.Warnf("Can't get container include/exclude filter, no filtering will be applied: %v", err)
-	}
-
-	d.processor = generic.NewProcessor(metrics.GetProvider(option.New(d.store)), generic.NewMetadataContainerAccessor(d.store), metricsAdapter{}, getProcessorFilter(d.containerFilter, d.store), d.tagger)
+	d.processor = generic.NewProcessor(metrics.GetProvider(option.New(d.store)), generic.NewMetadataContainerAccessor(d.store), metricsAdapter{}, getProcessorFilter(d.containerFilter, d.store), d.tagger, d.agentPerformance, false)
 	d.processor.RegisterExtension("docker-custom-metrics", &dockerCustomMetricsExtension{})
 	d.configureNetworkProcessor(&d.processor)
 	d.setOkExitCodes()
@@ -174,7 +177,7 @@ func (d *DockerCheck) Run() error {
 		d.collectContainerSizeCounter = (d.collectContainerSizeCounter + 1) % d.instance.CollectContainerSizeFreq
 	}
 
-	rawContainerList, err := du.RawContainerList(context.TODO(), container.ListOptions{All: true, Size: collectContainerSize})
+	rawContainerList, err := du.RawContainerList(context.TODO(), dockerclient.ContainerListOptions{All: true, Size: collectContainerSize})
 	if err != nil {
 		sender.ServiceCheck(DockerServiceUp, servicecheck.ServiceCheckCritical, "", nil, err.Error())
 		_ = d.Warnf("Error collecting containers: %s", err)
@@ -210,7 +213,7 @@ func (d *DockerCheck) runDockerCustom(sender sender.Sender, du docker.Client, ra
 	}
 
 	for _, rawContainer := range rawContainerList {
-		if rawContainer.State == string(workloadmeta.ContainerStatusRunning) {
+		if string(rawContainer.State) == string(workloadmeta.ContainerStatusRunning) {
 			containersRunning++
 		} else {
 			containersStopped++
@@ -228,22 +231,20 @@ func (d *DockerCheck) runDockerCustom(sender sender.Sender, du docker.Client, ra
 			resolvedImageName = rawContainer.Image
 		}
 
-		// We do reports some metrics about excluded containers, but the tagger won't have tags
-		// We always use rawContainer.Names[0] to match historic behavior
-		var containerName string
-		if len(rawContainer.Names) > 0 {
-			containerName = rawContainer.Names[0]
-		}
-		var annotations map[string]string
-		if pod, err := d.store.GetKubernetesPodForContainer(rawContainer.ID); err == nil {
-			annotations = pod.Annotations
+		// Retrieve filterable objects
+		pod, _ := d.store.GetKubernetesPodForContainer(rawContainer.ID)
+		filterablePod := workloadmetafilter.CreatePod(pod)
+		wmetaContainer, err := d.store.GetContainer(rawContainer.ID)
+		var filterableContainer *workloadfilter.Container
+		if err != nil {
+			// Backup partial definition of container from the summary in case of race conditions
+			filterableContainer = dockerfilter.CreateContainer(rawContainer, resolvedImageName, filterablePod)
+		} else {
+			filterableContainer = workloadmetafilter.CreateContainer(wmetaContainer, filterablePod)
 		}
 
-		isContainerExcluded := false
-		if d.containerFilter != nil {
-			isContainerExcluded = d.containerFilter.IsExcluded(annotations, containerName, resolvedImageName, rawContainer.Labels[kubernetes.CriContainerNamespaceLabel])
-		}
-		isContainerRunning := rawContainer.State == string(workloadmeta.ContainerStatusRunning)
+		isContainerExcluded := d.containerFilter.IsExcluded(filterableContainer)
+		isContainerRunning := string(rawContainer.State) == string(workloadmeta.ContainerStatusRunning)
 		taggerEntityID := types.NewEntityID(types.ContainerID, rawContainer.ID)
 		tags, err := d.getImageTagsFromContainer(taggerEntityID, resolvedImageName, isContainerExcluded || !isContainerRunning)
 		if err != nil {
@@ -342,8 +343,7 @@ func (d *DockerCheck) collectImageMetrics(sender sender.Sender, du docker.Client
 				continue
 			}
 
-			//nolint:staticcheck // TODO(CINT) Fix staticcheck linter
-			sender.Gauge("docker.image.virtual_size", float64(image.VirtualSize), "", imageTags)
+			sender.Gauge("docker.image.virtual_size", float64(image.Size), "", imageTags)
 			sender.Gauge("docker.image.size", float64(image.Size), "", imageTags)
 		}
 	}

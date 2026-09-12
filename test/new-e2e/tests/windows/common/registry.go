@@ -7,9 +7,10 @@ package common
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
 )
 
 // GetRegistryValue returns a registry value from a remote host
@@ -41,14 +42,15 @@ func DeleteRegistryKey(host *components.RemoteHost, path string) error {
 
 // SetRegistryDWORDValue sets, creating if necessary, a DWORD value at the specified path
 func SetRegistryDWORDValue(host *components.RemoteHost, path string, name string, value int) error {
-	return SetTypedRegistryValue(host, path, name, fmt.Sprintf("%d", value), "DWORD")
+	return SetTypedRegistryValue(host, path, name, strconv.Itoa(value), "DWORD")
 }
 
 // SetTypedRegistryValue sets, creating if necessary, the value at the specified path with the specified type
 //
 // https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty?view=powershell-7.4#-type
 func SetTypedRegistryValue(host *components.RemoteHost, path string, name string, value string, typeName string) error {
-	cmd := fmt.Sprintf("New-Item -Path '%s' -Force; Set-ItemProperty -Path '%s' -Name '%s' -Value '%s' -Type '%s'", path, path, name, value, typeName)
+	// Note: Need Test-path because -Force removes the key if it already exists
+	cmd := fmt.Sprintf("if (-not (Test-Path -Path '%s')) { New-Item -Path '%s' -Force } Set-ItemProperty -Path '%s' -Name '%s' -Value '%s' -Type '%s'", path, path, path, name, value, typeName)
 	_, err := host.Execute(cmd)
 	if err != nil {
 		return err
@@ -62,4 +64,21 @@ func SetRegistryMultiString(host *components.RemoteHost, path string, name strin
 	cmd := fmt.Sprintf("Set-ItemProperty -Path '%s' -Name '%s' -Value %s -Type MultiString", path, name, pslist)
 	_, err := host.Execute(cmd)
 	return err
+}
+
+// SetNewItemDWORDProperty sets a DWORD value at the specified path
+func SetNewItemDWORDProperty(host *components.RemoteHost, path string, name string, value int) error {
+	return SetNewItemProperty(host, path, name, strconv.Itoa(value), "DWORD")
+}
+
+// SetNewItemProperty sets a new item property on the remote host
+//
+// https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/new-itemproperty?view=powershell-7.5
+func SetNewItemProperty(host *components.RemoteHost, path string, name string, value string, typeName string) error {
+	cmd := fmt.Sprintf("New-ItemProperty -Path '%s' -Name '%s' -PropertyType '%s' -Value '%s' -Force", path, name, typeName, value)
+	_, err := host.Execute(cmd)
+	if err != nil {
+		return err
+	}
+	return nil
 }

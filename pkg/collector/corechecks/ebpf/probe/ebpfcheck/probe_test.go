@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package ebpfcheck
 
@@ -13,11 +13,13 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/assert"
@@ -93,6 +95,9 @@ func TestMinMapSize(t *testing.T) {
 	require.NoError(t, err)
 	nrcpus := uint64(cpus)
 
+	kv, err := kernel.HostVersion()
+	require.NoError(t, err)
+
 	ebpftest.TestBuildMode(t, ebpftest.CORE, "", func(t *testing.T) {
 		cfg := testConfig()
 		const keySize, valueSize, maxEntries = 50, 150, 1000
@@ -107,7 +112,7 @@ func TestMinMapSize(t *testing.T) {
 			{Type: ebpf.Hash, KeySize: keySize},
 			{Type: ebpf.LRUHash, KeySize: keySize},
 			{Type: ebpf.LRUCPUHash, KeySize: keySize},
-			{Type: ebpf.PerCPUHash, KeySize: keySize},
+			{Type: ebpf.PerCPUHash, KeySize: keySize, Flags: unix.BPF_F_NO_PREALLOC},
 			{Type: ebpf.LPMTrie, KeySize: 8, ValueSize: 8, Flags: unix.BPF_F_NO_PREALLOC},
 		}
 
@@ -166,8 +171,17 @@ func TestMinMapSize(t *testing.T) {
 			} else {
 				minSize = (ks + uint64(mt.ValueSize)) * uint64(mt.MaxEntries)
 			}
-			t.Logf("type: %s min: %d val: %d", mt.Type, minSize, typStats.MaxSize)
+
+			t.Logf("type: %s min: %d val: %d, rss: %d", mt.Type, minSize, typStats.MaxSize, typStats.RSS)
 			assert.GreaterOrEqual(t, typStats.MaxSize, minSize, "map type: %s", mt.Type)
+			assert.GreaterOrEqual(t, typStats.MaxSize, typStats.RSS, "map type: %s", mt.Type)
+			if strings.Contains(mt.Type.String(), "Hash") &&
+				(mt.Flags&unix.BPF_F_NO_PREALLOC) != 0 &&
+				kv < kernel.VersionCode(6, 4, 0) {
+				assert.Zero(t, typStats.RSS, "map type: %s", mt.Type)
+			} else {
+				assert.NotZero(t, typStats.RSS, "map type: %s", mt.Type)
+			}
 		}
 	})
 }
@@ -579,4 +593,64 @@ func TestHashMapNumberOfEntriesNoMemoryCorruption(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLocalStorageMemoryUsage(t *testing.T) {
+	if !preciseMapMemUsageSupported() {
+		t.SkipNow()
+	}
+
+	ebpftest.TestBuildMode(t, ebpftest.CORE, "", func(t *testing.T) {
+		cfg := testConfig()
+
+		probe, err := NewProbe(cfg)
+		require.NoError(t, err)
+		t.Cleanup(probe.Close)
+
+		kspec, err := btf.LoadKernelSpec()
+		require.NoError(t, err)
+
+		u32Type, err := kspec.AnyTypeByName("unsigned int")
+		require.NoError(t, err)
+
+		testMap, err := ebpf.NewMap(&ebpf.MapSpec{
+			Name:       "test_task_storage",
+			Type:       ebpf.TaskStorage,
+			KeySize:    4,
+			ValueSize:  4,
+			MaxEntries: 0,
+			Flags:      unix.BPF_F_NO_PREALLOC,
+			Key:        u32Type,
+			Value:      u32Type,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = testMap.Close() })
+
+		info, err := testMap.Info()
+		require.NoError(t, err)
+		id, _ := info.ID()
+
+		fd, err := unix.PidfdOpen(os.Getpid(), 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = unix.Close(fd) })
+
+		var val uint32 = 1
+		err = testMap.Update(unsafe.Pointer(&fd), unsafe.Pointer(&val), ebpf.UpdateAny)
+		require.NoError(t, err)
+
+		var result model.EBPFMapStats
+		require.Eventually(t, func() bool {
+			stats := probe.GetAndFlush()
+			for _, mapStats := range stats.Maps {
+				if mapStats.ID == uint32(id) {
+					result = mapStats
+					return true
+				}
+			}
+			return false
+		}, 5*time.Second, 500*time.Millisecond, "failed to find map")
+
+		assert.GreaterOrEqual(t, result.RSS, uint64(8))
+		assert.Equal(t, result.RSS, result.MaxSize)
+	})
 }

@@ -8,13 +8,19 @@ package forwarder
 import (
 	"testing"
 
+	"go.uber.org/fx"
+
 	"github.com/DataDog/datadog-agent/comp/core"
-	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	secretsmock "github.com/DataDog/datadog-agent/comp/core/secrets/mock"
+	defaultforwarder "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/def"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
 func TestBundleDependencies(t *testing.T) {
 	fxutil.TestBundle(t, Bundle(defaultforwarder.Params{}),
 		core.MockBundle(),
+		// TODO: Remove this once the mockForwarder is a proper mock
+		fx.Provide(func() secrets.Component { return secretsmock.New(t) }),
 	)
 }

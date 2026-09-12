@@ -7,34 +7,33 @@ package agentimpl
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
-
-	"github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl/hosttags"
-	"github.com/DataDog/datadog-agent/comp/remote-config/rcservice"
-	"github.com/DataDog/datadog-agent/comp/remote-config/rcservicemrf"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	"github.com/DataDog/datadog-agent/comp/core/autodiscovery"
+	autodiscovery "github.com/DataDog/datadog-agent/comp/core/autodiscovery/def"
 	autodiscoverystream "github.com/DataDog/datadog-agent/comp/core/autodiscovery/stream"
 	"github.com/DataDog/datadog-agent/comp/core/config"
-	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface"
+	configstreamServer "github.com/DataDog/datadog-agent/comp/core/configstream/server"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
 	remoteagentregistry "github.com/DataDog/datadog-agent/comp/core/remoteagentregistry/def"
-	rarproto "github.com/DataDog/datadog-agent/comp/core/remoteagentregistry/proto"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
-	taggerimpl "github.com/DataDog/datadog-agent/comp/core/tagger/impl"
 	taggerProto "github.com/DataDog/datadog-agent/comp/core/tagger/proto"
 	taggerserver "github.com/DataDog/datadog-agent/comp/core/tagger/server"
 	taggerTypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
-	noopTelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/noopsimpl"
+	workloadfilterServer "github.com/DataDog/datadog-agent/comp/core/workloadfilter/server"
 	workloadmetaServer "github.com/DataDog/datadog-agent/comp/core/workloadmeta/server"
-	"github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap"
+	pidmap "github.com/DataDog/datadog-agent/comp/dogstatsd/pidmap/def"
 	dsdReplay "github.com/DataDog/datadog-agent/comp/dogstatsd/replay/def"
-	dogstatsdServer "github.com/DataDog/datadog-agent/comp/dogstatsd/server"
+	dogstatsdServer "github.com/DataDog/datadog-agent/comp/dogstatsd/server/def"
+	healthplatformstore "github.com/DataDog/datadog-agent/comp/healthplatform/store/def"
+	"github.com/DataDog/datadog-agent/comp/metadata/host/impl/hosttags"
+	rcservice "github.com/DataDog/datadog-agent/comp/remote-config/rcservice/def"
+	rcservicemrf "github.com/DataDog/datadog-agent/comp/remote-config/rcservicemrf/def"
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 	"github.com/DataDog/datadog-agent/pkg/util/grpc"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -49,17 +48,27 @@ type agentServer struct {
 
 type serverSecure struct {
 	pb.UnimplementedAgentSecureServer
-	taggerServer        *taggerserver.Server
-	taggerComp          tagger.Component
-	workloadmetaServer  *workloadmetaServer.Server
-	configService       option.Option[rcservice.Component]
-	configServiceMRF    option.Option[rcservicemrf.Component]
-	dogstatsdServer     dogstatsdServer.Component
-	capture             dsdReplay.Component
-	pidMap              pidmap.Component
+	taggerServer         *taggerserver.Server
+	tagProcessor         option.Option[tagger.Processor]
+	workloadmetaServer   *workloadmetaServer.Server
+	workloadfilterServer *workloadfilterServer.Server
+	configService        option.Option[rcservice.Component]
+	configServiceMRF     option.Option[rcservicemrf.Component]
+	dogstatsdServer      dogstatsdServer.Component
+	capture              dsdReplay.Component
+	pidMap               pidmap.Component
+	remoteAgentRegistry  remoteagentregistry.Component
+	autodiscovery        autodiscovery.Component
+	configComp           config.Component
+	configStreamServer   *configstreamServer.Server
+	healthPlatformStore  healthplatformstore.Component
+}
+
+// remoteAgentServer implements the dedicated RemoteAgent gRPC service, which owns the remote agent lifecycle
+// (registration and refresh) and the reporting of operational events back to the Core Agent.
+type remoteAgentServer struct {
+	pb.UnimplementedRemoteAgentServer
 	remoteAgentRegistry remoteagentregistry.Component
-	autodiscovery       autodiscovery.Component
-	configComp          config.Component
 }
 
 func (s *agentServer) GetHostname(ctx context.Context, _ *pb.HostnameRequest) (*pb.HostnameReply, error) {
@@ -121,16 +130,13 @@ func (s *serverSecure) DogstatsdSetTaggerState(_ context.Context, req *pb.Tagger
 		return &pb.TaggerStateResponse{Loaded: false}, nil
 	}
 
-	// FiXME: we should perhaps lock the capture processing while doing this...
-	mockReq := taggerimpl.MockRequires{
-		Config:    s.configComp,
-		Telemetry: noopTelemetry.GetCompatComponent(),
+	tagProcessor, isSet := s.tagProcessor.Get()
+	if !isSet || tagProcessor == nil {
+		log.Debug("Tag processor is unavailable. Cannot set tagger state.")
+		return &pb.TaggerStateResponse{Loaded: false}, errors.New("tag processor is unavailable")
 	}
-	fakeTagger := taggerimpl.NewMock(mockReq).Comp
-	if fakeTagger == nil {
-		return &pb.TaggerStateResponse{Loaded: false}, fmt.Errorf("unable to instantiate state")
-	}
-	state := make([]taggerTypes.Entity, 0, len(req.State))
+
+	state := make([]*taggerTypes.TagInfo, 0, len(req.State))
 
 	// better stores these as the native type
 	for id, entity := range req.State {
@@ -140,16 +146,18 @@ func (s *serverSecure) DogstatsdSetTaggerState(_ context.Context, req *pb.Tagger
 			continue
 		}
 
-		state = append(state, taggerTypes.Entity{
-			ID:                          *entityID,
-			HighCardinalityTags:         entity.HighCardinalityTags,
-			OrchestratorCardinalityTags: entity.OrchestratorCardinalityTags,
-			LowCardinalityTags:          entity.LowCardinalityTags,
-			StandardTags:                entity.StandardTags,
+		state = append(state, &taggerTypes.TagInfo{
+			Source:               "replay",
+			EntityID:             *entityID,
+			HighCardTags:         entity.HighCardinalityTags,
+			OrchestratorCardTags: entity.OrchestratorCardinalityTags,
+			LowCardTags:          entity.LowCardinalityTags,
+			StandardTags:         entity.StandardTags,
+			ExpiryDate:           time.Now().Add(time.Duration(req.Duration) * time.Millisecond * 2),
 		})
 	}
-	fakeTagger.LoadState(state)
 
+	tagProcessor.ProcessTagInfo(state)
 	s.pidMap.SetPidMap(req.PidMap)
 
 	log.Debugf("API: loaded state successfully")
@@ -196,25 +204,152 @@ func (s *serverSecure) GetConfigStateHA(_ context.Context, _ *emptypb.Empty) (*p
 	return rcServiceMRF.ConfigGetState()
 }
 
+func (s *serverSecure) ResetConfigState(_ context.Context, _ *emptypb.Empty) (*pb.ResetStateConfigResponse, error) {
+	rcService, isSet := s.configService.Get()
+
+	if !isSet || rcService == nil {
+		log.Debug(rcNotInitializedErr.Error())
+		return nil, rcNotInitializedErr
+	}
+	return rcService.ConfigResetState()
+}
+
 // WorkloadmetaStreamEntities streams entities from the workloadmeta store applying the given filter
 func (s *serverSecure) WorkloadmetaStreamEntities(in *pb.WorkloadmetaStreamRequest, out pb.AgentSecure_WorkloadmetaStreamEntitiesServer) error {
 	return s.workloadmetaServer.StreamEntities(in, out)
 }
 
+// RegisterRemoteAgent is the AgentSecure copy of the remote agent registration RPC.
+//
+// Deprecated: this RPC has moved to the dedicated RemoteAgent service. It remains here so existing clients keep working
+// and can migrate at their own pace; new clients should use RemoteAgent.RegisterRemoteAgent.
 func (s *serverSecure) RegisterRemoteAgent(_ context.Context, in *pb.RegisterRemoteAgentRequest) (*pb.RegisterRemoteAgentResponse, error) {
+	return registerRemoteAgent(s.remoteAgentRegistry, in)
+}
+
+// RefreshRemoteAgent is the AgentSecure copy of the remote agent refresh RPC.
+//
+// Deprecated: this RPC has moved to the dedicated RemoteAgent service. It remains here so existing clients keep working
+// and can migrate at their own pace; new clients should use RemoteAgent.RefreshRemoteAgent.
+func (s *serverSecure) RefreshRemoteAgent(_ context.Context, in *pb.RefreshRemoteAgentRequest) (*pb.RefreshRemoteAgentResponse, error) {
+	return refreshRemoteAgent(s.remoteAgentRegistry, in)
+}
+
+func (s *remoteAgentServer) RegisterRemoteAgent(_ context.Context, in *pb.RegisterRemoteAgentRequest) (*pb.RegisterRemoteAgentResponse, error) {
+	return registerRemoteAgent(s.remoteAgentRegistry, in)
+}
+
+func (s *remoteAgentServer) RefreshRemoteAgent(_ context.Context, in *pb.RefreshRemoteAgentRequest) (*pb.RefreshRemoteAgentResponse, error) {
+	return refreshRemoteAgent(s.remoteAgentRegistry, in)
+}
+
+// ReportRemoteAgentEvent routes operational events reported by a remote agent to the remote agent registry.
+func (s *remoteAgentServer) ReportRemoteAgentEvent(_ context.Context, in *pb.ReportRemoteAgentEventRequest) (*pb.ReportRemoteAgentEventResponse, error) {
 	if s.remoteAgentRegistry == nil {
 		return nil, status.Error(codes.Unimplemented, "remote agent registry not enabled")
 	}
 
-	registration := rarproto.ProtobufToRemoteAgentRegistration(in)
-	recommendedRefreshIntervalSecs, err := s.remoteAgentRegistry.RegisterRemoteAgent(registration)
+	events := make([]remoteagentregistry.RemoteAgentEvent, 0, len(in.Events))
+	for _, pbEvent := range in.Events {
+		event := remoteagentregistry.RemoteAgentEvent{Message: pbEvent.Message}
+		switch pbEvent.Details.(type) {
+		case *pb.Event_InvalidApiKey:
+			event.Details = &remoteagentregistry.InvalidAPIKey{}
+		}
+		events = append(events, event)
+	}
+
+	if err := s.remoteAgentRegistry.ReportRemoteAgentEvent(in.SessionId, events); err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+
+	return &pb.ReportRemoteAgentEventResponse{}, nil
+}
+
+// registerRemoteAgent is the shared implementation of the RegisterRemoteAgent RPC, used by both the dedicated
+// RemoteAgent service and the deprecated AgentSecure copy so the two cannot drift.
+func registerRemoteAgent(registry remoteagentregistry.Component, in *pb.RegisterRemoteAgentRequest) (*pb.RegisterRemoteAgentResponse, error) {
+	if registry == nil {
+		return nil, status.Error(codes.Unimplemented, "remote agent registry not enabled")
+	}
+
+	registration := &remoteagentregistry.RegistrationData{
+		AgentPID:         in.Pid,
+		AgentFlavor:      in.Flavor,
+		AgentDisplayName: in.DisplayName,
+		APIEndpointURI:   in.ApiEndpointUri,
+		Services:         in.Services,
+	}
+	sessionID, recommendedRefreshIntervalSecs, err := registry.RegisterRemoteAgent(registration)
 	if err != nil {
 		return nil, err
 	}
 
 	return &pb.RegisterRemoteAgentResponse{
 		RecommendedRefreshIntervalSecs: recommendedRefreshIntervalSecs,
+		SessionId:                      sessionID,
 	}, nil
+}
+
+// refreshRemoteAgent is the shared implementation of the RefreshRemoteAgent RPC, used by both the dedicated
+// RemoteAgent service and the deprecated AgentSecure copy so the two cannot drift.
+func refreshRemoteAgent(registry remoteagentregistry.Component, in *pb.RefreshRemoteAgentRequest) (*pb.RefreshRemoteAgentResponse, error) {
+	if registry == nil {
+		return nil, status.Error(codes.Unimplemented, "remote agent registry not enabled")
+	}
+
+	found := registry.RefreshRemoteAgent(in.SessionId)
+	if !found {
+		return nil, status.Error(codes.NotFound, "no remote agent found with session ID")
+	}
+	return &pb.RefreshRemoteAgentResponse{}, nil
+}
+
+func (s *serverSecure) validateSessionID(sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	if s.remoteAgentRegistry == nil {
+		return status.Error(codes.Unavailable, "remote agent registry not available")
+	}
+	if found := s.remoteAgentRegistry.RefreshRemoteAgent(sessionID); !found {
+		return status.Error(codes.Unauthenticated, "invalid or expired remote agent session")
+	}
+	return nil
+}
+
+func (s *serverSecure) ReportHealthIssue(_ context.Context, in *pb.ReportHealthIssueRequest) (*emptypb.Empty, error) {
+	if err := s.validateSessionID(in.GetRemoteAgentSessionId()); err != nil {
+		return nil, err
+	}
+
+	issue := in.GetIssue()
+	if issue == nil {
+		return nil, status.Error(codes.InvalidArgument, "issue cannot be nil")
+	}
+	if issue.GetId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "issue id cannot be empty")
+	}
+	if issue.GetIssueName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "issue_name cannot be empty")
+	}
+
+	if err := s.healthPlatformStore.ReportIssue(issue); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to store issue: %v", err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (s *serverSecure) ResolveHealthIssue(_ context.Context, in *pb.ResolveHealthIssueRequest) (*emptypb.Empty, error) {
+	if err := s.validateSessionID(in.GetRemoteAgentSessionId()); err != nil {
+		return nil, err
+	}
+	if in.GetIssueId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "issue_id cannot be empty")
+	}
+
+	s.healthPlatformStore.ResolveIssue(in.GetIssueId())
+	return &emptypb.Empty{}, nil
 }
 
 func (s *serverSecure) AutodiscoveryStreamConfig(_ *emptypb.Empty, out pb.AgentSecure_AutodiscoveryStreamConfigServer) error {
@@ -226,6 +361,23 @@ func (s *serverSecure) GetHostTags(ctx context.Context, _ *pb.HostTagRequest) (*
 	return &pb.HostTagReply{System: tags.System, GoogleCloudPlatform: tags.GoogleCloudPlatform}, nil
 }
 
+func (s *serverSecure) StreamConfigEvents(in *pb.ConfigStreamRequest, out pb.AgentSecure_StreamConfigEventsServer) error {
+	return s.configStreamServer.StreamConfigEvents(in, out)
+}
+
 func init() {
 	grpclog.SetLoggerV2(grpc.NewLogger())
+}
+
+func (s *serverSecure) CreateConfigSubscription(stream pb.AgentSecure_CreateConfigSubscriptionServer) error {
+	rcService, isSet := s.configService.Get()
+	if !isSet || rcService == nil {
+		log.Debug(rcNotInitializedErr.Error())
+		return rcNotInitializedErr
+	}
+	return rcService.CreateConfigSubscription(stream)
+}
+
+func (s *serverSecure) WorkloadFilterEvaluate(ctx context.Context, req *pb.WorkloadFilterEvaluateRequest) (*pb.WorkloadFilterEvaluateResponse, error) {
+	return s.workloadfilterServer.WorkloadFilterEvaluate(ctx, req)
 }

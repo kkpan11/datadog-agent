@@ -14,8 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hashicorp/go-multierror"
-
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/config/env"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
@@ -124,9 +122,9 @@ func newSystemCollector(cache *provider.Cache, wlm option.Option[workloadmeta.Co
 	if env.IsContainerized() {
 		collectors = &provider.Collectors{}
 
-		// When the Agent runs as a sidecar (e.g. Fargate) with shared PID namespace, we can use the system collector in some cases.
+		// When the Agent runs as a sidecar (e.g. Fargate or Managed Instances) with shared PID namespace, we can use the system collector in some cases.
 		// TODO: Check how we could detect shared PID namespace instead of makeing assumption
-		isAgentSidecar := env.IsFeaturePresent(env.ECSFargate) || env.IsFeaturePresent(env.EKSFargate)
+		isAgentSidecar := env.IsFeaturePresent(env.ECSFargate) || env.IsFeaturePresent(env.EKSFargate) || env.IsECSSidecarMode(pkgconfigsetup.Datadog())
 
 		// With sysfs we can always get cgroup stats
 		if env.IsHostSysAvailable() {
@@ -261,11 +259,11 @@ func (c *systemCollector) GetSelfContainerID() (string, error) {
 // controller. The `reader` must use a `cgroups.ContainerFilter`.
 func (c *systemCollector) getSelfContainerIDFromInode() (string, error) {
 	if c.selfReader == nil {
-		return "", fmt.Errorf("self reader is not initialized")
+		return "", errors.New("self reader is not initialized")
 	}
 	selfCgroup := c.selfReader.GetCgroup(cgroups.SelfCgroupIdentifier)
 	if selfCgroup == nil {
-		return "", fmt.Errorf("unable to get self cgroup")
+		return "", errors.New("unable to get self cgroup")
 	}
 
 	return c.GetContainerIDForInode(selfCgroup.Inode(), 0)
@@ -281,7 +279,7 @@ func (c *systemCollector) getCgroup(containerID string, cacheValidity time.Durat
 
 		cg = c.reader.GetCgroup(containerID)
 		if cg == nil {
-			return nil, fmt.Errorf("containerID not found")
+			return nil, errors.New("containerID not found")
 		}
 	}
 
@@ -305,7 +303,7 @@ func (c *systemCollector) buildContainerMetrics(cg cgroups.Cgroup, _ time.Durati
 	stats := &cgroups.Stats{}
 	allFailed, errs := cgroups.GetStats(cg, stats)
 	if allFailed {
-		return nil, fmt.Errorf("cgroup parsing failed, no data for containerID: %s, err: %w", cg.Identifier(), multierror.Append(nil, errs...))
+		return nil, fmt.Errorf("cgroup parsing failed, no data for containerID: %s, err: %w", cg.Identifier(), errors.Join(errs...))
 	} else if len(errs) > 0 {
 		log.Debugf("Incomplete data when getting cgroup stats for cgroup id: %s, errs: %v", cg.Identifier(), errs)
 	}
@@ -351,10 +349,22 @@ func buildMemoryStats(cgs *cgroups.MemoryStats) *provider.ContainerMemStats {
 	convertField(cgs.Peak, &cs.Peak)
 	convertField(cgs.Pgfault, &cs.Pgfault)
 	convertField(cgs.Pgmajfault, &cs.Pgmajfault)
+	convertField(cgs.Shmem, &cs.Shmem)
+	convertField(cgs.FileMapped, &cs.FileMapped)
+	convertField(cgs.FileDirty, &cs.FileDirty)
+	convertField(cgs.FileWriteback, &cs.FileWriteback)
+	convertField(cgs.RefaultAnon, &cs.RefaultAnon)
+	convertField(cgs.RefaultFile, &cs.RefaultFile)
+	convertField(cgs.ActiveAnon, &cs.ActiveAnon)
+	convertField(cgs.InactiveAnon, &cs.InactiveAnon)
+	convertField(cgs.ActiveFile, &cs.ActiveFile)
+	convertField(cgs.InactiveFile, &cs.InactiveFile)
+	convertField(cgs.Unevictable, &cs.Unevictable)
+	convertField(cgs.PageTables, &cs.PageTables)
 	convertFieldAndUnit(cgs.PSISome.Total, &cs.PartialStallTime, float64(time.Microsecond))
 
 	// Compute complex fields
-	if cgs.UsageTotal != nil && cgs.InactiveFile != nil {
+	if cgs.UsageTotal != nil && cgs.InactiveFile != nil && *cgs.InactiveFile < *cgs.UsageTotal {
 		cs.WorkingSet = pointer.Ptr(float64(*cgs.UsageTotal - *cgs.InactiveFile))
 	}
 

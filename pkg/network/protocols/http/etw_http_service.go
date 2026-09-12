@@ -144,7 +144,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/DataDog/datadog-agent/comp/etw"
+	etw "github.com/DataDog/datadog-agent/comp/etw/def"
 	etwimpl "github.com/DataDog/datadog-agent/comp/etw/impl"
 	"github.com/DataDog/datadog-agent/pkg/network/driver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -278,11 +278,109 @@ var (
 	lastSummaryTime time.Time
 
 	iisConfig atomic.Pointer[iisconfig.DynamicIISConfig]
+
+	// iisTagsCache stores pre-built IIS tag lists keyed by (localPort, remotePort) port pair.
+	// Used to expose IIS-specific tags (sitename, app_pool, service, env, version) to the
+	// process-agent for remote service tag enrichment on same-host connections.
+	// Entries expire after iisTagsCacheTTL.
+	iisTagsCacheMu            sync.Mutex
+	iisTagsCacheMap           = make(map[[2]uint16]iisTagsCacheEntry)
+	iisTagsEvictSinceLastRead int64
 )
+
+const (
+	iisTagsCacheTTL     = 3 * time.Minute
+	iisTagsCacheMaxSize = 1024
+)
+
+type iisTagsCacheEntry struct {
+	tags   []string
+	expiry time.Time
+}
 
 func init() {
 	initializeEtwHttpServiceSubscription()
 
+}
+
+// buildIISTags returns tags for caching in the IIS tags cache, used for
+// remote service tag enrichment on same-host connections.
+func buildIISTags(h *WinHttpTransaction) []string {
+	return h.DynamicTags()
+}
+
+// storeIISTagsCache stores an IIS tags entry with a TTL.
+// If the cache is at capacity and the key is new, an expired entry is evicted
+// first. If no expired entry exists, the entry with the earliest expiry (oldest)
+// is evicted to make room for the new entry.
+func storeIISTagsCache(key [2]uint16, tags []string) {
+	iisTagsCacheMu.Lock()
+	defer iisTagsCacheMu.Unlock()
+
+	// Allow updates to existing keys regardless of capacity
+	if _, exists := iisTagsCacheMap[key]; !exists && len(iisTagsCacheMap) >= iisTagsCacheMaxSize {
+		now := time.Now()
+		evicted := false
+		// First pass: try to evict an expired entry (cheap)
+		for k, entry := range iisTagsCacheMap {
+			if now.After(entry.expiry) {
+				delete(iisTagsCacheMap, k)
+				evicted = true
+				break
+			}
+		}
+		// Second pass: evict the oldest (earliest expiry) entry
+		if !evicted {
+			var oldestKey [2]uint16
+			var oldestExpiry time.Time
+			first := true
+			for k, entry := range iisTagsCacheMap {
+				if first || entry.expiry.Before(oldestExpiry) {
+					oldestKey = k
+					oldestExpiry = entry.expiry
+					first = false
+				}
+			}
+			delete(iisTagsCacheMap, oldestKey)
+			iisTagsEvictSinceLastRead++
+		}
+	}
+
+	iisTagsCacheMap[key] = iisTagsCacheEntry{
+		tags:   tags,
+		expiry: time.Now().Add(iisTagsCacheTTL),
+	}
+}
+
+// GetIISTagsCache returns non-expired IIS tags as a JSON-friendly map.
+// Keys are "localPort-remotePort", values are pre-built tag lists.
+// This is a read-only operation; expired entries are skipped but not evicted
+// (eviction happens on the write path in storeIISTagsCache).
+func GetIISTagsCache() map[string][]string {
+	iisTagsCacheMu.Lock()
+	defer iisTagsCacheMu.Unlock()
+
+	evicted := iisTagsEvictSinceLastRead
+	iisTagsEvictSinceLastRead = 0
+
+	now := time.Now()
+	expired := 0
+	result := make(map[string][]string, len(iisTagsCacheMap))
+	for k, entry := range iisTagsCacheMap {
+		if now.After(entry.expiry) {
+			expired++
+			continue
+		}
+		mapKey := strconv.FormatUint(uint64(k[0]), 10) + "-" + strconv.FormatUint(uint64(k[1]), 10)
+		result[mapKey] = entry.tags
+	}
+
+	if evicted > 0 {
+		log.Warnf("iis tags cache: %d entries evicted before process-agent read (capacity=%d, returning=%d, expired=%d)",
+			evicted, iisTagsCacheMaxSize, len(result), expired)
+	}
+
+	return result
 }
 
 //nolint:revive // TODO(WKIT) Fix revive linter
@@ -373,6 +471,7 @@ func completeReqRespTracking(eventInfo *etw.DDEventRecord, httpConnLink *HttpCon
 			log.Infof("  Family:         %v\n", connOpen.conn.tup.Family)
 		}
 		log.Infof("  AppPool:        %v\n", httpConnLink.http.AppPool)
+		log.Infof("  SubSite:        %v\n", httpConnLink.http.SubSite)
 		log.Infof("  Url:            %v\n", httpConnLink.url)
 		log.Infof("  Method:         %v\n", Method(httpConnLink.http.Txn.RequestMethod).String())
 		log.Infof("  StatusCode:     %v\n", httpConnLink.http.Txn.ResponseStatusCode)
@@ -808,7 +907,6 @@ func httpCallbackOnHTTPRequestTraceTaskDeliver(eventInfo *etw.DDEventRecord) {
 	// Get req/resp conn link
 	httpConnLink, found := getHttpConnLink(eventInfo.EventHeader.ActivityID)
 	if !found {
-		log.Warnf("connlink not found at tracetaskdeliver")
 		return
 	}
 	httpConnLink.opcodes = append(httpConnLink.opcodes, eventInfo.EventHeader.EventDescriptor.ID)
@@ -833,12 +931,26 @@ func httpCallbackOnHTTPRequestTraceTaskDeliver(eventInfo *etw.DDEventRecord) {
 		return
 	}
 
-	httpConnLink.http.AppPool = appPool
 	httpConnLink.http.SiteID = userData.GetUint32(16)
+	httpConnLink.http.AppPool = appPool
 	cfg := iisConfig.Load()
 	if cfg != nil {
 		httpConnLink.http.SiteName = cfg.GetSiteNameFromID(httpConnLink.http.SiteID)
-		httpConnLink.http.TagsFromJson, httpConnLink.http.TagsFromConfig = cfg.GetAPMTags(httpConnLink.http.SiteID, httpConnLink.urlPath)
+		httpConnLink.http.SubSite = httpConnLink.http.SiteName
+		httpConnLink.http.TagsFromJson, httpConnLink.http.TagsFromConfig, httpConnLink.http.TagsFromAppHost = cfg.GetAPMTags(httpConnLink.http.SiteID, httpConnLink.urlPath)
+
+		// Determine the IIS application path handling this request
+		appPath := cfg.GetApplicationPath(httpConnLink.http.SiteID, httpConnLink.urlPath)
+		if appPath != "" && appPath != "/" {
+			// Sub-application: set SubSite to AppPool + path
+			httpConnLink.http.SubSite = appPool + appPath
+		}
+	}
+
+	// Cache IIS tags for remote service tag enrichment on same-host connections
+	if httpConnLink.http.SiteName != "" && connOpen.conn.tup.LocalAddr == connOpen.conn.tup.RemoteAddr {
+		key := [2]uint16{connOpen.conn.tup.LocalPort, connOpen.conn.tup.RemotePort}
+		storeIISTagsCache(key, buildIISTags(&httpConnLink.http))
 	}
 
 	// Parse url
@@ -858,6 +970,7 @@ func httpCallbackOnHTTPRequestTraceTaskDeliver(eventInfo *etw.DDEventRecord) {
 		log.Infof("  ConnActivityId: %v\n", FormatGUID(httpConnLink.connActivityId))
 		log.Infof("  ActivityId:     %v\n", FormatGUID(eventInfo.EventHeader.ActivityID))
 		log.Infof("  AppPool:        %v\n", httpConnLink.http.AppPool)
+		log.Infof("  SubSite:        %v\n", httpConnLink.http.SubSite)
 		log.Infof("  Url:            %v\n", httpConnLink.url)
 		if connFound {
 			log.Infof("  Local:          %v\n", IPFormat(connOpen.conn.tup, true))
@@ -982,6 +1095,7 @@ func httpCallbackOnHTTPRequestTraceTaskSrvdFrmCache(eventInfo *etw.DDEventRecord
 		// Get from cache and complete reqResp tracking
 		httpConnLink.http = cacheEntry.http
 		httpConnLink.http.AppPool = cacheEntry.http.AppPool
+		httpConnLink.http.SubSite = cacheEntry.http.SubSite
 		httpConnLink.http.Txn.ResponseStatusCode = cacheEntry.http.Txn.ResponseStatusCode
 
 		// <<<MORE ETW HttpService DETAILS>>>
@@ -989,6 +1103,15 @@ func httpCallbackOnHTTPRequestTraceTaskSrvdFrmCache(eventInfo *etw.DDEventRecord
 		cfg := iisConfig.Load()
 		if cfg != nil {
 			httpConnLink.http.SiteName = cfg.GetSiteNameFromID(cacheEntry.http.SiteID)
+		}
+
+		// Cache IIS tags for remote service tag enrichment on same-host connections
+		if httpConnLink.http.SiteName != "" {
+			connOpen, connFound := connOpened[httpConnLink.connActivityId]
+			if connFound && connOpen.conn.tup.LocalAddr == connOpen.conn.tup.RemoteAddr {
+				key := [2]uint16{connOpen.conn.tup.LocalPort, connOpen.conn.tup.RemotePort}
+				storeIISTagsCache(key, buildIISTags(&httpConnLink.http))
+			}
 		}
 
 		completeReqRespTracking(eventInfo, httpConnLink)
@@ -1129,6 +1252,7 @@ func httpCallbackOnHTTPCacheTraceTaskFlushedCache(eventInfo *etw.DDEventRecord) 
 			// log.Infof("  SiteID:         %v\n", cacheEntry.http.SiteID)
 
 			log.Infof("  AppPool:        %v\n", cacheEntry.http.AppPool)
+			log.Infof("  SubSite:        %v\n", cacheEntry.http.SubSite)
 		}
 
 		log.Infof("\n")

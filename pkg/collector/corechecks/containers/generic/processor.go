@@ -13,6 +13,7 @@ import (
 	taggerUtils "github.com/DataDog/datadog-agent/comp/core/tagger/utils"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
+	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/containers/agentperformance"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/metrics/provider"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes"
@@ -27,16 +28,21 @@ const (
 
 // Processor contains the core logic of the generic check, allowing reusability
 type Processor struct {
-	metricsProvider metrics.Provider
-	ctrLister       ContainerAccessor
-	metricsAdapter  MetricsAdapter
-	ctrFilter       ContainerFilter
-	extensions      map[string]ProcessorExtension
-	tagger          tagger.Component
+	metricsProvider  metrics.Provider
+	ctrLister        ContainerAccessor
+	metricsAdapter   MetricsAdapter
+	ctrFilter        ContainerFilter
+	extensions       map[string]ProcessorExtension
+	tagger           tagger.Component
+	agentPerformance *agentperformance.Recorder
+	now              func() time.Time
+	// extendedMemoryMetrics allows to send extednded metrics
+	extendedMemoryMetrics bool
 }
 
 // NewProcessor creates a new processor
-func NewProcessor(provider metrics.Provider, lister ContainerAccessor, adapter MetricsAdapter, filter ContainerFilter, tagger tagger.Component) Processor {
+func NewProcessor(provider metrics.Provider, lister ContainerAccessor, adapter MetricsAdapter,
+	filter ContainerFilter, tagger tagger.Component, agentPerformance *agentperformance.Recorder, extendedMemoryMetrics bool) Processor {
 	return Processor{
 		metricsProvider: provider,
 		ctrLister:       lister,
@@ -45,7 +51,10 @@ func NewProcessor(provider metrics.Provider, lister ContainerAccessor, adapter M
 		extensions: map[string]ProcessorExtension{
 			NetworkExtensionID: NewProcessorNetwork(),
 		},
-		tagger: tagger,
+		tagger:                tagger,
+		agentPerformance:      agentPerformance,
+		now:                   time.Now,
+		extendedMemoryMetrics: extendedMemoryMetrics,
 	}
 }
 
@@ -54,8 +63,20 @@ func (p *Processor) RegisterExtension(id string, extension ProcessorExtension) {
 	p.extensions[id] = extension
 }
 
-// Run executes the check
+// Run executes the check.
 func (p *Processor) Run(sender sender.Sender, cacheValidity time.Duration) error {
+	if p.agentPerformance == nil {
+		return p.run(sender, cacheValidity)
+	}
+
+	return p.agentPerformance.WithRuntimeMetrics(func() error {
+		return p.run(sender, cacheValidity)
+	})
+}
+
+func (p *Processor) run(sender sender.Sender, cacheValidity time.Duration) error {
+	collectionTime := p.now()
+
 	allContainers := p.ctrLister.ListRunning()
 
 	if len(allContainers) == 0 {
@@ -68,6 +89,10 @@ func (p *Processor) Run(sender sender.Sender, cacheValidity time.Duration) error
 	}
 
 	for _, container := range allContainers {
+		if p.agentPerformance != nil {
+			p.agentPerformance.MarkCPUContainerPresent(container.ID)
+		}
+
 		if p.ctrFilter != nil && p.ctrFilter.IsExcluded(container) {
 			log.Tracef("Container excluded due to filter, name: %s - image: %s - namespace: %s", container.Name, container.Image.Name, container.Labels[kubernetes.CriContainerNamespaceLabel])
 			continue
@@ -78,6 +103,10 @@ func (p *Processor) Run(sender sender.Sender, cacheValidity time.Duration) error
 		tags, err := p.tagger.Tag(entityID, types.HighCardinality)
 		if err != nil {
 			log.Errorf("Could not collect tags for container %q, err: %v", container.ID[:12], err)
+			continue
+		}
+		if len(tags) == 0 {
+			log.Debugf("No tags detected for container %q, dropping metrics", container.ID)
 			continue
 		}
 		tags = p.metricsAdapter.AdaptTags(tags, container)
@@ -97,7 +126,9 @@ func (p *Processor) Run(sender sender.Sender, cacheValidity time.Duration) error
 			continue
 		}
 
-		if err := p.processContainer(sender, tags, container, containerStats); err != nil {
+		ownerPod, _ := p.ctrLister.GetPodOfContainer(container.ID)
+
+		if err := p.processContainer(sender, tags, container, containerStats, collectionTime, ownerPod); err != nil {
 			log.Debugf("Generating metrics for container: %v failed, metrics may be missing, err: %v", container, err)
 			continue
 		}
@@ -126,7 +157,7 @@ func (p *Processor) Run(sender sender.Sender, cacheValidity time.Duration) error
 	return nil
 }
 
-func (p *Processor) processContainer(sender sender.Sender, tags []string, container *workloadmeta.Container, containerStats *metrics.ContainerStats) error {
+func (p *Processor) processContainer(sender sender.Sender, tags []string, container *workloadmeta.Container, containerStats *metrics.ContainerStats, collectionTime time.Time, ownerPod *workloadmeta.KubernetesPod) error {
 	if uptime := time.Since(container.State.StartedAt); uptime >= 0 {
 		p.sendMetric(sender.Gauge, "container.uptime", pointer.Ptr(uptime.Seconds()), tags)
 	}
@@ -137,6 +168,10 @@ func (p *Processor) processContainer(sender sender.Sender, tags []string, contai
 	}
 
 	if containerStats.CPU != nil {
+		if p.agentPerformance != nil {
+			p.agentPerformance.RecordCPUUsage(container.ID, containerStats.CPU.Total, collectionTime, ownerPod)
+		}
+
 		p.sendMetric(sender.Rate, "container.cpu.usage", containerStats.CPU.Total, tags)
 		p.sendMetric(sender.Rate, "container.cpu.user", containerStats.CPU.User, tags)
 		p.sendMetric(sender.Rate, "container.cpu.system", containerStats.CPU.System, tags)
@@ -150,6 +185,11 @@ func (p *Processor) processContainer(sender sender.Sender, tags []string, contai
 	}
 
 	if containerStats.Memory != nil {
+		if p.agentPerformance != nil {
+			p.agentPerformance.RecordMetric(agentperformance.MemoryUsage, containerStats.Memory.UsageTotal, ownerPod, "")
+			p.agentPerformance.RecordMetric(agentperformance.MemoryLimit, containerStats.Memory.Limit, ownerPod, "")
+		}
+
 		p.sendMetric(sender.Gauge, "container.memory.usage", containerStats.Memory.UsageTotal, tags)
 		p.sendMetric(sender.Gauge, "container.memory.kernel", containerStats.Memory.KernelMemory, tags)
 		p.sendMetric(sender.Gauge, "container.memory.limit", containerStats.Memory.Limit, tags)
@@ -166,6 +206,22 @@ func (p *Processor) processContainer(sender sender.Sender, tags []string, contai
 		p.sendMetric(sender.Rate, "container.memory.partial_stall", containerStats.Memory.PartialStallTime, tags)
 		p.sendMetric(sender.MonotonicCount, "container.memory.page_faults", containerStats.Memory.Pgfault, tags)
 		p.sendMetric(sender.MonotonicCount, "container.memory.major_page_faults", containerStats.Memory.Pgmajfault, tags)
+
+		// In order to not afftect end user experince these memory metrics are behind the config flag.
+		if p.extendedMemoryMetrics {
+			p.sendMetric(sender.Gauge, "container.memory.active_anon", containerStats.Memory.ActiveAnon, tags)
+			p.sendMetric(sender.Gauge, "container.memory.inactive_anon", containerStats.Memory.InactiveAnon, tags)
+			p.sendMetric(sender.Gauge, "container.memory.active_file", containerStats.Memory.ActiveFile, tags)
+			p.sendMetric(sender.Gauge, "container.memory.inactive_file", containerStats.Memory.InactiveFile, tags)
+			p.sendMetric(sender.Gauge, "container.memory.unevictable", containerStats.Memory.Unevictable, tags)
+			p.sendMetric(sender.Gauge, "container.memory.shmem", containerStats.Memory.Shmem, tags)
+			p.sendMetric(sender.Gauge, "container.memory.file_mapped", containerStats.Memory.FileMapped, tags)
+			p.sendMetric(sender.Gauge, "container.memory.file_dirty", containerStats.Memory.FileDirty, tags)
+			p.sendMetric(sender.Gauge, "container.memory.file_writeback", containerStats.Memory.FileWriteback, tags)
+			p.sendMetric(sender.Gauge, "container.memory.page_tables", containerStats.Memory.PageTables, tags)
+			p.sendMetric(sender.MonotonicCount, "container.memory.refault_anon", containerStats.Memory.RefaultAnon, tags)
+			p.sendMetric(sender.MonotonicCount, "container.memory.refault_file", containerStats.Memory.RefaultFile, tags)
+		}
 	}
 
 	if containerStats.IO != nil {

@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-Trap { Write-Host "Error in install.ps1: $_" }
+Trap { Write-Host "Error in install.ps1: $_"; break }
 
 function Install-Service {
   param(
@@ -12,25 +12,30 @@ function Install-Service {
   } else {
       New-Service -Name $SvcName -StartupType Manual -BinaryPathName $BinPath
   }
-  $eventSourceData = new-object System.Diagnostics.EventSourceCreationData("$SvcName", "Application")  
+  $eventSourceData = new-object System.Diagnostics.EventSourceCreationData("$SvcName", "Application")
   $eventSourceData.CategoryResourceFile = $BinPath
   $eventSourceData.MessageResourceFile = $BinPath
 
   If (![System.Diagnostics.EventLog]::SourceExists($eventSourceData.Source))
-  {      
-  [System.Diagnostics.EventLog]::CreateEventSource($eventSourceData)  
-  } 
+  {
+  [System.Diagnostics.EventLog]::CreateEventSource($eventSourceData)
+  }
 }
 
 if ("$env:WITH_JMX" -ne "false") {
+    . ./install-utils.ps1
     $JDK_UPSTREAM = "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.25%2B9"
     $JDK_FILENAME = "OpenJDK11U-jre_x64_windows_hotspot_11.0.25_9.zip"
     $JDK_DIR = "jdk-11.0.25+9-jre"
     $JDK_SHA256 = "052f09448d5b8d9afb7a8e5049d40d7fafa8f5884afe6043bb2359787fd41e84"
 
     $JDK_DOWNLOAD_URL = if ($env:GENERAL_ARTIFACTS_CACHE_BUCKET_URL) {"${env:GENERAL_ARTIFACTS_CACHE_BUCKET_URL}/openjdk"} else {$JDK_UPSTREAM}
-    Invoke-WebRequest -OutFile jre.zip "${JDK_DOWNLOAD_URL}/${JDK_FILENAME}"
-    (Get-FileHash -Algorithm SHA256 jre.zip).Hash -eq "$JDK_SHA256"
+    Invoke-WebRequestWithRetry -OutFile jre.zip "${JDK_DOWNLOAD_URL}/${JDK_FILENAME}"
+    if ((Get-FileHash -Algorithm SHA256 jre.zip).Hash -eq "$JDK_SHA256") {
+        Write-Host "JDK checksum match"
+    } else {
+        Write-Error "JDK checksum mismatch"
+    }
     Expand-Archive -Path jre.zip -DestinationPath C:/
     Remove-Item jre.zip
     Move-Item "C:/$JDK_DIR/" C:/java
@@ -40,7 +45,9 @@ if ("$env:WITH_JMX" -ne "false") {
 }
 
 New-Item -ItemType directory -Path 'C:/ProgramData/Datadog'
-Move-Item "C:/Program Files/Datadog/Datadog Agent/EXAMPLECONFSLOCATION" "C:/ProgramData/Datadog/conf.d"
+Move-Item "C:/Program Files/Datadog/Datadog Agent/etc/datadog-agent/conf.d" "C:/ProgramData/Datadog/conf.d"
+# This folder only contains config artifacts, we've copied what we need so we can remove the rest.
+rm -r -fo "C:/Program Files/Datadog/Datadog Agent/etc/"
 
 $services = [ordered]@{
   "datadogagent" = "C:\Program Files\Datadog\Datadog Agent\bin\agent.exe",@()
@@ -55,7 +62,7 @@ foreach ($s in $services.Keys) {
 # Since OpenSSL 3.4, the install paths can be retrieved from the registry instead of being hardcoded at build time.
 # https://github.com/openssl/openssl/blob/master/NOTES-WINDOWS.md#installation-directories
 # TODO: How best to configure the OpenSSL version?
-$opensslVersion = "3.4"
+$opensslVersion = "3.5"
 if ($env:WITH_FIPS -eq "true") {
   $opensslctx = "datadog-fips-agent"
 } else {
@@ -90,3 +97,15 @@ install_method:
   tool_version: docker-win-$env:INSTALL_INFO
   installer_version: docker-win-$env:INSTALL_INFO
 "@ > C:/ProgramData/Datadog/install_info
+
+# After this script is executed sometimes the WMI database is approximately 25 MB
+# bigger than otherwise which leads to a failing static quality gate.
+# This is a workaround to clean up the WMI database and reduce the image size.
+# It is ignored for non-core base images.
+try {
+    wevtutil cl 'Microsoft-Windows-WMI-Activity/Operational' -ErrorAction SilentlyContinue
+    wevtutil cl 'Microsoft-Windows-WMI-Activity/Trace' -ErrorAction SilentlyContinue
+    winmgmt /salvagerepository | Out-Null
+} catch {
+    # Silently continue if WMI cleanup fails
+}

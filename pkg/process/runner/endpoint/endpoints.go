@@ -11,9 +11,9 @@ import (
 	"net/url"
 
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/config/utils"
 	apicfg "github.com/DataDog/datadog-agent/pkg/process/util/api/config"
+	"github.com/DataDog/datadog-agent/pkg/util/scrubber"
 )
 
 // GetAPIEndpoints returns the list of api endpoints from the config
@@ -21,14 +21,9 @@ func GetAPIEndpoints(config pkgconfigmodel.Reader) (eps []apicfg.Endpoint, err e
 	return getAPIEndpointsWithKeys(config, "https://process.", "process_config.process_dd_url", "process_config.additional_endpoints")
 }
 
-// GetEventsAPIEndpoints returns the list of api event endpoints from the config
-func GetEventsAPIEndpoints(config pkgconfigmodel.Reader) (eps []apicfg.Endpoint, err error) {
-	return getAPIEndpointsWithKeys(config, "https://process-events.", "process_config.events_dd_url", "process_config.events_additional_endpoints")
-}
-
 func getAPIEndpointsWithKeys(config pkgconfigmodel.Reader, prefix, defaultEpKey, additionalEpsKey string) (eps []apicfg.Endpoint, err error) {
 	// Setup main endpoint
-	mainEndpointURL, err := url.Parse(utils.GetMainEndpoint(pkgconfigsetup.Datadog(), prefix, defaultEpKey))
+	mainEndpointURL, err := url.Parse(utils.GetMainEndpoint(config, prefix, defaultEpKey))
 	if err != nil {
 		return nil, fmt.Errorf("error parsing %s: %s", defaultEpKey, err)
 	}
@@ -53,4 +48,17 @@ func getAPIEndpointsWithKeys(config pkgconfigmodel.Reader, prefix, defaultEpKey,
 		}
 	}
 	return
+}
+
+// CheckAPIKeysResolved rejects endpoints whose API key is still an unresolved secret handle
+// (e.g. 'ENC[...]'). Callers that do not resolve secret-backend handles themselves (system-probe)
+// would otherwise send the handle verbatim as the API key.
+func CheckAPIKeysResolved(eps []apicfg.Endpoint) error {
+	for _, ep := range eps {
+		if scrubber.IsEnc(ep.APIKey) {
+			return fmt.Errorf("%s is an unresolved secret handle (%q): this process can not resolve secret handles "+
+				"and expects to receive them from the core agent already resolved", ep.ConfigSettingPath, ep.APIKey)
+		}
+	}
+	return nil
 }

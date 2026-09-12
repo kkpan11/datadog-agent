@@ -14,13 +14,13 @@ import (
 	"time"
 	"unsafe"
 
-	telemetryComp "github.com/DataDog/datadog-agent/comp/core/telemetry"
+	telemetryComp "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 
 	"golang.org/x/sys/windows"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/driver"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -55,27 +55,27 @@ const (
 
 // Telemetry
 var driverTelemetry = struct {
-	totalFlows  telemetry.Counter
-	openFlows   telemetry.Gauge
-	closedFlows telemetry.Gauge
+	totalFlows  telemetryComp.Counter
+	openFlows   telemetryComp.Gauge
+	closedFlows telemetryComp.Gauge
 
-	closedBufferSize      telemetry.Gauge
-	closedBufferIncreases telemetry.Counter
-	closedBufferDecreases telemetry.Counter
-	openBufferSize        telemetry.Gauge
-	openBufferIncreases   telemetry.Counter
-	openBufferDecreases   telemetry.Counter
+	closedBufferSize      telemetryComp.Gauge
+	closedBufferIncreases telemetryComp.Counter
+	closedBufferDecreases telemetryComp.Counter
+	openBufferSize        telemetryComp.Gauge
+	openBufferIncreases   telemetryComp.Counter
+	openBufferDecreases   telemetryComp.Counter
 }{
-	telemetry.NewCounter(flowStats, "total_flows", []string{}, "Counter measuring the total number of flows"),
-	telemetry.NewGauge(flowStats, "open_flows", []string{}, "Gauge measuring the current number of open flows"),
-	telemetry.NewGauge(flowStats, "closed_flows", []string{}, "Gauge measuring the current number of closed flows"),
+	telemetryimpl.GetCompatComponent().NewCounter(flowStats, "total_flows", []string{}, "Counter measuring the total number of flows"),
+	telemetryimpl.GetCompatComponent().NewGauge(flowStats, "open_flows", []string{}, "Gauge measuring the current number of open flows"),
+	telemetryimpl.GetCompatComponent().NewGauge(flowStats, "closed_flows", []string{}, "Gauge measuring the current number of closed flows"),
 
-	telemetry.NewGauge(driverStats, "closed_buffer_size", []string{}, "Gauge measuring the size of the closed buffer"),
-	telemetry.NewCounter(driverStats, "closed_buffer_increases", []string{}, "Counter measuring the number of closed buffer increases"),
-	telemetry.NewCounter(driverStats, "closed_buffer_decreases", []string{}, "Counter measuring the number of closed buffer decreases"),
-	telemetry.NewGauge(driverStats, "open_buffer_size", []string{}, "Gauge measuring the size of the open buffer"),
-	telemetry.NewCounter(driverStats, "open_buffer_increases", []string{}, "Counter measuring the number of open buffer increases"),
-	telemetry.NewCounter(driverStats, "open_buffer_decreases", []string{}, "Counter measuring the number of open buffer decreases"),
+	telemetryimpl.GetCompatComponent().NewGauge(driverStats, "closed_buffer_size", []string{}, "Gauge measuring the size of the closed buffer"),
+	telemetryimpl.GetCompatComponent().NewCounter(driverStats, "closed_buffer_increases", []string{}, "Counter measuring the number of closed buffer increases"),
+	telemetryimpl.GetCompatComponent().NewCounter(driverStats, "closed_buffer_decreases", []string{}, "Counter measuring the number of closed buffer decreases"),
+	telemetryimpl.GetCompatComponent().NewGauge(driverStats, "open_buffer_size", []string{}, "Gauge measuring the size of the open buffer"),
+	telemetryimpl.GetCompatComponent().NewCounter(driverStats, "open_buffer_increases", []string{}, "Counter measuring the number of open buffer increases"),
+	telemetryimpl.GetCompatComponent().NewCounter(driverStats, "open_buffer_decreases", []string{}, "Counter measuring the number of open buffer decreases"),
 }
 
 // DriverInterface holds all necessary information for interacting with the windows driver
@@ -200,8 +200,7 @@ func (di *DriverInterface) setupFlowHandle() error {
 }
 
 func (di *DriverInterface) setupClassification() error {
-	//nolint:gosimple // TODO(WKIT) Fix gosimple linter
-	if di.cfg.ProtocolClassificationEnabled == false {
+	if !di.cfg.ProtocolClassificationEnabled {
 		log.Infof("Traffic classification not enabled")
 		return nil
 	}
@@ -209,12 +208,12 @@ func (di *DriverInterface) setupClassification() error {
 	log.Infof("Enabling traffic classification")
 	var settings driver.ClassificationSettings
 	settings.Enabled = 1
-	err := di.driverFlowHandle.DeviceIoControl(
+	_, err := di.driverFlowHandle.SynchronousDeviceIoControl(
 		driver.EnableClassifyIOCTL,
 		(*byte)(unsafe.Pointer(&settings)),
 		uint32(driver.ClassificationSettingsTypeSize),
 		nil,
-		uint32(0), nil, nil)
+		uint32(0))
 	if err != nil {
 		log.Warnf("Error enabling classification %v", err)
 	}
@@ -225,12 +224,12 @@ func (di *DriverInterface) setupClassification() error {
 func (di *DriverInterface) SetFlowFilters(filters []driver.FilterDefinition) error {
 	var id int64
 	for _, filter := range filters {
-		err := di.driverFlowHandle.DeviceIoControl(
+		_, err := di.driverFlowHandle.SynchronousDeviceIoControl(
 			driver.SetFlowFilterIOCTL,
 			(*byte)(unsafe.Pointer(&filter)),
 			uint32(unsafe.Sizeof(filter)),
 			(*byte)(unsafe.Pointer(&id)),
-			uint32(unsafe.Sizeof(id)), nil, nil)
+			uint32(unsafe.Sizeof(id)))
 		if err != nil {
 			return fmt.Errorf("failed to set filter: %v", err)
 		}
@@ -260,7 +259,7 @@ func (di *DriverInterface) RefreshStats() {
 	}
 }
 
-//nolint:deadcode,unused // debugging helper normally commented out
+//nolint:unused // debugging helper normally commented out
 func printClassification(fd *driver.PerFlowData) {
 	if fd.ClassificationStatus != driver.ClassificationUnclassified {
 		if fd.ClassifyRequest == driver.ClassificationRequestTLS || fd.ClassifyResponse == driver.ClassificationResponseTLS {
@@ -271,12 +270,12 @@ func printClassification(fd *driver.PerFlowData) {
 			log.Infof("Flow classify ALPN chosen    Protocols %x", fd.Tls_alpn_chosen)
 			log.Infof("tls versions offered:  %x", fd.Tls_versions_offered)
 			log.Infof("tls version  chosen:   %x", fd.Tls_version_chosen)
+			log.Infof("tls cipher suite:      %x", fd.Tls_cipher_suite)
 		}
 	}
 }
 
-//nolint:revive // TODO(WKIT) Fix revive linter
-func (di *DriverInterface) getFlowConnectionStats(ioctl uint32, connbuffer *driverReadBuffer, outbuffer *ConnectionBuffer, filter func(*ConnectionStats) bool) (int, error, int, int) {
+func (di *DriverInterface) getFlowConnectionStats(ioctl uint32, connbuffer *driverReadBuffer, outbuffer *ConnectionBuffer, filter func(*ConnectionStats) bool) (int, int, int, error) {
 
 	start := outbuffer.Len()
 
@@ -287,16 +286,15 @@ func (di *DriverInterface) getFlowConnectionStats(ioctl uint32, connbuffer *driv
 
 	// keep reading while driver says there is more data available
 	for err := error(windows.ERROR_MORE_DATA); err == windows.ERROR_MORE_DATA; {
-		err = di.driverFlowHandle.DeviceIoControl(ioctl, nil, 0,
+		bytesRead, err = di.driverFlowHandle.SynchronousDeviceIoControl(ioctl, nil, 0,
 			(*byte)(unsafe.Pointer(&((*connbuffer)[0]))),
-			uint32(len(*connbuffer)),
-			&bytesRead, nil)
+			uint32(len(*connbuffer)))
 		if err != nil {
 			if err == windows.ERROR_NO_MORE_ITEMS {
 				break
 			}
 			if err != windows.ERROR_MORE_DATA {
-				return 0, fmt.Errorf("ReadFile: %w", err), 0, 0
+				return 0, 0, 0, fmt.Errorf("ReadFile: %w", err)
 			}
 		}
 		// Windows driver hashmap implementation could return this if the
@@ -336,7 +334,7 @@ func (di *DriverInterface) getFlowConnectionStats(ioctl uint32, connbuffer *driv
 		}
 	}
 	count := outbuffer.Len() - start
-	return count, nil, increases, decreases
+	return count, increases, decreases, nil
 }
 
 // GetConnectionStats will read all open flows from the driver and convert them into ConnectionStats.
@@ -347,7 +345,7 @@ func (di *DriverInterface) GetOpenConnectionStats(openBuf *ConnectionBuffer, fil
 	di.openBufferLock.Lock()
 	defer di.openBufferLock.Unlock()
 
-	count, err, increases, decreases := di.getFlowConnectionStats(driver.GetOpenFlowsIOCTL, &(di.openBuffer), openBuf, filter)
+	count, increases, decreases, err := di.getFlowConnectionStats(driver.GetOpenFlowsIOCTL, &(di.openBuffer), openBuf, filter)
 	if err != nil {
 		return 0, err
 	}
@@ -367,7 +365,7 @@ func (di *DriverInterface) GetClosedConnectionStats(closedBuf *ConnectionBuffer,
 	di.closedBufferLock.Lock()
 	defer di.closedBufferLock.Unlock()
 
-	count, err, increases, decreases := di.getFlowConnectionStats(driver.GetClosedFlowsIOCTL, &(di.closedBuffer), closedBuf, filter)
+	count, increases, decreases, err := di.getFlowConnectionStats(driver.GetClosedFlowsIOCTL, &(di.closedBuffer), closedBuf, filter)
 	if err != nil {
 		return 0, err
 	}
@@ -407,35 +405,35 @@ func (di *DriverInterface) setFlowParams() error {
 	maxOpenFlows := min(defaultMaxOpenFlows, di.maxOpenFlows)
 	maxClosedFlows := min(defaultMaxClosedFlows, di.maxClosedFlows)
 
-	err := di.driverFlowHandle.DeviceIoControl(
+	_, err := di.driverFlowHandle.SynchronousDeviceIoControl(
 		driver.SetMaxOpenFlowsIOCTL,
 		(*byte)(unsafe.Pointer(&maxOpenFlows)),
 		uint32(unsafe.Sizeof(maxOpenFlows)),
 		nil,
-		uint32(0), nil, nil)
+		uint32(0))
 	if err != nil {
 		log.Warnf("Failed to set max number of open flows to %v %v", maxOpenFlows, err)
 	}
-	err = di.driverFlowHandle.DeviceIoControl(
+	_, err = di.driverFlowHandle.SynchronousDeviceIoControl(
 		driver.SetMaxClosedFlowsIOCTL,
 		(*byte)(unsafe.Pointer(&maxClosedFlows)),
 		uint32(unsafe.Sizeof(maxClosedFlows)),
 		nil,
-		uint32(0), nil, nil)
+		uint32(0))
 	if err != nil {
 		log.Warnf("Failed to set max number of closed flows to %v %v", maxClosedFlows, err)
 	}
 
 	threshold := di.closedFlowsSignalLimit
-	if 0 == threshold {
+	if threshold == 0 {
 		threshold = maxClosedFlows / 2
 	}
-	err = di.driverFlowHandle.DeviceIoControl(
+	_, err = di.driverFlowHandle.SynchronousDeviceIoControl(
 		driver.SetClosedFlowsLimitIOCTL,
 		(*byte)(unsafe.Pointer(&threshold)),
 		uint32(unsafe.Sizeof(threshold)),
 		nil,
-		uint32(0), nil, nil)
+		uint32(0))
 	if err != nil {
 		log.Warnf("Failed to set closed flows threshold to %v %v", maxClosedFlows, err)
 	}
@@ -449,15 +447,6 @@ func (di *DriverInterface) createFlowHandleFilters() ([]driver.FilterDefinition,
 		filters = append(filters, driver.FilterDefinition{
 			FilterVersion:  driver.Signature,
 			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionOutbound,
-			FilterLayer:    driver.LayerTransport,
-			InterfaceIndex: uint64(0),
-			Af:             windows.AF_INET,
-			Protocol:       windows.IPPROTO_TCP,
-		}, driver.FilterDefinition{
-			FilterVersion:  driver.Signature,
-			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionInbound,
 			FilterLayer:    driver.LayerTransport,
 			InterfaceIndex: uint64(0),
 			Af:             windows.AF_INET,
@@ -468,15 +457,6 @@ func (di *DriverInterface) createFlowHandleFilters() ([]driver.FilterDefinition,
 		filters = append(filters, driver.FilterDefinition{
 			FilterVersion:  driver.Signature,
 			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionOutbound,
-			FilterLayer:    driver.LayerTransport,
-			InterfaceIndex: uint64(0),
-			Af:             windows.AF_INET6,
-			Protocol:       windows.IPPROTO_TCP,
-		}, driver.FilterDefinition{
-			FilterVersion:  driver.Signature,
-			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionInbound,
 			FilterLayer:    driver.LayerTransport,
 			InterfaceIndex: uint64(0),
 			Af:             windows.AF_INET6,
@@ -488,15 +468,6 @@ func (di *DriverInterface) createFlowHandleFilters() ([]driver.FilterDefinition,
 		filters = append(filters, driver.FilterDefinition{
 			FilterVersion:  driver.Signature,
 			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionOutbound,
-			FilterLayer:    driver.LayerTransport,
-			InterfaceIndex: uint64(0),
-			Af:             windows.AF_INET,
-			Protocol:       windows.IPPROTO_UDP,
-		}, driver.FilterDefinition{
-			FilterVersion:  driver.Signature,
-			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionInbound,
 			FilterLayer:    driver.LayerTransport,
 			InterfaceIndex: uint64(0),
 			Af:             windows.AF_INET,
@@ -507,15 +478,6 @@ func (di *DriverInterface) createFlowHandleFilters() ([]driver.FilterDefinition,
 		filters = append(filters, driver.FilterDefinition{
 			FilterVersion:  driver.Signature,
 			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionOutbound,
-			FilterLayer:    driver.LayerTransport,
-			InterfaceIndex: uint64(0),
-			Af:             windows.AF_INET6,
-			Protocol:       windows.IPPROTO_UDP,
-		}, driver.FilterDefinition{
-			FilterVersion:  driver.Signature,
-			Size:           driver.FilterDefinitionSize,
-			Direction:      driver.DirectionInbound,
 			FilterLayer:    driver.LayerTransport,
 			InterfaceIndex: uint64(0),
 			Af:             windows.AF_INET6,

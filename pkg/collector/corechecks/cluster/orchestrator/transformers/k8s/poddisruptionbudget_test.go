@@ -8,7 +8,6 @@
 package k8s
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -175,10 +174,8 @@ func TestExtractPodDisruptionBudget(t *testing.T) {
 	t1 := t0.Add(time.Minute)
 
 	for name, tc := range map[string]struct {
-		in                *policyv1.PodDisruptionBudget
-		labelsAsTags      map[string]string
-		annotationsAsTags map[string]string
-		expect            *model.PodDisruptionBudget
+		in     *policyv1.PodDisruptionBudget
+		expect *model.PodDisruptionBudget
 	}{
 		"nil": {
 			in:     nil,
@@ -246,12 +243,6 @@ func TestExtractPodDisruptionBudget(t *testing.T) {
 					},
 				},
 			},
-			labelsAsTags: map[string]string{
-				"app": "application",
-			},
-			annotationsAsTags: map[string]string{
-				"annotation": "annotation_key",
-			},
 			expect: &model.PodDisruptionBudget{
 				Metadata: &model.Metadata{
 					Name:              "gwern",
@@ -261,8 +252,8 @@ func TestExtractPodDisruptionBudget(t *testing.T) {
 					CreationTimestamp: 0,
 					DeletionTimestamp: 0,
 					Labels: []string{
-						fmt.Sprintf("%s:ultimate", kubernetes.VersionTagLabelKey),
-						fmt.Sprintf("%s:honorable", kubernetes.ServiceTagLabelKey),
+						kubernetes.VersionTagLabelKey + ":ultimate",
+						kubernetes.ServiceTagLabelKey + ":honorable",
 						"app:my-app",
 					},
 					Annotations: []string{"annotation:my-annotation"},
@@ -304,17 +295,12 @@ func TestExtractPodDisruptionBudget(t *testing.T) {
 				Tags: []string{
 					"version:ultimate",
 					"service:honorable",
-					"application:my-app",
-					"annotation_key:my-annotation",
 				},
 			},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			pctx := &processors.K8sProcessorContext{
-				LabelsAsTags:      tc.labelsAsTags,
-				AnnotationsAsTags: tc.annotationsAsTags,
-			}
+			pctx := &processors.K8sProcessorContext{}
 			got := ExtractPodDisruptionBudget(pctx, tc.in)
 			if tc.expect == nil {
 				assert.Nil(t, got)

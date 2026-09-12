@@ -9,17 +9,16 @@ import (
 	"bytes"
 	"expvar"
 
-	"github.com/DataDog/agent-payload/v5/gogen"
 	"github.com/richardartoul/molecule"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/transaction"
 	compression "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/def"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 	"github.com/DataDog/datadog-agent/pkg/serializer/internal/stream"
 	"github.com/DataDog/datadog-agent/pkg/serializer/marshaler"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 )
 
 // A SketchSeriesList implements marshaler.Marshaler
@@ -32,11 +31,11 @@ var (
 	expvarsItemTooBig          = expvar.Int{}
 	expvarsPayloadFull         = expvar.Int{}
 	expvarsUnexpectedItemDrops = expvar.Int{}
-	tlmItemTooBig              = telemetry.NewCounter("sketch_series", "sketch_too_big",
+	tlmItemTooBig              = telemetryimpl.GetCompatComponent().NewCounter("sketch_series", "sketch_too_big",
 		nil, "Number of payloads dropped because they were too big for the stream compressor")
-	tlmPayloadFull = telemetry.NewCounter("sketch_series", "payload_full",
+	tlmPayloadFull = telemetryimpl.GetCompatComponent().NewCounter("sketch_series", "payload_full",
 		nil, "How many times we've hit a 'payload is full' in the stream compressor")
-	tlmUnexpectedItemDrops = telemetry.NewCounter("sketch_series", "unexpected_item_drops",
+	tlmUnexpectedItemDrops = telemetryimpl.GetCompatComponent().NewCounter("sketch_series", "unexpected_item_drops",
 		nil, "Items dropped in the stream compressor")
 )
 
@@ -46,101 +45,76 @@ func init() {
 	expvars.Set("UnexpectedItemDrops", &expvarsUnexpectedItemDrops)
 }
 
-// MarshalSplitCompress uses the stream compressor to marshal and compress sketch series payloads.
-// If a compressed payload is larger than the max, a new payload will be generated. This method returns a slice of
-// compressed protobuf marshaled gogen.SketchPayload objects. gogen.SketchPayload is not directly marshaled - instead
-// it's contents are marshaled individually, packed with the appropriate protobuf metadata, and compressed in stream.
-// The resulting payloads (when decompressed) are binary equal to the result of marshaling the whole object at once.
-func (sl SketchSeriesList) MarshalSplitCompress(bufferContext *marshaler.BufferContext, config config.Component, strategy compression.Component, logger log.Component) (transaction.BytesPayloads, error) {
-	var err error
-
-	pb := newPayloadsBuilder(bufferContext, config, strategy, logger)
-
-	// start things off
-	err = pb.startPayload()
-	if err != nil {
-		return nil, err
-	}
-
-	for sl.MoveNext() {
-		ss := sl.Current()
-		err = pb.marshal(ss)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	err = pb.finishPayload()
-	if err != nil {
-		logger.Debugf("Failed to finish payload with err %v", err)
-		return nil, err
-	}
-
-	return pb.payloads, nil
+type sketchWriter interface {
+	writeSketch(dist metrics.Distribution) error
+	startPayload() error
+	finishPayload() error
 }
 
-// MarshalSplitCompressMultiple uses the stream compressor to marshal and
-// compress one sketch list into two sets of payloads.  One set of payloads
-// contains all metrics, and the other contains only those that pass the
-// provided filter function.  This function exists because we need a way to
-// build both payloads in a single pass over the input data, which cannot be
-// iterated over twice.
-func (sl SketchSeriesList) MarshalSplitCompressMultiple(config config.Component, strategy compression.Component, filterFunc func(ss *metrics.SketchSeries) bool, logger log.Component) (transaction.BytesPayloads, transaction.BytesPayloads, error) {
+// MarshalSplitCompressPipelines uses the stream compressor to marshal and
+// compress sketch series payloads across multiple pipelines. Each pipeline
+// defines a filter function and destination, enabling selective routing of
+// sketches to different endpoints.
+func (sl SketchSeriesList) MarshalSplitCompressPipelines(config config.Component, strategy compression.Component, pipelines PipelineSet, logger log.Component) error {
 	var err error
 
-	bufferContext := marshaler.NewBufferContext()
-	bufferContext2 := marshaler.NewBufferContext()
+	// Create payload builders for each pipeline
+	pbs := make([]sketchWriter, 0, len(pipelines))
+	for pipelineConfig, pipelineContext := range pipelines {
+		var pb sketchWriter
+		if !pipelineConfig.V3 {
+			bufferContext := marshaler.NewBufferContext()
+			pb = newPayloadsBuilder(bufferContext, config, strategy, logger, pipelineConfig, pipelineContext)
+		} else {
+			pbv3, err := newPayloadsBuilderV3WithConfig(config, strategy, pipelineConfig, pipelineContext)
+			if err != nil {
+				return err
+			}
+			pb = pbv3
+		}
 
-	pb := newPayloadsBuilder(bufferContext, config, strategy, logger)
-	pb2 := newPayloadsBuilder(bufferContext2, config, strategy, logger)
+		pbs = append(pbs, pb)
 
-	// start things off
-	err = pb.startPayload()
-	if err != nil {
-		return nil, nil, err
-	}
-	err = pb2.startPayload()
-	if err != nil {
-		return nil, nil, err
+		err = pb.startPayload()
+		if err != nil {
+			return err
+		}
 	}
 
 	for sl.MoveNext() {
 		ss := sl.Current()
-		err = pb.marshal(ss)
-		if err != nil {
-			return nil, nil, err
-		}
-		if filterFunc(ss) {
-			err = pb2.marshal(ss)
+		for i := range pbs {
+			err := pbs[i].writeSketch(ss)
 			if err != nil {
-				return nil, nil, err
+				return err
 			}
 		}
 	}
 
-	err = pb.finishPayload()
-	if err != nil {
-		logger.Debugf("Failed to finish payload with err %v", err)
-		return nil, nil, err
+	for i := range pbs {
+		err := pbs[i].finishPayload()
+		if err != nil {
+			return err
+		}
 	}
 
-	err = pb2.finishPayload()
-	if err != nil {
-		logger.Debugf("Failed to finish payload with err %v", err)
-		return nil, nil, err
-	}
-
-	return pb.payloads, pb2.payloads, nil
+	return nil
 }
 
-func newPayloadsBuilder(bufferContext *marshaler.BufferContext, config config.Component, strategy compression.Component, logger log.Component) payloadsBuilder {
+func newPayloadsBuilder(
+	bufferContext *marshaler.BufferContext,
+	config config.Component,
+	strategy compression.Component,
+	logger log.Component,
+	pipelineConfig PipelineConfig,
+	pipelineContext *PipelineContext,
+) *payloadsBuilder {
 	buf := bufferContext.PrecompressionBuf
-	pb := payloadsBuilder{
+	pb := &payloadsBuilder{
 		bufferContext: bufferContext,
 		strategy:      strategy,
 		compressor:    nil,
 		buf:           buf,
-		payloads:      transaction.BytesPayloads{},
 		ps:            molecule.NewProtoStream(buf),
 		// the backend accepts payloads up to specific compressed / uncompressed
 		// sizes, but prefers small uncompressed payloads.
@@ -148,6 +122,9 @@ func newPayloadsBuilder(bufferContext *marshaler.BufferContext, config config.Co
 		maxUncompressedSize: config.GetInt("serializer_max_uncompressed_payload_size"),
 		pointCount:          0,
 		logger:              logger,
+
+		pipelineConfig:  pipelineConfig,
+		pipelineContext: pipelineContext,
 	}
 	return pb
 }
@@ -157,20 +134,24 @@ type payloadsBuilder struct {
 	strategy            compression.Component
 	compressor          *stream.Compressor
 	buf                 *bytes.Buffer
-	payloads            transaction.BytesPayloads
 	ps                  *molecule.ProtoStream
 	maxPayloadSize      int
 	maxUncompressedSize int
 	pointCount          int
 	logger              log.Component
+
+	// Scratch state for serializing a single Distribution.
+	sketchStream     *molecule.ProtoStream
+	sketchPointCount int
+
+	pipelineConfig  PipelineConfig
+	pipelineContext *PipelineContext
 }
 
 // Prepare to write the next payload
 func (pb *payloadsBuilder) startPayload() error {
 	// constants for the protobuf data we will be writing, taken from
 	// https://github.com/DataDog/agent-payload/v5/blob/a2cd634bc9c088865b75c6410335270e6d780416/proto/metrics/agent_payload.proto#L47-L81
-	// Unused fields are commented out
-	// const payloadSketches = 1
 	const payloadMetadata = 2
 
 	// Generate a footer containing an empty Metadata field.  The gogoproto
@@ -203,11 +184,12 @@ func (pb *payloadsBuilder) startPayload() error {
 	return nil
 }
 
-func (pb *payloadsBuilder) marshal(ss *metrics.SketchSeries) error {
-	// constants for the protobuf data we will be writing, taken from
+// WriteDDSketch implements metrics.DistributionWriter.
+func (pb *payloadsBuilder) WriteDDSketch(meta metrics.DistributionMetadata, numPoints int, points metrics.DDSketchPoints) error {
+	// protobuf field numbers for the data we serialize, taken from
 	// https://github.com/DataDog/agent-payload/v5/blob/a2cd634bc9c088865b75c6410335270e6d780416/proto/metrics/agent_payload.proto#L47-L81
 	// Unused fields are commented out
-	const payloadSketches = 1
+	// const payloadSketches = 1
 	// const payloadMetadata = 2
 	const sketchMetric = 1
 	const sketchHost = 2
@@ -254,102 +236,89 @@ func (pb *payloadsBuilder) marshal(ss *metrics.SketchSeries) error {
 	//                 |----|  'Origin' message
 	//                       |-----------| 'origin_service' field index
 
-	pb.buf.Reset()
-	err := pb.ps.Embedded(payloadSketches, func(ps *molecule.ProtoStream) error {
-		var err error
+	// protobuf field numbers for the dogsketch entries, taken from
+	// https://github.com/DataDog/agent-payload/v5/blob/a2cd634bc9c088865b75c6410335270e6d780416/proto/metrics/agent_payload.proto#L47-L81
 
-		err = ps.String(sketchMetric, ss.Name)
-		if err != nil {
-			return err
-		}
+	pb.sketchPointCount = numPoints
 
-		err = ps.String(sketchHost, ss.Host)
-		if err != nil {
-			return err
-		}
-
-		err = ss.Tags.ForEachErr(func(tag string) error {
-			return ps.String(sketchTags, tag)
-		})
-		if err != nil {
-			return err
-		}
-
-		for _, p := range ss.Points {
-			err = ps.Embedded(sketchDogsketches, func(ps *molecule.ProtoStream) error {
-				b := p.Sketch.Basic
-				k, n := p.Sketch.Cols()
-
-				err = ps.Int64(dogsketchTs, p.Ts)
-				if err != nil {
+	ps := pb.sketchStream
+	if err := ps.String(sketchMetric, meta.Name); err != nil {
+		return err
+	}
+	if err := ps.String(sketchHost, meta.Host); err != nil {
+		return err
+	}
+	if err := meta.Tags.ForEachErr(func(tag string) error {
+		return ps.String(sketchTags, tag)
+	}); err != nil {
+		return err
+	}
+	err := ps.Embedded(sketchMetadata, func(ps *molecule.ProtoStream) error {
+		return ps.Embedded(sketchMetadataOrigin, func(ps *molecule.ProtoStream) error {
+			if meta.NoIndex {
+				if err := ps.Int32(sketchMetadataOriginMetricType, metryTypeNotIndexed); err != nil {
 					return err
 				}
-
-				err = ps.Int64(dogsketchCnt, b.Cnt)
-				if err != nil {
-					return err
-				}
-
-				err = ps.Double(dogsketchMin, b.Min)
-				if err != nil {
-					return err
-				}
-
-				err = ps.Double(dogsketchMax, b.Max)
-				if err != nil {
-					return err
-				}
-
-				err = ps.Double(dogsketchAvg, b.Avg)
-				if err != nil {
-					return err
-				}
-
-				err = ps.Double(dogsketchSum, b.Sum)
-				if err != nil {
-					return err
-				}
-
-				err = ps.Sint32Packed(dogsketchK, k)
-				if err != nil {
-					return err
-				}
-
-				err = ps.Uint32Packed(dogsketchN, n)
-				if err != nil {
-					return err
-				}
-
-				return nil
-			})
-			if err != nil {
+			}
+			if err := ps.Int32(sketchMetadataOriginOriginProduct, metricSourceToOriginProduct(meta.Source)); err != nil {
 				return err
 			}
-		}
-		err = ps.Embedded(sketchMetadata, func(ps *molecule.ProtoStream) error {
-			return ps.Embedded(sketchMetadataOrigin, func(ps *molecule.ProtoStream) error {
-				if ss.NoIndex {
-					err = ps.Int32(sketchMetadataOriginMetricType, metryTypeNotIndexed)
-					if err != nil {
-						return err
-					}
-				}
-				err = ps.Int32(sketchMetadataOriginOriginProduct, metricSourceToOriginProduct(ss.Source))
-				if err != nil {
-					return err
-				}
-				err = ps.Int32(sketchMetadataOriginOriginCategory, metricSourceToOriginCategory(ss.Source))
-				if err != nil {
-					return err
-				}
-				return ps.Int32(sketchMetadataOriginOriginService, metricSourceToOriginService(ss.Source))
-			})
+			if err := ps.Int32(sketchMetadataOriginOriginCategory, metricSourceToOriginCategory(meta.Source)); err != nil {
+				return err
+			}
+			return ps.Int32(sketchMetadataOriginOriginService, metricSourceToOriginService(meta.Source))
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < numPoints; i++ {
+		ts, cnt, min, max, sum, avg, k, n := points.GetDDSketchPoint(i)
+		err := ps.Embedded(sketchDogsketches, func(ps *molecule.ProtoStream) error {
+			if err := ps.Int64(dogsketchTs, ts); err != nil {
+				return err
+			}
+			if err := ps.Int64(dogsketchCnt, cnt); err != nil {
+				return err
+			}
+			if err := ps.Double(dogsketchMin, min); err != nil {
+				return err
+			}
+			if err := ps.Double(dogsketchMax, max); err != nil {
+				return err
+			}
+			if err := ps.Double(dogsketchAvg, avg); err != nil {
+				return err
+			}
+			if err := ps.Double(dogsketchSum, sum); err != nil {
+				return err
+			}
+			if err := ps.Sint32Packed(dogsketchK, k); err != nil {
+				return err
+			}
+			return ps.Uint32Packed(dogsketchN, n)
 		})
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
 
+func (pb *payloadsBuilder) writeSketch(dist metrics.Distribution) error {
+	// protobuf field numbers for the data we serialize, taken from
+	// https://github.com/DataDog/agent-payload/v5/blob/a2cd634bc9c088865b75c6410335270e6d780416/proto/metrics/agent_payload.proto#L47-L81
+	const payloadSketches = 1
+
+	if !pb.pipelineConfig.Filter.Filter(dist) {
 		return nil
+	}
+
+	pb.buf.Reset()
+	err := pb.ps.Embedded(payloadSketches, func(ps *molecule.ProtoStream) error {
+		pb.sketchStream = ps
+		return dist.WriteTo(pb)
 	})
 	if err != nil {
 		return err
@@ -388,13 +357,13 @@ func (pb *payloadsBuilder) marshal(ss *metrics.SketchSeries) error {
 			pb.logger.Debugf("Unexpected error trying to addItem to new payload after previous payload filled up: %v", err)
 			return err
 		}
-		pb.pointCount += len(ss.Points)
+		pb.pointCount += pb.sketchPointCount
 	case stream.ErrItemTooBig:
 		// Item was too big, drop it
 		expvarsItemTooBig.Add(1)
 		tlmItemTooBig.Add(1)
 	case nil:
-		pb.pointCount += len(ss.Points)
+		pb.pointCount += pb.sketchPointCount
 		return nil
 	default:
 		// Unexpected error bail out
@@ -413,96 +382,7 @@ func (pb *payloadsBuilder) finishPayload() error {
 		return err
 	}
 
-	pb.payloads = append(pb.payloads, transaction.NewBytesPayload(payload, pb.pointCount))
+	pb.pipelineContext.addPayload(transaction.NewBytesPayload(payload, pb.pointCount))
 
 	return nil
-}
-
-// Marshal encodes this series list.
-func (sl SketchSeriesList) Marshal() ([]byte, error) {
-	pb := &gogen.SketchPayload{
-		Sketches: make([]gogen.SketchPayload_Sketch, 0),
-	}
-
-	for sl.MoveNext() {
-		ss := sl.Current()
-		dsl := make([]gogen.SketchPayload_Sketch_Dogsketch, 0, len(ss.Points))
-
-		for _, p := range ss.Points {
-			b := p.Sketch.Basic
-			k, n := p.Sketch.Cols()
-			dsl = append(dsl, gogen.SketchPayload_Sketch_Dogsketch{
-				Ts:  p.Ts,
-				Cnt: b.Cnt,
-				Min: b.Min,
-				Max: b.Max,
-				Avg: b.Avg,
-				Sum: b.Sum,
-				K:   k,
-				N:   n,
-			})
-		}
-
-		sketch := gogen.SketchPayload_Sketch{
-			Metric:      ss.Name,
-			Host:        ss.Host,
-			Tags:        ss.Tags.UnsafeToReadOnlySliceString(),
-			Dogsketches: dsl,
-		}
-
-		// Add origin mapping to metadata
-		if ss.Source != 0 {
-			sketch.Metadata = &gogen.Metadata{
-				Origin: &gogen.Origin{
-					OriginProduct:  uint32(metricSourceToOriginProduct(ss.Source)),
-					OriginCategory: uint32(metricSourceToOriginCategory(ss.Source)),
-					OriginService:  uint32(metricSourceToOriginService(ss.Source)),
-				},
-			}
-		}
-
-		pb.Sketches = append(pb.Sketches, sketch)
-	}
-	return pb.Marshal()
-}
-
-// SplitPayload breaks the payload into times number of pieces
-func (sl SketchSeriesList) SplitPayload(times int) ([]marshaler.AbstractMarshaler, error) {
-	var sketches SketchSeriesSlice
-	for sl.MoveNext() {
-		ss := sl.Current()
-		sketches = append(sketches, ss)
-	}
-	if len(sketches) == 0 {
-		return []marshaler.AbstractMarshaler{}, nil
-	}
-	return sketches.SplitPayload(times)
-}
-
-//nolint:revive // TODO(AML) Fix revive linter
-type SketchSeriesSlice []*metrics.SketchSeries
-
-// SplitPayload breaks the payload into times number of pieces
-func (sl SketchSeriesSlice) SplitPayload(times int) ([]marshaler.AbstractMarshaler, error) {
-	// Only break it down as much as possible
-	if len(sl) < times {
-		times = len(sl)
-	}
-	splitPayloads := make([]marshaler.AbstractMarshaler, times)
-	batchSize := len(sl) / times
-	n := 0
-	for i := 0; i < times; i++ {
-		var end int
-		// In many cases the batchSize is not perfect
-		// so the last one will be a bit bigger or smaller than the others
-		if i < times-1 {
-			end = n + batchSize
-		} else {
-			end = len(sl)
-		}
-		newSL := sl[n:end]
-		splitPayloads[i] = newSL
-		n += batchSize
-	}
-	return splitPayloads, nil
 }

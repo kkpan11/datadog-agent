@@ -12,7 +12,18 @@ import (
 
 // Traceroute is a factory for NDMs Traceroute module
 var Traceroute = &module.Factory{
-	Name:             config.TracerouteModule,
-	ConfigNamespaces: tracerouteConfigNamespaces,
-	Fn:               createTracerouteModule,
+	Name: config.TracerouteModule,
+	Fn:   createTracerouteModule,
+}
+
+// startPlatformDriver is a no-op on Darwin
+func startPlatformDriver() error {
+	// No driver needed on Darwin
+	return nil
+}
+
+// stopPlatformDriver is a no-op on darwin
+func stopPlatformDriver() error {
+	// No driver needed on Darwin
+	return nil
 }

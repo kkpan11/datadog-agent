@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package usm
 
@@ -86,7 +86,7 @@ func NewMonitor(c *config.Config, connectionProtocolMap *ebpf.Map, statsd statsd
 
 	filter, _ := mgr.GetProbe(manager.ProbeIdentificationPair{EBPFFuncName: protocolDispatcherSocketFilterFunction, UID: probeUID})
 	if filter == nil {
-		return nil, fmt.Errorf("error retrieving socket filter")
+		return nil, errors.New("error retrieving socket filter")
 	}
 	ddebpf.AddNameMappings(mgr.Manager.Manager, "usm_monitor")
 
@@ -97,7 +97,11 @@ func NewMonitor(c *config.Config, connectionProtocolMap *ebpf.Map, statsd statsd
 
 	processMonitor := monitor.GetProcessMonitor()
 
-	usmstate.Set(usmstate.Running)
+	if c.DiscoveryServiceMapEnabled {
+		usmstate.Set(usmstate.Restricted)
+	} else {
+		usmstate.Set(usmstate.Running)
+	}
 
 	usmMonitor := &Monitor{
 		cfg:                  c,
@@ -124,7 +128,7 @@ func (m *Monitor) Start() error {
 	defer func() {
 		if err != nil {
 			if errors.Is(err, syscall.ENOMEM) {
-				err = fmt.Errorf("could not enable usm monitoring: not enough memory to attach http ebpf socket filter. please consider raising the limit via sysctl -w net.core.optmem_max=<LIMIT>")
+				err = errors.New("could not enable usm monitoring: not enough memory to attach http ebpf socket filter. please consider raising the limit via sysctl -w net.core.optmem_max=<LIMIT>")
 			} else {
 				err = fmt.Errorf("could not enable USM: %s", err)
 			}
@@ -173,8 +177,8 @@ func (m *Monitor) Resume() error {
 }
 
 // GetUSMStats returns the current state of the USM monitor
-func (m *Monitor) GetUSMStats() map[string]interface{} {
-	response := map[string]interface{}{
+func (m *Monitor) GetUSMStats() map[string]any {
+	response := map[string]any{
 		"state": usmstate.Get(),
 	}
 
@@ -187,8 +191,10 @@ func (m *Monitor) GetUSMStats() map[string]interface{} {
 	tracedPrograms := utils.GetTracedProgramList(consts.USMModuleName)
 	response["traced_programs"] = tracedPrograms
 
+	response["discovery_service_map_enabled"] = false
 	if m != nil {
 		response["last_check"] = m.lastUpdateTime
+		response["discovery_service_map_enabled"] = m.cfg.DiscoveryServiceMapEnabled
 	}
 	return response
 }
@@ -227,7 +233,9 @@ func (m *Monitor) Stop() {
 
 	ddebpf.RemoveNameMappings(m.ebpfProgram.Manager.Manager)
 
-	m.ebpfProgram.Close()
+	if err := m.ebpfProgram.Close(); err != nil {
+		log.Errorf("error during USM shutdown: %v", err)
+	}
 	m.closeFilterFn()
 	usmstate.Set(usmstate.Stopped)
 }

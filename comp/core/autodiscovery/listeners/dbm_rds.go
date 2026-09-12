@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/databasemonitoring/aws"
-	"github.com/DataDog/datadog-agent/pkg/databasemonitoring/rds"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -29,7 +29,7 @@ type DBMRdsListener struct {
 	delService   chan<- Service
 	stop         chan bool
 	services     map[string]Service
-	config       rds.Config
+	config       aws.Config
 	awsRdsClient aws.RdsClient
 	// ticks is used primarily for testing purposes so
 	// the frequency the discovers loop iterates can be controlled
@@ -50,7 +50,7 @@ type DBMRdsService struct {
 
 // NewDBMRdsListener returns a new DBMRdsListener
 func NewDBMRdsListener(ServiceListernerDeps) (ServiceListener, error) {
-	config, err := rds.NewRdsAutodiscoveryConfig()
+	config, err := aws.NewRdsAutodiscoveryConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func NewDBMRdsListener(ServiceListernerDeps) (ServiceListener, error) {
 	return newDBMRdsListener(config, client, nil), nil
 }
 
-func newDBMRdsListener(config rds.Config, awsClient aws.RdsClient, ticks <-chan time.Time) ServiceListener {
+func newDBMRdsListener(config aws.Config, awsClient aws.RdsClient, ticks <-chan time.Time) ServiceListener {
 	l := &DBMRdsListener{
 		config:       config,
 		services:     make(map[string]Service),
@@ -108,16 +108,16 @@ func (l *DBMRdsListener) run() {
 func (l *DBMRdsListener) discoverRdsInstances() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(l.config.QueryTimeout)*time.Second)
 	defer cancel()
-	instances, err := l.awsRdsClient.GetRdsInstancesFromTags(ctx, l.config.Tags, l.config.DbmTag)
+	instances, err := l.awsRdsClient.GetRdsInstancesFromTags(ctx, l.config)
 	if err != nil {
 		_ = log.Error(err)
 		return
 	}
 	if len(instances) == 0 {
 		log.Debugf("no rds instances found with provided tags %v", l.config.Tags)
-		return
+	} else {
+		log.Debugf("found %d rds instances with provided tags %v", len(instances), l.config.Tags)
 	}
-	log.Debugf("found %d rds instances with provided tags %v", len(instances), l.config.Tags)
 	discoveredServices := make(map[string]struct{})
 	for _, instance := range instances {
 		log.Debugf("found rds instance %v", instance)
@@ -131,15 +131,21 @@ func (l *DBMRdsListener) discoverRdsInstances() {
 }
 
 func (l *DBMRdsListener) createService(entityID string, instance aws.Instance) {
-	if _, present := l.services[entityID]; present {
-		return
-	}
 	svc := &DBMRdsService{
 		adIdentifier: engineToRdsADIdentifier[instance.Engine],
 		entityID:     entityID,
 		checkName:    engineToIntegrationType[instance.Engine],
 		instance:     &instance,
 		region:       l.config.Region,
+	}
+	if existing, present := l.services[entityID]; present {
+		if existingSvc, ok := existing.(*DBMRdsService); ok && existingSvc.Equal(svc) {
+			return
+		}
+		// If the cached service is not equal to the new service then metadata has changed
+		// Delete the cached service first and then send the updated one to the newSvc channel.
+		l.delService <- existing
+		delete(l.services, entityID)
 	}
 	l.services[entityID] = svc
 	l.newService <- svc
@@ -189,9 +195,9 @@ func (d *DBMRdsService) GetHosts() (map[string]string, error) {
 }
 
 // GetPorts returns the port for the rds endpoint
-func (d *DBMRdsService) GetPorts() ([]ContainerPort, error) {
+func (d *DBMRdsService) GetPorts() ([]workloadmeta.ContainerPort, error) {
 	port := int(d.instance.Port)
-	return []ContainerPort{{port, fmt.Sprintf("p%d", port)}}, nil
+	return []workloadmeta.ContainerPort{{Port: port, Name: fmt.Sprintf("p%d", port)}}, nil
 }
 
 // GetTags returns the list of container tags - currently always empty
@@ -225,7 +231,7 @@ func (d *DBMRdsService) GetCheckNames(context.Context) []string {
 }
 
 // HasFilter returns false on DBMRdsService
-func (d *DBMRdsService) HasFilter(containers.FilterType) bool {
+func (d *DBMRdsService) HasFilter(workloadfilter.Scope) bool {
 	return false
 }
 
@@ -244,11 +250,18 @@ func (d *DBMRdsService) GetExtraConfig(key string) (string, error) {
 		return d.instance.ClusterID, nil
 	case "dbname":
 		return d.instance.DbName, nil
+	case "global_view_db":
+		return d.instance.GlobalViewDb, nil
 	}
 
 	return "", ErrNotSupported
 }
 
 // FilterTemplates does nothing.
-func (d *DBMRdsService) FilterTemplates(map[string]integration.Config) {
+func (d *DBMRdsService) FilterTemplates(_ map[string]integration.Config) {
+}
+
+// GetImageName does nothing
+func (d *DBMRdsService) GetImageName() string {
+	return ""
 }

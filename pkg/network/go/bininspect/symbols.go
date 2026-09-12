@@ -24,6 +24,10 @@ const (
 	symbolNameAddressSize = 4
 )
 
+// ErrSymbolsNotFound is returned when the ELF symbol sections are readable, but
+// one or more requested symbols are missing.
+var ErrSymbolsNotFound = errors.New("failed to find symbols")
+
 // getSymbolNameByEntry extracts from the string data section the string in the given position.
 // If the symbol name is shorter or longer than the given min and max (==len(preAllocatedBuf)) then we return false.
 // preAllocatedBuf is a pre allocated buffer with a constant length (== max length among all given symbols) to spare
@@ -254,7 +258,7 @@ func GetAllSymbolsByName(elfFile *safeelf.File, filter symbolFilter) (map[string
 
 	if len(symbolByName) != numWanted {
 		missingSymbols := filter.findMissing(symbolByName)
-		return nil, fmt.Errorf("failed to find symbols %#v", missingSymbols)
+		return symbolByName, fmt.Errorf("%w %#v", ErrSymbolsNotFound, missingSymbols)
 	}
 
 	return symbolByName, nil
@@ -262,7 +266,7 @@ func GetAllSymbolsByName(elfFile *safeelf.File, filter symbolFilter) (map[string
 
 // GetAllSymbolsInSetByName returns all symbols (from the symbolSet) in the
 // given elf file, mapped by the symbol names.  In case of a missing symbol, an
-// error is returned.
+// error is returned and the map is returned with the symbols that were found.
 func GetAllSymbolsInSetByName(elfFile *safeelf.File, symbolSet common.StringSet) (map[string]safeelf.Symbol, error) {
 	filter := newStringSetSymbolFilter(symbolSet)
 	return GetAllSymbolsByName(elfFile, filter)

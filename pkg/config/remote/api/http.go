@@ -9,11 +9,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sync"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	pbgo "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 	httputils "github.com/DataDog/datadog-agent/pkg/util/http"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
+	"github.com/DataDog/datadog-agent/pkg/version"
 )
 
 const (
@@ -34,21 +37,16 @@ const (
 var (
 	// ErrUnauthorized is the error that will be logged for the customer to see in case of a 401. We make it as
 	// descriptive as possible (while not leaking data) to make RC onboarding easier
-	ErrUnauthorized = fmt.Errorf("unauthorized. Please make sure your API key is valid and has the Remote Config scope")
+	ErrUnauthorized = errors.New("unauthorized. Please make sure your API key is valid and has the Remote Config scope")
 	// ErrProxy is the error that will be logged if we suspect that there is a wrong proxy setup for remote-config.
 	// It is displayed for any 4XX status code except 401
-	ErrProxy = fmt.Errorf(
-		"4XX status code. This might be related to the proxy settings. " +
-			"Please make sure the agent can reach Remote Configuration with the proxy setup",
+	ErrProxy = errors.New("4XX status code. This might be related to the proxy settings. " +
+		"Please make sure the agent can reach Remote Configuration with the proxy setup",
 	)
 	// ErrGatewayTimeout is the error that will be logged if there is a gateway timeout
-	ErrGatewayTimeout = fmt.Errorf(
-		"non-200 response code: 504",
-	)
+	ErrGatewayTimeout = errors.New("non-200 response code: 504")
 	// ErrServiceUnavailable is the error that will be logged if there is the service is unavailable
-	ErrServiceUnavailable = fmt.Errorf(
-		"non-200 response code: 503",
-	)
+	ErrServiceUnavailable = errors.New("non-200 response code: 503")
 )
 
 // API is the interface to implement for a configuration fetcher
@@ -92,6 +90,15 @@ func NewHTTPClient(auth Auth, cfg model.Reader, baseURL *url.URL) (*HTTPClient, 
 		header["DD-Application-Key"] = []string{auth.AppKey}
 	}
 
+	// Set the User Agent in outgoing requests to convey the version of the
+	// agent making the request at the transport level.
+	version, err := version.Agent()
+	if err != nil {
+		header.Set("User-Agent", fmt.Sprintf("datadog-agent/%s (%s)", version.String(), runtime.Version()))
+	} else {
+		header.Set("User-Agent", fmt.Sprintf("datadog-agent/unknown (%s)", runtime.Version()))
+	}
+
 	transport := httputils.CreateHTTPTransport(cfg)
 	// Set the keep-alive timeout to 30s instead of the default 90s, so the http RC client is not closed by the backend
 	transport.IdleConnTimeout = 30 * time.Second
@@ -103,7 +110,7 @@ func NewHTTPClient(auth Auth, cfg model.Reader, baseURL *url.URL) (*HTTPClient, 
 		return nil, fmt.Errorf("remote Configuration URL %s is invalid as TLS is required by default. While it is not advised, the `remote_configuration.no_tls` config option can be set to `true` to disable this protection", baseURL)
 	}
 	if transport.TLSClientConfig.InsecureSkipVerify && !cfg.GetBool("remote_configuration.no_tls_validation") {
-		return nil, fmt.Errorf("remote Configuration does not allow skipping TLS validation by default (currently skipped because `skip_ssl_validation` is set to true). While it is not advised, the `remote_configuration.no_tls_validation` config option can be set to `true` to disable this protection")
+		return nil, errors.New("remote Configuration does not allow skipping TLS validation by default (currently skipped because `skip_ssl_validation` is set to true). While it is not advised, the `remote_configuration.no_tls_validation` config option can be set to `true` to disable this protection")
 	}
 	return &HTTPClient{
 		client:  httpClient,
@@ -254,6 +261,31 @@ func (c *HTTPClient) UpdateAPIKey(apiKey string) {
 	c.headerLock.Lock()
 	c.header["DD-Api-Key"] = []string{apiKey}
 	c.headerLock.Unlock()
+}
+
+// Transport returns a pointer to the transport (TLS + Proxy) configuration.
+//
+// Callers MUST NOT modify the returned data.
+func (c *HTTPClient) Transport() (*http.Transport, error) {
+	transport, ok := c.client.Transport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("failed to extract transport config from HTTP client")
+	}
+	return transport, nil
+}
+
+// Headers returns a copy of the HTTP headers configured for RC backend
+// requests, including API credentials.
+func (c *HTTPClient) Headers() http.Header {
+	c.headerLock.RLock()
+	headers := maps.Clone(c.header)
+	c.headerLock.RUnlock()
+	return headers
+}
+
+// BaseURL returns the HTTP endpoint address to the RC backend.
+func (c *HTTPClient) BaseURL() (*url.URL, error) {
+	return url.Parse(c.baseURL)
 }
 
 func (c *HTTPClient) addHeaders(req *http.Request) {

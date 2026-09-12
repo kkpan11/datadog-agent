@@ -2,12 +2,17 @@ syntax = "proto3";
 
 package datadog.workloadmeta;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "pkg/proto/pbgo/core"; // golang
 
 enum WorkloadmetaKind {
   CONTAINER = 0;
   KUBERNETES_POD = 1;
   ECS_TASK = 2;
+  PROCESS = 3;
+  CRD = 4;
+  CONTAINER_IMAGE_METADATA = 5;
 }
 
 enum WorkloadmetaSource {
@@ -54,10 +59,41 @@ message ContainerImage {
   string repo_digest = 6;
 }
 
+message ContainerImageLayer {
+  string mediaType = 1;
+  string diffID = 2;
+  int64 sizeBytes = 3;
+  repeated string urls = 4;
+}
+
+message ContainerImageMetadata {
+  WorkloadmetaEntityId entityId = 1;
+  EntityMeta entityMeta = 2;
+  repeated string repoTags = 3;
+  repeated string repoDigests = 4;
+  string mediaType = 5;
+  int64 sizeBytes = 6;
+  string os = 7;
+  string osVersion = 8;
+  string architecture = 9;
+  string variant = 10;
+  repeated ContainerImageLayer layers = 11;
+  CompressedSBOM sbom = 12;
+}
+
 message ContainerPort {
   string name = 1;
   int32 port = 2;
   string protocol = 3;
+}
+
+message CompressedSBOM {
+  bytes bom = 1;
+  google.protobuf.Timestamp generationTime = 2;
+  uint64 generationDuration = 3;
+  string generationMethod = 4;
+  string status = 5;
+  string error = 6;
 }
 
 enum Runtime {
@@ -100,6 +136,13 @@ message ContainerAllocatedResource {
   string ID = 2;
 }
 
+message ContainerResources {
+  optional double cpuRequest = 1;
+  optional double cpuLimit = 2;
+  optional uint64 memoryRequest = 3;
+  optional uint64 memoryLimit = 4;
+}
+
 message Container {
   WorkloadmetaEntityId entityId = 1;
   EntityMeta entityMeta = 2;
@@ -114,12 +157,15 @@ message Container {
   repeated string collectorTags = 11;
   string cgroupPath = 12;
   repeated ContainerAllocatedResource resolvedAllocatedResources = 13;
+  ContainerResources resources = 14;
+  WorkloadmetaEntityId owner = 15;
 }
 
 message KubernetesPodOwner {
   string kind = 1;
   string name = 2;
   string id = 3;
+  string group = 4;
 }
 
 message OrchestratorContainer {
@@ -143,6 +189,7 @@ message KubernetesPod {
   map<string, string> namespaceLabels = 12;
   repeated OrchestratorContainer InitContainers = 13;
   string runtimeClass = 14;
+  repeated OrchestratorContainer ephemeralContainers = 15;
 }
 
 enum ECSLaunchType {
@@ -165,13 +212,82 @@ message ECSTask {
   string awsAccountID = 12;
 }
 
+message TracerMetadata {
+  string runtimeId = 1;
+  string serviceName = 2;
+}
+
+message UST {
+  string service = 1;
+  string env = 2;
+  string version = 3;
+}
+
+message Service {
+  string generatedName = 1;
+  string generatedNameSource = 2;
+  repeated string additionalGeneratedNames = 4;
+  repeated TracerMetadata tracerMetadata = 5;
+  repeated int32 tcpPorts = 7;
+  repeated int32 udpPorts = 8;
+  bool apmInstrumentation = 9;
+  UST ust = 17;
+}
+
+message Language {
+  string name = 1;
+  string version = 2;
+}
+
+enum InjectionState {
+	INJECTION_UNKNOWN = 0;
+	INJECTION_INJECTED = 1;
+	INJECTION_NOT_INJECTED = 2;
+}
+
+message Process {
+  WorkloadmetaEntityId entityId = 1;
+  int32 pid = 2;
+  int32 nspid = 3;
+  int32 ppid = 4;
+  string name = 5;
+  string cwd = 6;
+  string exe = 7;
+  string comm = 8;
+  repeated string cmdline = 9;
+  repeated int32 uids = 10;
+  repeated int32 gids = 11;
+  string containerId = 12;
+  int64 creationTime = 13;
+  Language language = 14;
+  WorkloadmetaEntityId owner = 15;
+  Service service = 16;
+  InjectionState injectionState = 17;
+}
+
+message Crd {
+  WorkloadmetaEntityId enity_id = 1;
+  EntityMeta entity_meta = 2;
+  string group = 3;
+  string kind = 4;
+  string version = 5;
+}
+
 message WorkloadmetaEvent {
   WorkloadmetaEventType type = 1;
   Container container = 2;
   KubernetesPod kubernetesPod = 3;
   ECSTask ecsTask = 4;
+  Process process = 5;
+  Crd crd = 6;
+  ContainerImageMetadata containerImageMetadata = 7;
 }
 
 message WorkloadmetaStreamResponse {
   repeated WorkloadmetaEvent events = 1;
+  // When true, this message is the last chunk of the initial full-state
+  // snapshot sent after a (re)connection. Clients that need to resync should
+  // accumulate events until they receive a response with this flag set, then
+  // apply the complete set atomically.
+  bool initial_snapshot_complete = 2;
 }

@@ -8,15 +8,17 @@ package agenttelemetryimpl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
-	"go.uber.org/fx"
-	"gopkg.in/yaml.v2"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -24,11 +26,12 @@ import (
 
 	"github.com/DataDog/zstd"
 
-	"github.com/DataDog/datadog-agent/comp/core/config"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
 	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
-	"github.com/DataDog/datadog-agent/comp/core/telemetry/telemetryimpl"
+	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	mocktelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/mock"
+	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
+	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	"github.com/DataDog/datadog-agent/pkg/util/jsonquery"
 )
@@ -53,6 +56,21 @@ func newClientMock() client {
 // Sender mock
 type senderMock struct {
 	sentMetrics []*agentmetric
+
+	// Captures from the errortracking flush path. Protected by mu
+	// because the flush job may run concurrently with test setup and
+	// assertions; readers MUST take the lock or use a synchronisation
+	// barrier (e.g. wait on runner.stop().Done) that establishes
+	// happens-before with the job's completion.
+	//
+	// sendLogsCallCount counts sendLogsBatch invocations; sentLogs
+	// flattens every batch into one accumulating slice. The pair lets
+	// tests distinguish "1 call with N records" from "N calls with 1
+	// record each" — the latter would be a regression to per-batch
+	// dispatch that the flattened slice alone cannot detect.
+	sentLogsMu        sync.Mutex
+	sentLogs          []Log
+	sendLogsCallCount int
 }
 
 func (s *senderMock) startSession(_ context.Context) *senderSession {
@@ -66,6 +84,34 @@ func (s *senderMock) sendAgentMetricPayloads(_ *senderSession, metrics []*agentm
 }
 func (s *senderMock) sendEventPayload(_ *senderSession, _ *Event, _ map[string]interface{}) {
 }
+func (s *senderMock) sendLogsBatch(_ context.Context, logs []Log) error {
+	s.sentLogsMu.Lock()
+	defer s.sentLogsMu.Unlock()
+	s.sendLogsCallCount++
+	s.sentLogs = append(s.sentLogs, logs...)
+	return nil
+}
+
+// capturedLogs returns a thread-safe snapshot of the records captured
+// via sendLogsBatch. Tests should call this rather than reading
+// sentLogs directly.
+func (s *senderMock) capturedLogs() []Log {
+	s.sentLogsMu.Lock()
+	defer s.sentLogsMu.Unlock()
+	out := make([]Log, len(s.sentLogs))
+	copy(out, s.sentLogs)
+	return out
+}
+
+// sendLogsCalls returns a thread-safe snapshot of how many times
+// sendLogsBatch was invoked. Pair with capturedLogs to assert
+// "one HTTP call per flush" (N records via 1 call, not 1 record via N
+// calls).
+func (s *senderMock) sendLogsCalls() int {
+	s.sentLogsMu.Lock()
+	defer s.sentLogsMu.Unlock()
+	return s.sendLogsCallCount
+}
 
 // Runner mock (TODO: use use mock.Mock)
 type runnerMock struct {
@@ -75,7 +121,7 @@ type runnerMock struct {
 
 func (r *runnerMock) run() {
 	for _, j := range r.jobs {
-		j.a.run(j.profiles)
+		j.Run()
 	}
 }
 
@@ -96,13 +142,6 @@ func newRunnerMock() runner {
 
 // ------------------------------
 // Utility functions
-func convertYamlStrToMap(t *testing.T, cfgStr string) map[string]any {
-	var c map[string]any
-	err := yaml.Unmarshal([]byte(cfgStr), &c)
-	assert.NoError(t, err)
-	assert.NotNil(t, c)
-	return c
-}
 
 func makeStableMetricMap(metrics []*dto.Metric) map[string]*dto.Metric {
 	if len(metrics) == 0 {
@@ -111,33 +150,94 @@ func makeStableMetricMap(metrics []*dto.Metric) map[string]*dto.Metric {
 
 	metricMap := make(map[string]*dto.Metric)
 	for _, m := range metrics {
-		tagsKey := ""
+		var tagsKeyBuilder strings.Builder
 
 		// sort by names and values before insertion
 		origTags := m.GetLabel()
 		if len(origTags) > 0 {
-			for _, t := range cloneLabelsSorted(origTags) {
-				tagsKey += makeLabelPairKey(t)
+			for _, tag := range cloneLabelsSorted(origTags) {
+				// Omit the default emitter so callers can identify metrics by assertion-specific labels.
+				if tag.GetName() == emitterTagName && tag.GetValue() == defaultEmitter {
+					continue
+				}
+				tagsKeyBuilder.WriteString(tag.GetName())
+				tagsKeyBuilder.WriteByte(':')
+				tagsKeyBuilder.WriteString(tag.GetValue())
+				tagsKeyBuilder.WriteByte(':')
 			}
 		}
 
-		metricMap[tagsKey] = m
+		metricMap[tagsKeyBuilder.String()] = m
 	}
 
 	return metricMap
 }
 
+func testLabel(name, value string) *dto.LabelPair {
+	return &dto.LabelPair{Name: &name, Value: &value}
+}
+
+func testGaugeMetric(value float64, labels ...*dto.LabelPair) *dto.Metric {
+	return &dto.Metric{Label: labels, Gauge: &dto.Gauge{Value: &value}}
+}
+
+func testCounterMetric(value float64, labels ...*dto.LabelPair) *dto.Metric {
+	return &dto.Metric{Label: labels, Counter: &dto.Counter{Value: &value}}
+}
+
+func testMetricFamily(metricType dto.MetricType, metrics ...*dto.Metric) *dto.MetricFamily {
+	name := "foo_metric"
+	return &dto.MetricFamily{Name: &name, Type: &metricType, Metric: metrics}
+}
+
+func TestConvertPromCountersTreatsDecreaseAsReset(t *testing.T) {
+	previousValues := make(map[string]float64)
+
+	for _, testCase := range []struct {
+		current float64
+		want    float64
+	}{
+		{current: 100, want: 100},
+		{current: 175, want: 75},
+		{current: 20, want: 20},
+		{current: 35, want: 15},
+	} {
+		metric := testCounterMetric(testCase.current)
+		convertPromCountersToDatadogCountersValues([]*dto.Metric{metric}, previousValues, []string{"test-counter"})
+
+		require.Equal(t, testCase.want, metric.GetCounter().GetValue())
+		require.Equal(t, testCase.current, previousValues["test-counter"])
+	}
+}
+
+func metricLabels(metric *dto.Metric) map[string]string {
+	labels := make(map[string]string, len(metric.GetLabel()))
+	for _, label := range metric.GetLabel() {
+		labels[label.GetName()] = label.GetValue()
+	}
+	return labels
+}
+
+func compileTestMetric(t *testing.T, preserveTags []string, aggregateTotal bool) (*Profile, *MetricConfig) {
+	t.Helper()
+	profile := &Profile{
+		Name: "test",
+		Metric: &AgentMetricConfig{Metrics: []MetricConfig{{
+			Name:           "foo.metric",
+			PreserveTags:   preserveTags,
+			AggregateTotal: aggregateTotal,
+		}}},
+	}
+	require.NoError(t, compileConfig(&Config{Profiles: []*Profile{profile}}))
+	return profile, &profile.Metric.Metrics[0]
+}
+
 func makeTelMock(t *testing.T) telemetry.Component {
 	// Little hack. Telemetry component is not fully componentized, and relies on global registry so far
 	// so we need to reset it before running the test. This is not ideal and will be improved in the future.
-	tel := fxutil.Test[telemetry.Mock](t, telemetryimpl.MockModule())
+	tel := fxutil.Test[telemetry.Mock](t, mocktelemetry.Module())
 	tel.Reset()
 	return tel
-}
-
-func makeCfgMock(t *testing.T, confOverrides map[string]any) config.Component {
-	return fxutil.Test[config.Component](t, config.MockModule(),
-		fx.Replace(config.MockParams{Overrides: confOverrides}))
 }
 
 func makeLogMock(t *testing.T) log.Component {
@@ -145,8 +245,7 @@ func makeLogMock(t *testing.T) log.Component {
 }
 
 func makeSenderImpl(t *testing.T, cl client, c string) sender {
-	o := convertYamlStrToMap(t, c)
-	cfg := makeCfgMock(t, o)
+	cfg := configmock.NewFromYAML(t, c)
 	log := makeLogMock(t)
 	if cl == nil {
 		cl = newClientMock()
@@ -159,7 +258,7 @@ func makeSenderImpl(t *testing.T, cl client, c string) sender {
 // aggregator mock function
 func getTestAtel(t *testing.T,
 	tel telemetry.Component,
-	ovrrd map[string]any,
+	YAMLConf string,
 	sndr sender,
 	client client,
 	runner runner) *atel {
@@ -176,7 +275,7 @@ func getTestAtel(t *testing.T,
 		runner = newRunnerMock()
 	}
 
-	cfg := makeCfgMock(t, ovrrd)
+	cfg := configmock.NewFromYAML(t, YAMLConf)
 	log := makeLogMock(t)
 
 	var err error
@@ -187,23 +286,110 @@ func getTestAtel(t *testing.T,
 
 	atel := createAtel(cfg, log, tel, sndr, runner)
 	if atel == nil {
-		err = fmt.Errorf("failed to create atel")
+		err = errors.New("failed to create atel")
 	}
 	assert.NoError(t, err)
 
 	return atel
 }
 
-func getCommonOverrideConfig(enabled bool, site string) map[string]any {
+func getCommonYAMLConfig(enabled bool, site string) string {
 	if site == "" {
-		return map[string]any{
-			"agent_telemetry.enabled": enabled,
+		return fmt.Sprintf("agent_telemetry:\n  enabled: %t", enabled)
+	}
+	return fmt.Sprintf("site: %s\nagent_telemetry:\n  enabled: %t", site, enabled)
+}
+
+func findErrortrackingJob(t *testing.T, runner *runnerMock) job {
+	t.Helper()
+
+	for _, scheduledJob := range runner.jobs {
+		if scheduledJob.profiles == nil {
+			return scheduledJob
 		}
 	}
-	return map[string]any{
-		"agent_telemetry.enabled": enabled,
-		"site":                    site,
-	}
+
+	t.Fatal("errortracking job not found")
+	return job{}
+}
+
+func TestCreateAtel_NegativeErrortrackingBufferSizeDoesNotPanic(t *testing.T) {
+	cfg := configmock.NewFromYAML(t, `
+site: datadoghq.com
+agent_telemetry:
+  enabled: true
+  errortracking:
+    enabled: true
+    buffer_size: -1
+`)
+	log := makeLogMock(t)
+
+	var atel *atel
+	assert.NotPanics(t, func() {
+		atel = createAtel(cfg, log, makeTelMock(t), &senderMock{}, &runnerMock{})
+	})
+	require.NotNil(t, atel)
+	require.NotNil(t, atel.errLogsCh)
+	assert.Equal(t, defaultErrortrackingBufferSize, cap(atel.errLogsCh))
+}
+
+func TestCreateAtel_NegativeErrortrackingValuesFallbackToSafeDefaults(t *testing.T) {
+	runner := &runnerMock{}
+	atel := getTestAtel(t, nil, `
+site: datadoghq.com
+agent_telemetry:
+  enabled: true
+  errortracking:
+    enabled: true
+    flush_interval_seconds: -1
+    startup_jitter_seconds: -1
+    shutdown_drain_timeout_seconds: -1
+`, &senderMock{}, nil, runner)
+
+	assert.Equal(t, 60*time.Second, atel.errLogsFlushInterval)
+	assert.Equal(t, time.Duration(0), atel.errLogsStartupJitter)
+	assert.Equal(t, 5*time.Second, atel.shutdownDrainTimeout)
+
+	assert.NotPanics(t, func() {
+		require.NoError(t, atel.start())
+	})
+	t.Cleanup(func() {
+		atel.cancel()
+	})
+
+	errortrackingJob := findErrortrackingJob(t, runner)
+	assert.Equal(t, uint(defaultErrortrackingFlushIntervalSeconds), errortrackingJob.schedule.Period)
+	assert.Equal(t, uint(0), errortrackingJob.schedule.StartAfter)
+}
+
+func TestCreateAtel_ErrortrackingZeroValuesPreserveCurrentSemantics(t *testing.T) {
+	runner := &runnerMock{}
+	atel := getTestAtel(t, nil, `
+site: datadoghq.com
+agent_telemetry:
+  enabled: true
+  errortracking:
+    enabled: true
+    buffer_size: 0
+    flush_interval_seconds: 0
+    startup_jitter_seconds: 0
+    shutdown_drain_timeout_seconds: 0
+`, &senderMock{}, nil, runner)
+
+	require.NotNil(t, atel.errLogsCh)
+	assert.Equal(t, 0, cap(atel.errLogsCh))
+	assert.Equal(t, time.Duration(0), atel.errLogsFlushInterval)
+	assert.Equal(t, time.Duration(0), atel.errLogsStartupJitter)
+	assert.Equal(t, time.Duration(0), atel.shutdownDrainTimeout)
+
+	require.NoError(t, atel.start())
+	t.Cleanup(func() {
+		atel.cancel()
+	})
+
+	errortrackingJob := findErrortrackingJob(t, runner)
+	assert.Equal(t, uint(5), errortrackingJob.schedule.Period)
+	assert.Equal(t, uint(0), errortrackingJob.schedule.StartAfter)
 }
 
 func (p *Payload) UnmarshalAgentMetrics(itfPayload map[string]interface{}) error {
@@ -215,12 +401,12 @@ func (p *Payload) UnmarshalAgentMetrics(itfPayload map[string]interface{}) error
 	var metricsItfPayload map[string]interface{}
 	metricsItfPayload, ok = itfPayload["payload"].(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("payload not found")
+		return errors.New("payload not found")
 	}
 	var metricsItf map[string]interface{}
 	metricsItf, ok = metricsItfPayload["metrics"].(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("metrics not found")
+		return errors.New("metrics not found")
 	}
 
 	var err error
@@ -258,7 +444,7 @@ func (p *Payload) UnmarshalAgentMetrics(itfPayload map[string]interface{}) error
 func (p *Payload) UnmarshalMessageBatch(itfPayload map[string]interface{}) error {
 	payloadsRaw, ok := itfPayload["payload"].([]interface{})
 	if !ok {
-		return fmt.Errorf("payload not found")
+		return errors.New("payload not found")
 	}
 
 	// ensure all payloads which should be agent-metrics
@@ -266,20 +452,20 @@ func (p *Payload) UnmarshalMessageBatch(itfPayload map[string]interface{}) error
 	for _, payloadRaw := range payloadsRaw {
 		itfChildPayload, ok := payloadRaw.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("invalid payload item type")
+			return errors.New("invalid payload item type")
 		}
 
 		requestTypeRaw, ok := itfChildPayload["request_type"]
 		if !ok {
-			return fmt.Errorf("request_type not found")
+			return errors.New("request_type not found")
 		}
 		requestType, ok := requestTypeRaw.(string)
 		if !ok {
-			return fmt.Errorf("request_type type is invalid")
+			return errors.New("request_type type is invalid")
 		}
 
 		if requestType != "agent-metrics" {
-			return fmt.Errorf("request_type should be agent-metrics")
+			return errors.New("request_type should be agent-metrics")
 		}
 
 		var payload Payload
@@ -304,11 +490,11 @@ func (p *Payload) UnmarshalJSON(b []byte) (err error) {
 
 	requestTypeRaw, ok := itfPayload["request_type"]
 	if !ok {
-		return fmt.Errorf("request_type not found")
+		return errors.New("request_type not found")
 	}
 	requestType, ok := requestTypeRaw.(string)
 	if !ok {
-		return fmt.Errorf("request_type type is invalid")
+		return errors.New("request_type type is invalid")
 	}
 
 	if requestType == "agent-metrics" {
@@ -319,7 +505,7 @@ func (p *Payload) UnmarshalJSON(b []byte) (err error) {
 		return p.UnmarshalMessageBatch(itfPayload)
 	}
 
-	return fmt.Errorf("request_type should be either agent-metrics or message-batch")
+	return errors.New("request_type should be either agent-metrics or message-batch")
 }
 
 func getPayload(a *atel) (*Payload, error) {
@@ -399,9 +585,14 @@ func getPayloadMetricMap(a *atel) map[string]*MetricPayload {
 	return nil
 }
 
+// Existing callers omit the mandatory default emitter so their assertions stay focused on their own labels.
 func getPayloadMetricByTagValues(metrics []*MetricPayload, tags map[string]interface{}) (*MetricPayload, bool) {
+	expectedTags := maps.Clone(tags)
+	if _, found := expectedTags[emitterTagName]; !found {
+		expectedTags[emitterTagName] = defaultEmitter
+	}
 	for _, m := range metrics {
-		if maps.Equal(m.Tags, tags) {
+		if maps.Equal(m.Tags, expectedTags) {
 			return m, true
 		}
 	}
@@ -417,68 +608,88 @@ func getPayloadMetricByTagValues(metrics []*MetricPayload, tags map[string]inter
 // Tests
 
 func TestEnabled(t *testing.T) {
-	o := getCommonOverrideConfig(true, "foo.bar")
-	a := getTestAtel(t, nil, o, nil, nil, nil)
+	a := getTestAtel(t, nil, getCommonYAMLConfig(true, "foo.bar"), nil, nil, nil)
 	assert.True(t, a.enabled)
 }
 
 func TestDisable(t *testing.T) {
-	o := getCommonOverrideConfig(false, "foo.bar")
-	a := getTestAtel(t, nil, o, nil, nil, nil)
+	a := getTestAtel(t, nil, getCommonYAMLConfig(false, "foo.bar"), nil, nil, nil)
 	assert.False(t, a.enabled)
 }
 
 func TestDisableIfFipsEnabled(t *testing.T) {
-	o := map[string]any{
-		"agent_telemetry.enabled": true,
-		"site":                    "foo.bar",
-		"fips.enabled":            true}
-	a := getTestAtel(t, nil, o, nil, nil, nil)
+	c := `
+site: "foo.bar"
+agent_telemetry:
+  enabled: true
+fips:
+  enabled: true
+`
+	a := getTestAtel(t, nil, c, nil, nil, nil)
 	assert.False(t, a.enabled)
 }
 
 func TestEnableIfFipsDisabled(t *testing.T) {
-	o := map[string]any{
-		"agent_telemetry.enabled": true,
-		"site":                    "foo.bar",
-		"fips.enabled":            false}
-	a := getTestAtel(t, nil, o, nil, nil, nil)
+	c := `
+site: "foo.bar"
+agent_telemetry:
+  enabled: true
+fips:
+  enabled: false
+`
+	a := getTestAtel(t, nil, c, nil, nil, nil)
 	assert.True(t, a.enabled)
 }
 
 func TestDisableIfGovCloud(t *testing.T) {
-	o := map[string]any{
-		"agent_telemetry.enabled": true,
-		"site":                    "ddog-gov.com"}
-	a := getTestAtel(t, nil, o, nil, nil, nil)
+	c := `
+site: "ddog-gov.com"
+agent_telemetry:
+  enabled: true
+`
+	a := getTestAtel(t, nil, c, nil, nil, nil)
+	assert.False(t, a.enabled)
+}
+
+func TestDisableIfLongGovCloud(t *testing.T) {
+	c := `
+site: "xxxx99.ddog-gov.com"
+agent_telemetry:
+  enabled: true
+`
+	a := getTestAtel(t, nil, c, nil, nil, nil)
 	assert.False(t, a.enabled)
 }
 
 func TestEnableIfNotGovCloud(t *testing.T) {
-	o := map[string]any{
-		"agent_telemetry.enabled": true,
-		"site":                    "datadoghq.eu"}
-	a := getTestAtel(t, nil, o, nil, nil, nil)
+	c := `
+site: "datadoghq.eu"
+agent_telemetry:
+  enabled: true
+`
+	a := getTestAtel(t, nil, c, nil, nil, nil)
 	assert.True(t, a.enabled)
 }
 
 func TestRun(t *testing.T) {
 	r := newRunnerMock()
-	o := getCommonOverrideConfig(true, "foo.bar")
-	a := getTestAtel(t, nil, o, nil, nil, r)
+	a := getTestAtel(t, nil, getCommonYAMLConfig(true, "foo.bar"), nil, nil, r)
 	assert.True(t, a.enabled)
 
 	a.start()
 
-	// Default configuration has 2 job. One with 3 profiles and another with 1 profile
-	// Profiles with the same schedule are lumped into the same job
-	assert.Equal(t, 2, len(r.(*runnerMock).jobs))
+	// Default configuration has 7 jobs with different schedules:
+	fmt.Println(r.(*runnerMock).jobs)
+	assert.Equal(t, 7, len(r.(*runnerMock).jobs))
 
-	// The order is not deterministic
-	profile0Len := len(r.(*runnerMock).jobs[0].profiles)
-	profile1Len := len(r.(*runnerMock).jobs[1].profiles)
-	t.Logf("%+v", r.(*runnerMock).jobs)
-	assert.True(t, (profile0Len == 1 && profile1Len == 5) || (profile0Len == 5 && profile1Len == 1))
+	// Verify we have the expected number of profiles across all jobs
+	totalProfiles := 0
+	for _, job := range r.(*runnerMock).jobs {
+		totalProfiles += len(job.profiles)
+	}
+	fmt.Println(totalProfiles)
+	// Default config has 21 profiles total (checks, logs-and-metrics, database, synthetics, connectivity, csi-driver, agent-performance, service-discovery, runtime-started, runtime-running, hostname, rtloader, otlp, procmgr, trace-agent, gpu, cluster-agent, injector, ebpf, autodiscovery-discovery-probe, data-plane-preflight-mode)
+	assert.Equal(t, 21, totalProfiles)
 }
 
 func TestReportMetricBasic(t *testing.T) {
@@ -486,10 +697,9 @@ func TestReportMetricBasic(t *testing.T) {
 	counter := tel.NewCounter("checks", "execution_time", []string{"check_name"}, "")
 	counter.Inc("mycheck")
 
-	o := getCommonOverrideConfig(true, "foo.bar")
 	c := newClientMock()
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, nil, c, r)
+	a := getTestAtel(t, tel, getCommonYAMLConfig(true, "foo.bar"), nil, c, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -508,7 +718,7 @@ func TestNoTagSpecifiedAggregationCounter(t *testing.T) {
           metric:
             metrics:
               - name: bar.zoo
-                aggregate_tags: []
+                preserve_tags: []
   `
 
 	// setup and initiate atel
@@ -520,8 +730,7 @@ func TestNoTagSpecifiedAggregationCounter(t *testing.T) {
 
 	s := &senderMock{}
 	r := newRunnerMock()
-	o := convertYamlStrToMap(t, c)
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -535,8 +744,8 @@ func TestNoTagSpecifiedAggregationCounter(t *testing.T) {
 	m := s.sentMetrics[0].metrics[0]
 	assert.Equal(t, float64(60), m.Counter.GetValue())
 
-	// no tags
-	assert.Nil(t, m.GetLabel())
+	// only the mandatory emitter tag
+	assert.Equal(t, map[string]string{"emitter": "agent"}, metricLabels(m))
 }
 
 func TestNoTagSpecifiedExplicitAggregationGauge(t *testing.T) {
@@ -548,7 +757,7 @@ func TestNoTagSpecifiedExplicitAggregationGauge(t *testing.T) {
           metric:
             metrics:
               - name: bar.zoo
-                aggregate_tags: []
+                preserve_tags: []
   `
 
 	// setup and initiate atel
@@ -558,10 +767,9 @@ func TestNoTagSpecifiedExplicitAggregationGauge(t *testing.T) {
 	gauge.WithTags(map[string]string{"tag1": "a2", "tag2": "b2", "tag3": "c2"}).Set(20)
 	gauge.WithTags(map[string]string{"tag1": "a3", "tag2": "b3", "tag3": "c3"}).Set(30)
 
-	o := convertYamlStrToMap(t, c)
 	s := &senderMock{}
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -575,8 +783,8 @@ func TestNoTagSpecifiedExplicitAggregationGauge(t *testing.T) {
 	m := s.sentMetrics[0].metrics[0]
 	assert.Equal(t, float64(60), m.Gauge.GetValue())
 
-	// no tags
-	assert.Nil(t, m.GetLabel())
+	// only the mandatory emitter tag
+	assert.Equal(t, map[string]string{"emitter": "agent"}, metricLabels(m))
 }
 
 func TestNoTagSpecifiedImplicitAggregationGauge(t *testing.T) {
@@ -597,10 +805,9 @@ func TestNoTagSpecifiedImplicitAggregationGauge(t *testing.T) {
 	gauge.WithTags(map[string]string{"tag1": "a2", "tag2": "b2", "tag3": "c2"}).Set(20)
 	gauge.WithTags(map[string]string{"tag1": "a3", "tag2": "b3", "tag3": "c3"}).Set(30)
 
-	o := convertYamlStrToMap(t, c)
 	s := &senderMock{}
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -614,8 +821,8 @@ func TestNoTagSpecifiedImplicitAggregationGauge(t *testing.T) {
 	m := s.sentMetrics[0].metrics[0]
 	assert.Equal(t, float64(60), m.Gauge.GetValue())
 
-	// no tags
-	assert.Nil(t, m.GetLabel())
+	// only the mandatory emitter tag
+	assert.Equal(t, map[string]string{"emitter": "agent"}, metricLabels(m))
 }
 
 func TestNoTagSpecifiedAggregationHistogram(t *testing.T) {
@@ -627,7 +834,7 @@ func TestNoTagSpecifiedAggregationHistogram(t *testing.T) {
           metric:
             metrics:
               - name: bar.zoo
-                aggregate_tags: []
+                preserve_tags: []
   `
 
 	// setup and initiate atel
@@ -638,10 +845,9 @@ func TestNoTagSpecifiedAggregationHistogram(t *testing.T) {
 	hist.WithTags(map[string]string{"tag1": "a2", "tag2": "b2", "tag3": "c2"}).Observe(1002)
 	hist.WithTags(map[string]string{"tag1": "a3", "tag2": "b3", "tag3": "c3"}).Observe(1003)
 
-	o := convertYamlStrToMap(t, c)
 	s := &senderMock{}
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -656,8 +862,168 @@ func TestNoTagSpecifiedAggregationHistogram(t *testing.T) {
 	m := s.sentMetrics[0].metrics[0]
 	assert.Equal(t, uint64(3), m.Histogram.GetBucket()[3].GetCumulativeCount())
 
-	// no tags
-	assert.Nil(t, m.GetLabel())
+	// only the mandatory emitter tag
+	assert.Equal(t, map[string]string{"emitter": "agent"}, metricLabels(m))
+}
+
+func TestMandatoryEmitterLocalFlavor(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		flavor string
+		want   string
+	}{
+		{name: "normalizes underscores", flavor: "trace_agent", want: "trace-agent"},
+		{name: "falls back for empty flavor", flavor: "", want: "agent"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			flavor.SetTestFlavor(t, testCase.flavor)
+			provides := NewComponent(Requires{
+				Config: configmock.NewFromYAML(t, "agent_telemetry:\n  enabled: false"),
+				Log:    makeLogMock(t),
+			})
+			a := provides.Comp.(*atel)
+
+			metrics := a.aggregateMetricTags(&MetricConfig{}, dto.MetricType_GAUGE, []*dto.Metric{testGaugeMetric(1)})
+			require.Len(t, metrics, 1)
+			require.Equal(t, map[string]string{"emitter": testCase.want}, metricLabels(metrics[0]))
+		})
+	}
+}
+
+func TestMandatoryEmitterEffectiveIdentity(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		source     string
+		hasEmitter bool
+		want       string
+	}{
+		{name: "missing uses local", want: "agent"},
+		{name: "empty uses local", hasEmitter: true, want: "agent"},
+		{name: "non-empty is preserved", source: "source-agent", hasEmitter: true, want: "source-agent"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var labels []*dto.LabelPair
+			if testCase.hasEmitter {
+				labels = append(labels, testLabel("emitter", testCase.source))
+			}
+
+			metrics := (&atel{}).aggregateMetricTags(&MetricConfig{}, dto.MetricType_GAUGE, []*dto.Metric{testGaugeMetric(1, labels...)})
+			require.Len(t, metrics, 1)
+			require.Equal(t, map[string]string{"emitter": testCase.want}, metricLabels(metrics[0]))
+		})
+	}
+}
+
+func TestMandatoryEmitterPartitionsAggregation(t *testing.T) {
+	metrics := (&atel{}).aggregateMetricTags(&MetricConfig{}, dto.MetricType_GAUGE, []*dto.Metric{
+		testGaugeMetric(10, testLabel("emitter", "source-a"), testLabel("drop", "one")),
+		testGaugeMetric(20, testLabel("emitter", "source-b"), testLabel("drop", "two")),
+		testGaugeMetric(5, testLabel("emitter", "source-a"), testLabel("drop", "three")),
+	})
+
+	require.Len(t, metrics, 2)
+	byLabels := makeStableMetricMap(metrics)
+	require.Equal(t, float64(15), byLabels["emitter:source-a:"].Gauge.GetValue())
+	require.Equal(t, float64(20), byLabels["emitter:source-b:"].Gauge.GetValue())
+}
+
+func TestMandatoryEmitterPreserveTagsRemainUserFilters(t *testing.T) {
+	profile, metricConfig := compileTestMetric(t, []string{"emitter", "region"}, false)
+	require.Equal(t, []string{"emitter", "region"}, metricConfig.PreserveTags)
+	require.NotContains(t, metricConfig.preserveTagsMap, "emitter")
+	require.Contains(t, metricConfig.preserveTagsMap, "region")
+	require.True(t, metricConfig.preserveTagsExists)
+
+	result := (&atel{}).transformMetricFamily(profile, testMetricFamily(dto.MetricType_GAUGE,
+		testGaugeMetric(10, testLabel("emitter", "source-a"), testLabel("region", "east"), testLabel("drop", "one")),
+		testGaugeMetric(20, testLabel("emitter", "source-b"), testLabel("drop", "two")),
+	))
+
+	require.NotNil(t, result)
+	require.Len(t, result.metrics, 1)
+	require.Equal(t, float64(10), result.metrics[0].Gauge.GetValue())
+	require.Equal(t, map[string]string{"emitter": "source-a", "region": "east"}, metricLabels(result.metrics[0]))
+}
+
+func TestMandatoryEmitterTotalsArePerEmitter(t *testing.T) {
+	_, metricConfig := compileTestMetric(t, []string{"emitter", "region"}, true)
+	metrics := (&atel{}).aggregateMetricTags(metricConfig, dto.MetricType_GAUGE, []*dto.Metric{
+		testGaugeMetric(10, testLabel("emitter", "source-a"), testLabel("region", "east")),
+		testGaugeMetric(20, testLabel("emitter", "source-a"), testLabel("region", "west")),
+		testGaugeMetric(7, testLabel("emitter", "source-b"), testLabel("region", "east")),
+	})
+
+	require.Len(t, metrics, 5)
+	byLabels := makeStableMetricMap(metrics)
+	require.Equal(t, float64(30), byLabels["emitter:source-a:total:2:"].Gauge.GetValue())
+	require.Equal(t, float64(7), byLabels["emitter:source-b:total:1:"].Gauge.GetValue())
+}
+
+// This extends global-total delta coverage with independent per-emitter totals when one emitter gains a source series.
+func TestMandatoryEmitterCounterDeltasSurviveSourceCountChange(t *testing.T) {
+	profile, _ := compileTestMetric(t, []string{"emitter", "region"}, true)
+	a := &atel{
+		prevPromMetricCounterValues:   make(map[string]float64),
+		prevPromMetricHistogramValues: make(map[string]uint64),
+	}
+
+	first := a.transformMetricFamily(profile, testMetricFamily(dto.MetricType_COUNTER,
+		testCounterMetric(100, testLabel("emitter", "source-a"), testLabel("region", "east")),
+		testCounterMetric(200, testLabel("emitter", "source-b"), testLabel("region", "east")),
+	))
+	require.NotNil(t, first)
+
+	second := a.transformMetricFamily(profile, testMetricFamily(dto.MetricType_COUNTER,
+		testCounterMetric(150, testLabel("emitter", "source-a"), testLabel("region", "east")),
+		testCounterMetric(40, testLabel("emitter", "source-a"), testLabel("region", "west")),
+		testCounterMetric(225, testLabel("emitter", "source-b"), testLabel("region", "east")),
+	))
+	require.NotNil(t, second)
+
+	byLabels := makeStableMetricMap(second.metrics)
+	require.Contains(t, byLabels, "emitter:source-a:total:2:")
+	require.Contains(t, byLabels, "emitter:source-b:total:1:")
+	require.Equal(t, float64(90), byLabels["emitter:source-a:total:2:"].Counter.GetValue())
+	require.Equal(t, float64(25), byLabels["emitter:source-b:total:1:"].Counter.GetValue())
+}
+
+// TestAggregateTagsAliasBackwardCompat verifies that the deprecated aggregate_tags YAML key
+// is accepted and behaves identically to preserve_tags for existing custom configurations.
+func TestAggregateTagsAliasBackwardCompat(t *testing.T) {
+	var c = `
+    agent_telemetry:
+      enabled: true
+      profiles:
+        - name: foo
+          metric:
+            metrics:
+              - name: bar.zoo
+                aggregate_tags:
+                  - tag1
+    `
+	tel := makeTelMock(t)
+	counter := tel.NewCounter("bar", "zoo", []string{"tag1", "tag2"}, "")
+	counter.AddWithTags(10, map[string]string{"tag1": "a1", "tag2": "b1"})
+	counter.AddWithTags(20, map[string]string{"tag1": "a1", "tag2": "b2"})
+	counter.AddWithTags(30, map[string]string{"tag1": "a2", "tag2": "b3"})
+
+	s := &senderMock{}
+	r := newRunnerMock()
+	a := getTestAtel(t, tel, c, s, nil, r)
+	require.True(t, a.enabled)
+
+	a.start()
+	r.(*runnerMock).run()
+
+	// aggregate_tags: [tag1] should aggregate by tag1, dropping tag2
+	require.Equal(t, 1, len(s.sentMetrics))
+	require.Equal(t, 2, len(s.sentMetrics[0].metrics))
+	metrics := makeStableMetricMap(s.sentMetrics[0].metrics)
+
+	require.Contains(t, metrics, "tag1:a1:")
+	assert.Equal(t, float64(30), metrics["tag1:a1:"].Counter.GetValue())
+	require.Contains(t, metrics, "tag1:a2:")
+	assert.Equal(t, float64(30), metrics["tag1:a2:"].Counter.GetValue())
 }
 
 func TestTagSpecifiedAggregationCounter(t *testing.T) {
@@ -669,7 +1035,7 @@ func TestTagSpecifiedAggregationCounter(t *testing.T) {
           metric:
             metrics:
               - name: bar.zoo
-                aggregate_tags:
+                preserve_tags:
                   - tag1
     `
 
@@ -682,10 +1048,9 @@ func TestTagSpecifiedAggregationCounter(t *testing.T) {
 	counter.AddWithTags(20, map[string]string{"tag1": "a1", "tag2": "b2", "tag3": "c2"})
 	counter.AddWithTags(30, map[string]string{"tag1": "a2", "tag2": "b3", "tag3": "c3"})
 
-	o := convertYamlStrToMap(t, c)
 	s := &senderMock{}
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -709,6 +1074,162 @@ func TestTagSpecifiedAggregationCounter(t *testing.T) {
 	assert.Equal(t, float64(30), m2.Counter.GetValue())
 }
 
+func TestAggregationPreservedTagKeyDoesNotCollideOnDelimiters(t *testing.T) {
+	labelPair := func(name, value string) *dto.LabelPair {
+		return &dto.LabelPair{Name: &name, Value: &value}
+	}
+	gaugeMetric := func(value float64, labels ...*dto.LabelPair) *dto.Metric {
+		return &dto.Metric{Label: labels, Gauge: &dto.Gauge{Value: &value}}
+	}
+	mCfg := &MetricConfig{
+		preserveTagsExists: true,
+		preserveTagsMap: map[string]any{
+			"a": struct{}{},
+			"c": struct{}{},
+			"d": struct{}{},
+		},
+	}
+	metrics := []*dto.Metric{
+		gaugeMetric(10, labelPair("a", "b:c"), labelPair("d", "e")),
+		gaugeMetric(20, labelPair("a", "b"), labelPair("c", "d:e")),
+	}
+
+	results := (&atel{}).aggregateMetricTags(mCfg, dto.MetricType_GAUGE, metrics)
+
+	require.Len(t, results, 2)
+	labelsByValue := make(map[float64][]string, len(results))
+	for _, result := range results {
+		labels := make([]string, 0, len(result.GetLabel()))
+		for _, label := range result.GetLabel() {
+			if label.GetName() == emitterTagName && label.GetValue() == defaultEmitter {
+				continue
+			}
+			labels = append(labels, label.GetName()+"="+label.GetValue())
+		}
+		labelsByValue[result.Gauge.GetValue()] = labels
+	}
+	require.Equal(t, []string{"a=b:c", "d=e"}, labelsByValue[10])
+	require.Equal(t, []string{"a=b", "c=d:e"}, labelsByValue[20])
+}
+
+func TestCounterDeltaCacheLabelKeyDoesNotCollideOnDelimiters(t *testing.T) {
+	const config = `
+    agent_telemetry:
+      enabled: true
+      profiles:
+        - name: xxx
+          metric:
+            metrics:
+              - name: foo.counter
+                preserve_tags:
+                  - a
+                  - c
+    `
+
+	tel := makeTelMock(t)
+	a := getTestAtel(t, tel, config, makeSenderImpl(t, nil, config), nil, newRunnerMock())
+	require.True(t, a.enabled)
+
+	counter := tel.NewCounter("foo", "counter", []string{"a", "c"}, "")
+	firstTags := map[string]string{"a": "x:c:y", "c": "z"}
+	secondTags := map[string]string{"a": "x", "c": "y:c:z"}
+	firstPayloadTags := map[string]interface{}{"a": "x:c:y", "c": "z"}
+	secondPayloadTags := map[string]interface{}{"a": "x", "c": "y:c:z"}
+
+	assertDeltas := func(firstExpected, secondExpected float64) {
+		metrics, ok := getPayloadFilteredMetricList(a, "foo.counter")
+		require.True(t, ok)
+		require.Len(t, metrics, 2)
+
+		first, ok := getPayloadMetricByTagValues(metrics, firstPayloadTags)
+		require.True(t, ok)
+		second, ok := getPayloadMetricByTagValues(metrics, secondPayloadTags)
+		require.True(t, ok)
+		assert.Equal(t, firstExpected, first.Value)
+		assert.Equal(t, secondExpected, second.Value)
+	}
+
+	counter.AddWithTags(10, firstTags)
+	counter.AddWithTags(100, secondTags)
+	assertDeltas(10, 100)
+
+	counter.AddWithTags(3, firstTags)
+	counter.AddWithTags(7, secondTags)
+	assertDeltas(3, 7)
+}
+
+func TestHistogramDeltaCacheLabelKeyDoesNotCollideOnDelimiters(t *testing.T) {
+	const config = `
+    agent_telemetry:
+      enabled: true
+      profiles:
+        - name: xxx
+          metric:
+            metrics:
+              - name: foo.histogram
+                preserve_tags:
+                  - a
+                  - c
+    `
+
+	tel := makeTelMock(t)
+	a := getTestAtel(t, tel, config, makeSenderImpl(t, nil, config), nil, newRunnerMock())
+	require.True(t, a.enabled)
+
+	histogram := tel.NewHistogram("foo", "histogram", []string{"a", "c"}, "", []float64{1})
+	firstTags := map[string]string{"a": "x:c:y", "c": "z"}
+	secondTags := map[string]string{"a": "x", "c": "y:c:z"}
+	firstPayloadTags := map[string]interface{}{"a": "x:c:y", "c": "z"}
+	secondPayloadTags := map[string]interface{}{"a": "x", "c": "y:c:z"}
+
+	observe := func(tags map[string]string, explicitBucketCount, infBucketCount int) {
+		for range explicitBucketCount {
+			histogram.WithTags(tags).Observe(0.5)
+		}
+		for range infBucketCount {
+			histogram.WithTags(tags).Observe(2)
+		}
+	}
+	assertDeltas := func(firstExpected, secondExpected map[string]uint64) {
+		payload, err := getPayload(a)
+		require.NoError(t, err)
+		payloads, ok := payload.Payload.([]Payload)
+		require.True(t, ok)
+		metrics := make([]*MetricPayload, 0, len(payloads))
+		for _, payload := range payloads {
+			agentMetrics, ok := payload.Payload.(AgentMetricsPayload)
+			require.True(t, ok)
+			metricValue, ok := agentMetrics.Metrics["foo.histogram"]
+			require.True(t, ok)
+			metric, ok := metricValue.(MetricPayload)
+			require.True(t, ok)
+			metrics = append(metrics, &metric)
+		}
+		require.Len(t, metrics, 2)
+
+		first, ok := getPayloadMetricByTagValues(metrics, firstPayloadTags)
+		require.True(t, ok)
+		second, ok := getPayloadMetricByTagValues(metrics, secondPayloadTags)
+		require.True(t, ok)
+		assert.Equal(t, firstExpected, first.Buckets)
+		assert.Equal(t, secondExpected, second.Buckets)
+	}
+
+	observe(firstTags, 1, 1)
+	observe(secondTags, 4, 2)
+	assertDeltas(
+		map[string]uint64{"1": 1, "+Inf": 1},
+		map[string]uint64{"1": 4, "+Inf": 2},
+	)
+
+	observe(firstTags, 2, 1)
+	observe(secondTags, 3, 2)
+	assertDeltas(
+		map[string]uint64{"1": 2, "+Inf": 1},
+		map[string]uint64{"1": 3, "+Inf": 2},
+	)
+}
+
 func TestTagAggregateTotalCounter(t *testing.T) {
 	var c = `
     agent_telemetry:
@@ -719,7 +1240,7 @@ func TestTagAggregateTotalCounter(t *testing.T) {
             metrics:
               - name: bar.zoo
                 aggregate_total: true
-                aggregate_tags:
+                preserve_tags:
                   - tag1
     `
 	// setup and initiate atel
@@ -734,10 +1255,9 @@ func TestTagAggregateTotalCounter(t *testing.T) {
 	counter.AddWithTags(50, map[string]string{"tag1": "a3", "tag2": "b5", "tag3": "c5"})
 	counter.AddWithTags(60, map[string]string{"tag1": "a3", "tag2": "b6", "tag3": "c6"})
 
-	o := convertYamlStrToMap(t, c)
 	s := &senderMock{}
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -769,6 +1289,172 @@ func TestTagAggregateTotalCounter(t *testing.T) {
 	assert.Equal(t, float64(210), m4.Counter.GetValue())
 }
 
+func TestAggregateTotalRejectsReservedTotalPreserveTag(t *testing.T) {
+	const wantErr = "profile 'foo' metric 'bar.zoo' cannot preserve reserved tag 'total' when aggregate_total is enabled"
+
+	for _, tt := range []struct {
+		name                string
+		aggregateTotal      bool
+		tags                string
+		wantErr             bool
+		wantPreservedTags   []string
+		wantUnpreservedTags []string
+	}{
+		{
+			name:           "preserve_tags with aggregate total enabled",
+			aggregateTotal: true,
+			tags: `
+            preserve_tags:
+              - total`,
+			wantErr: true,
+		},
+		{
+			name: "preserve_tags with aggregate total disabled",
+			tags: `
+            preserve_tags:
+              - total`,
+			wantPreservedTags: []string{"total"},
+		},
+		{
+			name:           "deprecated aggregate_tags with aggregate total enabled",
+			aggregateTotal: true,
+			tags: `
+            aggregate_tags:
+              - total`,
+			wantErr: true,
+		},
+		{
+			name:           "preserve_tags takes precedence over deprecated alias",
+			aggregateTotal: true,
+			tags: `
+            preserve_tags:
+              - tag1
+            aggregate_tags:
+              - total`,
+			wantPreservedTags:   []string{"tag1"},
+			wantUnpreservedTags: []string{"total"},
+		},
+		{
+			name:           "empty preserve_tags falls back to deprecated alias",
+			aggregateTotal: true,
+			tags: `
+            preserve_tags: []
+            aggregate_tags:
+              - total`,
+			wantErr: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := configmock.NewFromYAML(t, fmt.Sprintf(`
+agent_telemetry:
+  enabled: true
+  profiles:
+    - name: foo
+      metric:
+        metrics:
+          - name: bar.zoo
+            aggregate_total: %t%s
+`, tt.aggregateTotal, tt.tags))
+
+			atelCfg, err := parseConfig(cfg)
+			if tt.wantErr {
+				require.EqualError(t, err, wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			mCfg := &atelCfg.Profiles[0].Metric.Metrics[0]
+			for _, tag := range tt.wantPreservedTags {
+				require.Contains(t, mCfg.preserveTagsMap, tag)
+			}
+			for _, tag := range tt.wantUnpreservedTags {
+				require.NotContains(t, mCfg.preserveTagsMap, tag)
+			}
+		})
+	}
+}
+
+// TestAggregateTotalDeltaStabilityOnTimeseriesCountChange verifies that the
+// aggregate_total counter delta remains correct when the number of timeseries
+// changes between collection cycles. This is a regression test for a bug where
+// the "total" tag value encoded the timeseries count (e.g., total="2" then
+// total="3"), causing unstable delta cache keys and inflated/incorrect totals.
+func TestAggregateTotalDeltaStabilityOnTimeseriesCountChange(t *testing.T) {
+	var c = `
+    agent_telemetry:
+      enabled: true
+      profiles:
+        - name: foo
+          metric:
+            exclude:
+              zero_metric: true
+            metrics:
+              - name: bar.zoo
+                aggregate_total: true
+                preserve_tags:
+                  - tag1
+    `
+	tel := makeTelMock(t)
+	counter := tel.NewCounter("bar", "zoo", []string{"tag1", "tag2"}, "")
+
+	// --- Cycle 1: only tag1=a1 has data (1 non-zero timeseries after filtering) ---
+	counter.AddWithTags(100, map[string]string{"tag1": "a1", "tag2": "b1"})
+
+	s := &senderMock{}
+	r := newRunnerMock()
+	a := getTestAtel(t, tel, c, s, nil, r)
+	require.True(t, a.enabled)
+
+	a.start()
+	r.(*runnerMock).run()
+
+	// First cycle: cumulative == delta (no previous cache)
+	require.Equal(t, 1, len(s.sentMetrics))
+	require.Equal(t, 2, len(s.sentMetrics[0].metrics)) // tag1:a1 + total
+
+	metrics1 := makeStableMetricMap(s.sentMetrics[0].metrics)
+	require.Contains(t, metrics1, "tag1:a1:")
+	assert.Equal(t, float64(100), metrics1["tag1:a1:"].Counter.GetValue())
+
+	// total should equal the partition sum (100)
+	// The total tag value will be "1" (1 timeseries after zero filtering)
+	require.Contains(t, metrics1, "total:1:")
+	assert.Equal(t, float64(100), metrics1["total:1:"].Counter.GetValue())
+
+	// --- Cycle 2: add a NEW timeseries tag1=a2 (now 2 timeseries) ---
+	// Also increment a1 so both are non-zero
+	counter.AddWithTags(50, map[string]string{"tag1": "a1", "tag2": "b1"})
+	counter.AddWithTags(200, map[string]string{"tag1": "a2", "tag2": "b2"})
+
+	// Reset sender to capture only cycle 2
+	s.sentMetrics = nil
+	r.(*runnerMock).run()
+
+	require.Equal(t, 1, len(s.sentMetrics))
+	require.Equal(t, 3, len(s.sentMetrics[0].metrics)) // tag1:a1 + tag1:a2 + total
+
+	metrics2 := makeStableMetricMap(s.sentMetrics[0].metrics)
+
+	// tag1:a1 delta should be 50 (cumulative went from 100 to 150)
+	require.Contains(t, metrics2, "tag1:a1:")
+	assert.Equal(t, float64(50), metrics2["tag1:a1:"].Counter.GetValue())
+
+	// tag1:a2 delta should be 200 (new timeseries, no previous value)
+	require.Contains(t, metrics2, "tag1:a2:")
+	assert.Equal(t, float64(200), metrics2["tag1:a2:"].Counter.GetValue())
+
+	// total tag value changed from "1" to "2" (timeseries count increased).
+	// The total delta MUST equal the sum of partition deltas: 50 + 200 = 250.
+	// Before the fix, this would be the full cumulative value (350) due to a
+	// cache key miss when the total tag changed from total:"1" to total:"2".
+	require.Contains(t, metrics2, "total:2:")
+	totalValue := metrics2["total:2:"].Counter.GetValue()
+	partitionSum := metrics2["tag1:a1:"].Counter.GetValue() + metrics2["tag1:a2:"].Counter.GetValue()
+	assert.Equal(t, partitionSum, totalValue,
+		"total delta (%v) must equal sum of partition deltas (%v); mismatch indicates unstable cache key bug",
+		totalValue, partitionSum)
+}
+
 func TestTwoProfilesOnTheSameScheduleGenerateSinglePayload(t *testing.T) {
 	var c = `
     agent_telemetry:
@@ -778,13 +1464,13 @@ func TestTwoProfilesOnTheSameScheduleGenerateSinglePayload(t *testing.T) {
           metric:
             metrics:
               - name: bar.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag1
         - name: bar
           metric:
             metrics:
               - name: foo.foo
-                aggregate_tags:
+                preserve_tags:
                   - tag1
     `
 	// setup and initiate a tel
@@ -794,10 +1480,9 @@ func TestTwoProfilesOnTheSameScheduleGenerateSinglePayload(t *testing.T) {
 	counter2 := tel.NewCounter("foo", "foo", []string{"tag1", "tag2", "tag3"}, "")
 	counter2.AddWithTags(20, map[string]string{"tag1": "a1", "tag2": "b1", "tag3": "c1"})
 
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// Get payload
@@ -822,7 +1507,7 @@ func TestOneProfileWithOneMetricMultipleContextsGenerateTwoPayloads(t *testing.T
           metric:
             metrics:
               - name: bar.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag1
     `
 	// setup and initiate atel
@@ -831,10 +1516,9 @@ func TestOneProfileWithOneMetricMultipleContextsGenerateTwoPayloads(t *testing.T
 	counter1.AddWithTags(10, map[string]string{"tag1": "a1", "tag2": "b1", "tag3": "c1"})
 	counter1.AddWithTags(20, map[string]string{"tag1": "a2", "tag2": "b2", "tag3": "c2"})
 
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	payloadJSON, err := a.getAsJSON()
@@ -894,10 +1578,10 @@ func TestOneProfileWithTwoMetricGenerateSinglePayloads(t *testing.T) {
           metric:
             metrics:
               - name: bar.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag1
               - name: foo.foo
-                aggregate_tags:
+                preserve_tags:
                   - tag1
     `
 	// setup and initiate atel
@@ -907,10 +1591,9 @@ func TestOneProfileWithTwoMetricGenerateSinglePayloads(t *testing.T) {
 	counter2 := tel.NewCounter("foo", "foo", []string{"tag1", "tag2", "tag3"}, "")
 	counter2.AddWithTags(20, map[string]string{"tag1": "a1", "tag2": "b1", "tag3": "c1"})
 
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// Get payload
@@ -1059,6 +1742,25 @@ func TestSenderConfigDDUrlWithEmptyAdditionalPoint(t *testing.T) {
 	assert.Equal(t, "https://instrumentation-telemetry-intake.us5.datadoghq.com./api/v2/apmtelemetry", url)
 }
 
+// TestSenderConfigLogsNoSSL verifies that logs_no_ssl: true causes buildURL to
+// produce an http:// URL. Previously buildURL hardcoded "https" and ignored
+// Endpoint.UseSSL(), silently dropping all telemetry in no-SSL environments.
+func TestSenderConfigLogsNoSSL(t *testing.T) {
+	c := `
+    api_key: foo
+    agent_telemetry:
+      enabled: true
+      logs_dd_url: "localhost:19999"
+      logs_no_ssl: true
+    `
+	sndr := makeSenderImpl(t, nil, c)
+	assert.NotNil(t, sndr)
+
+	assert.Len(t, sndr.(*senderImpl).endpoints.Endpoints, 1)
+	url := buildURL(sndr.(*senderImpl).endpoints.Endpoints[0])
+	assert.Equal(t, "http://localhost:19999/api/v2/apmtelemetry", url)
+}
+
 func TestGetAsJSONScrub(t *testing.T) {
 	var c = `
     agent_telemetry:
@@ -1068,13 +1770,13 @@ func TestGetAsJSONScrub(t *testing.T) {
           metric:
             metrics:
               - name: foo.bar_auth
-                aggregate_tags:
+                preserve_tags:
                   - password
               - name: foo.bar_key
-                aggregate_tags:
+                preserve_tags:
                   - api_key
               - name: foo.bar_text
-                aggregate_tags:
+                preserve_tags:
                   - text
     `
 
@@ -1090,10 +1792,9 @@ func TestGetAsJSONScrub(t *testing.T) {
 	counter2.AddWithTags(11, map[string]string{"api_key": "1234567890"})
 	counter3.AddWithTags(11, map[string]string{"text": "test"})
 
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// Get payload
@@ -1108,7 +1809,7 @@ func TestGetAsJSONScrub(t *testing.T) {
 	assert.Equal(t, "********", metric.(MetricPayload).Tags["password"])
 	metric, ok = metrics["foo.bar_key"]
 	require.True(t, ok)
-	assert.Equal(t, "********", metric.(MetricPayload).Tags["api_key"])
+	assert.Equal(t, "********90", metric.(MetricPayload).Tags["api_key"])
 	metric, ok = metrics["foo.bar_text"]
 	require.True(t, ok)
 	assert.Equal(t, "test", metric.(MetricPayload).Tags["text"])
@@ -1123,14 +1824,14 @@ func TestAdjustPrometheusCounterValueMultipleTags(t *testing.T) {
           metric:
             metrics:
               - name: foo.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag1
                   - tag2
               - name: foo.cat
-                aggregate_tags:
+                preserve_tags:
                   - tag
               - name: zoo.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag1
                   - tag2
               - name: zoo.cat
@@ -1138,10 +1839,9 @@ func TestAdjustPrometheusCounterValueMultipleTags(t *testing.T) {
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup metrics using few family names, metric names and tag- and tag-less counters
@@ -1241,16 +1941,15 @@ func TestAdjustPrometheusCounterValueMultipleTagValues(t *testing.T) {
           metric:
             metrics:
               - name: foo.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag
     `
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup metrics using few family names, metric names and tag- and tag-less counters
@@ -1321,10 +2020,9 @@ func TestAdjustPrometheusCounterValueTagless(t *testing.T) {
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup metrics using few family names, metric names and tag- and tag-less counters
@@ -1428,10 +2126,9 @@ func TestHistogramFloatUpperBoundNormalization(t *testing.T) {
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup and initiate atel
@@ -1547,17 +2244,16 @@ func TestHistogramFloatUpperBoundNormalizationWithTags(t *testing.T) {
           metric:
             metrics:
               - name: foo.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag1
                   - tag2
     `
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup and initiate atel
@@ -1665,16 +2361,15 @@ func TestHistogramFloatUpperBoundNormalizationWithMultivalueTags(t *testing.T) {
           metric:
             metrics:
               - name: foo.bar
-                aggregate_tags:
+                preserve_tags:
                   - tag
     `
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup and initiate atel
@@ -1921,10 +2616,9 @@ func TestHistogramPercentile(t *testing.T) {
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	// setup and initiate atel
@@ -1997,11 +2691,10 @@ func TestUsingPayloadCompressionInAgentTelemetrySender(t *testing.T) {
 	hist.Observe(100)
 
 	// setup and initiate atel
-	o1 := convertYamlStrToMap(t, cfg1)
 	cl1 := newClientMock()
 	s1 := makeSenderImpl(t, cl1, cfg1)
 	r1 := newRunnerMock()
-	a1 := getTestAtel(t, tel, o1, s1, cl1, r1)
+	a1 := getTestAtel(t, tel, cfg1, s1, cl1, r1)
 	require.True(t, a1.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -2019,15 +2712,14 @@ func TestUsingPayloadCompressionInAgentTelemetrySender(t *testing.T) {
           metric:
             metrics:
               - name: foo.bar
-                aggregate_tags:
+                preserve_tags:
     `
 
 	// setup and initiate atel
-	o2 := convertYamlStrToMap(t, cfg2)
 	cl2 := newClientMock()
 	s2 := makeSenderImpl(t, cl2, cfg2)
 	r2 := newRunnerMock()
-	a2 := getTestAtel(t, tel, o2, s2, cl2, r2)
+	a2 := getTestAtel(t, tel, cfg2, s2, cl2, r2)
 	require.True(t, a2.enabled)
 
 	// run the runner to trigger the telemetry report
@@ -2046,6 +2738,48 @@ func TestUsingPayloadCompressionInAgentTelemetrySender(t *testing.T) {
 	assert.True(t, float64(nonCompressBodyLen)/float64(compressBodyLen) > 1.5)
 }
 
+func TestCoalescesDefaultAndNoDefaultMetricFamiliesBeforeAggregation(t *testing.T) {
+	var c = `
+    agent_telemetry:
+      enabled: true
+      profiles:
+        - name: points
+          metric:
+            metrics:
+              - name: point.sent
+                aggregate_tags:
+                  - domain
+                  - remote_agent
+    `
+
+	// setup and initiate atel
+	tel := makeTelMock(t)
+	s := makeSenderImpl(t, nil, c)
+	r := newRunnerMock()
+	a := getTestAtel(t, tel, c, s, nil, r)
+	require.True(t, a.enabled)
+
+	corePointSent := tel.NewGaugeWithOpts("point", "sent", []string{"domain"}, "", telemetry.Options{DefaultMetric: true})
+	adpPointSent := tel.NewGaugeWithOpts("point", "sent", []string{"domain", "remote_agent"}, "", telemetry.Options{DefaultMetric: false})
+	corePointSent.Set(5, "https://api.datadoghq.com")
+	adpPointSent.Set(400, "https://api.datadoghq.com", "agent-data-plane")
+
+	metrics, ok := getPayloadFilteredMetricList(a, "point.sent")
+	require.True(t, ok)
+	require.Len(t, metrics, 2)
+
+	coreMetric, ok := getPayloadMetricByTagValues(metrics, map[string]interface{}{"domain": "https://api.datadoghq.com"})
+	require.True(t, ok)
+	assert.Equal(t, 5.0, coreMetric.Value)
+
+	adpMetric, ok := getPayloadMetricByTagValues(metrics, map[string]interface{}{
+		"domain":       "https://api.datadoghq.com",
+		"remote_agent": "agent-data-plane",
+	})
+	require.True(t, ok)
+	assert.Equal(t, 400.0, adpMetric.Value)
+}
+
 func TestDefaultAndNoDefaultPromRegistries(t *testing.T) {
 	var c = `
     agent_telemetry:
@@ -2060,10 +2794,9 @@ func TestDefaultAndNoDefaultPromRegistries(t *testing.T) {
 
 	// setup and initiate atel
 	tel := makeTelMock(t)
-	o := convertYamlStrToMap(t, c)
 	s := makeSenderImpl(t, nil, c)
 	r := newRunnerMock()
-	a := getTestAtel(t, tel, o, s, nil, r)
+	a := getTestAtel(t, tel, c, s, nil, r)
 	require.True(t, a.enabled)
 
 	gaugeFooBar := tel.NewGaugeWithOpts("foo", "bar", nil, "", telemetry.Options{DefaultMetric: false})
@@ -2082,10 +2815,215 @@ func TestDefaultAndNoDefaultPromRegistries(t *testing.T) {
 	assert.Equal(t, 20.0, m2.Value)
 }
 
+func TestDefaultProfilesExportRARClientByteCounters(t *testing.T) {
+	config := getCommonYAMLConfig(true, "")
+	tel := makeTelMock(t)
+	counter := tel.NewCounter("dogstatsd_client", "bytes_sent", []string{"client", "client_transport", "emitter"}, "")
+	counter.Add(100, "go", "uds", "agent-data-plane")
+
+	sender := &senderMock{}
+	runner := newRunnerMock()
+	a := getTestAtel(t, tel, config, sender, nil, runner)
+	require.True(t, a.enabled)
+
+	a.start()
+	runner.(*runnerMock).run()
+
+	require.Len(t, sender.sentMetrics, 1)
+	require.Equal(t, "dogstatsd_client.bytes_sent", sender.sentMetrics[0].name)
+	require.Len(t, sender.sentMetrics[0].metrics, 1)
+	metric := sender.sentMetrics[0].metrics[0]
+	assert.Equal(t, 100.0, metric.GetCounter().GetValue())
+	assert.Equal(t, map[string]string{"client": "go", "client_transport": "uds", "emitter": "agent-data-plane"}, metricLabels(metric))
+}
+
+func TestDefaultProfilesExportRARTransactionSuccessCounters(t *testing.T) {
+	config := getCommonYAMLConfig(true, "")
+	tel := makeTelMock(t)
+	success := tel.NewCounter("transactions", "success", []string{"domain", "endpoint", "proto_version", "emitter"}, "")
+	success.Add(42, "remote-config", "/v1/transactions", "v1", "agent-data-plane")
+	successBytes := tel.NewCounter("transactions", "success_bytes", []string{"domain", "endpoint", "emitter"}, "")
+	successBytes.Add(1024, "remote-config", "/v1/transactions", "agent-data-plane")
+
+	sender := &senderMock{}
+	runner := newRunnerMock()
+	a := getTestAtel(t, tel, config, sender, nil, runner)
+	require.True(t, a.enabled)
+
+	a.start()
+	runner.(*runnerMock).run()
+
+	expectedMetrics := map[string]struct {
+		value  float64
+		labels map[string]string
+	}{
+		"transactions.success": {
+			value: 42,
+			labels: map[string]string{
+				"domain":        "remote-config",
+				"endpoint":      "/v1/transactions",
+				"proto_version": "v1",
+				"emitter":       "agent-data-plane",
+			},
+		},
+		"transactions.success_bytes": {
+			value: 1024,
+			labels: map[string]string{
+				"domain":   "remote-config",
+				"endpoint": "/v1/transactions",
+				"emitter":  "agent-data-plane",
+			},
+		},
+	}
+
+	require.Len(t, sender.sentMetrics, len(expectedMetrics))
+	for _, payload := range sender.sentMetrics {
+		expected, ok := expectedMetrics[payload.name]
+		require.True(t, ok, payload.name)
+		require.Len(t, payload.metrics, 1, payload.name)
+		metric := payload.metrics[0]
+		require.NotNil(t, metric.GetCounter(), payload.name)
+		assert.Equal(t, expected.value, metric.GetCounter().GetValue(), payload.name)
+		assert.Equal(t, expected.labels, metricLabels(metric), payload.name)
+		delete(expectedMetrics, payload.name)
+	}
+	require.Empty(t, expectedMetrics)
+}
+
+func TestDefaultProfilesDoNotListMandatoryEmitter(t *testing.T) {
+	cfg, err := parseConfig(configmock.NewFromYAML(t, defaultProfiles))
+	require.NoError(t, err)
+
+	metricsByName := make(map[string]*MetricConfig)
+	for _, profile := range cfg.Profiles {
+		if profile.Metric == nil {
+			continue
+		}
+		for i := range profile.Metric.Metrics {
+			metric := &profile.Metric.Metrics[i]
+			require.NotContains(t, metric.PreserveTags, emitterTagName, metric.Name)
+			metricsByName[metric.Name] = metric
+		}
+	}
+
+	for _, testCase := range []struct {
+		name           string
+		preserveTags   []string
+		aggregateTotal bool
+	}{
+		{name: "dogstatsd.udp_packets_bytes"},
+		{name: "dogstatsd.uds_packets_bytes"},
+		{name: "dogstatsd_client.bytes_sent", preserveTags: []string{"client", "client_transport"}},
+		{name: "dogstatsd_client.bytes_dropped", preserveTags: []string{"client", "client_transport"}},
+		{name: "dogstatsd_client.bytes_dropped_queue", preserveTags: []string{"client", "client_transport"}},
+		{name: "dogstatsd_client.bytes_dropped_writer", preserveTags: []string{"client", "client_transport"}},
+		{name: "logs.bytes_sent", aggregateTotal: true},
+		{name: "logs.encoded_bytes_sent", preserveTags: []string{"compression_kind"}, aggregateTotal: true},
+		{name: "point.sent", preserveTags: []string{"domain"}},
+		{name: "point.dropped", preserveTags: []string{"domain"}},
+		{name: "transactions.input_count", preserveTags: []string{"domain", "endpoint"}},
+		{name: "transactions.input_bytes", preserveTags: []string{"domain", "endpoint"}},
+		{name: "transactions.success", preserveTags: []string{"domain", "endpoint", "proto_version"}, aggregateTotal: false},
+		{name: "transactions.success_bytes", preserveTags: []string{"domain", "endpoint"}, aggregateTotal: false},
+		{name: "transactions.http_errors", preserveTags: []string{"code", "endpoint"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			metric := metricsByName[testCase.name]
+			require.NotNil(t, metric)
+			require.Equal(t, testCase.preserveTags, metric.PreserveTags)
+			require.Equal(t, testCase.aggregateTotal, metric.AggregateTotal)
+		})
+	}
+}
+
+func TestInstrumentationControllerMetricsInClusterAgentProfile(t *testing.T) {
+	cfg, err := parseConfig(configmock.NewFromYAML(t, defaultProfiles))
+	require.NoError(t, err)
+
+	var profile *Profile
+	for _, candidate := range cfg.Profiles {
+		if candidate.Name == "cluster-agent" {
+			profile = candidate
+			break
+		}
+	}
+	require.NotNil(t, profile)
+	require.NotNil(t, profile.Metric)
+
+	metrics := make(map[string][]string, len(profile.Metric.Metrics))
+	for _, metric := range profile.Metric.Metrics {
+		metrics[metric.Name] = metric.PreserveTags
+	}
+
+	assert.Contains(t, metrics, "instrumentation_controller.resources")
+	assert.ElementsMatch(t, []string{"section", "status"}, metrics["instrumentation_controller.reconciliations"])
+}
+
+// TestDataPlanePreflightModeProfile guards the Agent Data Plane preflight mode metrics.
+//
+// The pre-flight in comp/dataplane/preflightmode reports its outcome purely through these
+// three metrics, and a metric missing from this allowlist is dropped rather than shipped.
+// The label allowlists matter just as much: an unlisted label is stripped and its
+// timeseries summed into the others, which would collapse every distinct finding into one
+// meaningless number. The matching tripwire on the producing side is
+// TestFindingsAreAllowlisted in comp/dataplane/preflightmode/impl.
+func TestDataPlanePreflightModeProfile(t *testing.T) {
+	cfg := configmock.NewFromYAML(t, defaultProfiles)
+	atCfg, err := parseConfig(cfg)
+	require.NoError(t, err)
+
+	var profile *Profile
+	for _, p := range atCfg.Profiles {
+		if p.Name == "data-plane-preflight-mode" {
+			profile = p
+			break
+		}
+	}
+	require.NotNil(t, profile, "the data-plane-preflight-mode profile is missing")
+	require.NotNil(t, profile.Metric)
+
+	wantTags := map[string][]string{
+		"data_plane.preflight_mode_result":           {"result"},
+		"data_plane.preflight_mode_finding":          {"finding"},
+		"data_plane.preflight_mode_duration_seconds": nil,
+	}
+
+	got := make(map[string][]string, len(profile.Metric.Metrics))
+	for _, m := range profile.Metric.Metrics {
+		got[m.Name] = m.PreserveTags
+	}
+
+	for name, tags := range wantTags {
+		preserved, ok := got[name]
+		require.Truef(t, ok, "%s is not allowlisted, so it would never be sent", name)
+		assert.ElementsMatchf(t, tags, preserved, "preserve_tags for %s", name)
+	}
+
+	require.NotNil(t, profile.Schedule)
+
+	// The first flush must land after the run finishes, or it would report an empty run. The
+	// shortest possible window is minPreflightModeDuration in comp/dataplane/preflightmode/impl
+	// (90s; data_plane.preflight_mode_duration can only extend it, which the recurring schedule
+	// below covers). This asserts the schedule keeps clear of the floor with margin. Raising that
+	// constant past this bound should fail here.
+	const preflightModeWindowSeconds = 90
+	assert.Greater(t, int(profile.Schedule.StartAfter), preflightModeWindowSeconds,
+		"the first flush must land after the preflight mode window closes")
+
+	// The schedule also stays recurring, so a future change to the window cannot silently
+	// strand the outcome. Safe because counters are delta-converted: the increment ships on
+	// whichever flush first observes it, and later flushes send zero, which zero_metric drops.
+	assert.Zero(t, int(profile.Schedule.Iterations),
+		"the schedule must be recurring so a longer preflight mode window still reports")
+	require.NotNil(t, profile.Metric.Exclude)
+	require.NotNil(t, profile.Metric.Exclude.ZeroMetric)
+	assert.True(t, *profile.Metric.Exclude.ZeroMetric,
+		"zero_metric exclusion is what keeps the recurring schedule from re-shipping the same run")
+}
+
 func TestAgentTelemetryParseDefaultConfiguration(t *testing.T) {
 	c := defaultProfiles
-	o := convertYamlStrToMap(t, c)
-	cfg := makeCfgMock(t, o)
+	cfg := configmock.NewFromYAML(t, c)
 	atCfg, err := parseConfig(cfg)
 
 	require.NoError(t, err)
@@ -2105,7 +3043,7 @@ func TestAgentTelemetryEventConfiguration(t *testing.T) {
         metric:
           metrics:
             - name: checks.execution_time
-              aggregate_tags:
+              preserve_tags:
                 - check_name
             - name: pymem.inuse
         schedule:
@@ -2144,9 +3082,7 @@ func TestAgentTelemetryEventConfiguration(t *testing.T) {
             payload_key: agent_barfoo
             message: 'Agent barfoo'
     `
-
-	o := convertYamlStrToMap(t, c)
-	cfg := makeCfgMock(t, o)
+	cfg := configmock.NewFromYAML(t, c)
 	atCfg, err := parseConfig(cfg)
 
 	require.NoError(t, err)
@@ -2194,11 +3130,10 @@ func TestAgentTelemetrySendRegisteredEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	// setup and initiate atel
-	o := convertYamlStrToMap(t, cfg)
 	cl := newClientMock()
 	s := makeSenderImpl(t, cl, cfg)
 	r := newRunnerMock()
-	a := getTestAtel(t, nil, o, s, cl, r)
+	a := getTestAtel(t, nil, cfg, s, cl, r)
 	require.True(t, a.enabled)
 
 	a.start()
@@ -2260,11 +3195,10 @@ func TestAgentTelemetrySendNonRegisteredEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	// setup and initiate atel
-	o := convertYamlStrToMap(t, cfg)
 	cl := newClientMock()
 	s := makeSenderImpl(t, cl, cfg)
 	r := newRunnerMock()
-	a := getTestAtel(t, nil, o, s, cl, r)
+	a := getTestAtel(t, nil, cfg, s, cl, r)
 	require.True(t, a.enabled)
 
 	a.start()

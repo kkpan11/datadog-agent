@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/DataDog/datadog-agent/pkg/aggregator/mocksender"
+	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
 )
 
@@ -271,14 +273,14 @@ func TestRun(t *testing.T) {
 				time.Minute,
 			)
 
-			mockedSender := mocksender.NewMockSender(CheckName)
+			mockedSender := mocksender.NewMockSender(t, CheckName)
 			mockedSender.SetupAcceptAll()
 
 			// The informers are set up in the first run, but the first metrics
 			// are not necessarily emitted in the first run. It depends on
 			// whether the check had time to process the events.
 
-			err := check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "")
+			err := check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "", "")
 			require.NoError(t, err)
 
 			err = check.Run()
@@ -329,11 +331,11 @@ func TestRun_withCollectEvents(t *testing.T) {
 	k8sClient := fake.NewSimpleClientset()
 	check.informerFactory = informers.NewSharedInformerFactory(k8sClient, time.Minute)
 
-	mockedSender := mocksender.NewMockSender(CheckName)
+	mockedSender := mocksender.NewMockSender(t, CheckName)
 	mockedSender.SetupAcceptAll()
 
 	// First run to set up the informers.
-	err = check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "")
+	err = check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "", "")
 	require.NoError(t, err)
 
 	err = check.Run()
@@ -348,11 +350,13 @@ func TestRun_withCollectEvents(t *testing.T) {
 	err = check.Run()
 	require.NoError(t, err)
 	expectedTags := check.allTags(&rel, k8sSecrets, true)
-	mockedSender.AssertEvent(
+	mockedSender.AssertEventWithCompareFunc(
 		t,
 		eventForRelease(&rel, "New Helm release \"my_datadog\" has been deployed in \"default\" namespace. Its status is \"deployed\".", expectedTags),
 		eventsAllowedDelta,
+		eventCompareFunc,
 	)
+	mockedSender.ResetCalls()
 
 	// Upgrade the release and check that it creates the appropriate event.
 	upgradedRel := rel
@@ -366,12 +370,14 @@ func TestRun_withCollectEvents(t *testing.T) {
 	}, testTimeout, testTicker)
 	err = check.Run()
 	require.NoError(t, err)
-	expectedTags = check.allTags(&rel, k8sSecrets, true)
-	mockedSender.AssertEvent(
+	expectedTags = check.allTags(&upgradedRel, k8sSecrets, true)
+	mockedSender.AssertEventWithCompareFunc(
 		t,
-		eventForRelease(&rel, "Helm release \"my_datadog\" in \"default\" namespace upgraded to revision 2. Its status is \"deployed\".", expectedTags),
+		eventForRelease(&upgradedRel, "Helm release \"my_datadog\" in \"default\" namespace upgraded to revision 2. Its status is \"deployed\".", expectedTags),
 		eventsAllowedDelta,
+		eventCompareFunc,
 	)
+	mockedSender.ResetCalls()
 
 	// Delete the release (all revisions) and check that it creates the
 	// appropriate event.
@@ -382,11 +388,20 @@ func TestRun_withCollectEvents(t *testing.T) {
 	require.Eventually(t, func() bool { // Wait until the delete events have been processed (store should be empty)
 		return len(check.store.getAll(k8sSecrets)) == 0
 	}, testTimeout, testTicker)
+	err = check.Run()
+	require.NoError(t, err)
 	expectedTags = check.allTags(&rel, k8sSecrets, false)
-	mockedSender.AssertEvent(
+	for i, tag := range expectedTags {
+		if strings.HasPrefix(tag, "helm_status:") {
+			expectedTags[i] = "helm_status:uninstalled"
+			break
+		}
+	}
+	mockedSender.AssertEventWithCompareFunc(
 		t,
 		eventForRelease(&rel, "Helm release \"my_datadog\" in \"default\" namespace has been deleted.", expectedTags),
 		eventsAllowedDelta,
+		eventCompareFunc,
 	)
 }
 
@@ -419,13 +434,13 @@ func TestRun_skipEventForExistingRelease(t *testing.T) {
 	k8sClient := fake.NewSimpleClientset()
 	check.informerFactory = informers.NewSharedInformerFactory(k8sClient, time.Minute)
 
-	mockedSender := mocksender.NewMockSender(CheckName)
+	mockedSender := mocksender.NewMockSender(t, CheckName)
 	mockedSender.SetupAcceptAll()
 
 	// Create a new release and check that we never send an event for it
 	_, err = k8sClient.CoreV1().Secrets("default").Create(context.TODO(), secret, metav1.CreateOptions{})
 	require.NoError(t, err)
-	err = check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "")
+	err = check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "", "")
 	require.NoError(t, err)
 	err = check.Run()
 	require.NoError(t, err)
@@ -555,12 +570,12 @@ func TestRun_ServiceCheck(t *testing.T) {
 				check.store.add(rel, test.storage, commonTags(rel, test.storage), check.tagsForMetricsAndEvents(rel, true))
 			}
 
-			mockedSender := mocksender.NewMockSender(CheckName)
+			mockedSender := mocksender.NewMockSender(t, CheckName)
 			mockedSender.SetupAcceptAll()
 
 			k8sClient := fake.NewSimpleClientset()
 			check.informerFactory = informers.NewSharedInformerFactory(k8sClient, time.Minute)
-			err := check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "")
+			err := check.CommonConfigure(mockedSender.GetSenderManager(), nil, nil, "", "")
 			require.NoError(t, err)
 			err = check.Run()
 			require.NoError(t, err)
@@ -678,4 +693,11 @@ func encodeRelease(rls *release) (string, error) {
 	w.Close()
 
 	return b64.EncodeToString(buf.Bytes()), nil
+}
+
+// This function is used to compare events, because by default, the mocksender
+// package doesn't check the text of the event but for these tests we are
+// interested on it
+func eventCompareFunc(expected, actual event.Event) bool {
+	return expected.Text == actual.Text
 }

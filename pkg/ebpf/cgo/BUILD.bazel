@@ -1,0 +1,29 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("//bazel/rules/go:dd_agent_go_test.bzl", "dd_agent_go_test")
+
+go_library(
+    name = "cgo_lib",
+    srcs = ["genpost.go"],
+    importpath = "github.com/DataDog/datadog-agent/pkg/ebpf/cgo",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "genpost",
+    embed = [":cgo_lib"],
+    visibility = ["//visibility:public"],
+)
+
+dd_agent_go_test(
+    name = "cgo_test",
+    srcs = ["genpost_test.go"],
+    embed = [":cgo_lib"],
+    deps = ["@com_github_stretchr_testify//assert"],
+)
+
+dd_agent_go_test(
+    name = "genpost_test",
+    srcs = ["genpost_test.go"],
+    embed = [":cgo_lib"],
+    deps = ["@com_github_stretchr_testify//assert"],
+)

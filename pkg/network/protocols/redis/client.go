@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf && test
+//go:build linux && bpf && test
 
 // Package redis implements USM's Redis monitoring, as well as provide
 // helpers used in tests.
@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"slices"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -48,10 +49,8 @@ func NewClient(serverAddress string, dialer *net.Dialer, enableTLS bool, protoco
 }
 
 func verifyProtocolVersion(protocolVersion int) error {
-	for _, supportedProtocolVersion := range supportedProtocolVersions {
-		if protocolVersion == supportedProtocolVersion {
-			return nil
-		}
+	if slices.Contains(supportedProtocolVersions, protocolVersion) {
+		return nil
 	}
 	return errProtocolVersionNotSupported
 }

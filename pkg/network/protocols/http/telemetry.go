@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build (windows && npm) || linux_bpf
+//go:build (windows && npm) || (linux && bpf)
 
 package http
 
@@ -37,17 +37,17 @@ type Telemetry struct {
 
 	hits1XX, hits2XX, hits3XX, hits4XX, hits5XX *TLSCounter
 
-	dropped                                                          *libtelemetry.Counter // this happens when statKeeper reaches capacity
-	rejected                                                         *libtelemetry.Counter // this happens when an user-defined reject-filter matches a request
-	emptyPath, unknownMethod, invalidLatency, nonPrintableCharacters *libtelemetry.Counter // this happens when the request doesn't have the expected format
-	aggregations                                                     *libtelemetry.Counter
+	dropped                                                                             *libtelemetry.Counter // this happens when statKeeper reaches capacity
+	rejected                                                                            *libtelemetry.Counter // this happens when an user-defined reject-filter matches a request
+	emptyPath, unknownMethod, invalidLatency, nonPrintableCharacters, invalidStatusCode *libtelemetry.Counter // this happens when the request doesn't have the expected format
+	aggregations                                                                        *libtelemetry.Counter
 
 	joiner telemetryJoiner
 }
 
 // NewTelemetry returns a new Telemetry.
 func NewTelemetry(protocol string) *Telemetry {
-	metricGroup := libtelemetry.NewMetricGroup(fmt.Sprintf("usm.%s", protocol))
+	metricGroup := libtelemetry.NewMetricGroup("usm." + protocol)
 	metricGroupJoiner := libtelemetry.NewMetricGroup(fmt.Sprintf("usm.%s.joiner", protocol))
 
 	return &Telemetry{
@@ -67,6 +67,7 @@ func NewTelemetry(protocol string) *Telemetry {
 		unknownMethod:          metricGroup.NewCounter("malformed", "type:unknown-method", libtelemetry.OptStatsd),
 		invalidLatency:         metricGroup.NewCounter("malformed", "type:invalid-latency", libtelemetry.OptStatsd),
 		nonPrintableCharacters: metricGroup.NewCounter("malformed", "type:non-printable-char", libtelemetry.OptStatsd),
+		invalidStatusCode:      metricGroup.NewCounter("malformed", "type:invalid-status-code", libtelemetry.OptStatsd),
 
 		joiner: telemetryJoiner{
 			requests:         metricGroupJoiner.NewCounter("requests", libtelemetry.OptPrometheus),

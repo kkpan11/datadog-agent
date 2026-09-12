@@ -13,23 +13,20 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/gorilla/mux"
-
 	"github.com/DataDog/datadog-agent/pkg/clusteragent"
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/api"
 	cctypes "github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	dcautil "github.com/DataDog/datadog-agent/pkg/util/clusteragent"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // Install registers v1 API endpoints
-func installClusterCheckEndpoints(r *mux.Router, sc clusteragent.ServerContext) {
-	r.HandleFunc("/clusterchecks/status/{identifier}", api.WithTelemetryWrapper("postCheckStatus", postCheckStatus(sc))).Methods("POST")
-	r.HandleFunc("/clusterchecks/configs/{identifier}", api.WithTelemetryWrapper("getCheckConfigs", getCheckConfigs(sc))).Methods("GET")
-	r.HandleFunc("/clusterchecks/rebalance", api.WithTelemetryWrapper("postRebalanceChecks", postRebalanceChecks(sc))).Methods("POST")
-	r.HandleFunc("/clusterchecks", api.WithTelemetryWrapper("getState", getState(sc))).Methods("GET")
-	r.HandleFunc("/clusterchecks/isolate/check/{identifier}", api.WithTelemetryWrapper("postIsolateCheck", postIsolateCheck(sc))).Methods("POST")
+func installClusterCheckEndpoints(r *http.ServeMux, sc clusteragent.ServerContext) {
+	r.HandleFunc("POST /clusterchecks/status/{identifier}", api.WithTelemetryWrapper("postCheckStatus", postCheckStatus(sc)))
+	r.HandleFunc("GET /clusterchecks/configs/{identifier}", api.WithTelemetryWrapper("getCheckConfigs", getCheckConfigs(sc)))
+	r.HandleFunc("POST /clusterchecks/rebalance", api.WithTelemetryWrapper("postRebalanceChecks", postRebalanceChecks(sc)))
+	r.HandleFunc("GET /clusterchecks", api.WithTelemetryWrapper("getState", getState(sc)))
+	r.HandleFunc("POST /clusterchecks/isolate/check/{identifier}", api.WithTelemetryWrapper("postIsolateCheck", postIsolateCheck(sc)))
 }
 
 // RebalancePostPayload struct is for the JSON messages received from a client POST request
@@ -48,8 +45,7 @@ func postCheckStatus(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 			return
 		}
 
-		vars := mux.Vars(r)
-		identifier := vars["identifier"]
+		identifier := r.PathValue("identifier")
 
 		decoder := json.NewDecoder(r.Body)
 		var status cctypes.NodeStatus
@@ -59,7 +55,7 @@ func postCheckStatus(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 			return
 		}
 
-		clientIP, err := validateClientIP(r.Header.Get(dcautil.RealIPHeader))
+		clientIP, err := validateClientIP(r.Header.Get(dcautil.RealIPHeader), sc.ClusterCheckHandler.IsAdvancedDispatchingEnabled())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -81,8 +77,7 @@ func getCheckConfigs(sc clusteragent.ServerContext) func(w http.ResponseWriter, 
 			return
 		}
 
-		vars := mux.Vars(r)
-		identifier := vars["identifier"]
+		identifier := r.PathValue("identifier")
 		response, err := sc.ClusterCheckHandler.GetConfigs(identifier)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -133,8 +128,7 @@ func postIsolateCheck(sc clusteragent.ServerContext) func(w http.ResponseWriter,
 			return
 		}
 
-		vars := mux.Vars(r)
-		isolateCheckID := vars["identifier"]
+		isolateCheckID := r.PathValue("identifier")
 
 		response := sc.ClusterCheckHandler.IsolateCheck(isolateCheckID)
 
@@ -148,9 +142,11 @@ func getState(sc clusteragent.ServerContext) func(w http.ResponseWriter, r *http
 		return clusterChecksDisabledHandler
 	}
 
-	return func(w http.ResponseWriter, _ *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scrub := r != nil && r.URL.Query().Get("scrub") == "true"
+
 		// No redirection for this one, internal endpoint
-		response, err := sc.ClusterCheckHandler.GetState()
+		response, err := sc.ClusterCheckHandler.GetState(scrub)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -187,13 +183,13 @@ func clusterChecksDisabledHandler(w http.ResponseWriter, r *http.Request) {
 // validateClientIP validates the http client IP retrieved from the request's header.
 // Empty IPs are considered valid for backward compatibility with old clc runner versions
 // that don't set the realIPHeader header field.
-func validateClientIP(addr string) (string, error) {
+func validateClientIP(addr string, advancedDispatchingActive bool) (string, error) {
 	if addr != "" && net.ParseIP(addr) == nil {
 		log.Debugf("Error while parsing CLC runner address %s", addr)
 		return "", fmt.Errorf("cannot parse CLC runner address: %s", addr)
 	}
 
-	if addr == "" && pkgconfigsetup.Datadog().GetBool("cluster_checks.advanced_dispatching_enabled") {
+	if addr == "" && advancedDispatchingActive {
 		log.Warn("Cluster check dispatching error: cannot get runner IP from http headers. advanced_dispatching_enabled requires agent 6.17 or above.")
 	}
 

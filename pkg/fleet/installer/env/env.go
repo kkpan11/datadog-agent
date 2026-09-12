@@ -19,12 +19,15 @@ import (
 	"time"
 
 	"golang.org/x/net/http/httpproxy"
+
+	pkgfips "github.com/DataDog/datadog-agent/pkg/fips"
 )
 
 const (
 	envAPIKey                = "DD_API_KEY"
 	envSite                  = "DD_SITE"
 	envRemoteUpdates         = "DD_REMOTE_UPDATES"
+	envOTelCollectorEnabled  = "DD_OTELCOLLECTOR_ENABLED"
 	envMirror                = "DD_INSTALLER_MIRROR"
 	envRegistryURL           = "DD_INSTALLER_REGISTRY_URL"
 	envRegistryAuth          = "DD_INSTALLER_REGISTRY_AUTH"
@@ -35,6 +38,8 @@ const (
 	envApmLibraries          = "DD_APM_INSTRUMENTATION_LIBRARIES"
 	envAgentMajorVersion     = "DD_AGENT_MAJOR_VERSION"
 	envAgentMinorVersion     = "DD_AGENT_MINOR_VERSION"
+	envAgentDistChannel      = "DD_AGENT_DIST_CHANNEL"
+	envAgentPipelineID       = "DD_AGENT_PIPELINE_ID"
 	envApmLanguages          = "DD_APM_INSTRUMENTATION_LANGUAGES"
 	envTags                  = "DD_TAGS"
 	envExtraTags             = "DD_EXTRA_TAGS"
@@ -46,18 +51,32 @@ const (
 	envDDNoProxy             = "DD_PROXY_NO_PROXY"
 	envNoProxy               = "NO_PROXY"
 	envIsFromDaemon          = "DD_INSTALLER_FROM_DAEMON"
+	envProcessManagerEnabled = "DD_PROCESS_MANAGER_ENABLED"
+	// envFIPSMode is the canonical FIPS toggle, also recognized by
+	// pkg/fleet/installer/setup/defaultscript/default_script.go.
+	envFIPSMode = "DD_FIPS_MODE"
 
 	// install script
-	envApmInstrumentationEnabled = "DD_APM_INSTRUMENTATION_ENABLED"
-	envRuntimeMetricsEnabled     = "DD_RUNTIME_METRICS_ENABLED"
-	envLogsInjection             = "DD_LOGS_INJECTION"
-	envAPMTracingEnabled         = "DD_APM_TRACING_ENABLED"
-	envProfilingEnabled          = "DD_PROFILING_ENABLED"
-	envDataStreamsEnabled        = "DD_DATA_STREAMS_ENABLED"
-	envAppsecEnabled             = "DD_APPSEC_ENABLED"
-	envIastEnabled               = "DD_IAST_ENABLED"
-	envDataJobsEnabled           = "DD_DATA_JOBS_ENABLED"
-	envAppsecScaEnabled          = "DD_APPSEC_SCA_ENABLED"
+	envApmInstrumentationEnabled   = "DD_APM_INSTRUMENTATION_ENABLED"
+	envRuntimeMetricsEnabled       = "DD_RUNTIME_METRICS_ENABLED"
+	envLogsInjection               = "DD_LOGS_INJECTION"
+	envAPMTracingEnabled           = "DD_APM_TRACING_ENABLED"
+	envProfilingEnabled            = "DD_PROFILING_ENABLED"
+	envDataStreamsEnabled          = "DD_DATA_STREAMS_ENABLED"
+	envAppsecEnabled               = "DD_APPSEC_ENABLED"
+	envIastEnabled                 = "DD_IAST_ENABLED"
+	envDataJobsEnabled             = "DD_DATA_JOBS_ENABLED"
+	envAppsecScaEnabled            = "DD_APPSEC_SCA_ENABLED"
+	envInfrastructureMode          = "DD_INFRASTRUCTURE_MODE"
+	envAppKey                      = "DD_APP_KEY"
+	envPAREnabled                  = "DD_PRIVATE_ACTION_RUNNER_ENABLED"
+	envPARActionsAllowlist         = "DD_PRIVATE_ACTION_RUNNER_ACTIONS_ALLOWLIST"
+	envTracerLogsCollectionEnabled = "DD_APP_LOGS_COLLECTION_ENABLED"
+	envRumEnabled                  = "DD_RUM_ENABLED"
+	envRumApplicationID            = "DD_RUM_APPLICATION_ID"
+	envRumClientToken              = "DD_RUM_CLIENT_TOKEN"
+	envRumRemoteConfigurationID    = "DD_RUM_REMOTE_CONFIGURATION_ID"
+	envRumSite                     = "DD_RUM_SITE"
 )
 
 // Windows MSI options
@@ -70,13 +89,16 @@ const (
 	envAgentUserPasswordCompat  = "DDAGENTUSER_PASSWORD"
 	envProjectLocation          = "DD_PROJECTLOCATION"
 	envApplicationDataDirectory = "DD_APPLICATIONDATADIRECTORY"
+	envAgentUserKeepRights      = "DDAGENTUSER_KEEP_RIGHTS"
 )
 
 var defaultEnv = Env{
-	APIKey:        "",
-	Site:          "datadoghq.com",
-	RemoteUpdates: false,
-	Mirror:        "",
+	APIKey:                "",
+	Site:                  "datadoghq.com",
+	RemoteUpdates:         false,
+	OTelCollectorEnabled:  false,
+	ProcessManagerEnabled: true,
+	Mirror:                "",
 
 	RegistryOverride:            "",
 	RegistryAuthOverride:        "",
@@ -101,6 +123,11 @@ var defaultEnv = Env{
 		IastEnabled:               nil,
 		DataJobsEnabled:           nil,
 		AppsecScaEnabled:          nil,
+		RumEnabled:                nil,
+		RumApplicationID:          "",
+		RumClientToken:            "",
+		RumRemoteConfigurationID:  "",
+		RumSite:                   "",
 	},
 }
 
@@ -117,6 +144,8 @@ const (
 	APMInstrumentationEnabledDocker = "docker"
 	// APMInstrumentationEnabledHost enables APM instrumentation for the host.
 	APMInstrumentationEnabledHost = "host"
+	// APMInstrumentationEnabledIIS enables APM instrumentation for .NET applications running on IIS on Windows
+	APMInstrumentationEnabledIIS = "iis"
 	// APMInstrumentationNotSet is the default value when the environment variable is not set.
 	APMInstrumentationNotSet = "not_set"
 )
@@ -127,6 +156,9 @@ type MsiParamsEnv struct {
 	AgentUserPassword        string
 	ProjectLocation          string
 	ApplicationDataDirectory string
+	// AgentUserKeepRights opts the installer out of re-applying the ddagentuser
+	// SeDeny*LogonRight assignments. Accepts MSI-style truthy values (1/true/yes).
+	AgentUserKeepRights string
 }
 
 // InstallScriptEnv contains the environment variables for the install script.
@@ -135,22 +167,33 @@ type InstallScriptEnv struct {
 	APMInstrumentationEnabled string
 
 	// APM features toggles
-	RuntimeMetricsEnabled *bool
-	LogsInjection         *bool
-	APMTracingEnabled     *bool
-	ProfilingEnabled      string
-	DataStreamsEnabled    *bool
-	AppsecEnabled         *bool
-	IastEnabled           *bool
-	DataJobsEnabled       *bool
-	AppsecScaEnabled      *bool
+	RuntimeMetricsEnabled       *bool
+	LogsInjection               *bool
+	APMTracingEnabled           *bool
+	ProfilingEnabled            string
+	DataStreamsEnabled          *bool
+	AppsecEnabled               *bool
+	IastEnabled                 *bool
+	DataJobsEnabled             *bool
+	AppsecScaEnabled            *bool
+	TracerLogsCollectionEnabled *bool
+
+	// RUM configuration
+	RumEnabled               *bool
+	RumApplicationID         string
+	RumClientToken           string
+	RumRemoteConfigurationID string
+	RumSite                  string
 }
 
 // Env contains the configuration for the installer.
 type Env struct {
-	APIKey        string
-	Site          string
-	RemoteUpdates bool
+	APIKey                string
+	Site                  string
+	RemoteUpdates         bool
+	OTelCollectorEnabled  bool
+	ProcessManagerEnabled bool
+	ConfigID              string
 
 	Mirror                      string
 	RegistryOverride            string
@@ -169,6 +212,8 @@ type Env struct {
 
 	AgentMajorVersion string
 	AgentMinorVersion string
+	AgentDistChannel  string
+	AgentPipelineID   string
 
 	MsiParams MsiParamsEnv // windows only
 
@@ -181,9 +226,36 @@ type Env struct {
 	HTTPSProxy string
 	NoProxy    string
 
+	InfrastructureMode string
+
+	AppKey              string
+	PAREnabled          bool
+	PARActionsAllowlist string
+
 	IsCentos6 bool
 
 	IsFromDaemon bool
+
+	// FIPSMode requests the FIPS-compliant flavor of any package downloaded by the
+	// installer. When true, only manifests annotated with com.datadoghq.package.flavor=fips
+	// are eligible, with no fallback to the base flavor.
+	FIPSMode bool
+}
+
+func (e *Env) HasDefaultRegistryOverride() bool {
+	return e.RegistryOverride == defaultEnv.RegistryOverride
+}
+
+func (e *Env) HasDefaultRegistryAuthOverride() bool {
+	return e.RegistryAuthOverride == defaultEnv.RegistryAuthOverride
+}
+
+func (e *Env) HasDefaultRegistryUsername() bool {
+	return e.RegistryUsername == defaultEnv.RegistryUsername
+}
+
+func (e *Env) HasDefaultRegistryPassword() bool {
+	return e.RegistryPassword == defaultEnv.RegistryPassword
 }
 
 // HTTPClient returns an HTTP client with the proxy settings from the environment.
@@ -219,9 +291,11 @@ func FromEnv() *Env {
 	}
 
 	return &Env{
-		APIKey:        getEnvOrDefault(envAPIKey, defaultEnv.APIKey),
-		Site:          getEnvOrDefault(envSite, defaultEnv.Site),
-		RemoteUpdates: strings.ToLower(os.Getenv(envRemoteUpdates)) == "true",
+		APIKey:                getEnvOrDefault(envAPIKey, defaultEnv.APIKey),
+		Site:                  getEnvOrDefault(envSite, defaultEnv.Site),
+		RemoteUpdates:         strings.ToLower(os.Getenv(envRemoteUpdates)) == "true",
+		OTelCollectorEnabled:  strings.ToLower(os.Getenv(envOTelCollectorEnabled)) == "true",
+		ProcessManagerEnabled: processManagerEnabledFromEnv(),
 
 		Mirror:                      getEnvOrDefault(envMirror, defaultEnv.Mirror),
 		RegistryOverride:            getEnvOrDefault(envRegistryURL, defaultEnv.RegistryOverride),
@@ -240,25 +314,34 @@ func FromEnv() *Env {
 
 		AgentMajorVersion: os.Getenv(envAgentMajorVersion),
 		AgentMinorVersion: os.Getenv(envAgentMinorVersion),
+		AgentDistChannel:  os.Getenv(envAgentDistChannel),
+		AgentPipelineID:   os.Getenv(envAgentPipelineID),
 
 		MsiParams: MsiParamsEnv{
 			AgentUserName:            getEnvOrDefault(envAgentUserName, os.Getenv(envAgentUserNameCompat)),
 			AgentUserPassword:        getEnvOrDefault(envAgentUserPassword, os.Getenv(envAgentUserPasswordCompat)),
 			ProjectLocation:          getEnvOrDefault(envProjectLocation, ""),
 			ApplicationDataDirectory: getEnvOrDefault(envApplicationDataDirectory, ""),
+			AgentUserKeepRights:      os.Getenv(envAgentUserKeepRights),
 		},
 
 		InstallScript: InstallScriptEnv{
-			APMInstrumentationEnabled: getEnvOrDefault(envApmInstrumentationEnabled, APMInstrumentationNotSet),
-			RuntimeMetricsEnabled:     getBoolEnv(envRuntimeMetricsEnabled),
-			LogsInjection:             getBoolEnv(envLogsInjection),
-			APMTracingEnabled:         getBoolEnv(envAPMTracingEnabled),
-			ProfilingEnabled:          getEnvOrDefault(envProfilingEnabled, ""),
-			DataStreamsEnabled:        getBoolEnv(envDataStreamsEnabled),
-			AppsecEnabled:             getBoolEnv(envAppsecEnabled),
-			IastEnabled:               getBoolEnv(envIastEnabled),
-			DataJobsEnabled:           getBoolEnv(envDataJobsEnabled),
-			AppsecScaEnabled:          getBoolEnv(envAppsecScaEnabled),
+			APMInstrumentationEnabled:   getEnvOrDefault(envApmInstrumentationEnabled, APMInstrumentationNotSet),
+			RuntimeMetricsEnabled:       getBoolEnv(envRuntimeMetricsEnabled),
+			LogsInjection:               getBoolEnv(envLogsInjection),
+			APMTracingEnabled:           getBoolEnv(envAPMTracingEnabled),
+			ProfilingEnabled:            getEnvOrDefault(envProfilingEnabled, ""),
+			DataStreamsEnabled:          getBoolEnv(envDataStreamsEnabled),
+			AppsecEnabled:               getBoolEnv(envAppsecEnabled),
+			IastEnabled:                 getBoolEnv(envIastEnabled),
+			DataJobsEnabled:             getBoolEnv(envDataJobsEnabled),
+			AppsecScaEnabled:            getBoolEnv(envAppsecScaEnabled),
+			TracerLogsCollectionEnabled: getBoolEnv(envTracerLogsCollectionEnabled),
+			RumEnabled:                  getBoolEnv(envRumEnabled),
+			RumApplicationID:            getEnvOrDefault(envRumApplicationID, ""),
+			RumClientToken:              getEnvOrDefault(envRumClientToken, ""),
+			RumRemoteConfigurationID:    getEnvOrDefault(envRumRemoteConfigurationID, ""),
+			RumSite:                     getEnvOrDefault(envRumSite, ""),
 		},
 
 		Tags: append(
@@ -271,8 +354,15 @@ func FromEnv() *Env {
 		HTTPSProxy: getProxySetting(envDDHTTPSProxy, envHTTPSProxy),
 		NoProxy:    getProxySetting(envDDNoProxy, envNoProxy),
 
+		InfrastructureMode: os.Getenv(envInfrastructureMode),
+
+		AppKey:              os.Getenv(envAppKey),
+		PAREnabled:          strings.ToLower(os.Getenv(envPAREnabled)) == "true",
+		PARActionsAllowlist: os.Getenv(envPARActionsAllowlist),
+
 		IsCentos6:    DetectCentos6(),
 		IsFromDaemon: os.Getenv(envIsFromDaemon) == "true",
+		FIPSMode:     pkgfips.BuiltForFIPS() || strings.ToLower(os.Getenv(envFIPSMode)) == "true",
 	}
 }
 
@@ -302,6 +392,11 @@ func (e *InstallScriptEnv) ToEnv(env []string) []string {
 	env = appendBoolEnv(env, envIastEnabled, e.IastEnabled)
 	env = appendBoolEnv(env, envDataJobsEnabled, e.DataJobsEnabled)
 	env = appendBoolEnv(env, envAppsecScaEnabled, e.AppsecScaEnabled)
+	env = appendBoolEnv(env, envRumEnabled, e.RumEnabled)
+	env = appendStringEnv(env, envRumApplicationID, e.RumApplicationID, "")
+	env = appendStringEnv(env, envRumClientToken, e.RumClientToken, "")
+	env = appendStringEnv(env, envRumRemoteConfigurationID, e.RumRemoteConfigurationID, "")
+	env = appendStringEnv(env, envRumSite, e.RumSite, "")
 	return env
 }
 
@@ -311,6 +406,7 @@ func (e *MsiParamsEnv) ToEnv(env []string) []string {
 	env = appendStringEnv(env, envAgentUserPassword, e.AgentUserPassword, "")
 	env = appendStringEnv(env, envProjectLocation, e.ProjectLocation, "")
 	env = appendStringEnv(env, envApplicationDataDirectory, e.ApplicationDataDirectory, "")
+	env = appendStringEnv(env, envAgentUserKeepRights, e.AgentUserKeepRights, "")
 	return env
 }
 
@@ -321,6 +417,9 @@ func (e *Env) ToEnv() []string {
 	env = appendStringEnv(env, envSite, e.Site, "")
 	if e.RemoteUpdates {
 		env = append(env, envRemoteUpdates+"=true")
+	}
+	if e.OTelCollectorEnabled {
+		env = append(env, envOTelCollectorEnabled+"=true")
 	}
 	env = appendStringEnv(env, envMirror, e.Mirror, "")
 	env = appendStringEnv(env, envRegistryURL, e.RegistryOverride, "")
@@ -348,6 +447,12 @@ func (e *Env) ToEnv() []string {
 	env = appendStringEnv(env, envHTTPProxy, e.HTTPProxy, "")
 	env = appendStringEnv(env, envHTTPSProxy, e.HTTPSProxy, "")
 	env = appendStringEnv(env, envNoProxy, e.NoProxy, "")
+	env = appendStringEnv(env, envInfrastructureMode, e.InfrastructureMode, "")
+	if e.PAREnabled {
+		env = appendStringEnv(env, envAppKey, e.AppKey, "")
+		env = append(env, envPAREnabled+"=true")
+		env = appendStringEnv(env, envPARActionsAllowlist, e.PARActionsAllowlist, "")
+	}
 	if e.IsFromDaemon {
 		env = append(env, envIsFromDaemon+"=true")
 		// This is a bit of a hack; as we should properly redirect the log level
@@ -356,6 +461,9 @@ func (e *Env) ToEnv() []string {
 		// The easiest way to do this without having to import setup/log & pkg/config
 		// is by env var.
 		env = append(env, "DD_LOG_LEVEL=off")
+	}
+	if e.FIPSMode {
+		env = append(env, envFIPSMode+"=true")
 	}
 	env = append(env, overridesByNameToEnv(envRegistryURL, e.RegistryOverrideByImage)...)
 	env = append(env, overridesByNameToEnv(envRegistryAuth, e.RegistryAuthOverrideByImage)...)
@@ -405,7 +513,7 @@ func DetectCentos6() bool {
 func parseAPMLanguagesEnv() map[ApmLibLanguage]ApmLibVersion {
 	apmLanguages := os.Getenv(envApmLanguages)
 	res := map[ApmLibLanguage]ApmLibVersion{}
-	for _, language := range strings.Split(apmLanguages, " ") {
+	for language := range strings.SplitSeq(apmLanguages, " ") {
 		if len(language) > 0 {
 			res[ApmLibLanguage(language)] = ""
 		}
@@ -421,8 +529,8 @@ func overridesByNameFromEnv[T any](envPrefix string, convert func(string) T) map
 		if len(keyVal) != 2 {
 			continue
 		}
-		if strings.HasPrefix(keyVal[0], envPrefix+"_") {
-			pkg := strings.TrimPrefix(keyVal[0], envPrefix+"_")
+		if after, ok := strings.CutPrefix(keyVal[0], envPrefix+"_"); ok {
+			pkg := after
 			pkg = strings.ToLower(pkg)
 			pkg = strings.ReplaceAll(pkg, "_", "-")
 			overridesByPackage[pkg] = convert(keyVal[1])
@@ -461,6 +569,14 @@ func getBoolEnv(env string) *bool {
 	default:
 		return nil
 	}
+}
+
+func processManagerEnabledFromEnv() bool {
+	v := strings.TrimSpace(os.Getenv(envProcessManagerEnabled))
+	if v == "" {
+		return defaultEnv.ProcessManagerEnabled
+	}
+	return !strings.EqualFold(v, "false")
 }
 
 func getProxySetting(ddEnv string, env string) string {

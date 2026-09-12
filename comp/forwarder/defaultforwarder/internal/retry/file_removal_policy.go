@@ -7,14 +7,13 @@ package retry
 
 import (
 	"crypto/md5"
-	"fmt"
+	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"time"
-
-	"github.com/hashicorp/go-multierror"
 
 	"github.com/DataDog/datadog-agent/pkg/util/filesystem"
 )
@@ -113,7 +112,7 @@ func (p *FileRemovalPolicy) getFolderPathForDomain(domainName string) (string, e
 	if _, err := io.WriteString(h, domainName); err != nil {
 		return "", err
 	}
-	folder := fmt.Sprintf("%x", h.Sum(nil))
+	folder := hex.EncodeToString(h.Sum(nil))
 
 	return path.Join(p.rootPath, folder), nil
 }
@@ -143,17 +142,17 @@ func (p *FileRemovalPolicy) removeRetryFiles(folderPath string, shouldRemove fun
 	}
 
 	var filesRemoved []string
-	var errs error
+	var errs []error
 	for _, f := range files {
 		if shouldRemove(f) {
 			if err = os.Remove(f); err != nil {
-				errs = multierror.Append(errs, err)
+				errs = append(errs, err)
 			} else {
 				filesRemoved = append(filesRemoved, f)
 			}
 		}
 	}
-	return filesRemoved, errs
+	return filesRemoved, errors.Join(errs...)
 }
 
 func (p *FileRemovalPolicy) getRetryFiles(folder string) ([]string, error) {

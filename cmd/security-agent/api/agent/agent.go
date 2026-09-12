@@ -12,19 +12,16 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/gorilla/mux"
-
 	"github.com/DataDog/datadog-agent/cmd/agent/common/signals"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
-	"github.com/DataDog/datadog-agent/comp/core/settings"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
+	settings "github.com/DataDog/datadog-agent/comp/core/settings/def"
 	"github.com/DataDog/datadog-agent/comp/core/status"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
-	apiutil "github.com/DataDog/datadog-agent/pkg/api/util"
+	"github.com/DataDog/datadog-agent/pkg/api/coverage"
 	"github.com/DataDog/datadog-agent/pkg/api/version"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/flare/securityagent"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
-	"github.com/DataDog/datadog-agent/pkg/util/hostname"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -47,24 +44,27 @@ func NewAgent(statusComponent status.Component, settings settings.Component, wme
 }
 
 // SetupHandlers adds the specific handlers for /agent endpoints
-func (a *Agent) SetupHandlers(r *mux.Router) {
-	r.HandleFunc("/version", version.Get).Methods("GET")
-	r.HandleFunc("/flare", a.makeFlare).Methods("POST")
-	r.HandleFunc("/hostname", a.getHostname).Methods("GET")
-	r.HandleFunc("/stop", a.stopAgent).Methods("POST")
-	r.HandleFunc("/status", a.getStatus).Methods("GET")
-	r.HandleFunc("/status/health", a.getHealth).Methods("GET")
-	r.HandleFunc("/config", a.settings.GetFullConfig("")).Methods("GET")
+func (a *Agent) SetupHandlers(r *http.ServeMux) {
+	r.HandleFunc("GET /version", version.Get)
+	r.HandleFunc("POST /flare", a.makeFlare)
+	r.HandleFunc("POST /stop", a.stopAgent)
+	r.HandleFunc("GET /status", a.getStatus)
+	r.HandleFunc("GET /status/health", a.getHealth)
+	r.HandleFunc("GET /config", a.settings.GetFullConfig(""))
+	r.HandleFunc("GET /config/without-defaults", a.settings.GetFullConfigWithoutDefaults(""))
 	// FIXME: this returns the entire datadog.yaml and not just security-agent.yaml config
-	r.HandleFunc("/config/by-source", a.settings.GetFullConfigBySource()).Methods("GET")
-	r.HandleFunc("/config/list-runtime", a.settings.ListConfigurable).Methods("GET")
-	r.HandleFunc("/config/{setting}", a.settings.GetValue).Methods("GET")
-	r.HandleFunc("/config/{setting}", a.settings.SetValue).Methods("POST")
-	r.HandleFunc("/workload-list", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("GET /config/by-source", a.settings.GetFullConfigBySource())
+	r.HandleFunc("GET /config/list-runtime", a.settings.ListConfigurable)
+	r.HandleFunc("GET /config/{setting}", a.settings.GetValue)
+	r.HandleFunc("POST /config/{setting}", a.settings.SetValue)
+	r.HandleFunc("GET /workload-list", func(w http.ResponseWriter, r *http.Request) {
 		verbose := r.URL.Query().Get("verbose") == "true"
 		workloadList(w, verbose, a.wmeta)
-	}).Methods("GET")
-	r.HandleFunc("/secret/refresh", a.refreshSecrets).Methods("GET")
+	})
+	r.HandleFunc("GET /secret/refresh", a.refreshSecrets)
+
+	// Special handler to compute running agent Code coverage
+	coverage.SetupCoverageHandler(r)
 }
 
 func workloadList(w http.ResponseWriter, verbose bool, wmeta workloadmeta.Component) {
@@ -85,22 +85,6 @@ func (a *Agent) stopAgent(w http.ResponseWriter, _ *http.Request) {
 	signals.Stopper <- true
 	w.Header().Set("Content-Type", "application/json")
 	j, err := json.Marshal("")
-	if err != nil {
-		log.Warnf("Failed to serialize json: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Write(j)
-}
-
-func (a *Agent) getHostname(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	hname, err := hostname.Get(r.Context())
-	if err != nil {
-		log.Warnf("Error getting hostname: %s\n", err) // or something like this
-		hname = ""
-	}
-	j, err := json.Marshal(hname)
 	if err != nil {
 		log.Warnf("Failed to serialize json: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -159,14 +143,10 @@ func (a *Agent) makeFlare(w http.ResponseWriter, _ *http.Request) {
 	w.Write([]byte(filePath))
 }
 
-func (a *Agent) refreshSecrets(w http.ResponseWriter, req *http.Request) {
-	if apiutil.Validate(w, req) != nil {
-		return
-	}
-
-	res, err := a.secrets.Refresh()
+func (a *Agent) refreshSecrets(w http.ResponseWriter, _ *http.Request) {
+	res, err := a.secrets.RefreshNow()
 	if err != nil {
-		log.Errorf("error while refresing secrets: %s", err)
+		log.Errorf("error while refreshing secrets: %s", err)
 		w.Header().Set("Content-Type", "application/json")
 		body, _ := json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(body), http.StatusInternalServerError)

@@ -12,7 +12,6 @@ import (
 	"os"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -28,7 +27,84 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/trace/writer"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
+
+	"github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace/idx"
 )
+
+// Ensure spanModifier implements both the pb and idx modifier interfaces.
+var (
+	_ agent.SpanModifier   = (*spanModifier)(nil)
+	_ agent.SpanModifierV1 = (*spanModifier)(nil)
+)
+
+func TestSpanModifierSetsOrigin(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "cloudrun"}
+
+	t.Run("sets span tag and chunk origin when empty", func(t *testing.T) {
+		span := &pb.Span{}
+		chunk := &pb.TraceChunk{Spans: []*pb.Span{span}}
+
+		sm.ModifySpan(chunk, span)
+
+		assert.Equal(t, "cloudrun", span.Meta[ddOriginTagName])
+		assert.Equal(t, "cloudrun", chunk.Origin, "chunk origin should be populated when empty")
+	})
+
+	t.Run("does not overwrite an existing span tag or chunk origin", func(t *testing.T) {
+		span := &pb.Span{Meta: map[string]string{ddOriginTagName: "existing-span"}}
+		chunk := &pb.TraceChunk{Origin: "existing-chunk", Spans: []*pb.Span{span}}
+
+		sm.ModifySpan(chunk, span)
+
+		assert.Equal(t, "existing-span", span.Meta[ddOriginTagName])
+		assert.Equal(t, "existing-chunk", chunk.Origin, "chunk origin should not be overwritten")
+	})
+
+	t.Run("tolerates a nil chunk", func(t *testing.T) {
+		span := &pb.Span{}
+		assert.NotPanics(t, func() { sm.ModifySpan(nil, span) })
+		assert.Equal(t, "cloudrun", span.Meta[ddOriginTagName])
+	})
+}
+
+func TestSpanModifierV1SetsOrigin(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "cloudrun"}
+
+	t.Run("sets span attribute and chunk origin when empty", func(t *testing.T) {
+		strings := idx.NewStringTable()
+		span := idx.NewInternalSpan(strings, &idx.Span{})
+		chunk := idx.NewInternalTraceChunk(strings, 0, "", nil, []*idx.InternalSpan{span}, false, make([]byte, 16), 0)
+
+		sm.ModifySpanV1(chunk, span)
+
+		got, ok := span.GetAttributeAsString(ddOriginTagName)
+		assert.True(t, ok)
+		assert.Equal(t, "cloudrun", got)
+		assert.Equal(t, "cloudrun", chunk.Origin(), "chunk origin should be populated when empty")
+	})
+
+	t.Run("does not overwrite an existing span attribute or chunk origin", func(t *testing.T) {
+		strings := idx.NewStringTable()
+		span := idx.NewInternalSpan(strings, &idx.Span{})
+		span.SetStringAttribute(ddOriginTagName, "existing-span")
+		chunk := idx.NewInternalTraceChunk(strings, 0, "existing-chunk", nil, []*idx.InternalSpan{span}, false, make([]byte, 16), 0)
+
+		sm.ModifySpanV1(chunk, span)
+
+		got, _ := span.GetAttributeAsString(ddOriginTagName)
+		assert.Equal(t, "existing-span", got)
+		assert.Equal(t, "existing-chunk", chunk.Origin(), "chunk origin should not be overwritten")
+	})
+
+	t.Run("tolerates a nil chunk", func(t *testing.T) {
+		strings := idx.NewStringTable()
+		span := idx.NewInternalSpan(strings, &idx.Span{})
+		assert.NotPanics(t, func() { sm.ModifySpanV1(nil, span) })
+		got, ok := span.GetAttributeAsString(ddOriginTagName)
+		assert.True(t, ok)
+		assert.Equal(t, "cloudrun", got)
+	})
+}
 
 type mockTraceWriter struct {
 	mu       sync.Mutex
@@ -52,112 +128,6 @@ func (m *mockTraceWriter) FlushSync() error {
 }
 
 func (m *mockTraceWriter) UpdateAPIKey(_, _ string) {}
-
-func TestServerlessServiceRewrite(t *testing.T) {
-	cfg := config.New()
-	cfg.GlobalTags = map[string]string{
-		"service": "myTestService",
-	}
-	cfg.Endpoints[0].APIKey = "test"
-	ctx, cancel := context.WithCancel(context.Background())
-	agnt := agent.NewAgent(ctx, cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, gzip.NewComponent())
-	agnt.SpanModifier = &spanModifier{
-		tags: cfg.GlobalTags,
-	}
-	agnt.TraceWriter = &mockTraceWriter{}
-	defer cancel()
-
-	tc := testutil.RandomTraceChunk(1, 1)
-	tc.Priority = 1 // ensure trace is never sampled out
-	tp := testutil.TracerPayloadWithChunk(tc)
-	tp.Chunks[0].Spans[0].Service = "aws.lambda"
-	agnt.Process(&api.Payload{
-		TracerPayload: tp,
-		Source:        agnt.Receiver.Stats.GetTagStats(info.Tags{}),
-	})
-	payloads := agnt.TraceWriter.(*mockTraceWriter).payloads
-	assert.NotEmpty(t, payloads, "no payloads were written")
-	span := payloads[0].TracerPayload.Chunks[0].Spans[0]
-	assert.Equal(t, "myTestService", span.Service)
-}
-
-func TestInferredSpanFunctionTagFiltering(t *testing.T) {
-	cfg := config.New()
-	cfg.GlobalTags = map[string]string{"some": "tag", "function_arn": "arn:aws:foo:bar:baz"}
-	cfg.Endpoints[0].APIKey = "test"
-	ctx, cancel := context.WithCancel(context.Background())
-	agnt := agent.NewAgent(ctx, cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, gzip.NewComponent())
-	agnt.SpanModifier = &spanModifier{
-		tags: cfg.GlobalTags,
-	}
-	agnt.TraceWriter = &mockTraceWriter{}
-	defer cancel()
-
-	tc := testutil.RandomTraceChunk(2, 1)
-	tc.Priority = 1 // ensure trace is never sampled out
-	tp := testutil.TracerPayloadWithChunk(tc)
-	tp.Chunks[0].Spans[0].Meta["_inferred_span.tag_source"] = "self"
-	tp.Chunks[0].Spans[1].Meta["_dd_origin"] = "lambda"
-	agnt.Process(&api.Payload{
-		TracerPayload: tp,
-		Source:        agnt.Receiver.Stats.GetTagStats(info.Tags{}),
-	})
-	payloads := agnt.TraceWriter.(*mockTraceWriter).payloads
-	assert.NotEmpty(t, payloads, "no payloads were written")
-	tp = payloads[0].TracerPayload
-
-	_, lambdaSpanHasGlobalTags := tp.Chunks[0].Spans[1].GetMeta()["function_arn"]
-	assert.True(t, lambdaSpanHasGlobalTags, "The regular span should get global tags")
-	_, tagOriginSelfSpanHasGlobalTags := tp.Chunks[0].Spans[0].GetMeta()["function_arn"]
-	assert.False(t, tagOriginSelfSpanHasGlobalTags, "A span with meta._inferred_span.tag_origin = self should not get global tags")
-}
-
-func TestSpanModifierAddsOriginToAllSpans(t *testing.T) {
-	cfg := config.New()
-	cfg.GlobalTags = map[string]string{"some": "tag", "_dd.origin": "lambda"}
-	cfg.Endpoints[0].APIKey = "test"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	testOriginTags := func(withModifier bool) {
-		agnt := agent.NewAgent(ctx, cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, gzip.NewComponent())
-		if withModifier {
-			agnt.SpanModifier = &spanModifier{tags: cfg.GlobalTags, ddOrigin: getDDOrigin()}
-		}
-		agnt.TraceWriter = &mockTraceWriter{}
-		tc := testutil.RandomTraceChunk(2, 1)
-		tc.Priority = 1 // ensure trace is never sampled out
-		tp := testutil.TracerPayloadWithChunk(tc)
-
-		agnt.Process(&api.Payload{
-			TracerPayload: tp,
-			Source:        agnt.Receiver.Stats.GetTagStats(info.Tags{}),
-		})
-		payloads := agnt.TraceWriter.(*mockTraceWriter).payloads
-		assert.NotEmpty(t, payloads, "no payloads were written")
-		tp = payloads[0].TracerPayload
-
-		for _, chunk := range tp.Chunks {
-			if chunk.Origin != "lambda" {
-				t.Errorf("chunk should have Origin=lambda but has %#v", chunk.Origin)
-			}
-			for _, span := range chunk.Spans {
-				tags := span.GetMeta()
-				originVal, ok := tags["_dd.origin"]
-				if withModifier != ok {
-					t.Errorf("unexpected span tags, should have _dd.origin tag %#v: tags=%#v",
-						withModifier, tags)
-				}
-				if withModifier && originVal != "lambda" {
-					t.Errorf("got the wrong origin tag value: %#v", originVal)
-				}
-			}
-		}
-	}
-
-	testOriginTags(true)
-	testOriginTags(false)
-}
 
 func TestSpanModifierDetectsCloudService(t *testing.T) {
 	cfg := config.New()
@@ -207,8 +177,7 @@ func TestSpanModifierDetectsCloudService(t *testing.T) {
 	cloudServiceToEnvVar := map[string]string{
 		"cloudrun":     cloudservice.ServiceNameEnvVar,
 		"containerapp": cloudservice.ContainerAppNameEnvVar,
-		"appservice":   cloudservice.WebsiteStack,
-		"lambda":       functionNameEnvVar}
+		"appservice":   cloudservice.WebsiteStack}
 	for origin, cloudServiceEnvVar := range cloudServiceToEnvVar {
 		// Set the appropriate environment variable to simulate a cloud service
 		t.Setenv(cloudServiceEnvVar, "myService")
@@ -219,72 +188,109 @@ func TestSpanModifierDetectsCloudService(t *testing.T) {
 	}
 }
 
-func TestLambdaSpanChan(t *testing.T) {
-	cfg := config.New()
-	cfg.GlobalTags = map[string]string{
-		"service": "myTestService",
-	}
-	cfg.Endpoints[0].APIKey = "test"
-	ctx, cancel := context.WithCancel(context.Background())
-	agnt := agent.NewAgent(ctx, cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, gzip.NewComponent())
-	lambdaSpanChan := make(chan *pb.Span)
-	agnt.SpanModifier = &spanModifier{
-		tags:           cfg.GlobalTags,
-		lambdaSpanChan: lambdaSpanChan,
-	}
-	defer cancel()
+// TestSpanModifierModifySpanBeforeSetTags verifies that ModifySpan only
+// applies the _dd.origin tag when SetTags has never been called, since
+// spanModifier.tags starts as an unset atomic.Pointer.
+func TestSpanModifierModifySpanBeforeSetTags(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "lambda"}
+	span := &pb.Span{Meta: map[string]string{}}
 
-	tc := testutil.RandomTraceChunk(1, 1)
-	tc.Priority = 1 // ensure trace is never sampled out
-	tp := testutil.TracerPayloadWithChunk(tc)
-	tp.Chunks[0].Spans[0].Service = "aws.lambda"
-	tp.Chunks[0].Spans[0].Name = "aws.lambda"
-	go agnt.Process(&api.Payload{
-		TracerPayload: tp,
-		Source:        agnt.Receiver.Stats.GetTagStats(info.Tags{}),
-	})
-	timeout := time.After(2 * time.Second)
-	var span *pb.Span
-	select {
-	case ss := <-lambdaSpanChan:
-		span = ss
-	case <-timeout:
-		t.Fatal("timed out")
-	}
-	assert.Equal(t, "myTestService", span.Service)
+	sm.ModifySpan(&pb.TraceChunk{}, span)
+
+	assert.Equal(t, "lambda", span.Meta[ddOriginTagName])
+	assert.Len(t, span.Meta, 1)
 }
 
-func TestLambdaSpanChanWithInvalidSpan(t *testing.T) {
-	cfg := config.New()
-	cfg.GlobalTags = map[string]string{
-		"service": "myTestService",
-	}
-	cfg.Endpoints[0].APIKey = "test"
-	ctx, cancel := context.WithCancel(context.Background())
-	agnt := agent.NewAgent(ctx, cfg, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, gzip.NewComponent())
-	lambdaSpanChan := make(chan *pb.Span)
-	agnt.SpanModifier = &spanModifier{
-		tags:           cfg.GlobalTags,
-		lambdaSpanChan: lambdaSpanChan,
-	}
-	defer cancel()
+// TestSpanModifierModifySpanAppliesTagsSetDynamically verifies that tags
+// applied via SetTags after construction are picked up by ModifySpan, the
+// mechanism MicroVM uses to deliver the lambda_microvm_id tag once it becomes
+// known at /run time.
+func TestSpanModifierModifySpanAppliesTagsSetDynamically(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "lambda"}
+	sm.SetTags(map[string]string{"lambda_microvm_id": "vm-123"})
 
-	tc := testutil.RandomTraceChunk(1, 1)
-	tc.Priority = 1 // ensure trace is never sampled out
-	tp := testutil.TracerPayloadWithChunk(tc)
-	tp.Chunks[0].Spans[0].Service = "aws.lambda"
-	tp.Chunks[0].Spans[0].Name = "not.aws.lambda"
-	go agnt.Process(&api.Payload{
-		TracerPayload: tp,
-		Source:        agnt.Receiver.Stats.GetTagStats(info.Tags{}),
-	})
-	timeout := time.After(time.Millisecond)
-	timedOut := false
-	select {
-	case ss := <-lambdaSpanChan:
-		t.Fatalf("received a non-lambda named span, %v", ss)
-	case <-timeout:
-		timedOut = true
-	}
-	assert.Equal(t, true, timedOut)
+	span := &pb.Span{Meta: map[string]string{}}
+	sm.ModifySpan(&pb.TraceChunk{}, span)
+
+	assert.Equal(t, "lambda", span.Meta[ddOriginTagName])
+	assert.Equal(t, "vm-123", span.Meta["lambda_microvm_id"])
+}
+
+// TestSpanModifierModifySpanV1AppliesTagsSetDynamically is the V1 (idx)
+// equivalent of TestSpanModifierModifySpanAppliesTagsSetDynamically, verifying
+// that dynamically-set runtime tags reach V1 spans as well.
+func TestSpanModifierModifySpanV1AppliesTagsSetDynamically(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "lambda"}
+	sm.SetTags(map[string]string{"lambda_microvm_id": "vm-123"})
+
+	strings := idx.NewStringTable()
+	span := idx.NewInternalSpan(strings, &idx.Span{})
+	chunk := idx.NewInternalTraceChunk(strings, 0, "", nil, []*idx.InternalSpan{span}, false, make([]byte, 16), 0)
+
+	sm.ModifySpanV1(chunk, span)
+
+	origin, ok := span.GetAttributeAsString(ddOriginTagName)
+	assert.True(t, ok)
+	assert.Equal(t, "lambda", origin)
+	microvmID, ok := span.GetAttributeAsString("lambda_microvm_id")
+	assert.True(t, ok)
+	assert.Equal(t, "vm-123", microvmID)
+}
+
+// TestSpanModifierModifySpanPreservesExistingOrigin verifies that ModifySpan
+// does not overwrite a span's existing _dd.origin when the dynamically-set
+// tags also contain _dd.origin. Every CloudService.GetTags() sets _dd.origin
+// (e.g. MicroVM sets "lambdamicrovm"), and that value flows into the tags
+// applied here via SetTags/UpdateRuntimeTags — so without this guard, every
+// span would have a tracer-supplied origin (e.g. "rum") silently replaced.
+func TestSpanModifierModifySpanPreservesExistingOrigin(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "lambda"}
+	sm.SetTags(map[string]string{ddOriginTagName: "lambdamicrovm", "lambda_microvm_id": "vm-123"})
+
+	span := &pb.Span{Meta: map[string]string{ddOriginTagName: "rum"}}
+	sm.ModifySpan(&pb.TraceChunk{}, span)
+
+	assert.Equal(t, "rum", span.Meta[ddOriginTagName], "must not overwrite a tracer-supplied origin")
+	assert.Equal(t, "vm-123", span.Meta["lambda_microvm_id"])
+}
+
+// TestSpanModifierModifySpanReflectsLatestSetTags verifies that a later
+// SetTags call replaces the tag set used by subsequent ModifySpan calls.
+func TestSpanModifierModifySpanReflectsLatestSetTags(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "lambda"}
+	sm.SetTags(map[string]string{"lambda_microvm_id": "vm-1"})
+	sm.SetTags(map[string]string{"lambda_microvm_id": "vm-2"})
+
+	span := &pb.Span{Meta: map[string]string{}}
+	sm.ModifySpan(&pb.TraceChunk{}, span)
+
+	assert.Equal(t, "vm-2", span.Meta["lambda_microvm_id"])
+}
+
+// TestSpanModifierSetTagsConcurrentWithModifySpan exercises SetTags and
+// ModifySpan concurrently under the race detector. This is a regression test
+// for the data race Codex flagged on PR #53036: MicroVM's /run hook calls
+// SetTags from a goroutine that runs concurrently with the trace agent's
+// span-processing loop, which calls ModifySpan on every span.
+func TestSpanModifierSetTagsConcurrentWithModifySpan(t *testing.T) {
+	sm := &spanModifier{ddOrigin: "lambda"}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			sm.SetTags(map[string]string{"lambda_microvm_id": "vm-1"})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			span := &pb.Span{Meta: map[string]string{}}
+			sm.ModifySpan(&pb.TraceChunk{}, span)
+		}
+	}()
+	wg.Wait()
+
+	assert.Equal(t, map[string]string{"lambda_microvm_id": "vm-1"}, *sm.tags.Load())
 }

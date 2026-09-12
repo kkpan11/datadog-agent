@@ -9,6 +9,7 @@
 package pipelineimpl
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,12 +18,12 @@ import (
 	"strings"
 
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
+	ipchttp "github.com/DataDog/datadog-agent/comp/core/ipc/httphelpers"
 	extensiontypes "github.com/DataDog/datadog-agent/comp/otelcol/ddflareextension/types"
-	apiutil "github.com/DataDog/datadog-agent/pkg/api/util"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
-func (c *collectorImpl) fillFlare(fb flaretypes.FlareBuilder) error {
+func (c *collectorImpl) fillFlare(_ context.Context, fb flaretypes.FlareBuilder) error {
 	if !c.config.GetBool("otelcollector.enabled") {
 		fb.AddFile("otel/otel-agent.log", []byte("'otelcollector.enabled' is disabled in the configuration"))
 		return nil
@@ -61,7 +62,7 @@ func (c *collectorImpl) fillFlare(fb flaretypes.FlareBuilder) error {
 		sourceURLs := src.URLs
 		for _, sourceURL := range sourceURLs {
 			if !strings.HasPrefix(sourceURL, "http://") && !strings.HasPrefix(sourceURL, "https://") {
-				sourceURL = fmt.Sprintf("http://%s", sourceURL)
+				sourceURL = "http://" + sourceURL
 			}
 
 			urll, err := url.Parse(sourceURL)
@@ -127,14 +128,7 @@ func (c *collectorImpl) requestOtelConfigInfo(endpointURL string) ([]byte, error
 		return []byte(overrideConfigResponse), nil
 	}
 
-	authToken := c.ipc.GetAuthToken()
-
-	options := apiutil.ReqOptions{
-		Ctx:       c.ctx,
-		Authtoken: authToken,
-	}
-
-	data, err := apiutil.DoGetWithOptions(c.client, endpointURL, &options)
+	data, err := c.client.Get(endpointURL, ipchttp.WithContext(c.ctx), ipchttp.WithTimeout(c.clientTimeout))
 	if err != nil {
 		return nil, err
 	}

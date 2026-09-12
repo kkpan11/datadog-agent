@@ -1,0 +1,164 @@
+From 0f647dca0d34a952004c8986a1ff62861a4e8ed4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Hugo=20Beauz=C3=A9e-Luyssen?= <hugo.beauzee@datadoghq.com>
+Date: Fri, 21 Aug 2026 08:15:30 +0200
+Subject: [PATCH 1/4] adapt to our ctng toolchain
+
+---
+ toolchain/defs.bzl              | 94 +++++----------------------------
+ toolchain/module_extensions.bzl |  1 +
+ 2 files changed, 13 insertions(+), 82 deletions(-)
+
+diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
+index f96cc79..b6b2be2 100644
+--- a/toolchain/defs.bzl
++++ b/toolchain/defs.bzl
+@@ -87,11 +87,11 @@ def _gcc_toolchain_impl(rctx):
+
+     include_prefix = None
+     if target_arch == ARCHS.aarch64:
+-        include_prefix = "aarch64-linux/"
++        include_prefix = "aarch64-linux-gnu/"
+     elif target_arch == ARCHS.armv7:
+         include_prefix = "arm-linux-gnueabihf/"
+     elif target_arch == ARCHS.x86_64:
+-        include_prefix = "x86_64-linux/"
++        include_prefix = "x86_64-linux-gnu/"
+
+     c_builtin_includes = [
+         include.format(
+@@ -104,7 +104,7 @@ def _gcc_toolchain_impl(rctx):
+         ] + ([
+             "%workspace%/{include_prefix}include",
+         ] if target_arch != ARCHS.x86_64 else []) + [
+-            "%workspace%/sysroot/usr/include",
++            "%workspace%/{include_prefix}sysroot/usr/include",
+         ]
+     ]
+
+@@ -313,88 +313,16 @@ def _fortran_vars(enable_fortran, gcc_toolchain_workspace_name, include_prefix,
+     )
+
+ AVAILABLE_GCC_VERSIONS = {
+-    "12.5.0": {
+-        "aarch64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/18082025/gcc-toolchain-12.5.0-aarch64.tar.xz",
+-            "sha256": "7b0e25133a98d44b648a925ba11f64a3adc470e87668af80ce2c3af389ebe9be",
+-        },
+-        "armv7": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/18082025/gcc-toolchain-12.5.0-armv7.tar.xz",
+-            "sha256": "a0ef76c8cc517b3d76dd2f09b1a371975b2ff1082e2f9372ed79af01b9292934",
+-        },
+-        "x86_64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/18082025/gcc-toolchain-12.5.0-x86_64.tar.xz",
+-            "sha256": "51076e175839b434bb2dc0006c0096916df585e8c44666d35b0e3ce821d535db",
+-        },
+-    },
+-    "13.4.0": {
+-        "aarch64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/18082025/gcc-toolchain-13.4.0-aarch64.tar.xz",
+-            "sha256": "770cf6bf62bdf78763de526d3a9f5cae4c19f1a3aca0ef8f18b05f1a46d1ffaf",
+-        },
+-        "armv7": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/18082025/gcc-toolchain-13.4.0-armv7.tar.xz",
+-            "sha256": "1b2739b5003c5a3f0ab7c4cc7fb95cc99c0e933982512de7255c2bd9ced757ad",
+-        },
+-        "x86_64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/18082025/gcc-toolchain-13.4.0-x86_64.tar.xz",
+-            "sha256": "d96071c1b98499afd7b7b56ebd69ad414020edf66e982004acffe7df8aaf7e02",
+-        },
+-    },
+-    "14.3.0": {
+-        "aarch64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-14.3.0-aarch64.tar.xz",
+-            "sha256": "b5a73bc840938c8dbb49e2f15b8b8d63e5c33beae0be2aa9a7c52b593522cdcd",
+-        },
+-        "armv7": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-14.3.0-armv7.tar.xz",
+-            "sha256": "376684c062a23e84b619a717fa4c7bba336211c8b48169f76eb5aa6ed4da6bb8",
+-        },
++    "11.4.0": {
+         "x86_64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-14.3.0-x86_64.tar.xz",
+-            "sha256": "d155a38e4acff9588df466f0edc98c1a2c54d09bc0162805ba38908cfd7a1d28",
++            "url": "https://dd-agent-build-artifacts.s3.amazonaws.com/toolchains/main/98b584a9d5921dfe1262878d9d7fc322288f919c6e24763401f7cf29194de9c7/x86_64/x86_64-linux-gnu-gcc.tar.xz",
++            "sha256": "3e842665eecc8ebe8ebf8e6f391809a2124c362e97f3d7dfb2df78225c719342",
+         },
+     },
+-    "15.2.0": {
++    "12.3.0": {
+         "aarch64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-15.2.0-aarch64.tar.xz",
+-            "sha256": "f38696590786e7c99d3bb5b8ce9ed66be6224d505fa45dcae0b2a6ec07eb0570",
+-        },
+-        "armv7": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-15.2.0-armv7.tar.xz",
+-            "sha256": "8ecb5b35aa25efe78772701c70ed27eda727264303d03cffc372a6f24f18be90",
+-        },
+-        "x86_64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-15.2.0-x86_64.tar.xz",
+-            "sha256": "f31edf791877935258dcc864afbfb7c9f9238be9f7d9da0ee57f5bc121074457",
+-        },
+-    },
+-    "16.1.0": {
+-        "aarch64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-16.1.0-aarch64.tar.xz",
+-            "sha256": "4331e513156a699c1015fb94021497306f0a896520efbad8b3e16418eb683468",
+-        },
+-        "armv7": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-16.1.0-armv7.tar.xz",
+-            "sha256": "8d42c1fd130ccb170fe8d5d17148ae2d3f97134ac0009fdcac87550fec6a6289",
+-        },
+-        "x86_64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/08072026/gcc-toolchain-16.1.0-x86_64.tar.xz",
+-            "sha256": "cfd8ca5bc365c1c838825ed6e44c7b2c309aada25791f76ef73b1aec819e362e",
+-        },
+-    },
+-    "16.2.0": {
+-        "aarch64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/10082026/gcc-toolchain-16.2.0-aarch64.tar.xz",
+-            "sha256": "6407b35116f21c59e98ab5ad68ddd8ff5f3e0469723a5d465ec08ed615b11a55",
+-        },
+-        "armv7": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/10082026/gcc-toolchain-16.2.0-armv7.tar.xz",
+-            "sha256": "515da8a22fa560002d3d149ad701acb725502c70f7bf8d4905f90b0830d38238",
+-        },
+-        "x86_64": {
+-            "url": "https://github.com/f0rmiga/gcc-builds/releases/download/10082026/gcc-toolchain-16.2.0-x86_64.tar.xz",
+-            "sha256": "54af34c821e59b03ded8f82d3a1104426ec4baaf3b226233e1fd76ad5dcb78cf",
++            "url": "https://dd-agent-build-artifacts.s3.amazonaws.com/toolchains/main/3857f6dd078bb69ceb53e37536fa0e90eb7f3c2eefa1454f5f43376f02d8c9cc/aarch64/aarch64-linux-gnu-gcc.tar.xz",
++            "sha256": "26b924f31f21c2d84a3f78954d295ff6eaeaa758dca39cb3c25178c2cfd00692",
+         },
+     },
+ }
+@@ -640,6 +568,7 @@ ATTRS_SHARED_WITH_MODULE_EXTENSION = {
+         "extra_ldflags",
+         "extra_fflags",
+         "extra_asmflags",
++        "binary_prefix",
+         "extra_target_compatible_with",
+         "supports_param_files",
+     ]
+@@ -1015,7 +944,8 @@ filegroup(
+         "lib/gcc/{include_prefix}*/include/**",
+         "lib/gcc/{include_prefix}*/include-fixed/**",
+         "{include_prefix}include/**",
+-        "sysroot/usr/include/**",
++        "{include_prefix}sysroot/usr/include/**",
++        "{include_prefix}sysroot/usr/include/linux/**",
+
+         # C++ includes
+         "{include_prefix}include/c++/*/**",
+diff --git a/toolchain/module_extensions.bzl b/toolchain/module_extensions.bzl
+index efe9f27..a940de7 100644
+--- a/toolchain/module_extensions.bzl
++++ b/toolchain/module_extensions.bzl
+@@ -15,6 +15,7 @@ def _gcc_register_toolchain_module_extension(mctx):
+                 target_arch = declare.target_arch,
+                 gcc_version = declare.gcc_version,
+                 gcc_versions = declare.gcc_versions,
++                binary_prefix = declare.binary_prefix,
+                 enable_fortran = declare.enable_fortran,
+                 extra_cflags = declare.extra_cflags,
+                 extra_cxxflags = declare.extra_cxxflags,
+--
+2.52.0

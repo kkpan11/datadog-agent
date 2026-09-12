@@ -4,6 +4,7 @@
 # Copyright 2016-present Datadog, Inc.
 require "./lib/ostools.rb"
 require "./lib/project_helpers.rb"
+require "./lib/omnibus/packagers/tarball.rb"
 flavor = ENV['AGENT_FLAVOR']
 output_config_dir = ENV["OUTPUT_CONFIG_DIR"]
 
@@ -27,9 +28,8 @@ else
   COMPRESSION_THREADS = 1
 end
 
-# We want an higher compression level on deploy pipelines that are not nightly.
-# Nightly pipelines will be used as main reference for static quality gates and need the same compression level as main.
-if ENV.has_key?("DEPLOY_AGENT") && ENV["DEPLOY_AGENT"] == "true" && ENV.has_key?("BUCKET_BRANCH") && ENV['BUCKET_BRANCH'] != "nightly"
+# We want an higher compression level on deploy pipelines.
+if ENV.has_key?("DEPLOY_AGENT") && ENV["DEPLOY_AGENT"] == "true"
   COMPRESSION_LEVEL = 9
 else
   COMPRESSION_LEVEL = 5
@@ -42,18 +42,10 @@ if ENV.has_key?("OMNIBUS_GIT_CACHE_DIR") && !BUILD_OCIRU
   Omnibus::Config.git_cache_dir ENV["OMNIBUS_GIT_CACHE_DIR"]
 end
 
-if windows_target?
-  if ot_target?
-    raise UnknownPlatform
-  end
+INSTALL_DIR = ENV["INSTALL_DIR"] || raise('INSTALL_DIR must be set in tasks/omnibus.py')
 
-  # Note: this is the path used by Omnibus to build the agent, the final install
-  # dir will be determined by the Windows installer. This path must not contain
-  # spaces because Omnibus doesn't quote the Git commands it launches.
-  INSTALL_DIR = 'C:/opt/datadog-agent/'
+if windows_target?
   PYTHON_3_EMBEDDED_DIR = format('%s/embedded3', INSTALL_DIR)
-else
-  INSTALL_DIR = ENV["INSTALL_DIR"] || '/opt/datadog-agent'
 end
 
 install_dir INSTALL_DIR
@@ -93,10 +85,8 @@ else
   end
 
   if osx_target?
-    unless ENV['SKIP_SIGN_MAC'] == 'true'
+    if ENV['SIGN_MAC'] == 'true'
       code_signing_identity 'Developer ID Application: Datadog, Inc. (JKFCB4CN7C)'
-    end
-    if ENV['HARDENED_RUNTIME_MAC'] == 'true'
       entitlements_file "#{files_path}/macos/Entitlements.plist"
     end
   else
@@ -188,7 +178,7 @@ package :pkg do
   identifier 'com.datadoghq.agent'
   # This defines where the package will be installed in the target system
   install_location "/opt/datadog-agent"
-  unless ENV['SKIP_SIGN_MAC'] == 'true'
+  if ENV['SIGN_MAC'] == 'true'
     signing_identity 'Developer ID Installer: Datadog, Inc. (JKFCB4CN7C)'
   end
 end
@@ -200,15 +190,10 @@ end
 
 # Windows .zip specific flags
 package :zip do
-  if windows_arch_i386?
-    skip_packager true
-  else
-    # noinspection RubyLiteralArrayInspection
-    extra_package_dirs [
-      "#{Omnibus::Config.source_dir()}\\etc\\datadog-agent\\extra_package_files",
-      "#{Omnibus::Config.source_dir()}\\cf-root"
-    ]
-  end
+  # noinspection RubyLiteralArrayInspection
+  extra_package_dirs [
+    "#{Omnibus::Config.source_dir()}\\cf-root"
+  ]
 end
 
 package :msi do
@@ -216,9 +201,14 @@ package :msi do
 end
 
 package :xz do
-  skip_packager (!do_build && !BUILD_OCIRU) || heroku_target?
+  skip_packager (!do_build && !BUILD_OCIRU) || heroku_target? || (ENV["SKIP_PKG_COMPRESSION"] == "true")
   compression_threads COMPRESSION_THREADS
   compression_level COMPRESSION_LEVEL
+end
+
+# Uncompressed tar for faster local builds (skip the slow XZ compression)
+package :tarball do
+  skip_packager !(ENV["SKIP_PKG_COMPRESSION"] == "true")
 end
 
 # ------------------------------------
@@ -229,19 +219,6 @@ if do_build
   # Datadog agent
   dependency 'datadog-agent'
 
-  # This depends on the agent and must be added after it
-  if ENV['WINDOWS_DDPROCMON_DRIVER'] and not ENV['WINDOWS_DDPROCMON_DRIVER'].empty?
-    dependency 'datadog-security-agent-policies'
-  end
-
-  if osx_target?
-    dependency 'datadog-agent-mac-app'
-  end
-
-  if linux_target?
-    dependency 'datadog-security-agent-policies'
-  end
-
   # this dependency puts few files out of the omnibus install dir and move them
   # in the final destination. This way such files will be listed in the packages
   # manifest and owned by the package manager. This is the only point in the build
@@ -249,19 +226,19 @@ if do_build
   # the `extra_package_file` directive.
   # This must be the last dependency in the project.
   dependency 'datadog-agent-finalize'
-  dependency 'datadog-cf-finalize'
   # Special csae for heroku which does build & packaging in a single step
   if do_package
     dependency "init-scripts-agent"
   end
 elsif do_package
+  dependency "init-scripts-agent"
+  dependency 'datadog-agent-installer-symlinks'
   if do_repackage?
     dependency "existing-agent-package"
     dependency "datadog-agent"
   else
     dependency "package-artifact"
   end
-  dependency "init-scripts-agent"
 end
 
 # version manifest is based on the built softwares.
@@ -277,14 +254,11 @@ if linux_target?
   extra_package_file "#{output_config_dir}/etc/datadog-agent/"
   extra_package_file '/usr/bin/dd-agent'
   extra_package_file '/var/log/datadog/'
+  extra_package_file "#{install_dir}/.install_root"
 end
 
 # all flavors use the same package scripts
 if linux_target?
-  if do_build && !do_package
-    extra_package_file "#{Omnibus::Config.project_root}/package-scripts/agent-deb"
-    extra_package_file "#{Omnibus::Config.project_root}/package-scripts/agent-rpm"
-  end
   if do_package
     if debian_target?
       package_scripts_path "#{Omnibus::Config.project_root}/package-scripts/agent-deb"
@@ -300,6 +274,9 @@ resources_path "#{Omnibus::Config.project_root}/resources/agent"
 
 exclude '\.git*'
 exclude 'bundler\/git'
+
+# Exclude headers that are not needed in the final package
+exclude "embedded/include/systemd"
 
 if windows_target?
   FORBIDDEN_SYMBOLS = [
@@ -319,9 +296,17 @@ if windows_target?
     "#{install_dir}\\bin\\agent\\agent.exe",
     "#{install_dir}\\bin\\agent\\trace-agent.exe",
     "#{install_dir}\\bin\\agent\\process-agent.exe",
-    "#{install_dir}\\bin\\agent\\system-probe.exe"
+    "#{install_dir}\\bin\\agent\\system-probe.exe",
+    "#{install_dir}\\bin\\agent\\secret-generic-connector.exe",
+    "#{install_dir}\\datadog-installer.exe"
   ]
-  if not windows_arch_i386? and ENV['WINDOWS_DDPROCMON_DRIVER'] and not ENV['WINDOWS_DDPROCMON_DRIVER'].empty?
+
+  if not fips_mode?
+    # TODO(ACTP-XXX): PAR is not enabled in Gov yet
+    GO_BINARIES << "#{install_dir}\\bin\\agent\\privateactionrunner.exe"
+  end
+
+  if ENV['WINDOWS_DDPROCMON_DRIVER'] and not ENV['WINDOWS_DDPROCMON_DRIVER'].empty?
     GO_BINARIES << "#{install_dir}\\bin\\agent\\security-agent.exe"
   end
 
@@ -345,8 +330,19 @@ if windows_target?
     windows_symbol_stripping_file bin
   end
 
-  # We need to strip the debug symbols from the rtloader files
+  # We need to strip the debug symbols from the rtloader files and from the compile policy binary
   windows_symbol_stripping_file "#{install_dir}\\bin\\agent\\libdatadog-agent-three.dll"
+  windows_symbol_stripping_file "#{install_dir}\\bin\\agent\\dd-compile-policy.exe"
+
+  # Rust binaries (not in GO_BINARIES — no Go symbol inspection needed)
+  windows_symbol_stripping_file "#{install_dir}\\bin\\agent\\dd-procmgrd.exe"
+  windows_symbol_stripping_file "#{install_dir}\\bin\\agent\\dd-procmgr.exe"
+  windows_symbol_stripping_file "#{install_dir}\\bin\\agent\\agent-data-plane.exe"
+
+  if not fips_mode?
+    # TODO(ACTP-XXX): PAR is not enabled in Gov yet
+    windows_symbol_stripping_file "#{install_dir}\\bin\\agent\\par-control.exe"
+  end
 
   if windows_signing_enabled?
     # Sign additional binaries from here.
@@ -358,7 +354,7 @@ if windows_target?
       "#{python_3_embedded}\\python.exe",
       "#{python_3_embedded}\\pythonw.exe",
       "#{python_3_embedded}\\python3.dll",
-      "#{python_3_embedded}\\python312.dll",
+      "#{python_3_embedded}\\python313.dll",
     ]
     OPENSSL_BINARIES = [
       "#{python_3_embedded}\\DLLs\\libcrypto-3-x64.dll",
@@ -369,8 +365,12 @@ if windows_target?
 
     BINARIES_TO_SIGN = GO_BINARIES + PYTHON_BINARIES + OPENSSL_BINARIES + [
       "#{install_dir}\\bin\\agent\\ddtray.exe",
-      "#{install_dir}\\bin\\agent\\libdatadog-agent-three.dll"
-    ]
+      "#{install_dir}\\bin\\agent\\libdatadog-agent-three.dll",
+      "#{install_dir}\\bin\\agent\\dd-compile-policy.exe",
+      "#{install_dir}\\bin\\agent\\dd-procmgrd.exe",
+      "#{install_dir}\\bin\\agent\\dd-procmgr.exe",
+      "#{install_dir}\\bin\\agent\\agent-data-plane.exe",
+    ] + (fips_mode? ? [] : ["#{install_dir}\\bin\\agent\\par-control.exe"])
 
     BINARIES_TO_SIGN.each do |bin|
       sign_file bin
@@ -385,4 +385,10 @@ if linux_target? or windows_target?
   # in the debug package.
   strip_build windows_target? || do_build
   debug_path ".debug"  # the strip symbols will be in here
+end
+
+if linux_target?
+  # Strip runs before packaging, so restore final perms after strip.
+  chmod_before_packaging "#{install_dir}/embedded/bin/dd-compile-policy", 0555
+  chmod_before_packaging "#{install_dir}/embedded/bin/secret-generic-connector", 0500
 end

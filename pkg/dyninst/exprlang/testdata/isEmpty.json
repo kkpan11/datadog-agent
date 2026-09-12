@@ -1,0 +1,11 @@
+{
+  "type": "isEmpty",
+  "operation": "",
+  "left": {
+    "type": "ref",
+    "ref": "empty_str",
+    "operation": "",
+    "error": ""
+  },
+  "error": ""
+}

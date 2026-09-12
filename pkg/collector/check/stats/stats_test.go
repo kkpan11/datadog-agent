@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/datadog-agent/comp/core/telemetry/telemetryimpl"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
+	haagentmock "github.com/DataDog/datadog-agent/comp/haagent/mock"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
 )
@@ -31,6 +33,7 @@ type mockCheck struct {
 
 // Mock Check interface implementation
 func (mc *mockCheck) ConfigSource() string    { return mc.cfgSource }
+func (mc *mockCheck) ConfigProvider() string  { return "" }
 func (mc *mockCheck) Loader() string          { return mc.loaderName }
 func (mc *mockCheck) ID() checkid.ID          { return mc.id }
 func (mc *mockCheck) String() string          { return mc.stringVal }
@@ -89,14 +92,12 @@ func TestNewStats(t *testing.T) {
 
 func TestNewStatsStateTelemetryInitialized(t *testing.T) {
 	mockConfig := configmock.New(t)
-	mockConfig.SetWithoutSource("telemetry.checks", "*")
+	mockConfig.SetInTest("telemetry.checks", []string{"*"})
 
 	NewStats(newMockCheck())
 
 	tlmData, err := getTelemetryData()
-	if !assert.NoError(t, err) {
-		return
-	}
+	require.NoError(t, err)
 
 	assert.Contains(
 		t,
@@ -110,32 +111,68 @@ func TestNewStatsStateTelemetryInitialized(t *testing.T) {
 	)
 }
 
+func TestFirstExecutionTimeMetric(t *testing.T) {
+	mockConfig := configmock.New(t)
+	mockConfig.SetInTest("telemetry.checks", []string{"*"})
+
+	stats := NewStats(newMockCheck())
+	haagent := haagentmock.NewMockHaAgent()
+
+	stats.Add(100*time.Millisecond, nil, []error{}, SenderStats{}, haagent)
+
+	tlmData, err := getTelemetryData()
+	require.NoError(t, err)
+	// first run goes only to checks.first_execution_time
+	assert.Contains(t, tlmData,
+		`checks__first_execution_time{check_loader="mockLoader",check_name="checkString"} 100`,
+	)
+	assert.NotContains(t, tlmData, `checks__execution_time{check_loader="mockLoader",check_name="checkString"}`)
+
+	stats.Add(50*time.Millisecond, nil, []error{}, SenderStats{}, haagent)
+
+	tlmData, err = getTelemetryData()
+	require.NoError(t, err)
+	// subsequent runs go only to checks.execution_time, first_execution_time stays frozen
+	assert.Contains(t, tlmData,
+		`checks__execution_time{check_loader="mockLoader",check_name="checkString"} 50`,
+	)
+	assert.Contains(t, tlmData,
+		`checks__first_execution_time{check_loader="mockLoader",check_name="checkString"} 100`,
+	)
+}
+
 func TestTranslateEventPlatformEventTypes(t *testing.T) {
 	original := map[string]interface{}{
 		"EventPlatformEvents": map[string]interface{}{
 			"dbm-samples":  12,
+			"genresources": 56,
 			"unknown-type": 34,
 		},
 		"EventPlatformEventsErrors": map[string]interface{}{
 			"dbm-samples":  12,
+			"genresources": 56,
 			"unknown-type": 34,
 		},
 		"SomeOtherKey": map[string]interface{}{
 			"dbm-samples":  12,
+			"genresources": 56,
 			"unknown-type": 34,
 		},
 	}
 	expected := map[string]interface{}{
 		"EventPlatformEvents": map[string]interface{}{
 			"Database Monitoring Query Samples": 12,
+			"Generic Resources":                 56,
 			"unknown-type":                      34,
 		},
 		"EventPlatformEventsErrors": map[string]interface{}{
 			"Database Monitoring Query Samples": 12,
+			"Generic Resources":                 56,
 			"unknown-type":                      34,
 		},
 		"SomeOtherKey": map[string]interface{}{
 			"dbm-samples":  12,
+			"genresources": 56,
 			"unknown-type": 34,
 		},
 	}
@@ -143,4 +180,25 @@ func TestTranslateEventPlatformEventTypes(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, assert.ObjectsAreEqual(expected, result))
 	assert.EqualValues(t, expected, result)
+}
+
+// TestStatsCloneConcurrent reproduces the scenario that raced in production: something
+// reading a *Stats (e.g. via GetCheckStats()) while Add()/SetStateCancelling() run
+// concurrently on the same instance. Run with -race.
+func TestStatsCloneConcurrent(_ *testing.T) {
+	stats := NewStats(newMockCheck())
+	haagent := haagentmock.NewMockHaAgent()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			stats.Add(time.Millisecond, nil, []error{}, SenderStats{}, haagent)
+			stats.SetStateCancelling()
+		}
+	}()
+	for range 1000 {
+		stats.Clone()
+	}
+	<-done
 }

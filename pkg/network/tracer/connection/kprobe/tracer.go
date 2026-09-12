@@ -3,13 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package kprobe
 
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	manager "github.com/DataDog/ebpf-manager"
 	"github.com/cilium/ebpf"
@@ -23,6 +24,7 @@ import (
 	netebpf "github.com/DataDog/datadog-agent/pkg/network/ebpf"
 	"github.com/DataDog/datadog-agent/pkg/network/ebpf/probes"
 	"github.com/DataDog/datadog-agent/pkg/network/filter"
+	ssluprobes "github.com/DataDog/datadog-agent/pkg/network/tracer/connection/ssl-uprobes"
 	"github.com/DataDog/datadog-agent/pkg/network/tracer/connection/util"
 	"github.com/DataDog/datadog-agent/pkg/network/tracer/offsetguess"
 	"github.com/DataDog/datadog-agent/pkg/util/kernel"
@@ -105,7 +107,7 @@ func LoadTracer(cfg *config.Config, mgrOpts manager.Options, connCloseEventHandl
 
 	mgrOpts.DefaultKprobeAttachMethod = kprobeAttachMethod
 
-	if cfg.EnableCORE {
+	if cfg.EnableCORETracer {
 		err := isCORETracerSupported()
 		if err != nil && !errors.Is(err, errCORETracerNotSupported) {
 			return nil, nil, TracerTypeCORE, fmt.Errorf("error determining if CO-RE tracer is supported: %w", err)
@@ -134,7 +136,7 @@ func LoadTracer(cfg *config.Config, mgrOpts manager.Options, connCloseEventHandl
 		}
 	}
 
-	if cfg.EnableRuntimeCompiler && (!cfg.EnableCORE || cfg.AllowRuntimeCompiledFallback) {
+	if cfg.EnableRuntimeCompiler && (!cfg.EnableCORETracer || cfg.AllowRuntimeCompiledFallback) {
 		m, closeFn, err := rcTracerLoader(cfg, mgrOpts, connCloseEventHandler)
 		if err == nil {
 			return m, closeFn, TracerTypeRuntimeCompiled, err
@@ -174,7 +176,7 @@ func loadTracerFromAsset(buf bytecode.AssetReader, runtimeTracer, coreTracer boo
 	var tailCallsIdentifiersSet map[manager.ProbeIdentificationPair]struct{}
 
 	if classificationSupported {
-		pcTailCalls := protocolClassificationTailCalls(config)
+		pcTailCalls := protocolClassificationTailCalls()
 		tailCallsIdentifiersSet = make(map[manager.ProbeIdentificationPair]struct{}, len(pcTailCalls))
 		for _, tailCall := range pcTailCalls {
 			tailCallsIdentifiersSet[tailCall.ProbeIdentificationPair] = struct{}{}
@@ -219,19 +221,23 @@ func loadTracerFromAsset(buf bytecode.AssetReader, runtimeTracer, coreTracer boo
 
 	// exclude all non-enabled probes to ensure we don't run into problems with unsupported probe types
 	for _, p := range m.Probes {
-		if _, enabled := enabledProbes[p.EBPFFuncName]; !enabled {
+		if _, enabled := enabledProbes[p.ProbeIdentificationPair]; !enabled {
+			// OpenSSLProbes will get used later by the uprobe attacher
+			if config.EnableCertCollection && slices.Contains(ssluprobes.OpenSSLUProbes, p.EBPFFuncName) {
+				continue
+			}
 			mgrOpts.ExcludedFunctions = append(mgrOpts.ExcludedFunctions, p.EBPFFuncName)
 		}
 	}
 
-	_, udpSendPageEnabled := enabledProbes[probes.UDPSendPage]
+	udpSendPageIdentifier := manager.ProbeIdentificationPair{
+		EBPFFuncName: probes.UDPSendPage,
+		UID:          probeUID,
+	}
+	_, udpSendPageEnabled := enabledProbes[udpSendPageIdentifier]
 	util.AddBoolConst(&mgrOpts, "udp_send_page_enabled", udpSendPageEnabled)
 
-	for funcName := range enabledProbes {
-		probeIdentifier := manager.ProbeIdentificationPair{
-			EBPFFuncName: funcName,
-			UID:          probeUID,
-		}
+	for probeIdentifier := range enabledProbes {
 		if _, ok := tailCallsIdentifiersSet[probeIdentifier]; ok {
 			// tail calls should be enabled (a.k.a. not excluded) but not activated.
 			continue

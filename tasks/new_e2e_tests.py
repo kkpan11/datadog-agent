@@ -4,14 +4,21 @@ Running E2E Tests with infra based on Pulumi
 
 from __future__ import annotations
 
+import datetime
 import json
 import multiprocessing
 import os
 import os.path
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -19,21 +26,103 @@ from invoke.context import Context
 from invoke.exceptions import Exit
 from invoke.tasks import task
 
+from tasks.e2e_framework import tool
+from tasks.e2e_framework.deploy import get_pipeline_commit_sha
 from tasks.flavor import AgentFlavor
 from tasks.gotest import process_test_result, test_flavor
+from tasks.libs.ciproviders.gitlab_api import get_gitlab_repo
 from tasks.libs.common.color import Color
-from tasks.libs.common.git import get_commit_sha
+from tasks.libs.common.git import get_commit_sha, get_current_branch, get_modified_files
 from tasks.libs.common.go import download_go_dependencies
 from tasks.libs.common.gomodules import get_default_modules
 from tasks.libs.common.utils import (
     REPO_PATH,
     color_message,
+    environ,
     gitlab_section,
     running_in_ci,
 )
+from tasks.libs.dynamic_test.backend import S3Backend
+from tasks.libs.dynamic_test.executor import DynTestExecutor
+from tasks.libs.dynamic_test.index import IndexKind
+from tasks.libs.releasing.json import load_release_json
+from tasks.libs.releasing.version import get_version
+from tasks.libs.testing.e2e import create_test_selection_gotest_regex, filter_only_leaf_tests
+from tasks.libs.testing.result_json import ActionType, ResultJson
+from tasks.schema.generate import schema_codegen
 from tasks.test_core import DEFAULT_E2E_TEST_OUTPUT_JSON
 from tasks.testwasher import TestWasher
-from tasks.tools.e2e_stacks import destroy_remote_stack
+from tasks.tools.e2e_stacks import destroy_remote_stack_api, destroy_remote_stack_local
+
+DEFAULT_DYNTEST_BUCKET_URI = "s3://dd-ci-persistent-artefacts-build-stable/datadog-agent"
+
+
+def _load_e2e_local_config():
+    """
+    Load ~/.test_infra_config.yaml. Returns the Config or None if absent / invalid.
+    Imported lazily so we don't pay the pydantic cost on unrelated invoke tasks.
+    """
+    try:
+        from tasks.e2e_framework import config as e2e_config
+
+        return e2e_config.get_local_config()
+    except Exception:
+        return None
+
+
+def _check_e2e_local_config_or_exit(
+    profile: str | None = None,
+    with_azure: bool = False,
+    with_gcp: bool = False,
+):
+    """
+    Pre-flight check for `dda inv new-e2e-tests.run` on a developer machine.
+
+    Fails fast with a single actionable line if ~/.test_infra_config.yaml is missing
+    or doesn't contain the fields the runner relies on. Skipped in CI (where config
+    comes from AWS SSM via the CI profile).
+
+    Prints a warning when Azure or GCP are not configured, because the test target
+    is not known until the test actually runs. Pass --with-azure / --with-gcp to
+    turn those warnings into hard errors.
+    """
+    if running_in_ci() or os.environ.get("E2E_PROFILE") == "ci" or profile == "ci":
+        return
+    cfg = _load_e2e_local_config()
+    aws = cfg.get_aws() if cfg is not None else None
+    if cfg is None or aws is None or not aws.keyPairName:
+        raise Exit(
+            "Local E2E config is missing or incomplete. "
+            "Run `dda inv e2e.setup` once to configure (~30s, opens an SSO browser flow).",
+            1,
+        )
+
+    # Keep ~/.aws/config in sync: add the SSO profile if it's missing (e.g. after a role
+    # rename like account-admin -> account-admin-8h). No-op if already present.
+    from tasks.e2e_framework.setup.aws import setup_aws_sso_config
+
+    setup_aws_sso_config(cfg, interactive=False)
+
+    azure_missing = cfg is None or cfg.configParams.azure is None
+    gcp_missing = cfg is None or cfg.configParams.gcp is None
+    if azure_missing:
+        msg = (
+            "Azure is not configured in ~/.test_infra_config.yaml. "
+            "Tests targeting Azure will fail. "
+            "Run `dda inv e2e.setup --with-azure` to configure it."
+        )
+        if with_azure:
+            raise Exit(msg, 1)
+        print(color_message(f"Warning: {msg}", "yellow"))
+    if gcp_missing:
+        msg = (
+            "GCP is not configured in ~/.test_infra_config.yaml. "
+            "Tests targeting GCP will fail. "
+            "Run `dda inv e2e.setup --with-gcp` to configure it."
+        )
+        if with_gcp:
+            raise Exit(msg, 1)
+        print(color_message(f"Warning: {msg}", "yellow"))
 
 
 class TestState:
@@ -49,18 +138,479 @@ class TestState:
         return f'{"Failing" if failing else "Successful"} / {"Flaky" if flaky else "Non-flaky"}'
 
 
+@contextmanager
+def _shared_orchestrion_jobserver():
+    """
+    Start a single `orchestrion server` and point `ORCHESTRION_JOBSERVER_URL` at it, so every `orchestrion go test -c`
+    invocation started underneath this context shares its package-resolution cache instead of each starting its own:
+    orchestrion only auto-shares a job server across invocations that reuse the same `go build` $WORK directory, which
+    independent top-level `orchestrion go test -c` processes never do.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        log_file = os.path.join(tmp_dir, "server.log")
+        url_file = os.path.join(tmp_dir, "server.url")
+        with open(log_file, "wb") as log:
+            server = subprocess.Popen(
+                ["orchestrion", "server", f"-url-file={url_file}", "-inactivity-timeout=15m"],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        try:
+            timeout = datetime.timedelta(seconds=10)
+            deadline = time.monotonic() + timeout.total_seconds()
+            url = ""
+            while time.monotonic() < deadline:
+                if os.path.exists(url_file):
+                    url = Path(url_file).read_text().strip()
+                    if url:
+                        break
+                try:
+                    server.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    continue
+                raise Exit(
+                    f"orchestrion server exited early with code {server.returncode}:\n{Path(log_file).read_text()}"
+                )
+            if not url:
+                raise Exit(
+                    f"orchestrion server did not report readiness within {timeout}:\n{Path(log_file).read_text()}"
+                )
+
+            with environ({"ORCHESTRION_JOBSERVER_URL": url}):
+                yield
+        finally:
+            # Orchestrion watches the url file and shuts itself down once it disappears.
+            if os.path.exists(url_file):
+                os.remove(url_file)
+            for escalate in lambda: None, server.terminate, server.kill:
+                escalate()
+                try:
+                    server.communicate(timeout=timeout.total_seconds())
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+def _build_single_binary(ctx, pkg, build_tags, output_path, print_lock):
+    """
+    Build a single test binary for the given package.
+    Returns (pkg, success, message) tuple.
+    """
+    try:
+        # Create binary name from package path
+        binary_name = pkg.replace("/", "-").replace("\\", "-") + ".test"
+        binary_path = output_path / binary_name
+
+        # Build test binary
+        cmd = f"orchestrion go test -c -tags '{build_tags}' -ldflags='-w -s -X {REPO_PATH}/test/new-e2e/tests/containers.GitCommit={get_commit_sha(ctx, short=True)}' -o {binary_path} ./{pkg}"
+
+        result = ctx.run(cmd, hide=True)
+        if result.ok:
+            with print_lock:
+                print(f"  ✓ Built {binary_name}")
+            return (pkg, True, f"Built {binary_name}")
+        else:
+            with print_lock:
+                print(f"  ✗ Failed to build {binary_name}: {result.stderr}")
+            return (pkg, False, f"Failed to build {binary_name}: {result.stderr}")
+
+    except Exception as e:
+        with print_lock:
+            print(f"  ✗ Error building {binary_name}: {e}")
+        return (pkg, False, f"Error building {binary_name}: {e}")
+
+
+@task(
+    help={
+        "output_dir": "Directory to store compiled test binaries",
+        "tags": "Build tags to use",
+        "parallel": "Number of parallel builds [default: number of CPUs]",
+    },
+)
+def build_binaries(
+    ctx,
+    output_dir="test-binaries",
+    manifest_file_path="manifest.json",
+    tags=[],  # noqa: B006
+    parallel=0,
+):
+    """
+    Build E2E test binaries for all test packages to be reused across test jobs.
+    This pre-builds all test binaries to optimize CI pipeline performance.
+    """
+    if "test" not in tags:
+        tags = tags + ["test"]
+
+    if parallel == 0:
+        parallel = multiprocessing.cpu_count()
+
+    print(f"Building test binaries using {parallel} parallel workers")
+
+    # TODO: remove once Bazel is used to build the Agent
+    schema_codegen(ctx)
+
+    e2e_test_dir = Path("test/new-e2e/tests")
+    output_path = Path(output_dir).absolute()
+
+    # Create output directory
+    output_path.mkdir(exist_ok=True, parents=True)
+
+    # Find all test packages
+    test_packages = []
+    for root, _, files in os.walk(e2e_test_dir):
+        # Check if directory contains Go test files
+        has_go_tests = any(f.endswith("_test.go") for f in files)
+        if has_go_tests:
+            # Convert to Go package path
+            pkg_path = os.path.relpath(root, "./test/new-e2e")
+            test_packages.append(pkg_path)
+
+    if not test_packages:
+        print("No test packages found")
+        return
+
+    print(f"Found {len(test_packages)} test packages to build")
+
+    # Build tags
+    build_tags = ",".join(tags) if tags else "test"
+
+    # Build test binaries in parallel
+    print_lock = threading.Lock()
+    success_count = 0
+    failure_count = 0
+    built_packages = []  # Track successfully built packages with their info
+    with ctx.cd("test/new-e2e"), _shared_orchestrion_jobserver():
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            # Submit all build jobs
+            futures = {
+                executor.submit(_build_single_binary, ctx, pkg, build_tags, output_path, print_lock): pkg
+                for pkg in test_packages
+            }
+
+            # Process completed builds
+            for i, future in enumerate(as_completed(futures), 1):
+                pkg = futures[future]
+                try:
+                    pkg_result, success, message = future.result()
+                    if success:
+                        success_count += 1
+
+                    else:
+                        failure_count += 1
+
+                    # Even if it failed to build, we still want to add it to the manifest, so that we know something is missing in the test execution
+                    binary_name = pkg.replace("/", "-").replace("\\", "-") + ".test"
+                    built_packages.append((pkg_result, binary_name))
+
+                    # Print progress
+                    with print_lock:
+                        print(f"Progress: {i}/{len(test_packages)} completed")
+
+                except Exception as e:
+                    failure_count += 1
+                    with print_lock:
+                        print(f"  ✗ Unexpected error building {pkg}: {e}")
+
+    print(f"\nBuild completed: {success_count} successful, {failure_count} failed")
+    print(f"Test binaries built in: {output_path.absolute()}")
+
+    # Create manifest file
+    manifest = {
+        "build_info": {
+            "timestamp": ctx.run("date -u +%Y-%m-%dT%H:%M:%SZ", hide=True).stdout.strip(),
+            "commit": get_commit_sha(ctx, short=True),
+            "build_tags": build_tags,
+            "parallel_workers": parallel,
+            "success_count": success_count,
+            "failure_count": failure_count,
+        },
+        "binaries": [],
+    }
+
+    # Use the original package paths from the build process
+    for pkg_path, binary_name in built_packages:
+        binary_file = output_path / binary_name
+        if binary_file.exists():
+            manifest["binaries"].append(
+                {
+                    "package": pkg_path,
+                    "binary": binary_name,
+                    "size": binary_file.stat().st_size,
+                }
+            )
+
+    with open(manifest_file_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"Manifest created: {manifest_file_path}")
+
+    if failure_count > 0:
+        print(f"Error: {failure_count} packages failed to build")
+        raise Exit(code=1)
+
+
+@task(
+    help={
+        "output_dir": "Directory containing compiled test binaries",
+        "manifest_file_path": "Path to the manifest JSON file",
+        "s3_base_uri": "S3 base URI for uploading (e.g. s3://bucket/path/e2e-pre-build/pipeline-id)",
+        "parallel": "Number of parallel uploads [default: 8]",
+    },
+)
+def upload_binaries(
+    ctx,
+    output_dir="test-binaries",
+    manifest_file_path="manifest.json",
+    s3_base_uri="",
+    parallel=8,
+):
+    """
+    Create per-package tarballs from pre-built test binaries and upload them to S3.
+    Each binary gets its own tarball so that test jobs can download only what they need.
+    """
+    if not s3_base_uri:
+        raise Exit("--s3-base-uri is required", code=1)
+
+    with open(manifest_file_path) as f:
+        manifest = json.load(f)
+
+    output_path = Path(output_dir)
+    tarball_dir = Path(tempfile.mkdtemp(prefix="e2e-tarballs-"))
+
+    print(f"Creating per-package tarballs and uploading to {s3_base_uri}")
+
+    print_lock = threading.Lock()
+    upload_failures = 0
+
+    def upload_single(binary_info):
+        nonlocal upload_failures
+        binary_name = binary_info["binary"]
+        binary_file = output_path / binary_name
+        if not binary_file.exists():
+            with print_lock:
+                print(f"  ✗ Binary {binary_name} not found, skipping")
+            return
+
+        tarball_path = tarball_dir / f"{binary_name}.tar.zst"
+        try:
+            ctx.run(
+                f'tar c -I zstd -f {tarball_path} -C {output_path.parent} {output_path.name}/{binary_name}',
+                hide=True,
+            )
+            ctx.run(f'aws s3 cp {tarball_path} {s3_base_uri}/{binary_name}.tar.zst', hide=True)
+            with print_lock:
+                print(f"  ✓ Uploaded {binary_name}")
+        except Exception as e:
+            with print_lock:
+                print(f"  ✗ Failed to upload {binary_name}: {e}")
+                upload_failures += 1
+
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = [executor.submit(upload_single, bi) for bi in manifest["binaries"]]
+        for future in as_completed(futures):
+            future.result()
+
+    if upload_failures > 0:
+        print(f"Error: {upload_failures} uploads failed")
+        raise Exit(code=1)
+
+    # Upload manifest
+    result = ctx.run(f'aws s3 cp {manifest_file_path} {s3_base_uri}/manifest.json', warn=True)
+    if not result.ok:
+        print(f"  ✗ Failed to upload manifest to {s3_base_uri}/manifest.json")
+        raise Exit(code=1)
+    print(f"Uploaded manifest to {s3_base_uri}/manifest.json")
+
+    # Cleanup temp tarballs
+    shutil.rmtree(tarball_dir, ignore_errors=True)
+
+
+def _download_prebuilt_binaries(ctx, s3_base_uri, targets):
+    """Download pre-built binaries from S3 for the specified targets.
+
+    Downloads manifest.json, resolves which binaries are needed based on the
+    target package prefixes, then downloads and extracts only those tarballs.
+    Returns True if binaries were successfully downloaded, False otherwise.
+    """
+    manifest_path = "manifest.json"
+    extract_path = Path("test-binaries")
+
+    # Download manifest from S3 (unset AWS_PROFILE to use default runner credentials for the build-stable bucket)
+    with environ({"AWS_PROFILE": "DELETE"}):
+        result = ctx.run(f'aws s3 cp {s3_base_uri}/manifest.json {manifest_path}', warn=True)
+        if not result.ok:
+            print(f"WARNING: Failed to download manifest from {s3_base_uri}/manifest.json")
+            return False
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    # Normalize targets: ./tests/agent-devx -> tests/agent-devx
+    target_prefixes = []
+    for target in targets:
+        prefix = target.lstrip("./")
+        target_prefixes.append(prefix)
+
+    # Find matching binaries in manifest
+    needed_binaries = []
+    for binary_info in manifest["binaries"]:
+        pkg = binary_info["package"]
+        for prefix in target_prefixes:
+            if pkg == prefix or pkg.startswith(prefix + "/"):
+                needed_binaries.append(binary_info)
+                break
+
+    if not needed_binaries:
+        print(f"WARNING: No pre-built binaries found matching targets: {targets}")
+        return False
+
+    print(f"Downloading {len(needed_binaries)} pre-built binaries from S3")
+
+    extract_path.mkdir(exist_ok=True, parents=True)
+
+    with environ({"AWS_PROFILE": "DELETE"}):
+        for binary_info in needed_binaries:
+            binary_name = binary_info["binary"]
+            tarball_name = f"{binary_name}.tar.zst"
+            s3_path = f"{s3_base_uri}/{tarball_name}"
+
+            print(f"  Downloading {binary_name}...")
+            result = ctx.run(f'aws s3 cp {s3_path} {tarball_name}', warn=True)
+            if not result.ok:
+                print(f"  ✗ Failed to download {tarball_name}")
+                return False
+            result = ctx.run(f'tar xf {tarball_name}', warn=True)
+            if not result.ok:
+                print(f"  ✗ Failed to extract {tarball_name}")
+                return False
+            os.remove(tarball_name)
+
+    print(f"Pre-built binaries extracted to {extract_path}")
+    return True
+
+
+# Buffer subtracted from the remaining GitLab job time to derive the go test
+# timeout. It gives the test framework (TearDownSuite: pulumi destroy, cluster
+# state dump, dashboard URL log) a window to run after go test panics on its
+# own timeout and before GitLab kills the whole job.
+GO_TEST_CI_TIMEOUT_BUFFER_SECONDS = 5 * 60
+
+# Floor for the go test timeout: below this, attempting cleanup is pointless,
+# but we still want go test to exit with its own timeout (and stack dump)
+# rather than be killed mid-run by GitLab with no output.
+GO_TEST_MIN_TIMEOUT_SECONDS = 60
+
+# Fallback go test timeout when no GitLab CI timeout is available (local runs).
+DEFAULT_GO_TEST_TIMEOUT = "4h"
+
+
+def _format_go_duration(seconds: int) -> str:
+    """Format an integer number of seconds as a Go duration literal (e.g. "1h55m0s")."""
+    if seconds < 0:
+        seconds = 0
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h{minutes}m{secs}s"
+
+
+def _ci_job_elapsed_seconds(now: datetime.datetime | None = None) -> int | None:
+    """Return seconds elapsed since the GitLab job started, or None when unknown.
+
+    Uses `CI_JOB_STARTED_AT` (ISO 8601 UTC) set by GitLab, so the value
+    accounts for `before_script` time and any earlier retry attempts within
+    the same job.
+    """
+    started_at = os.environ.get("CI_JOB_STARTED_AT")
+    if not started_at:
+        return None
+    try:
+        # GitLab uses trailing 'Z' for UTC; datetime.fromisoformat needs '+00:00'.
+        parsed = datetime.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        print(f"WARNING: CI_JOB_STARTED_AT={started_at!r} is not a valid ISO 8601 datetime")
+        return None
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    return int((now - parsed).total_seconds())
+
+
+def _compute_go_test_timeout(explicit: str | None, now: datetime.datetime | None = None) -> str:
+    """Resolve the value passed to `go test -timeout`.
+
+    Priority:
+      1. Explicit CLI value (`--timeout`).
+      2. Remaining GitLab job time (`CI_JOB_TIMEOUT` minus elapsed since
+         `CI_JOB_STARTED_AT`) minus a teardown buffer, so go test panics a
+         few minutes before GitLab kills the job and TearDownSuite can
+         complete.
+      3. Hardcoded fallback (`DEFAULT_GO_TEST_TIMEOUT`).
+    """
+    if explicit:
+        print(f"Using explicit go test timeout: {explicit}")
+        return explicit
+
+    ci_job_timeout = os.environ.get("CI_JOB_TIMEOUT")
+    if not ci_job_timeout:
+        return DEFAULT_GO_TEST_TIMEOUT
+    try:
+        job_seconds = int(ci_job_timeout)
+    except ValueError:
+        print(
+            f"WARNING: CI_JOB_TIMEOUT={ci_job_timeout!r} is not an integer, "
+            f"falling back to default go test timeout {DEFAULT_GO_TEST_TIMEOUT}"
+        )
+        return DEFAULT_GO_TEST_TIMEOUT
+
+    elapsed = _ci_job_elapsed_seconds(now=now) or 0
+    remaining = job_seconds - elapsed
+    go_seconds = remaining - GO_TEST_CI_TIMEOUT_BUFFER_SECONDS
+
+    if go_seconds < GO_TEST_MIN_TIMEOUT_SECONDS:
+        print(
+            f"WARNING: only {remaining}s left in the GitLab job (CI_JOB_TIMEOUT={job_seconds}s, "
+            f"elapsed={elapsed}s); the {GO_TEST_CI_TIMEOUT_BUFFER_SECONDS}s teardown buffer does "
+            f"not fit. Clamping go test timeout to {GO_TEST_MIN_TIMEOUT_SECONDS}s — cleanup may "
+            f"not finish before GitLab kills the job."
+        )
+        return _format_go_duration(GO_TEST_MIN_TIMEOUT_SECONDS)
+
+    go_timeout = _format_go_duration(go_seconds)
+    print(
+        f"Derived go test timeout from remaining GitLab job time "
+        f"(CI_JOB_TIMEOUT={job_seconds}s, elapsed={elapsed}s, "
+        f"buffer={GO_TEST_CI_TIMEOUT_BUFFER_SECONDS}s): {go_timeout}"
+    )
+    return go_timeout
+
+
 @task(
     iterable=['tags', 'targets', 'configparams', 'run', 'skip'],
     help={
         "profile": "Override auto-detected runner profile (local or CI)",
         "tags": "Build tags to use",
-        "targets": "Target packages (same as dda inv test)",
+        "targets": "Target packages, relative to the module (same as dda inv test). Repeatable",
         "configparams": "Set overrides for ConfigMap parameters (same as -c option in test-infra-definitions)",
         "verbose": "Verbose output: log all tests as they are run (same as gotest -v) [default: True]",
-        "run": "Only run tests matching the regular expression",
+        "run": "Only run tests matching the regular expression. Anchor it to avoid matching tests that share a prefix",
         "skip": "Only run tests not matching the regular expression",
+        "recursive": "Include subpackages of each target [default: True]",
+        "osdescriptors": "Restrict the run to these OS descriptors, comma-separated (e.g. 'ubuntu:22.04')",
         "agent_image": 'Full image path for the agent image (e.g. "repository:tag") to run the e2e tests with',
         "cluster_agent_image": 'Full image path for the cluster agent image (e.g. "repository:tag") to run the e2e tests with',
+        "local_package": "Directory holding a locally built Agent package to install instead of a published one; build one with `dda inv omnibus.build-repackaged-agent`",
+        "flavor": 'Agent package flavor to install (e.g. "datadog-agent")',
+        "stack_name_suffix": "Suffix to add to the stack name, it can be useful when your stack is stuck in a weird state and you need to run the tests again",
+        "use_prebuilt_binaries": "Use pre-built test binaries instead of building on the fly",
+        "max_retries": "Maximum number of retries for failed tests, default 3",
+        "impacted": "Only run tests that are impacted by the changes (only available in CI for now)",
+        "keep_stack": "Keep the stack after running the test, you are responsible for destroying the stack later.",
+        "timeout": "Go test timeout (Go duration string, e.g. '1h55m'). Defaults to CI_JOB_TIMEOUT minus a teardown buffer when running in GitLab CI, otherwise to 4h.",
+        "pipeline_id": "GitLab pipeline ID to use; the commit SHA is automatically fetched from this pipeline for container-based tests",
+        "cache": "Allow the Go test cache. Disabled by default so that re-running a passing test really re-runs it",
+        "extra_flags": "Flags appended verbatim to the go test command after -args, for suite-specific flags this task does not model",
+        "logs_folder": "Directory the Agent logs collected from the environment are written to",
+        "result_json": "Path to write the machine-readable test results to",
+        "junit_tar": "Path to write a tarball of JUnit XML reports to",
     },
 )
 def run(
@@ -72,15 +622,12 @@ def run(
     verbose=True,
     run=[],  # noqa: B006
     skip=[],  # noqa: B006
-    osversion="",
-    platform="",
-    arch="",
+    impacted=False,
     flavor="",
-    major_version="",
-    cws_supported_osversion="",
+    cws_supported_osdescriptors="",
     src_agent_version="",
     dest_agent_version="",
-    keep_stacks=False,
+    keep_stack=False,
     extra_flags="",
     cache=False,
     junit_tar="",
@@ -93,27 +640,153 @@ def run(
     logs_folder="e2e_logs",
     local_package="",
     result_json=DEFAULT_E2E_TEST_OUTPUT_JSON,
+    stack_name_suffix="",
+    use_prebuilt_binaries=False,
+    max_retries=0,
+    osdescriptors="",
+    module_name="test/new-e2e",
+    recursive=True,
+    timeout="",
+    pipeline_id="",
 ):
     """
     Run E2E Tests based on test-infra-definitions infrastructure provisioning.
     """
+    if "test" not in tags:
+        tags = tags + ["test"]
 
     if shutil.which("pulumi") is None:
         raise Exit(
-            "pulumi CLI not found, Pulumi needs to be installed on the system (see https://github.com/DataDog/test-infra-definitions/blob/main/README.md)",
+            "pulumi CLI not found, Pulumi needs to be installed on the system (see https://github.com/DataDog/datadog-agent/blob/main/test/e2e-framework/README.md)",
             1,
         )
 
-    e2e_module = get_default_modules()["test/new-e2e"]
+    _check_e2e_local_config_or_exit(profile)
+
+    e2e_module = get_default_modules()[module_name]
+
     e2e_module.should_test_condition = "always"
     if targets:
         e2e_module.test_targets = targets
+
+    if impacted and running_in_ci():
+        try:
+            print(color_message("Using dynamic tests", "yellow"))
+            # DynTestExecutor needs to access build stable account to retrieve the index. Temporarly remove the AWS_PROFILE to avoid connecting on agent-qa account
+            with environ({"AWS_PROFILE": "DELETE"}):
+                backend = S3Backend(DEFAULT_DYNTEST_BUCKET_URI)
+                executor = DynTestExecutor(ctx, backend, IndexKind.DIFFED_PACKAGE, get_commit_sha(ctx, short=True))
+                changed_files = get_modified_files(ctx)
+                changed_packages = list({os.path.dirname(change) for change in changed_files})
+                print(color_message(f"The following changes were detected: {changed_files}", "yellow"))
+                test_job_name = os.getenv("CI_JOB_NAME")
+                if test_job_name.endswith("-init"):
+                    test_job_name = test_job_name.removesuffix("-init")
+                to_skip = executor.tests_to_skip(test_job_name, changed_packages + changed_files)
+                ctx.run(f"datadog-ci measure --level job --measures 'e2e.skipped_tests:{len(to_skip)}'", warn=True)
+                print(color_message(f"The following tests will be skipped: {to_skip}", "yellow"))
+                skip.extend(to_skip)
+        except Exception as e:
+            print(color_message(f"Error using dynamic tests: {e}", "red"))
+            print(color_message("Continuing with static tests", "yellow"))
 
     env_vars = {}
     if profile:
         env_vars["E2E_PROFILE"] = profile
 
+    # Pulls PULUMI_CONFIG_PASSPHRASE out of the local config when the environment doesn't
+    # already carry one, so developers don't have to put the passphrase in their rc file.
+    env_vars.update(tool.pulumi_env(skip_update_check=False))
+
     parsed_params = {}
+
+    # Image pull credentials: build as aligned lists, then join with commas.
+    registries: list[str] = []
+    usernames: list[str] = []
+    passwords: list[str] = []
+
+    env_registry = os.environ.get("E2E_IMAGE_PULL_REGISTRY", "")
+    env_username = os.environ.get("E2E_IMAGE_PULL_USERNAME", "")
+    env_password = os.environ.get("E2E_IMAGE_PULL_PASSWORD", "")
+    if env_password:
+        registries = env_registry.split(",") if env_registry else []
+        usernames = env_username.split(",") if env_username else []
+        passwords = env_password.split(",")
+
+    if not running_in_ci() and not passwords:
+        ecr_password = _get_agent_qa_ecr_password(ctx)
+        if ecr_password:
+            registries.append("669783387624.dkr.ecr.us-east-1.amazonaws.com")
+            usernames.append("AWS")
+            passwords.append(ecr_password)
+
+    if not running_in_ci():
+        # TODO(agent-devx): Add GCP authentication (follow-up to #47298)
+        # If we use an agent image from sandbox registry we need to authenticate against it
+        if "376334461865" in (agent_image or "") or "376334461865" in (cluster_agent_image or ""):
+            sandbox_pwd = ctx.run(
+                "aws-vault exec sso-agent-sandbox-account-admin-8h -- aws ecr get-login-password",
+                hide=True,
+            ).stdout.strip()
+            registries.append("376334461865.dkr.ecr.us-east-1.amazonaws.com")
+            usernames.append("AWS")
+            passwords.append(sandbox_pwd)
+
+    if passwords:
+        env_vars["E2E_IMAGE_PULL_REGISTRY"] = ",".join(registries)
+        env_vars["E2E_IMAGE_PULL_USERNAME"] = ",".join(usernames)
+        env_vars["E2E_IMAGE_PULL_PASSWORD"] = ",".join(passwords)
+    # resolved_commit_sha is the short SHA used for containers.GitCommit; start from local HEAD
+    resolved_commit_sha = get_commit_sha(ctx, short=True)
+
+    if pipeline_id:
+        # Explicit pipeline ID: fetch its commit SHA and wire up env vars directly
+        print(color_message(f"Using pipeline {pipeline_id}...", "blue"))
+        pipeline_commit_sha = get_pipeline_commit_sha(pipeline_id)
+        if pipeline_commit_sha:
+            resolved_commit_sha = pipeline_commit_sha
+            print(color_message(f"Fetched commit SHA {resolved_commit_sha} from pipeline {pipeline_id}", "blue"))
+        else:
+            print(
+                color_message(
+                    f"Could not fetch commit SHA for pipeline {pipeline_id}, falling back to local HEAD", "yellow"
+                )
+            )
+        env_vars["E2E_PIPELINE_ID"] = pipeline_id
+        env_vars["E2E_COMMIT_SHA"] = resolved_commit_sha
+    elif not running_in_ci():
+        # Auto-detect pipeline ID and commit SHA for local runs if not already set
+        if "E2E_PIPELINE_ID" not in os.environ:
+            print(
+                color_message(
+                    "E2E_PIPELINE_ID is not set. The E2E job you are running may require build and packaging "
+                    "jobs to have completed in the pipeline (e.g. container images, deb/rpm packages, OCI deploys). "
+                    "Check the `needs:` of your target job in the relevant .gitlab/test/e2e/*.yml file and ensure those jobs "
+                    "have run on your branch before triggering the E2E job.",
+                    "yellow",
+                )
+            )
+            commit_sha = get_commit_sha(ctx)
+            short_commit_sha = get_commit_sha(ctx, short=True)
+            print(color_message(f"Auto-detecting pipeline for commit {short_commit_sha}...", "blue"))
+            detected_pipeline_id = _find_pipeline_for_commit_sha(ctx, commit_sha)
+            if detected_pipeline_id:
+                print(
+                    color_message(
+                        f"Auto-detected pipeline {detected_pipeline_id} for commit {short_commit_sha}", "blue"
+                    )
+                )
+                env_vars["E2E_PIPELINE_ID"] = detected_pipeline_id
+                env_vars["E2E_COMMIT_SHA"] = short_commit_sha
+                resolved_commit_sha = short_commit_sha
+            else:
+                print(
+                    color_message(
+                        f"No pipeline with passing packaging and deploy_packages stages found for commit {short_commit_sha}, skipping pipeline auto-detection",
+                        "yellow",
+                    )
+                )
+
     for param in configparams:
         parts = param.split("=", 1)
         if len(parts) != 2:
@@ -135,6 +808,9 @@ def run(
     if parsed_params:
         env_vars["E2E_STACK_PARAMS"] = json.dumps(parsed_params)
 
+    if stack_name_suffix:
+        env_vars["E2E_STACK_NAME_SUFFIX"] = stack_name_suffix
+
     gotestsum_format = "standard-verbose" if verbose else "pkgname"
 
     test_run_arg = ""
@@ -148,17 +824,40 @@ def run(
         with open(os.environ.get("FLAKY_PATTERNS_CONFIG"), 'a') as f:
             f.write("{}")
 
-    cmd = f"gotestsum --format {gotestsum_format} "
-    scrubber_raw_command = ""
+    # TODO: remove once Bazel is used to build the Agent
+    schema_codegen(ctx)
+
+    cmd = f"--format {gotestsum_format} "
+    raw_command = ""
     # Scrub the test output to avoid leaking API or APP keys when running in the CI
+
+    if use_prebuilt_binaries:
+        s3_uri = os.environ.get("E2E_PREBUILD_S3_URI", "")
+        if s3_uri and targets:
+            # New flow: download per-package tarballs from S3
+            if not _download_prebuilt_binaries(ctx, s3_uri, targets):
+                print("WARNING: Failed to download pre-built binaries from S3, disabling use_prebuilt_binaries")
+                use_prebuilt_binaries = False
+        elif not os.path.exists("test-binaries.tar.zst") or not os.path.exists("manifest.json"):
+            print(
+                "WARNING: required artifacts test-binaries.tar.zst and manifest.json not found, disabling use_prebuilt_binaries"
+            )
+            use_prebuilt_binaries = False
+
+    if use_prebuilt_binaries:
+        ctx.run("go build -o ./gotest-custom ./internal/tools/gotest-custom")
+        raw_command = "--raw-command ./gotest-custom {packages}"
+        env_vars["GOTEST_COMMAND"] = "./gotest-custom"
+
     if running_in_ci():
-        scrubber_raw_command = (
+        raw_command = (
             # Using custom go command piped with scrubber sed instructions https://github.com/gotestyourself/gotestsum#custom-go-test-command
             f"--raw-command {os.path.join(os.path.dirname(__file__), 'tools', 'gotest-scrubbed.sh')} {{packages}}"
         )
-    cmd += f'{{junit_file_flag}} {{json_flag}} --packages="{{packages}}" {scrubber_raw_command} -- -ldflags="-X {{REPO_PATH}}/test/new-e2e/tests/containers.GitCommit={{commit}}" {{verbose}} -mod={{go_mod}} -vet=off -timeout {{timeout}} -tags "{{go_build_tags}}" {{nocache}} {{run}} {{skip}} {{test_run_arg}} -args {{osversion}} {{platform}} {{major_version}} {{arch}} {{flavor}} {{cws_supported_osversion}} {{src_agent_version}} {{dest_agent_version}} {{keep_stacks}} {{extra_flags}}'
 
-    # Strings can come with extra double-quotes which can break the command, remove them
+    cmd += f'{{junit_file_flag}} {{json_flag}} --packages="{{packages}}" {raw_command} -- -ldflags="-X {{REPO_PATH}}/test/new-e2e/tests/containers.GitCommit={{commit}}" {{verbose}} -mod={{go_mod}} -vet=off -timeout {{timeout}} -tags "{{go_build_tags}}" {{nocache}} {{run}} {{skip}} {{test_run_arg}} -args {{osdescriptors}} {{flavor}} {{cws_supported_osdescriptors}} {{src_agent_version}} {{dest_agent_version}} {{extra_flags}}'
+
+    # Strinbuilt_binaries:gs can come with extra double-quotes which can break the command, remove them
     clean_run = []
     clean_skip = []
     for r in run:
@@ -168,72 +867,158 @@ def run(
 
     args = {
         "go_mod": "readonly",
-        "timeout": "4h",
-        "verbose": "-v" if verbose else "",
-        "nocache": "-count=1" if not cache else "",
+        # Set per-attempt inside the retry loop so each attempt reflects the
+        # remaining GitLab job budget.
+        "timeout": "",
+        "verbose": "-test.v" if verbose else "",
+        "nocache": "-test.count=1" if not cache else "",
         "REPO_PATH": REPO_PATH,
-        "commit": get_commit_sha(ctx, short=True),
+        "commit": resolved_commit_sha,
         "run": '-test.run ' + '"{}"'.format('|'.join(clean_run)) if run else '',
         "skip": '-test.skip ' + '"{}"'.format('|'.join(clean_skip)) if skip else '',
         "test_run_arg": test_run_arg,
-        "osversion": f"-osversion {osversion}" if osversion else "",
-        "platform": f"-platform {platform}" if platform else "",
-        "arch": f"-arch {arch}" if arch else "",
         "flavor": f"-flavor {flavor}" if flavor else "",
-        "major_version": f"-major-version {major_version}" if major_version else "",
-        "cws_supported_osversion": f"-cws-supported-osversion {cws_supported_osversion}"
-        if cws_supported_osversion
+        "osdescriptors": f"-osdescriptors {osdescriptors}" if osdescriptors else "",
+        "cws_supported_osdescriptors": f"-cws-supported-osdescriptors {cws_supported_osdescriptors}"
+        if cws_supported_osdescriptors
         else "",
         "src_agent_version": f"-src-agent-version {src_agent_version}" if src_agent_version else "",
         "dest_agent_version": f"-dest-agent-version {dest_agent_version}" if dest_agent_version else "",
-        "keep_stacks": '-keep-stacks' if keep_stacks else "",
         "extra_flags": extra_flags,
     }
 
-    test_res = test_flavor(
-        ctx,
-        flavor=AgentFlavor.base,
-        build_tags=tags,
-        modules=[e2e_module],
-        args=args,
-        cmd=cmd,
-        env=env_vars,
-        junit_tar=junit_tar,
-        result_json=result_json,
-        test_profiler=None,
-    )
+    to_teardown: set[tuple[str, str]] = set()
+    result_jsons: list[str] = []
+    result_junits: list[str] = []
+    for attempt in range(max_retries + 1):
+        # Recomputed each attempt because retries eat into the GitLab job
+        # budget; a stale value would overshoot the kill deadline.
+        args["timeout"] = _compute_go_test_timeout(timeout)
 
-    success = process_test_result(test_res, junit_tar, AgentFlavor.base, test_washer)
+        remaining_tries = max_retries - attempt
+        if remaining_tries > 0:
+            # If any tries are left, avoid destroying infra on failure
+            env_vars["E2E_SKIP_DELETE_ON_FAILURE"] = "true"
+        else:
+            env_vars.pop("E2E_SKIP_DELETE_ON_FAILURE", None)
+
+        if keep_stack is True:
+            env_vars["E2E_DEV_MODE"] = "true"
+
+        partial_result_json = f"{result_json}.{attempt}.part"
+        result_jsons.append(partial_result_json)
+
+        partial_result_junit = f"junit-out-{str(AgentFlavor.base)}-{attempt}.xml"
+        result_junits.append(partial_result_junit)
+
+        test_res = test_flavor(
+            ctx,
+            flavor=AgentFlavor.base,
+            build_tags=tags,
+            modules=[e2e_module],
+            args=args,
+            cmd=cmd,
+            env=env_vars,
+            result_junit=partial_result_junit,
+            result_json=partial_result_json,
+            recursive=recursive,
+        )
+        if test_res is None:
+            ctx.run("datadog-ci tag --level job --tags 'e2e.skipped_all_tests:true'")
+            return
+
+        washer = TestWasher(test_output_json_file=partial_result_json)
+
+        if remaining_tries > 0:
+            failed_tests = filter_only_leaf_tests(
+                (package, test_name) for package, tests in washer.get_failing_tests().items() for test_name in tests
+            )
+
+            # Note: `get_flaky_failures` can return some unexpected things due to its logic for detecting failing tests by looking at its eventual children.
+            # By using an `intersection` we ensure that we only get tests that have actually failed.
+            known_flaky_failures = failed_tests.intersection(
+                {(package, test_name) for package, tests in washer.get_flaky_failures().items() for test_name in tests}
+            )
+
+            # Retry any failed tests that are not known to be flaky
+            to_retry = failed_tests - known_flaky_failures
+
+            if known_flaky_failures:
+                print(
+                    color_message(
+                        f"{len(known_flaky_failures)} tests failed but are known flaky. They will not be retried !",
+                        "yellow",
+                    )
+                )
+                # Schedule teardown for all known flaky failures, so that they are not left hanging after the retry loop
+                to_teardown.update(known_flaky_failures)
+
+            if to_retry:
+                failed_tests_printout = '\n- '.join(f'{package} {test_name}' for package, test_name in sorted(to_retry))
+                print(
+                    color_message(
+                        f"Retrying {len(to_retry)} failed tests:\n- {failed_tests_printout}",
+                        "yellow",
+                    )
+                )
+
+                # Retry the failed tests only
+                affected_packages = {
+                    os.path.relpath(package, "github.com/DataDog/datadog-agent/test/new-e2e/")
+                    for package, _ in to_retry
+                }
+                e2e_module.test_targets = list(affected_packages)
+                args["run"] = '-test.run ' + create_test_selection_gotest_regex([test for _, test in to_retry])
+            else:
+                break
+
+    # Make sure that any non-successful test suites that were not retried (i.e., fully-known-flaky-failing suites) are torn down
+    # Do this by calling the tests with the E2E_TEARDOWN_ONLY env var set, which will only run the teardown logic
+    if to_teardown:
+        print(
+            color_message(
+                f"Tearing down {len(to_teardown)} leftover test infras",
+                "yellow",
+            )
+        )
+        affected_packages = {
+            os.path.relpath(package, "github.com/DataDog/datadog-agent/test/new-e2e/") for package, _ in to_teardown
+        }
+        e2e_module.test_targets = list(affected_packages)
+        args["run"] = '-test.run ' + create_test_selection_gotest_regex([test for _, test in to_teardown])
+        env_vars["E2E_TEARDOWN_ONLY"] = "true"
+        test_flavor(
+            ctx,
+            flavor=AgentFlavor.base,
+            build_tags=tags,
+            modules=[e2e_module],
+            args=args,
+            cmd=cmd,
+            env=env_vars,
+            result_junit="",  # No need to store JUnit results for teardown-only runs
+            result_json="",  # No need to store results for teardown-only runs
+        )
+
+    # Merge all the partial result JSON files into the final result JSON
+    with open(result_json, "w") as merged_file:
+        for partial_file in result_jsons:
+            with open(partial_file) as f:
+                merged_file.writelines(line.strip() + "\n" for line in f.readlines())
+
+    success, _ = process_test_result(
+        ctx, test_res, junit_tar, result_junits, AgentFlavor.base, test_washer, test_system="e2e"
+    )
 
     if running_in_ci():
         # Do not print all the params, they could contain secrets needed only in the CI
         params = [f"--targets {t}" for t in targets]
 
-        param_keys = ("osversion", "platform", "arch")
+        param_keys = ("osversion", "osdescriptors", "platform", "arch")
         for param_key in param_keys:
             if args.get(param_key):
                 params.append(f"-{args[param_key]}")
 
-        configparams_to_retain = {
-            "ddagent:imagePullRegistry",
-            "ddagent:imagePullUsername",
-        }
-
-        registry_to_password_commands = {
-            "669783387624.dkr.ecr.us-east-1.amazonaws.com": "aws-vault exec sso-agent-qa-read-only -- aws ecr get-login-password"
-        }
-
-        for configparam in configparams:
-            parts = configparam.split("=", 1)
-            key = parts[0]
-            if key in configparams_to_retain:
-                params.append(f"-c {configparam}")
-
-                if key == "ddagent:imagePullRegistry" and len(parts) > 1:
-                    registry = parts[1]
-                    password_cmd = registry_to_password_commands.get(registry)
-                    if password_cmd is not None:
-                        params.append(f"-c ddagent:imagePullPassword=$({password_cmd})")
+        params.extend(f"-c {param}" for param in configparams if "password" not in param.split("=", 1)[0].casefold())
 
         command = f"E2E_PIPELINE_ID={os.environ.get('CI_PIPELINE_ID')} E2E_COMMIT_SHA={os.environ.get('CI_COMMIT_SHORT_SHA')} dda inv -- -e new-e2e-tests.run {' '.join(params)}"
         print(
@@ -292,55 +1077,135 @@ def clean(ctx, locks=True, stacks=False, output=False, skip_destroy=False):
         _clean_output()
 
 
+def _get_pulumi_backend_url(ctx: Context) -> str | None:
+    """
+    Get the Pulumi backend URL using 'pulumi whoami --json'.
+    Returns the backend URL or None if it cannot be determined.
+    """
+    try:
+        whoami = tool.pulumi_json(ctx, "whoami --json", project_dir=False, warn=True)
+    except json.JSONDecodeError:
+        return None
+    if whoami is None:
+        return None
+    return whoami.get("url")
+
+
+def _list_stacks_from_s3(backend_url: str, project: str = "e2eci") -> list[dict]:
+    """
+    List Pulumi stacks directly from S3 backend.
+    Much faster than 'pulumi stack ls' for buckets with many stacks.
+
+    Args:
+        backend_url: S3 backend URL (e.g., 's3://bucket-name' or 's3://bucket-name/path')
+        project: Pulumi project name (default: 'e2eci')
+
+    Returns:
+        List of stack dictionaries with 'name' key matching pulumi stack ls format
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    # Parse S3 URL: s3://bucket-name/optional/path
+    s3_path = backend_url.removeprefix("s3://")
+    parts = s3_path.split("/", 1)
+    bucket_name = parts[0]
+    base_prefix = parts[1] if len(parts) > 1 else ""
+    bucket_name = bucket_name.split("?")[0]  # Remove query parameters for AWS url
+
+    # Pulumi stores stacks at: {base_prefix}/.pulumi/stacks/{project}/
+    stacks_prefix = f"{base_prefix}/.pulumi/stacks/{project}/".lstrip("/")
+
+    try:
+        s3_client = boto3.client('s3')
+        stacks = []
+
+        paginator = s3_client.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=stacks_prefix)
+
+        for page in page_iterator:
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                # Stack files are {stack_name}.json (skip .json.bak files)
+                if key.endswith('.json'):
+                    # Extract stack name from path
+                    filename = key.split('/')[-1]
+                    stack_name = filename.removesuffix('.json')
+                    stacks.append(
+                        {
+                            'name': f"organization/{project}/{stack_name}",
+                            'lastUpdate': obj.get('LastModified', '').isoformat() if obj.get('LastModified') else None,
+                        }
+                    )
+
+        return stacks
+
+    except ClientError as e:
+        print(f"Failed to list stacks from S3: {e}")
+        return []
+
+
+def list_stacks(ctx: Context, project: str = "e2eci") -> list[dict]:
+    """
+    List Pulumi stacks. Uses S3 SDK for S3 backends (much faster),
+    falls back to pulumi CLI for other backends.
+
+    Args:
+        ctx: Invoke context
+        project: Pulumi project name (default: 'e2eci')
+
+    Returns:
+        List of stack dictionaries with 'name' key
+    """
+    backend_url = _get_pulumi_backend_url(ctx)
+
+    if backend_url and backend_url.startswith("s3://"):
+        return _list_stacks_from_s3(backend_url, project)
+
+    # Fallback to pulumi CLI for non-S3 backends (local, etc.)
+    return tool.pulumi_json(ctx, "stack ls --all --json", project_dir=False, warn=True) or []
+
+
 @task
-def cleanup_remote_stacks(ctx, stack_regex, pulumi_backend):
+def cleanup_remote_stacks(ctx, stack_regex):
     """
     Clean up remote stacks created by the pipeline
     """
-    if not running_in_ci():
-        raise Exit("This task should be run in CI only", 1)
+    remote_stack_cleaning = os.getenv("REMOTE_STACK_CLEANING") == "true"
+    if remote_stack_cleaning:
+        print("Using remote stack cleaning")
+    else:
+        print("Using local stack cleaning")
 
     stack_regex = re.compile(stack_regex)
 
-    # Ideally we'd use the pulumi CLI to list all the stacks. However we have way too much stacks in the bucket so the commands hang forever.
-    # Once the bucket is cleaned up we can switch to the pulumi CLI
-    res = ctx.run(
-        "pulumi stack ls --all --json",
-        hide=True,
-        warn=True,
-    )
-    if res.exited != 0:
-        print(f"Failed to list stacks in {pulumi_backend}:", res.stdout, res.stderr)
+    # Use S3 SDK for listing stacks (much faster than pulumi CLI)
+    stacks = list_stacks(ctx)
+    if not stacks:
+        print("No stacks found or failed to list stacks")
         return
     to_delete_stacks = set()
-    stacks = json.loads(res.stdout)
-    print(stacks)
     for stack in stacks:
-        stack_id = (
-            stack.get("name", "")
-            .split("/")[-1]
-            .replace(".json.bak", "")
-            .replace(".json", "")
-            .replace(".pulumi/stacks/e2eci", "")
-        )
-        if stack_regex.match(stack_id):
-            to_delete_stacks.add(f"organization/e2eci/{stack_id}")
+        if stack_regex.match(stack["name"].split("/")[-1]):
+            to_delete_stacks.add(stack["name"])
 
     if len(to_delete_stacks) == 0:
         print("No stacks to delete")
         return
 
     print("About to delete the following stacks:", to_delete_stacks)
+
     with multiprocessing.Pool(len(to_delete_stacks)) as pool:
-        res = pool.map(destroy_remote_stack, to_delete_stacks)
+        destroy_func = destroy_remote_stack_api if remote_stack_cleaning else destroy_remote_stack_local
+        res = pool.map(destroy_func, to_delete_stacks)
         destroyed_stack = set()
         failed_stack = set()
-        for r, stack in res:
-            if r.returncode != 0:
+        for exit_code, stdout, stderr, stack in res:
+            if exit_code != 0:
                 failed_stack.add(stack)
             else:
                 destroyed_stack.add(stack)
-            print(f"Stack {stack}: {r.stdout} {r.stderr}")
+            print(f"Stack {stack}: {stdout} {stderr}")
 
     for stack in destroyed_stack:
         print(f"Stack {stack} destroyed successfully")
@@ -370,38 +1235,36 @@ def post_process_output(path: str, test_depth: int = 1) -> list[tuple[str, str, 
         if len(parent) > len(child):
             return False
 
-        for i in range(len(parent)):
-            if parent[i] != child[i]:
+        for i, parent_part in enumerate(parent):
+            if parent_part != child[i]:
                 return False
 
         return True
 
-    with open(path) as f:
-        lines = [json.loads(line) for line in f]
+    result_json = ResultJson.from_file(path)
 
-    lines = [
-        json_line for json_line in lines if "Package" in json_line and "Test" in json_line and "Output" in json_line
-    ]
+    lines = [line for line in result_json.lines if line.output and line.test]
 
-    tests = {(json_line["Package"], json_line["Test"]): [] for json_line in lines}
+    tests: dict[tuple[str, str], list] = {(json_line.package, json_line.test): [] for json_line in lines}  # type: ignore
 
     # Used to preserve order, line where a test appeared first
-    test_order = {(json_line["Package"], json_line["Test"]): i for (i, json_line) in list(enumerate(lines))[::-1]}
+    test_order = {(json_line.package, json_line.test): i for (i, json_line) in list(enumerate(lines))[::-1]}
 
     for json_line in lines:
-        if json_line["Action"] == "output":
-            output: str = json_line["Output"]
+        assert json_line.output and json_line.test  # Just making mypy happy
+        if json_line.action == ActionType.OUTPUT:
+            output: str = json_line.output
             if "===" in output:
                 continue
 
             # Append logs to all children tests + this test
-            current_test_name_splitted = json_line["Test"].split("/")
+            current_test_name_splitted = json_line.test.split("/")
             for (package, test_name), logs in tests.items():
-                if package != json_line["Package"]:
+                if package != json_line.package:
                     continue
 
                 if is_parent(current_test_name_splitted, test_name.split("/")):
-                    logs.append(json_line["Output"])
+                    logs.append(json_line.output)
 
     # Rebuild order
     return sorted(
@@ -516,10 +1379,6 @@ def deps(ctx, verbose=False):
     download_go_dependencies(ctx, paths=["test/new-e2e"], verbose=verbose, max_retry=3)
 
 
-def _get_default_env():
-    return {"PULUMI_SKIP_UPDATE_CHECK": "true"}
-
-
 def _get_home_dir():
     # TODO: Go os.UserHomeDir() uses a different algorithm than Python Path.home()
     #       so a different directory may be returned in some cases.
@@ -584,36 +1443,63 @@ def _clean_locks():
 def _clean_stacks(ctx: Context, skip_destroy: bool):
     print("🧹 Clean up stack")
 
-    if not skip_destroy:
-        stacks = _get_existing_stacks(ctx)
-        for stack in stacks:
-            print(f"🔥 Destroying stack {stack}")
-            _destroy_stack(ctx, stack)
-
-    # get stacks again as they may have changed after destroy
     stacks = _get_existing_stacks(ctx)
-    for stack in stacks:
+    if not stacks:
+        print("No local stacks found")
+        return
+
+    selected_stacks = _prompt_select_stacks(stacks)
+    if not selected_stacks:
+        print("No stacks selected, aborting")
+        return
+
+    if not skip_destroy:
+        for stack in selected_stacks:
+            print(f"🔥 Destroying stack {stack}")
+            try:
+                _destroy_stack(ctx, stack)
+            except Exception as e:
+                print(
+                    color_message(
+                        f"⚠️  Failed to destroy stack {stack}, will remove it locally anyway: {e}", Color.ORANGE
+                    )
+                )
+
+    for stack in selected_stacks:
         print(f"🗑️ Removing stack {stack}")
         _remove_stack(ctx, stack)
 
 
-def _get_existing_stacks(ctx: Context) -> list[str]:
-    e2e_stacks: list[str] = []
-    output = ctx.run(
-        "pulumi stack ls --all --project e2elocal --json",
-        hide=True,
-        env=_get_default_env(),
-    )
-    if output is None or not output:
-        return []
-    stacks_data = json.loads(output.stdout)
-    for stack in stacks_data:
-        if "name" not in stack:
-            print(f"Skipping stack {stack} as it does not have a name")
+def _prompt_select_stacks(stacks: list[str]) -> list[str]:
+    print("Existing local stacks:")
+    for i, stack in enumerate(stacks, start=1):
+        print(f"  {i}. {stack}")
+
+    while True:
+        answer = input("Select stacks to destroy (comma-separated indices, 'all', or empty to cancel): ").strip()
+        if not answer:
+            return []
+        if answer.lower() == "all":
+            return stacks
+
+        indices = [chunk.strip() for chunk in answer.split(",") if chunk.strip()]
+        try:
+            selected_indices = [int(chunk) for chunk in indices]
+        except ValueError:
+            print(f"Invalid input: {answer!r}, expected comma-separated indices or 'all'")
             continue
-        stack_name = stack["name"]
+
+        if any(i < 1 or i > len(stacks) for i in selected_indices):
+            print(f"Invalid selection, indices must be between 1 and {len(stacks)}")
+            continue
+
+        return [stacks[i - 1] for i in selected_indices]
+
+
+def _get_existing_stacks(ctx: Context) -> list[str]:
+    e2e_stacks = tool.pulumi_stack_names(ctx, project="e2elocal", project_dir=False)
+    for stack_name in e2e_stacks:
         print(f"Adding stack {stack_name}")
-        e2e_stacks.append(stack_name)
     return e2e_stacks
 
 
@@ -621,53 +1507,57 @@ def _destroy_stack(ctx: Context, stack: str):
     # running in temp dir as this is where datadog-agent test
     # stacks are stored. It is expected to fail on stacks existing locally
     # with resources removed by agent-sandbox clean up job
-    with ctx.cd(tempfile.gettempdir()):
-        ret = ctx.run(
-            f"pulumi destroy --stack {stack} --yes --remove --skip-preview",
+
+    destroy_env = {"PULUMI_K8S_DELETE_UNREACHABLE": "true"}
+    tmp_dir = tempfile.gettempdir()
+
+    ret = tool.run_pulumi(
+        ctx,
+        f"destroy --stack {stack} --yes --remove --skip-preview",
+        project_dir=tmp_dir,
+        env=destroy_env,
+        warn=True,
+        hide=True,
+    )
+    if ret is not None and ret.exited != 0:
+        if "No valid credential sources found" in ret.stdout:
+            raise Exception(
+                f"no valid credentials sources found for stack {stack}, if you set the AWS_PROFILE environment variable ensure it is valid"
+            )
+        if "no previous deployment" in ret.stderr:
+            # Stack was created but never had a successful up; no resources to destroy.
+            print(f"Stack {stack} has no previous deployment, skipping destroy")
+            return
+        # run with refresh on first destroy attempt failure
+        ret = tool.run_pulumi(
+            ctx,
+            f"destroy --stack {stack} -r --yes --remove --skip-preview",
+            project_dir=tmp_dir,
+            env=destroy_env,
             warn=True,
             hide=True,
-            env=_get_default_env(),
         )
-        if ret is not None and ret.exited != 0:
-            if "No valid credential sources found" in ret.stdout:
-                print(
-                    "No valid credentials sources found, if you set the AWS_PROFILE environment variable ensure it is valid"
-                )
-                print(ret.stdout)
-                raise Exit(
-                    color_message(
-                        f"Failed to destroy stack {stack}, no valid credentials sources found, if you set the AWS_PROFILE environment variable ensure it is valid",
-                        "red",
-                    ),
-                    1,
-                )
-            # run with refresh on first destroy attempt failure
-            ret = ctx.run(
-                f"pulumi destroy --stack {stack} -r --yes --remove --skip-preview",
-                warn=True,
-                hide=True,
-                env=_get_default_env(),
-            )
-        if ret is not None and ret.exited != 0:
-            raise Exit(
-                color_message(f"Failed to destroy stack {stack}: {ret.stdout, ret.stderr}", "red"),
-                1,
-            )
+    if ret is not None and ret.exited != 0:
+        raise Exception(f"{ret.stdout, ret.stderr}")
 
 
 def _remove_stack(ctx: Context, stack: str):
-    ctx.run(
-        f"pulumi stack rm --force --yes --stack {stack}",
+    ret = tool.run_pulumi(
+        ctx,
+        f"stack rm --force --yes --stack {stack}",
+        project_dir=False,
+        warn=True,
         hide=True,
-        env=_get_default_env(),
     )
+    if ret is not None and ret.exited != 0:
+        if "no stack named" in ret.stderr:
+            print(f"Stack {stack} was already removed")
+            return
+        print(color_message(f"⚠️  Failed to remove stack {stack} locally: {ret.stderr}", Color.ORANGE))
 
 
 def _get_pulumi_about(ctx: Context) -> dict:
-    output = ctx.run("pulumi about --json", hide=True, env=_get_default_env())
-    if output is None or not output:
-        return {}
-    return json.loads(output.stdout)
+    return tool.pulumi_json(ctx, "about --json", project_dir=False) or {}
 
 
 def _is_local_state(pulumi_about: dict) -> bool:
@@ -684,3 +1574,477 @@ def _is_local_state(pulumi_about: dict) -> bool:
     if url is None or not isinstance(url, str):
         return False
     return url.startswith("file://")
+
+
+def _get_agent_qa_ecr_password(ctx: Context) -> str:
+    ecr_password_res = ctx.run(
+        "aws-vault exec sso-agent-qa-read-only -- aws ecr get-login-password", hide=True, warn=True
+    )
+    if ecr_password_res.exited != 0:
+        ecr_password_res = ctx.run(
+            "aws-vault exec sso-agent-qa-account-admin-8h -- aws ecr get-login-password", hide=True, warn=True
+        )
+    if ecr_password_res.exited != 0:
+        print(
+            "WARNING: Could not get ECR password for agent-qa account, if your test need to pull image from agent-qa ECR it is likely to fail"
+        )
+        return ""
+    return ecr_password_res.stdout.strip()
+
+
+def _find_recent_successful_pipeline(ctx: Context, branch: str | None = None) -> str | None:
+    """
+    Find the most recent successful pipeline on the given branch or current branch if not specified.
+    Returns pipeline_id or None if not found.
+    """
+    try:
+        # Explicitly use GITLAB_TOKEN if set
+        token = os.environ.get('GITLAB_TOKEN')
+        repo = get_gitlab_repo(token=token)
+
+        # Try the specified branch or current branch
+        branch_to_try = ""
+        if branch:
+            branch_to_try = branch
+        else:
+            try:
+                current = get_current_branch(ctx)
+                if current:
+                    branch_to_try = current
+            except Exception as e:
+                raise Exit(f"Could not get current branch: {e}", code=1) from e
+
+        # Get pipelines on this branch, ordered by most recent
+        pipelines = repo.pipelines.list(ref=branch_to_try, per_page=10, order_by='updated_at', get_all=False)
+        for pipeline in pipelines:
+            if pipeline.status == "success":
+                return str(pipeline.id)
+
+        return None
+    except Exception as e:
+        print(f"Warning: Could not query GitLab for recent pipelines: {e}")
+        if 'GITLAB_TOKEN' not in os.environ:
+            print(
+                "No GITLAB_TOKEN environment variable found, set it with a GitLab Personal Access Token (read_api scope)"
+            )
+        return None
+
+
+def _find_pipeline_for_commit_sha(ctx: Context, commit_sha: str) -> str | None:
+    """
+    Find the most recent pipeline for a given commit SHA where stages
+    'packaging' and 'deploy_packages' have all jobs successfully completed (success or skipped).
+    Searches by branch ref and matches on SHA, as GitLab's sha filter is unreliable.
+    Returns pipeline_id or None if not found.
+    """
+    required_stages = {"packaging", "deploy_packages"}
+
+    try:
+        token = os.environ.get('GITLAB_TOKEN')
+        repo = get_gitlab_repo(token=token)
+
+        branch = get_current_branch(ctx)
+        pipelines = repo.pipelines.list(ref=branch, per_page=20, order_by='updated_at', get_all=False)
+        for pipeline in pipelines:
+            if not pipeline.sha.startswith(commit_sha) and not commit_sha.startswith(pipeline.sha):
+                continue
+            jobs = pipeline.jobs.list(get_all=True)
+
+            stage_jobs: dict[str, list] = {}
+            for job in jobs:
+                if job.stage in required_stages:
+                    stage_jobs.setdefault(job.stage, []).append(job)
+
+            # All required stages must be present
+            if not required_stages.issubset(stage_jobs.keys()):
+                missing = required_stages - stage_jobs.keys()
+                print(
+                    f"Pipeline {pipeline.id} skipped: missing stages {missing}",
+                    file=sys.stderr,
+                )
+                continue
+
+            # All jobs in required stages must have passed (success, skipped, or manual/not triggered)
+            failed_jobs = [
+                f"{job.stage}/{job.name} ({job.status})"
+                for stage in required_stages
+                for job in stage_jobs[stage]
+                if job.status not in ("success", "skipped", "manual")
+            ]
+            if failed_jobs:
+                print(
+                    f"Pipeline {pipeline.id} skipped: jobs not passed: {', '.join(failed_jobs)}",
+                    file=sys.stderr,
+                )
+                continue
+
+            return str(pipeline.id)
+
+        return None
+    except Exception as e:
+        print(f"Warning: Could not query GitLab for pipelines for commit {commit_sha[:8]}: {e}")
+        if 'GITLAB_TOKEN' not in os.environ:
+            print(
+                "No GITLAB_TOKEN environment variable found, set it with a GitLab Personal Access Token (read_api scope)"
+            )
+        return None
+
+
+def _find_local_msi_build(pkg: str | None = None) -> str | None:
+    """
+    Find a local MSI build in the omnibus/pkg directory.
+
+    Args:
+        pkg: Optional package name or pattern to search for.
+             Can be a full filename (e.g., "datadog-agent-7.75.0-devel.git.59.ac0523a-1-x86_64.msi"),
+             a partial name (e.g., "datadog-agent-7.75"), or None to find the most recent MSI.
+
+    Returns the absolute path to the MSI file, or None if not found.
+    """
+    import glob
+
+    # Standard output directory for local MSI builds
+    output_dir = Path.cwd() / "omnibus" / "pkg"
+
+    if not output_dir.is_dir():
+        return None
+
+    if pkg:
+        # If pkg is provided, search for it
+        # Check if it's an absolute path first
+        if os.path.isabs(pkg) and os.path.isfile(pkg):
+            return pkg
+
+        # Check if it's a file in the output directory
+        direct_path = os.path.join(output_dir, pkg)
+        if os.path.isfile(direct_path):
+            return direct_path
+
+        # Try as a glob pattern
+        if '*' not in pkg:
+            pkg = f"*{pkg}*"
+        pattern = os.path.join(output_dir, pkg)
+        if not pattern.endswith('.msi'):
+            pattern = f"{pattern}*.msi"
+        msi_files = glob.glob(pattern)
+    else:
+        # Look for agent MSI files (both regular and FIPS)
+        patterns = [
+            os.path.join(output_dir, "datadog-agent-*.msi"),
+            os.path.join(output_dir, "datadog-fips-agent-*.msi"),
+        ]
+        msi_files = []
+        for pattern in patterns:
+            msi_files.extend(glob.glob(pattern))
+
+    if not msi_files:
+        return None
+
+    # Return the most recently modified MSI
+    return max(msi_files, key=os.path.getmtime)
+
+
+def _version_from_msi_filename(filename: str) -> tuple[str, str] | None:
+    """Parse version information from an MSI filename (basename or full path).
+
+    MSI filename format: datadog-agent-{version}-{arch}.msi
+    Example: datadog-agent-7.75.0-devel.git.59.ac0523a-1-x86_64.msi
+
+    Returns (display_version, package_version) tuple, or None if parsing fails.
+    - display_version: e.g., "7.75.0-devel"
+    - package_version: e.g., "7.75.0-devel.git.59.ac0523a-1"
+    """
+    import re
+
+    basename = os.path.basename(filename)
+    pattern = r'^datadog(?:-fips)?-agent-(.+)-(x86_64|amd64)\.msi$'
+    match = re.match(pattern, basename)
+    if not match:
+        return None
+
+    package_version = match.group(1)
+
+    if '.git.' in package_version:
+        display_version = package_version.split('.git.')[0]
+    elif package_version.endswith('-1'):
+        display_version = package_version[:-2]
+    else:
+        display_version = package_version
+
+    return display_version, package_version
+
+
+def _parse_version_from_msi_filename(ctx, msi_path: str) -> tuple[str, str] | None:
+    """Parse version information from a local MSI file path.
+
+    Tries the agent.version cache first for accuracy, then falls back to
+    regex parsing via _version_from_msi_filename.
+    """
+    filename = os.path.basename(msi_path)
+
+    try:
+        expected_version = f"{get_version(ctx, include_git=True, url_safe=True)}-1"
+        if expected_version in filename:
+            package_version = expected_version
+            if '.git.' in package_version:
+                display_version = package_version.split('.git.')[0]
+            elif package_version.endswith('-1'):
+                display_version = package_version[:-2]
+            else:
+                display_version = package_version
+            return display_version, package_version
+    except Exception:
+        print("Warning: Could not determine version from cached agent.version. Falling back to regex parsing")
+
+    return _version_from_msi_filename(msi_path)
+
+
+def _path_to_file_url(file_path: str) -> str:
+    """Convert a file path to a file:// URL."""
+    # Normalize the path and convert to forward slashes
+    abs_path = os.path.abspath(file_path)
+    if os.name == 'nt':
+        return f"file://{abs_path.replace(os.sep, '/')}"
+    return f"file://{abs_path}"
+
+
+def _resolve_local_build(ctx, prefix, env_vars, pkg=None):
+    """Resolve agent package from a local MSI build in omnibus/pkg."""
+    msi_path = _find_local_msi_build(pkg)
+    if not msi_path:
+        if pkg:
+            raise Exit(f"No MSI matching '{pkg}' found in omnibus/pkg/.", code=1)
+        raise Exit("No local MSI build found in omnibus/pkg/. Run 'dda inv msi.build' first.", code=1)
+
+    env_vars[f"{prefix}_MSI_URL"] = _path_to_file_url(msi_path)
+    print(f"# Found local MSI: {msi_path}", file=sys.stderr)
+
+    # parse the version from the MSI filename
+    version_info = _parse_version_from_msi_filename(ctx, msi_path)
+    if version_info:
+        display_version, package_version = version_info
+        env_vars[f"{prefix}_ASSERT_VERSION"] = display_version
+        env_vars[f"{prefix}_ASSERT_PACKAGE_VERSION"] = package_version
+    else:
+        print("Warning: Could not parse version from MSI filename, falling back to git", file=sys.stderr)
+        try:
+            env_vars[f"{prefix}_ASSERT_VERSION"] = get_version(ctx, include_git=False, include_pre=True)
+            package_version = get_version(ctx, include_git=True, url_safe=True)
+            env_vars[f"{prefix}_ASSERT_PACKAGE_VERSION"] = f"{package_version}-1"
+        except Exception as e:
+            raise Exit(f"Could not determine agent version: {e}", code=1) from e
+
+    # find matching OCI package
+    pkg_version_key = f"{prefix}_ASSERT_PACKAGE_VERSION"
+    if pkg_version_key in env_vars:
+        oci_filename = f"datadog-agent-{env_vars[pkg_version_key]}-windows-amd64.oci.tar"
+        oci_path = os.path.join(os.path.dirname(msi_path), oci_filename)
+        if os.path.isfile(oci_path):
+            env_vars[f"{prefix}_OCI_URL"] = _path_to_file_url(oci_path)
+            print(f"# Found local OCI: {oci_path}", file=sys.stderr)
+        else:
+            print(f"# Note: No OCI package found at {oci_filename}", file=sys.stderr)
+
+
+def _list_pipeline_msi_files(pipeline_id, bucket="dd-agent-mstesting"):
+    """List MSI files in S3 for a given pipeline.
+
+    Returns a list of S3 object keys matching the pipeline prefix.
+    """
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
+
+    s3_client = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+    s3_prefix = f"pipelines/A7/{pipeline_id}/"
+
+    result = s3_client.list_objects_v2(Bucket=bucket, Prefix=s3_prefix)
+    if result.get('KeyCount', 0) == 0:
+        raise Exit(f"No artifacts found in s3://{bucket}/{s3_prefix}", code=1)
+
+    return [obj['Key'] for obj in result.get('Contents', [])]
+
+
+def _extract_version_from_pipeline_artifacts(keys):
+    """Extract version info from pipeline S3 artifact filenames.
+
+    Looks for the base datadog-agent MSI (not fips) and parses the version.
+    Returns (display_version, package_version) or raises Exit.
+    """
+    for key in keys:
+        if '/datadog-fips-agent-' in key:
+            continue
+        result = _version_from_msi_filename(key)
+        if result:
+            return result
+
+    raise Exit("No datadog-agent MSI found in pipeline artifacts", code=1)
+
+
+def _resolve_pipeline_build(ctx, prefix, env_vars, pipeline_id=None, branch=None):
+    """Resolve agent package from a CI pipeline."""
+    if pipeline_id:
+        env_vars[f"{prefix}_PIPELINE"] = pipeline_id
+        print(f"# Using pipeline: {pipeline_id}", file=sys.stderr)
+    else:
+        result = _find_recent_successful_pipeline(ctx, branch)
+        if result:
+            env_vars[f"{prefix}_PIPELINE"] = result
+            pipeline_id = result
+            print(f"# Found pipeline: {result}", file=sys.stderr)
+        else:
+            raise Exit("Could not find a recent successful pipeline.", code=1)
+
+    try:
+        keys = _list_pipeline_msi_files(pipeline_id)
+        display_version, package_version = _extract_version_from_pipeline_artifacts(keys)
+        env_vars[f"{prefix}_ASSERT_VERSION"] = display_version
+        env_vars[f"{prefix}_ASSERT_PACKAGE_VERSION"] = package_version
+        print(f"# Resolved version from S3: {display_version} (package: {package_version})", file=sys.stderr)
+    except Exit:
+        raise
+    except Exception as e:
+        raise Exit(f"Could not determine agent version from pipeline artifacts: {e}", code=1) from e
+
+
+def _resolve_release_build(prefix, env_vars, version=None):
+    """Resolve agent package from a released version.
+
+    When version is provided, uses that version directly (supports stable and
+    beta/RC versions). When omitted, reads the last stable version from release.json.
+    """
+    if version is None:
+        try:
+            release_json = load_release_json()
+            version = release_json["last_stable"]["7"]
+        except Exception as e:
+            print(f"# Warning: Could not read stable version from release.json: {e}", file=sys.stderr)
+            print("# Using fallback stable version", file=sys.stderr)
+            version = "7.75.0"
+
+    env_vars[f"{prefix}_ASSERT_VERSION"] = version
+    env_vars[f"{prefix}_ASSERT_PACKAGE_VERSION"] = f"{version}-1"
+    env_vars[f"{prefix}_SOURCE_VERSION"] = f"{version}-1"
+
+
+@task(
+    help={
+        "fmt": "Output format: 'bash' for export commands, 'powershell' for $env: commands, 'json' for JSON output",
+        "build": "Build source: 'local' (local MSI in omnibus/pkg), 'pipeline' (CI pipeline artifacts), 'release' (released version from S3)",
+        "prefix": "Environment variable prefix (e.g., CURRENT_AGENT, STABLE_AGENT). When omitted, outputs CURRENT_AGENT from --build + STABLE_AGENT from release.json",
+        "pkg": "Local MSI to use instead of the most recent one. Only used with --build local",
+        "branch": "Git branch to find pipeline from (default: current branch, falls back to main). Only used with --build pipeline",
+        "pipeline_id": "Override pipeline ID instead of auto-detecting. Only used with --build pipeline",
+        "version": "Specific released version (e.g., 7.75.0 or 7.76.0-rc.2). Only used with --build release. When omitted, reads last stable from release.json",
+    }
+)
+def setup_env(ctx, fmt="bash", build="pipeline", prefix=None, pkg=None, branch=None, pipeline_id=None, version=None):
+    """
+    Generate environment variables for running Windows E2E tests locally.
+
+    This task derives version information and artifact locations to set the required
+    environment variables (CURRENT_AGENT_*, STABLE_AGENT_*) for running E2E tests.
+
+    Build modes:
+      local    - Find MSI/OCI from omnibus/pkg (a local build)
+      pipeline - Resolve artifacts from a CI pipeline (auto-detects or use --pipeline-id)
+      release  - Resolve from a released version (stable or RC). Uses release.json by default,
+                 or a specific version with --version
+
+    When --prefix is omitted, the task outputs both:
+      - CURRENT_AGENT_* from the specified --build mode (default: pipeline)
+      - STABLE_AGENT_* from release.json
+
+    When --prefix is specified, the task outputs only that prefix using the
+    specified --build mode.
+
+    Usage:
+        # Default: CURRENT_AGENT from pipeline + STABLE_AGENT from release.json
+        dda inv new-e2e-tests.setup-env --build pipeline
+
+        # Default: CURRENT_AGENT from local build + STABLE_AGENT from release.json
+        dda inv new-e2e-tests.setup-env --build local
+
+        # Only STABLE_AGENT, resolved from a specific pipeline
+        dda inv new-e2e-tests.setup-env --prefix STABLE_AGENT --build pipeline --pipeline-id 12345678
+
+        # Only CURRENT_AGENT from a local build
+        dda inv new-e2e-tests.setup-env --prefix CURRENT_AGENT --build local
+
+        # STABLE_AGENT from a specific stable release
+        dda inv new-e2e-tests.setup-env --prefix STABLE_AGENT --build release --version 7.75.0
+
+        # STABLE_AGENT from a release candidate (beta channel)
+        dda inv new-e2e-tests.setup-env --prefix STABLE_AGENT --build release --version 7.76.0-rc.2
+
+        # Bash/WSL - eval the output to apply the environment variables
+        eval "$(dda inv new-e2e-tests.setup-env --build local)"
+
+        # PowerShell - pipe to Invoke-Expression to execute the commands
+        dda inv new-e2e-tests.setup-env --build local --fmt powershell | Invoke-Expression
+
+        # JSON - for programmatic use
+        dda inv new-e2e-tests.setup-env --build local --fmt json
+
+    Note: The task outputs shell commands (e.g., 'export VAR=value' for bash).
+    Using eval (bash) or Invoke-Expression (PowerShell) executes these commands
+    to actually set the environment variables in your current shell session.
+    Without eval/Invoke-Expression, the commands are just printed but not executed.
+    """
+    env_vars = {}
+
+    valid_formats = ["bash", "powershell", "json"]
+    if fmt not in valid_formats:
+        raise Exit(f"Invalid --fmt option: {fmt}. Use one of: {', '.join(valid_formats)}", code=1)
+
+    valid_builds = ["local", "pipeline", "release"]
+    if build not in valid_builds:
+        raise Exit(f"Invalid --build option: {build}. Use one of: {', '.join(valid_builds)}", code=1)
+
+    if version and build != "release":
+        raise Exit("--version can only be used with --build release", code=1)
+
+    if prefix:
+        # Single-prefix mode: resolve one prefix using the specified build mode
+        if build == "local":
+            _resolve_local_build(ctx, prefix, env_vars, pkg=pkg)
+        elif build == "pipeline":
+            _resolve_pipeline_build(ctx, prefix, env_vars, pipeline_id=pipeline_id, branch=branch)
+        elif build == "release":
+            _resolve_release_build(prefix, env_vars, version=version)
+    else:
+        # Default mode: CURRENT_AGENT from build mode + STABLE_AGENT from release.json
+        if build == "release":
+            raise Exit("--build release requires --prefix (e.g., --prefix STABLE_AGENT)", code=1)
+        if build == "local":
+            _resolve_local_build(ctx, "CURRENT_AGENT", env_vars, pkg=pkg)
+        elif build == "pipeline":
+            _resolve_pipeline_build(ctx, "CURRENT_AGENT", env_vars, pipeline_id=pipeline_id, branch=branch)
+        _resolve_release_build("STABLE_AGENT", env_vars)
+
+    # Output in requested format
+    if fmt == "json":
+        print(json.dumps(env_vars, indent=2))
+    elif fmt == "powershell":
+        for key, value in env_vars.items():
+            print(f'$env:{key}="{value}"')
+    else:  # bash
+        for key, value in env_vars.items():
+            print(f'export {key}="{value}"')
+
+
+@task(
+    help={
+        "input": "Path to a test2json JSONL file produced by a Go e2e test run",
+    }
+)
+def print_utof_report(ctx, input):
+    """Print the UTOF report that would be generated from an e2e test output JSON file."""
+    from tasks.libs.testing.result_json import ResultJson
+    from tasks.libs.testing.utof import format_report
+    from tasks.libs.testing.utof.go.e2e import convert_e2e_test_results, generate_metadata
+
+    result_json = ResultJson.from_file(input)
+    metadata = generate_metadata(ctx, test_system="e2e")
+    doc = convert_e2e_test_results(ctx, result_json, metadata=metadata)
+    print(format_report(doc))

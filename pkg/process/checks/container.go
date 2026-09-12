@@ -6,7 +6,6 @@
 package checks
 
 import (
-	"fmt"
 	"math"
 	"net/http"
 	"sync"
@@ -18,6 +17,7 @@ import (
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	proccontainers "github.com/DataDog/datadog-agent/pkg/process/util/containers"
+	"github.com/DataDog/datadog-agent/pkg/process/util/coreagent"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/api/client"
 	"github.com/DataDog/datadog-agent/pkg/util/flavor"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -28,11 +28,12 @@ const (
 )
 
 // NewContainerCheck returns an instance of the ContainerCheck.
-func NewContainerCheck(config pkgconfigmodel.Reader, wmeta workloadmeta.Component, statsd statsd.ClientInterface) *ContainerCheck {
+func NewContainerCheck(config pkgconfigmodel.Reader, sysConfig pkgconfigmodel.Reader, wmeta workloadmeta.Component, statsd statsd.ClientInterface) *ContainerCheck {
 	return &ContainerCheck{
-		config: config,
-		wmeta:  wmeta,
-		statsd: statsd,
+		config:    config,
+		sysConfig: sysConfig,
+		wmeta:     wmeta,
+		statsd:    statsd,
 	}
 }
 
@@ -40,7 +41,8 @@ func NewContainerCheck(config pkgconfigmodel.Reader, wmeta workloadmeta.Componen
 type ContainerCheck struct {
 	sync.Mutex
 
-	config pkgconfigmodel.Reader
+	config    pkgconfigmodel.Reader
+	sysConfig pkgconfigmodel.Reader
 
 	hostInfo          *HostInfo
 	containerProvider proccontainers.ContainerProvider
@@ -83,11 +85,11 @@ func (c *ContainerCheck) Init(syscfg *SysProbeConfig, info *HostInfo, _ bool) er
 // IsEnabled returns true if the check is enabled by configuration
 // Keep in mind that ContainerRTCheck.IsEnabled should only be enabled if the `ContainerCheck` is enabled
 func (c *ContainerCheck) IsEnabled() bool {
-	if c.config.GetBool("process_config.run_in_core_agent.enabled") && flavor.GetFlavor() == flavor.ProcessAgent {
+	if coreagent.ProcessChecksRunInCoreAgent() && flavor.GetFlavor() == flavor.ProcessAgent {
 		return false
 	}
 
-	return canEnableContainerChecks(c.config, true)
+	return canEnableContainerChecks(c.config, c.sysConfig, true)
 }
 
 // SupportsRunOptions returns true if the check supports RunOptions
@@ -154,7 +156,7 @@ func (c *ContainerCheck) Run(nextGroupID func() int32, options *RunOptions) (Run
 	}
 
 	numContainers := float64(len(containers))
-	agentNameTag := fmt.Sprintf("agent:%s", flavor.GetFlavor())
+	agentNameTag := "agent:" + flavor.GetFlavor()
 	_ = c.statsd.Gauge("datadog.process.containers.host_count", numContainers, []string{agentNameTag}, 1)
 	log.Debugf("collected %d containers in %s", int(numContainers), time.Since(startTime))
 	return StandardRunResult(messages), nil

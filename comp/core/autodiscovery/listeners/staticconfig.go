@@ -7,8 +7,9 @@ package listeners
 
 import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
+	filter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
 )
 
 // StaticConfigListener implements a ServiceListener based on static configuration parameters
@@ -41,18 +42,45 @@ func (l *StaticConfigListener) Stop() {
 }
 
 func (l *StaticConfigListener) createServices() {
-	for _, staticCheck := range []string{
-		"container_image",
-		"container_lifecycle",
-		"sbom",
+	// Each entry maps a config key (which controls enablement) to an autodiscovery
+	// identifier (which routes to a check via ad_identifiers). Nested config keys
+	// like gpu.nccl require an explicit AD identifier because dots are not
+	// conventional in AD names.
+	for _, entry := range []struct {
+		configKey    string
+		adIdentifier string
+	}{
+		{"container_image.enabled", "_container_image"},
+		{"container_lifecycle.enabled", "_container_lifecycle"},
+		{"sbom.enabled", "_sbom"},
+		{"gpu.enabled", "_gpu"},
+		{"gpu.nccl.enabled", "_gpu_nccl"},
 	} {
-		if enabled := pkgconfigsetup.Datadog().GetBool(staticCheck + ".enabled"); enabled {
-			l.newService <- &StaticConfigService{adIdentifier: "_" + staticCheck}
+		if enabled := pkgconfigsetup.Datadog().GetBool(entry.configKey); enabled {
+			l.newService <- &StaticConfigService{adIdentifier: entry.adIdentifier}
 		}
 	}
 
-	if enabled := pkgconfigsetup.SystemProbe().GetBool("discovery.enabled"); enabled {
-		l.newService <- &StaticConfigService{adIdentifier: "_discovery"}
+	// System-probe sourced toggles: these live in system-probe.yaml and enable
+	// checks that depend on a system-probe module being active.
+	for _, entry := range []struct {
+		configKey    string
+		adIdentifier string
+	}{
+		{"discovery.enabled", "_discovery"},
+		{"system_probe_config.enable_oom_kill", "_oom_kill"},
+		{"system_probe_config.enable_tcp_queue_length", "_tcp_queue_length"},
+	} {
+		if enabled := pkgconfigsetup.SystemProbe().GetBool(entry.configKey); enabled {
+			l.newService <- &StaticConfigService{adIdentifier: entry.adIdentifier}
+		}
+	}
+
+	// Infrastructure mode: emit a single service for the mode
+	// All checks with ad_identifiers: [_<mode>] will be scheduled
+	infraMode := pkgconfigsetup.Datadog().GetString("infrastructure_mode")
+	if infraMode != "full" {
+		l.newService <- &StaticConfigService{adIdentifier: "_" + infraMode}
 	}
 }
 
@@ -82,7 +110,7 @@ func (s *StaticConfigService) GetHosts() (map[string]string, error) {
 }
 
 // GetPorts returns nil and an error because port is not supported in this listener
-func (s *StaticConfigService) GetPorts() ([]ContainerPort, error) {
+func (s *StaticConfigService) GetPorts() ([]workloadmeta.ContainerPort, error) {
 	return nil, ErrNotSupported
 }
 
@@ -113,13 +141,18 @@ func (s *StaticConfigService) IsReady() bool {
 }
 
 // HasFilter is not supported
-func (s *StaticConfigService) HasFilter(_ containers.FilterType) bool {
+func (s *StaticConfigService) HasFilter(_ filter.Scope) bool {
 	return false
 }
 
 // GetExtraConfig is not supported
 func (s *StaticConfigService) GetExtraConfig(_ string) (string, error) {
 	return "", ErrNotSupported
+}
+
+// GetImageName does nothing
+func (s *StaticConfigService) GetImageName() string {
+	return ""
 }
 
 // FilterTemplates does nothing.

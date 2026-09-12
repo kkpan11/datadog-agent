@@ -48,6 +48,18 @@
         "is_kworker": {
             "type": "boolean"
         },
+        "is_thread": {
+            "type": "boolean"
+        },
+        "is_exec": {
+            "type": "boolean"
+        },
+        "is_exec_child": {
+            "type": "boolean"
+        },
+        "is_parent_missing": {
+            "type": "boolean"
+        },
         "args": {
             "type": "array",
             "items": {
@@ -174,7 +186,12 @@
                     "enum": [
                         "procfs",
                         "event",
-                        "unshare"
+                        "unshare",
+                        "fsmount",
+                        "open_tree",
+                        "listmount",
+                        "move_mount",
+                        "pivot_root"
                     ]
                 }
             },
@@ -182,7 +199,6 @@
                 "name",
                 "inode",
                 "mode",
-                "filesystem",
                 "uid",
                 "gid",
                 "modification_time",
@@ -201,6 +217,23 @@
                 "required": [
                     "path",
                     "mount_id"
+                ]
+            },
+            "if": {
+                "not": {
+                    "properties": {
+                        "path": {
+                            "const": "/runc"
+                        },
+                        "mount_origin": {
+                            "const": "fsmount"
+                        }
+                    }
+                }
+            },
+            "then": {
+                "required": [
+                    "filesystem"
                 ]
             }
         },

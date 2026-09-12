@@ -18,7 +18,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/crio"
 	"github.com/DataDog/datadog-agent/pkg/util/docker"
 	"github.com/DataDog/datadog-agent/pkg/util/trivy"
-	"github.com/containerd/containerd"
+	containerd "github.com/containerd/containerd/v2/client"
 )
 
 func runScanFS(path string, analyzers []string, fast bool) error {
@@ -46,7 +46,7 @@ func runScanDocker(imageMeta *workloadmeta.ContainerImageMetadata, analyzers []s
 	dockerClient := cl.RawClient()
 
 	ctx := context.Background()
-	report, err := collector.ScanDockerImage(
+	report, _, err := collector.ScanDockerImage(
 		ctx,
 		imageMeta,
 		dockerClient,
@@ -126,11 +126,7 @@ func runScanCrio(imageMeta *workloadmeta.ContainerImageMetadata, analyzers []str
 }
 
 func outputReport(report sbom.Report) error {
-	bom, err := report.ToCycloneDX()
-	if err != nil {
-		return err
-	}
-
+	bom := report.ToCycloneDX()
 	bomJSON, err := json.MarshalIndent(bom, "", "  ")
 	if err != nil {
 		return err

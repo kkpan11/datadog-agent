@@ -1,0 +1,17 @@
+---
+.upload_junit_source:
+  - $CI_PROJECT_DIR/tools/ci/junit_upload.sh
+
+.manage_coverage_cache:
+  # Restore or persist the shared coverage cache. Never fail on cache operations.
+  - dda inv -- -e coverage.manage-coverage-cache $COVERAGE_CACHE_FLAG || true
+
+.upload_coverage_datadog:
+  # Upload a coverage file or glob to Datadog Code Coverage. Never fail on coverage upload.
+  - DD_API_KEY=$($CI_PROJECT_DIR/tools/ci/fetch_secret.sh $AGENT_API_KEY_ORG2 token) || exit $?; export DD_API_KEY
+  - datadog-ci coverage upload --format=go-coverprofile "${COVERAGE_FILE:-coverage.out}" || true
+
+.unit_test_base:
+  extends: .bazel:defs:cache:progressive
+  variables:
+    FLAKY_PATTERNS_CONFIG: $CI_PROJECT_DIR/flaky-patterns-runtime.yaml

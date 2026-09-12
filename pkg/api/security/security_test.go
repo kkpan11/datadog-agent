@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,7 +33,7 @@ func initMockConf(t *testing.T) (model.Config, string) {
 
 	mockConfig := configmock.New(t)
 	mockConfig.SetConfigFile(f.Name())
-	mockConfig.SetWithoutSource("auth_token", "")
+	mockConfig.SetInTest("auth_token", "")
 
 	return mockConfig, filepath.Join(testDir, "auth_token")
 }
@@ -41,7 +42,7 @@ func TestCreateOrFetchAuthTokenValidGen(t *testing.T) {
 	config, expectTokenPath := initMockConf(t)
 	token, err := FetchOrCreateAuthToken(context.Background(), config)
 	require.NoError(t, err, fmt.Sprintf("%v", err))
-	assert.True(t, len(token) > authTokenMinimalLen, fmt.Sprintf("%d", len(token)))
+	assert.True(t, len(token) > authTokenMinimalLen, strconv.Itoa(len(token)))
 	_, err = os.Stat(expectTokenPath)
 	require.NoError(t, err)
 }
@@ -57,7 +58,7 @@ func TestFetchAuthToken(t *testing.T) {
 
 	newToken, err := FetchOrCreateAuthToken(context.Background(), config)
 	require.NoError(t, err, fmt.Sprintf("%v", err))
-	require.True(t, len(newToken) > authTokenMinimalLen, fmt.Sprintf("%d", len(newToken)))
+	require.True(t, len(newToken) > authTokenMinimalLen, strconv.Itoa(len(newToken)))
 	_, err = os.Stat(expectTokenPath)
 	require.NoError(t, err)
 

@@ -9,7 +9,7 @@ package hostname
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"testing"
 
@@ -47,7 +47,7 @@ type testCase struct {
 
 func setupHostnameTest(t *testing.T, tc testCase) {
 	t.Cleanup(func() {
-		isFargateInstance = fargate.IsFargateInstance
+		isSidecar = fargate.IsSidecar
 		ec2GetInstanceID = ec2.GetInstanceID
 		isContainerized = env.IsContainerized
 		gceGetHostname = gce.GetHostname
@@ -62,40 +62,40 @@ func setupHostnameTest(t *testing.T, tc testCase) {
 	cfg := configmock.New(t)
 
 	if tc.configHostname {
-		cfg.SetWithoutSource("hostname", "hostname-from-configuration")
+		cfg.SetInTest("hostname", "hostname-from-configuration")
 	}
 	if tc.hostnameFile {
 		setupHostnameFile(t, "hostname-from-file")
 	}
 	if tc.fargate {
-		isFargateInstance = func() bool { return true }
+		isSidecar = func() bool { return true }
 	} else {
-		isFargateInstance = func() bool { return false }
+		isSidecar = func() bool { return false }
 	}
 
 	if tc.GCE {
 		gceGetHostname = func(context.Context) (string, error) { return "hostname-from-gce", nil }
 	} else {
-		gceGetHostname = func(context.Context) (string, error) { return "", fmt.Errorf("some error") }
+		gceGetHostname = func(context.Context) (string, error) { return "", errors.New("some error") }
 	}
 
 	if tc.azure {
 		azureGetHostname = func(context.Context) (string, error) { return "hostname-from-azure", nil }
 	} else {
-		azureGetHostname = func(context.Context) (string, error) { return "", fmt.Errorf("some error") }
+		azureGetHostname = func(context.Context) (string, error) { return "", errors.New("some error") }
 	}
 
 	if tc.FQDN || tc.FQDNEC2 {
 		// making isOSHostnameUsable return true
 		osHostnameUsable = func(context.Context) bool { return true }
-		cfg.SetWithoutSource("hostname_fqdn", true)
+		cfg.SetInTest("hostname_fqdn", true)
 		if !tc.FQDNEC2 {
 			fqdnHostname = func() (string, error) { return "hostname-from-fqdn", nil }
 		} else {
 			fqdnHostname = func() (string, error) { return "ip-default-ec2-hostname", nil }
 		}
 	} else {
-		fqdnHostname = func() (string, error) { return "", fmt.Errorf("some error") }
+		fqdnHostname = func() (string, error) { return "", errors.New("some error") }
 	}
 
 	if tc.OS || tc.OSEC2 {
@@ -107,17 +107,17 @@ func setupHostnameTest(t *testing.T, tc testCase) {
 			osHostname = func() (string, error) { return "ip-default-ec2-hostname", nil }
 		}
 	} else {
-		osHostname = func() (string, error) { return "", fmt.Errorf("some error") }
+		osHostname = func() (string, error) { return "", errors.New("some error") }
 	}
 
 	if tc.EC2 {
 		ec2GetInstanceID = func(context.Context) (string, error) { return "hostname-from-ec2", nil }
 	} else {
-		ec2GetInstanceID = func(context.Context) (string, error) { return "", fmt.Errorf("some error") }
+		ec2GetInstanceID = func(context.Context) (string, error) { return "", errors.New("some error") }
 	}
 
 	if tc.EC2Proritized {
-		cfg.SetWithoutSource("ec2_prioritize_instance_id_as_hostname", true)
+		cfg.SetInTest("ec2_prioritize_instance_id_as_hostname", true)
 	}
 }
 

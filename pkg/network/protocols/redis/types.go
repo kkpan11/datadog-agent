@@ -21,8 +21,11 @@ var (
 	UnknownCommand = CommandType(C.REDIS_UNKNOWN)
 	GetCommand     = CommandType(C.REDIS_GET)
 	SetCommand     = CommandType(C.REDIS_SET)
+	PingCommand    = CommandType(C.REDIS_PING)
 	maxCommand     = CommandType(C.__MAX_REDIS_COMMAND)
 )
 
 type EbpfEvent C.redis_event_t
+type EbpfKeyedEvent C.redis_with_key_event_t
+type EbpfKey C.redis_key_data_t
 type EbpfTx C.redis_transaction_t

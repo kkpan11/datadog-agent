@@ -7,9 +7,11 @@
 package config
 
 import (
+	"slices"
 	"time"
 
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/structure"
 	"github.com/DataDog/datadog-agent/pkg/ebpf"
 	sysconfig "github.com/DataDog/datadog-agent/pkg/system-probe/config"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -20,9 +22,13 @@ const (
 	netNS = "network_config"
 	smNS  = "service_monitoring_config"
 	evNS  = "event_monitoring_config"
+	dscNS = "discovery"
 
 	defaultUDPTimeoutSeconds       = 30
 	defaultUDPStreamTimeoutSeconds = 120
+
+	// Must stay in sync with DNS_PORTS_MAX in pkg/network/ebpf/c/prebuilt/dns.c.
+	DNSPortsMax = 8
 )
 
 // Config stores all flags used by the network eBPF tracer
@@ -31,9 +37,6 @@ type Config struct {
 
 	// NPMEnabled is whether the network performance monitoring feature is explicitly enabled or not
 	NPMEnabled bool
-
-	// ServiceMonitoringEnabled is whether the service monitoring feature is enabled or not
-	ServiceMonitoringEnabled bool
 
 	// CollectTCPv4Conns specifies whether the tracer should collect traffic statistics for TCPv4 connections
 	CollectTCPv4Conns bool
@@ -62,6 +65,9 @@ type Config struct {
 	// It is relevant *only* when DNSInspection and CollectDNSStats is enabled.
 	CollectDNSDomains bool
 
+	// DNSMonitoringPortList specifies the list of ports to monitor for DNS traffic
+	DNSMonitoringPortList []int
+
 	// DNSTimeout determines the length of time to wait before considering a DNS Query to have timed out
 	DNSTimeout time.Duration
 
@@ -69,53 +75,8 @@ type Config struct {
 	// These stats objects get flushed on every client request (default 30s check interval)
 	MaxDNSStats int
 
-	// EnableHTTPMonitoring specifies whether the tracer should monitor HTTP traffic
-	EnableHTTPMonitoring bool
-
-	// EnableHTTP2Monitoring specifies whether the tracer should monitor HTTP2 traffic
-	EnableHTTP2Monitoring bool
-
-	// EnableKafkaMonitoring specifies whether the tracer should monitor Kafka traffic
-	EnableKafkaMonitoring bool
-
-	// EnablePostgresMonitoring specifies whether the tracer should monitor Postgres traffic.
-	EnablePostgresMonitoring bool
-
-	// EnableRedisMonitoring specifies whether the tracer should monitor Redis traffic.
-	EnableRedisMonitoring bool
-
-	// EnableNativeTLSMonitoring specifies whether the USM should monitor HTTPS traffic via native libraries.
-	// Supported libraries: OpenSSL, GnuTLS, LibCrypto.
-	EnableNativeTLSMonitoring bool
-
-	// EnableIstioMonitoring specifies whether USM should monitor Istio traffic
-	EnableIstioMonitoring bool
-
-	// EnvoyPath specifies the envoy path to be used for Istio monitoring
-	EnvoyPath string
-
-	// EnableNodeJSMonitoring specifies whether USM should monitor NodeJS TLS traffic
-	EnableNodeJSMonitoring bool
-
-	// EnableGoTLSSupport specifies whether the tracer should monitor HTTPS
-	// traffic done through Go's standard library's TLS implementation
-	EnableGoTLSSupport bool
-
-	// GoTLSExcludeSelf specifies whether USM's GoTLS module should avoid
-	// hooking the system-probe test binary. Defaults to true.
-	GoTLSExcludeSelf bool
-
-	// MaxTrackedHTTPConnections max number of http(s) flows that will be concurrently tracked.
-	// value is currently Windows only
-	MaxTrackedHTTPConnections int64
-
-	// HTTPNotificationThreshold is the number of connections to hold in the kernel before signalling
-	// to be retrieved.  Currently Windows only
-	HTTPNotificationThreshold int64
-
-	// HTTPMaxRequestFragment is the size of the HTTP path buffer to be retrieved.
-	// Currently Windows only
-	HTTPMaxRequestFragment int64
+	// Embedded USM configuration
+	*USMConfig
 
 	// UDPConnTimeout determines the length of traffic inactivity between two
 	// (IP, port)-pairs before declaring a UDP connection as inactive. This is
@@ -151,29 +112,6 @@ type Config struct {
 	// MaxDNSStatsBuffered represents the maximum number of DNS stats we'll buffer in memory. These stats
 	// get flushed on every client request (default 30s check interval)
 	MaxDNSStatsBuffered int
-
-	// MaxUSMConcurrentRequests represents the maximum number of requests (for a single protocol)
-	// that can happen concurrently at a given point in time. This parameter is used for sizing our eBPF maps.
-	MaxUSMConcurrentRequests uint32
-
-	// MaxHTTPStatsBuffered represents the maximum number of HTTP stats we'll buffer in memory. These stats
-	// get flushed on every client request (default 30s check interval)
-	MaxHTTPStatsBuffered int
-
-	// MaxKafkaStatsBuffered represents the maximum number of Kafka stats we'll buffer in memory. These stats
-	// get flushed on every client request (default 30s check interval)
-	MaxKafkaStatsBuffered int
-
-	// MaxPostgresTelemetryBuffer represents the maximum size of the telemetry buffer size for Postgres.
-	MaxPostgresTelemetryBuffer int
-
-	// MaxPostgresStatsBuffered represents the maximum number of Postgres stats we'll buffer in memory. These stats
-	// get flushed on every client request (default 30s check interval)
-	MaxPostgresStatsBuffered int
-
-	// MaxRedisStatsBuffered represents the maximum number of Redis stats we'll buffer in memory. These stats
-	// get flushed on every client request (default 30s check interval)
-	MaxRedisStatsBuffered int
 
 	// MaxConnectionsStateBuffered represents the maximum number of state objects that we'll store in memory. These state objects store
 	// the stats for a connection so we can accurately determine traffic change between client requests.
@@ -236,27 +174,21 @@ type Config struct {
 	// RecordedQueryTypes enables specific DNS query types to be recorded
 	RecordedQueryTypes []string
 
-	// HTTP replace rules
-	HTTPReplaceRules []*ReplaceRule
-
 	// EnableProcessEventMonitoring enables consuming CWS process monitoring events from the runtime security module
 	EnableProcessEventMonitoring bool
 
 	// MaxProcessesTracked is the maximum number of processes whose information is stored in the network module
 	MaxProcessesTracked int
 
+	// EnableContainerStore enables reading resolv.conf out of container filesystems. Requires EnableProcessEventMonitoring.
+	EnableContainerStore bool
+
+	// MaxContainersTracked is the maximum number of containers whose resolv.conf information is stored in the network module
+	MaxContainersTracked int
+
 	// EnableRootNetNs disables using the network namespace of the root process (1)
 	// for things like creating netlink sockets for conntrack updates, etc.
 	EnableRootNetNs bool
-
-	// HTTP2DynamicTableMapCleanerInterval is the interval to run the cleaner function.
-	HTTP2DynamicTableMapCleanerInterval time.Duration
-
-	// HTTPMapCleanerInterval is the interval to run the cleaner function.
-	HTTPMapCleanerInterval time.Duration
-
-	// HTTPIdleConnectionTTL is the time an idle connection counted as "inactive" and should be deleted.
-	HTTPIdleConnectionTTL time.Duration
 
 	// ProtocolClassificationEnabled specifies whether the tracer should enhance connection data with protocols names by
 	// classifying the L7 protocols being used.
@@ -268,20 +200,8 @@ type Config struct {
 	// EnableNPMConnectionRollup enables aggregating connections by rolling up ephemeral ports
 	EnableNPMConnectionRollup bool
 
-	// EnableUSMQuantization enables endpoint quantization for USM programs
-	EnableUSMQuantization bool
-
 	// NPMRingbuffersEnabled specifies whether ringbuffers are enabled or not
 	NPMRingbuffersEnabled bool
-
-	// EnableUSMConnectionRollup enables the aggregation of connection data belonging to a same (client, server) pair
-	EnableUSMConnectionRollup bool
-
-	// EnableUSMRingBuffers enables the use of eBPF Ring Buffer types on
-	// supported kernels.
-	// Defaults to true. Setting this to false on a Kernel that supports ring
-	// buffers (>=5.8) will result in forcing the use of Perf Maps instead.
-	EnableUSMRingBuffers bool
 
 	// EnableEbpfless enables the use of network tracing without eBPF using packet capture.
 	EnableEbpfless bool
@@ -289,18 +209,25 @@ type Config struct {
 	// EnableFentry enables the experimental fentry tracer (disabled by default)
 	EnableFentry bool
 
-	// EnableUSMEventStream enables USM to use the event stream instead
-	// of netlink for receiving process events.
-	EnableUSMEventStream bool
+	// EnableCORETracer enables the CO-RE version of the tracer
+	EnableCORETracer bool
 
-	// CustomBatchingEnabled enables the use of custom batching for eBPF perf events with perf buffers
-	CustomBatchingEnabled bool
+	// ExpectedTagsDuration is the duration for which we add host and container tags to our payloads, to handle the race
+	// in the backend for processing host/container tags and resolving them in our own pipelines.
+	ExpectedTagsDuration time.Duration
 
-	// USMKernelBufferPages defines the number of pages to allocate for the USM kernel buffer, used for either ring buffers or perf maps.
-	USMKernelBufferPages int
+	// EnableCertCollection enables the collection of TLS certificates via userspace probing
+	EnableCertCollection bool
 
-	// USMDataChannelSize specifies the size of the data channel for USM, used to temporarily store data from the kernel in user mode before processing.
-	USMDataChannelSize int
+	// CertCollectionMapCleanerInterval is the interval between eBPF map cleaning for TLS cert collection
+	CertCollectionMapCleanerInterval time.Duration
+
+	// DirectSend controls whether we send payloads directly from system-probe or they are queried from process-agent.
+	// Not supported on Windows
+	DirectSend bool
+
+	// EnableSKTracer enables to experimental sk tracer
+	EnableSKTracer bool
 }
 
 // New creates a config for the network tracer
@@ -311,8 +238,7 @@ func New() *Config {
 	c := &Config{
 		Config: *ebpf.NewConfig(),
 
-		NPMEnabled:               cfg.GetBool(sysconfig.FullKeyPath(netNS, "enabled")),
-		ServiceMonitoringEnabled: cfg.GetBool(sysconfig.FullKeyPath(smNS, "enabled")),
+		NPMEnabled: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enabled")),
 
 		CollectTCPv4Conns: cfg.GetBool(sysconfig.FullKeyPath(netNS, "collect_tcp_v4")),
 		CollectTCPv6Conns: cfg.GetBool(sysconfig.FullKeyPath(netNS, "collect_tcp_v6")),
@@ -348,27 +274,9 @@ func New() *Config {
 		ProtocolClassificationEnabled: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_protocol_classification")),
 
 		NPMRingbuffersEnabled: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_ringbuffers")),
-		CustomBatchingEnabled: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_custom_batching")),
 
-		EnableHTTPMonitoring:       cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_http_monitoring")),
-		EnableHTTP2Monitoring:      cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_http2_monitoring")),
-		EnableKafkaMonitoring:      cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_kafka_monitoring")),
-		EnablePostgresMonitoring:   cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_postgres_monitoring")),
-		EnableRedisMonitoring:      cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_redis_monitoring")),
-		EnableNativeTLSMonitoring:  cfg.GetBool(sysconfig.FullKeyPath(smNS, "tls", "native", "enabled")),
-		EnableIstioMonitoring:      cfg.GetBool(sysconfig.FullKeyPath(smNS, "tls", "istio", "enabled")),
-		EnvoyPath:                  cfg.GetString(sysconfig.FullKeyPath(smNS, "tls", "istio", "envoy_path")),
-		EnableNodeJSMonitoring:     cfg.GetBool(sysconfig.FullKeyPath(smNS, "tls", "nodejs", "enabled")),
-		MaxUSMConcurrentRequests:   uint32(cfg.GetInt(sysconfig.FullKeyPath(smNS, "max_concurrent_requests"))),
-		MaxHTTPStatsBuffered:       cfg.GetInt(sysconfig.FullKeyPath(smNS, "max_http_stats_buffered")),
-		MaxKafkaStatsBuffered:      cfg.GetInt(sysconfig.FullKeyPath(smNS, "max_kafka_stats_buffered")),
-		MaxPostgresStatsBuffered:   cfg.GetInt(sysconfig.FullKeyPath(smNS, "max_postgres_stats_buffered")),
-		MaxPostgresTelemetryBuffer: cfg.GetInt(sysconfig.FullKeyPath(smNS, "max_postgres_telemetry_buffer")),
-		MaxRedisStatsBuffered:      cfg.GetInt(sysconfig.FullKeyPath(smNS, "max_redis_stats_buffered")),
-
-		MaxTrackedHTTPConnections: cfg.GetInt64(sysconfig.FullKeyPath(smNS, "max_tracked_http_connections")),
-		HTTPNotificationThreshold: cfg.GetInt64(sysconfig.FullKeyPath(smNS, "http_notification_threshold")),
-		HTTPMaxRequestFragment:    cfg.GetInt64(sysconfig.FullKeyPath(smNS, "http_max_request_fragment")),
+		// Embed USM configuration
+		USMConfig: NewUSMConfig(cfg),
 
 		EnableConntrack:              cfg.GetBool(sysconfig.FullKeyPath(spNS, "enable_conntrack")),
 		ConntrackMaxStateSize:        cfg.GetInt(sysconfig.FullKeyPath(spNS, "conntrack_max_state_size")),
@@ -389,35 +297,24 @@ func New() *Config {
 		EnableProcessEventMonitoring: cfg.GetBool(sysconfig.FullKeyPath(evNS, "network_process", "enabled")),
 		MaxProcessesTracked:          cfg.GetInt(sysconfig.FullKeyPath(evNS, "network_process", "max_processes_tracked")),
 
+		EnableContainerStore: cfg.GetBool(sysconfig.FullKeyPath(evNS, "network_process", "container_store", "enabled")),
+		MaxContainersTracked: cfg.GetInt(sysconfig.FullKeyPath(evNS, "network_process", "container_store", "max_containers_tracked")),
+
 		EnableRootNetNs: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_root_netns")),
-
-		HTTP2DynamicTableMapCleanerInterval: time.Duration(cfg.GetInt(sysconfig.FullKeyPath(smNS, "http2_dynamic_table_map_cleaner_interval_seconds"))) * time.Second,
-
-		HTTPMapCleanerInterval: time.Duration(cfg.GetInt(sysconfig.FullKeyPath(smNS, "http_map_cleaner_interval_in_s"))) * time.Second,
-		HTTPIdleConnectionTTL:  time.Duration(cfg.GetInt(sysconfig.FullKeyPath(smNS, "http_idle_connection_ttl_in_s"))) * time.Second,
 
 		EnableNPMConnectionRollup: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_connection_rollup")),
 
-		EnableEbpfless: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_ebpfless")),
-		EnableFentry:   cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_fentry")),
+		EnableCORETracer: cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_co_re")),
+		EnableEbpfless:   cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_ebpfless")),
+		EnableFentry:     cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_fentry")),
+		EnableSKTracer:   cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_sk_tracer")),
 
-		// Service Monitoring
-		EnableGoTLSSupport:        cfg.GetBool(sysconfig.FullKeyPath(smNS, "tls", "go", "enabled")),
-		GoTLSExcludeSelf:          cfg.GetBool(sysconfig.FullKeyPath(smNS, "tls", "go", "exclude_self")),
-		EnableUSMQuantization:     cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_quantization")),
-		EnableUSMConnectionRollup: cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_connection_rollup")),
-		EnableUSMRingBuffers:      cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_ring_buffers")),
-		EnableUSMEventStream:      cfg.GetBool(sysconfig.FullKeyPath(smNS, "enable_event_stream")),
-		USMKernelBufferPages:      cfg.GetInt(sysconfig.FullKeyPath(smNS, "kernel_buffer_pages")),
-		USMDataChannelSize:        cfg.GetInt(sysconfig.FullKeyPath(smNS, "data_channel_size")),
-	}
+		ExpectedTagsDuration: cfg.GetDuration(sysconfig.FullKeyPath(spNS, "expected_tags_duration")),
 
-	httpRRKey := sysconfig.FullKeyPath(smNS, "http_replace_rules")
-	rr, err := parseReplaceRules(cfg, httpRRKey)
-	if err != nil {
-		log.Errorf("error parsing %q: %v", httpRRKey, err)
-	} else {
-		c.HTTPReplaceRules = rr
+		EnableCertCollection:             cfg.GetBool(sysconfig.FullKeyPath(netNS, "enable_cert_collection")),
+		CertCollectionMapCleanerInterval: cfg.GetDuration(sysconfig.FullKeyPath(netNS, "cert_collection_map_cleaner_interval")),
+
+		DirectSend: cfg.GetBool(sysconfig.FullKeyPath(netNS, "direct_send")),
 	}
 
 	if !c.CollectTCPv4Conns {
@@ -436,9 +333,44 @@ func New() *Config {
 		log.Info("network tracer DNS inspection disabled by configuration")
 	}
 
+	if err := structure.UnmarshalKey(cfg, sysconfig.FullKeyPath(netNS, "dns_monitoring_ports"), &c.DNSMonitoringPortList); err != nil {
+		log.Warnf("failed to parse dns_monitoring_ports: %v", err)
+	}
+
+	dnsPortsKey := sysconfig.FullKeyPath(netNS, "dns_monitoring_ports")
+	c.DNSMonitoringPortList = slices.DeleteFunc(c.DNSMonitoringPortList, func(port int) bool {
+		if port < 1 || port > 65535 {
+			log.Warnf("CNM detected and removed invalid port %d from %s (must be 1-65535)", port, dnsPortsKey)
+			return true
+		}
+		if port == 80 || port == 443 {
+			log.Warnf("CNM detected and removed HTTP port %d from %s, which is unsupported due to the large volume of traffic it would capture", port, dnsPortsKey)
+			return true
+		}
+		return false
+	})
+	// Sort + dedup before applying the slot cap.
+	slices.Sort(c.DNSMonitoringPortList)
+	c.DNSMonitoringPortList = slices.Compact(c.DNSMonitoringPortList)
+	numPorts := len(c.DNSMonitoringPortList)
+	if numPorts > DNSPortsMax {
+		dropped := c.DNSMonitoringPortList[DNSPortsMax:]
+		c.DNSMonitoringPortList = c.DNSMonitoringPortList[:DNSPortsMax]
+		log.Warnf(
+			"%s has %d distinct entries, exceeding the maximum of %d. "+
+				"Monitoring only %v (sorted ascending). Ports %v will NOT be monitored.",
+			dnsPortsKey, numPorts, DNSPortsMax, c.DNSMonitoringPortList, dropped,
+		)
+	}
+
+	if len(c.DNSMonitoringPortList) == 0 {
+		c.DNSMonitoringPortList = []int{53}
+	}
+
 	if !c.EnableProcessEventMonitoring {
 		log.Info("network process event monitoring disabled")
 	}
+
 	return c
 }
 

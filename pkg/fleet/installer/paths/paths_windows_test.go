@@ -18,6 +18,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"io/fs"
+	"syscall"
 	"testing"
 )
 
@@ -26,23 +28,27 @@ func TestSecureCreateDirectory(t *testing.T) {
 		root := t.TempDir()
 		subdir := filepath.Join(root, "A")
 		sddl := "D:PAI(A;OICI;FA;;;AU)"
-		err := secureCreateDirectory(subdir, sddl)
+		err := SecureCreateDirectory(subdir, sddl)
 		require.NoError(t, err)
 		sd, err := getSecurityDescriptor(subdir)
 		require.NoError(t, err)
 		assertDACLProtected(t, sd)
+		assertDACLAutoInherit(t, sd)
+		sd, err = windows.GetNamedSecurityInfo(subdir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		require.NoError(t, err)
+		assert.Equal(t, sddl, sd.String())
 	})
 
 	t.Run("directory exists", func(t *testing.T) {
 		t.Run("unknown owner", func(t *testing.T) {
 			root := t.TempDir()
 			subdir := filepath.Join(root, "A")
-			err := os.Mkdir(subdir, 0)
-			require.NoError(t, err)
+			createDirectoryOwnedByUntrusted(t, subdir)
 			sddl := "O:BAG:BAD:PAI(A;OICI;FA;;;AU)"
-			err = secureCreateDirectory(subdir, sddl)
+			err := SecureCreateDirectory(subdir, sddl)
 			require.Error(t, err)
-			assert.ErrorContains(t, err, "installer data directory has unexpected owner")
+			assert.ErrorContains(t, err, "has unexpected owner")
+			assert.ErrorContains(t, err, "takeown.exe")
 		})
 		t.Run("known owner", func(t *testing.T) {
 			// required to set owner to another user
@@ -56,13 +62,92 @@ func TestSecureCreateDirectory(t *testing.T) {
 			})
 			require.NoError(t, err)
 			sddl = "O:BAG:BAD:PAI(A;OICI;FA;;;AU)"
-			err = secureCreateDirectory(subdir, sddl)
+			err = SecureCreateDirectory(subdir, sddl)
 			require.NoError(t, err)
 			sd, err := getSecurityDescriptor(subdir)
 			require.NoError(t, err)
 			assertDACLProtected(t, sd)
+			assert.Equal(t, sddl, sd.String())
 		})
 	})
+}
+
+func TestEnsureDatadogDataDir(t *testing.T) {
+	// DatadogDataDir is resolved at init, point it at a test directory for the duration of the test
+	originalDataDir := DatadogDataDir
+	t.Cleanup(func() { DatadogDataDir = originalDataDir })
+
+	sddl := installerDataSecurityDescriptor
+
+	t.Run("directory does not exist", func(t *testing.T) {
+		DatadogDataDir = filepath.Join(t.TempDir(), "Datadog")
+		require.NoError(t, ensureDatadogDataDir(sddl))
+		sd, err := getSecurityDescriptor(DatadogDataDir)
+		require.NoError(t, err)
+		assertDACLProtected(t, sd)
+	})
+
+	t.Run("directory owned by an unprivileged user", func(t *testing.T) {
+		DatadogDataDir = filepath.Join(t.TempDir(), "Datadog")
+		createDirectoryOwnedByUntrusted(t, DatadogDataDir)
+
+		err := ensureDatadogDataDir(sddl)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "has unexpected owner")
+		// The account name is resolved, the SID alone does not tell the user who owns the directory.
+		// Only the name is followed by the SID in parentheses, so this fails if it is not resolved.
+		assert.ErrorContains(t, err, "(S-1-5-32-546)")
+	})
+
+	t.Run("directory owned by SYSTEM", func(t *testing.T) {
+		privilegesRequired := []string{"SeRestorePrivilege"}
+		skipIfDontHavePrivileges(t, privilegesRequired)
+		DatadogDataDir = filepath.Join(t.TempDir(), "Datadog")
+		err := winio.RunWithPrivileges(privilegesRequired, func() error {
+			return createDirectoryWithSDDL(DatadogDataDir, "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+		})
+		require.NoError(t, err)
+
+		assert.NoError(t, ensureDatadogDataDir(sddl))
+	})
+
+	t.Run("directory owned by ContainerAdministrator", func(t *testing.T) {
+		privilegesRequired := []string{"SeRestorePrivilege"}
+		skipIfDontHavePrivileges(t, privilegesRequired)
+		DatadogDataDir = filepath.Join(t.TempDir(), "Datadog")
+		err := winio.RunWithPrivileges(privilegesRequired, func() error {
+			return createDirectoryWithSDDL(DatadogDataDir, "O:"+containerAdministratorSID+"G:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+		})
+		require.NoError(t, err)
+
+		assert.NoError(t, ensureDatadogDataDir(sddl))
+	})
+}
+
+func TestIsDirSecureSuggestsARunnableCommand(t *testing.T) {
+	root := t.TempDir()
+	subdir := filepath.Join(root, "A")
+	createDirectoryOwnedByUntrusted(t, subdir)
+
+	// The MSI passes this directory with a trailing separator, which would escape the closing quote
+	err := IsDirSecure(subdir + `\`)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `takeown.exe /A /F "`+subdir+`"`)
+}
+
+// createDirectoryOwnedByUntrusted creates a directory owned by an account that is neither
+// Administrators nor SYSTEM. The owner is set explicitly because a directory created by an
+// elevated process, as the CI uses, is owned by Administrators, which is trusted.
+func createDirectoryOwnedByUntrusted(t *testing.T, path string) {
+	t.Helper()
+	privilegesRequired := []string{"SeRestorePrivilege"}
+	skipIfDontHavePrivileges(t, privilegesRequired)
+	sddl := "O:BGG:BGD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)"
+	err := winio.RunWithPrivileges(privilegesRequired, func() error {
+		return createDirectoryWithSDDL(path, sddl)
+	})
+	require.NoError(t, err)
 }
 
 func skipIfDontHavePrivileges(t *testing.T, privilegesRequired []string) {
@@ -87,9 +172,77 @@ func getSecurityDescriptor(path string) (*windows.SECURITY_DESCRIPTOR, error) {
 	return windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 }
 
+// assertDACLProtected asserts that the DACL is protected, which ensure it does not inherit ACEs from parents
 func assertDACLProtected(t *testing.T, sd *windows.SECURITY_DESCRIPTOR) {
 	t.Helper()
 	control, _, err := sd.Control()
 	require.NoError(t, err)
 	assert.NotZero(t, control&windows.SE_DACL_PROTECTED)
+}
+
+// assertDACLAutoInherit asserts that the DACL is auto inherited, which ensures it propagates ACEs to children
+func assertDACLAutoInherit(t *testing.T, sd *windows.SECURITY_DESCRIPTOR) {
+	t.Helper()
+	control, _, err := sd.Control()
+	require.NoError(t, err)
+	assert.NotZero(t, control&windows.SE_DACL_AUTO_INHERITED)
+}
+
+func TestFileReadableByEveryonePreservesDACLProtection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("api_key: test\n"), 0600))
+	require.NoError(t, setNamedSecurityInfoWithSDDL(path, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)"))
+
+	sd, err := getSecurityDescriptor(path)
+	require.NoError(t, err)
+	assertDACLProtected(t, sd)
+
+	require.NoError(t, SetFileReadableByEveryone(path))
+	sd, err = getSecurityDescriptor(path)
+	require.NoError(t, err)
+	assertDACLProtected(t, sd)
+}
+
+func TestCreateDirIfNotExists(t *testing.T) {
+	t.Run("directory does not exist", func(t *testing.T) {
+		root := t.TempDir()
+		subdir := filepath.Join(root, "newdir")
+		err := createDirIfNotExists(subdir)
+		require.NoError(t, err)
+		info, err := os.Stat(subdir)
+		require.NoError(t, err)
+		assert.True(t, info.IsDir())
+	})
+
+	t.Run("directory already exists", func(t *testing.T) {
+		root := t.TempDir()
+		subdir := filepath.Join(root, "existingdir")
+		err := os.Mkdir(subdir, 0)
+		require.NoError(t, err)
+		err = createDirIfNotExists(subdir)
+		require.NoError(t, err)
+		info, err := os.Stat(subdir)
+		require.NoError(t, err)
+		assert.True(t, info.IsDir())
+	})
+
+	t.Run("path exists but is not a directory", func(t *testing.T) {
+		root := t.TempDir()
+		file := filepath.Join(root, "notadir")
+		err := os.WriteFile(file, []byte("test"), 0)
+		require.NoError(t, err)
+		err = createDirIfNotExists(file)
+		require.Error(t, err)
+		var pathErr *fs.PathError
+		require.ErrorAs(t, err, &pathErr)
+		assert.Equal(t, syscall.ENOTDIR, pathErr.Err)
+	})
+
+	t.Run("parent directory does not exist", func(t *testing.T) {
+		root := t.TempDir()
+		subdir := filepath.Join(root, "nonexistent", "subdir")
+		err := createDirIfNotExists(subdir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to create directory")
+	})
 }

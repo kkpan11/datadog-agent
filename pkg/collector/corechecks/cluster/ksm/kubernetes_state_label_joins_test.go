@@ -8,6 +8,7 @@
 package ksm
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -432,6 +433,42 @@ func Test_labelJoiner(t *testing.T) {
 				},
 			},
 		},
+		{
+			// Regression test for a crash (`makeslice: cap out of range`) triggered by a
+			// wildcard annotations-as-tags/labels-as-tags config on an un-annotated namespace,
+			// when labelsToMatch has more entries than metric.Labels (e.g. due to a duplicated
+			// "namespace" entry in labelsToMatch).
+			name: "Wildcard join with more labels to match than metric labels doesn't panic",
+			config: map[string]*joinsConfig{
+				"kube_namespace_annotations": {
+					labelsToMatch: []string{"namespace", "namespace"},
+					getAllLabels:  true,
+				},
+			},
+			families: map[string][]ksmstore.DDMetricsFam{
+				"uuid1": {
+					{
+						Name: "kube_namespace_annotations",
+						ListMetrics: []ksmstore.DDMetric{
+							{
+								Labels: map[string]string{
+									"namespace": "default",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []struct {
+				inputLabels map[string]string
+				labelsToAdd []label
+			}{
+				{
+					inputLabels: map[string]string{"namespace": "default"},
+					labelsToAdd: []label{},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -441,6 +478,45 @@ func Test_labelJoiner(t *testing.T) {
 			for _, expected := range tt.expected {
 				assert.ElementsMatch(t, labelJoiner.getLabelsToAdd(expected.inputLabels), expected.labelsToAdd)
 			}
+		})
+	}
+}
+
+func Test_resolveTag(t *testing.T) {
+	testCases := []struct {
+		tmpl, label, expected string
+	}{
+		{
+			"kube_%%label%%", "label_app", "kube_app",
+		},
+		{
+			"foo_%%label%%_bar", "label_app", "foo_app_bar",
+		},
+		{
+			"%%label%%%%label%%", "label_app", "appapp",
+		},
+		{
+			"kube_%%annotation%%", "annotation_app", "kube_app",
+		},
+		{
+			"foo_%%annotation%%_bar", "annotation_app", "foo_app_bar",
+		},
+		{
+			"%%annotation%%%%annotation%%", "annotation_app", "appapp",
+		},
+		{
+			"kube_", "label_app", "kube_", // no template variable
+		},
+		{
+			"kube_%%foo%%", "label_app", "kube_%%foo%%", // unsupported template variable
+		},
+	}
+
+	for i, testCase := range testCases {
+		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
+			cfg := &joinsConfig{wildcardTemplate: testCase.tmpl}
+			tagName := resolveTag(testCase.label, cfg)
+			assert.Equal(t, testCase.expected, tagName)
 		})
 	}
 }

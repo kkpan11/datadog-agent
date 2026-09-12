@@ -3,23 +3,27 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+// linuxfiletailing is a test suite for the log agent interacting with a virtual machine and fake intake.
 package linuxfiletailing
 
 import (
 	_ "embed"
 	"fmt"
-	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-log-pipelines/utils"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-log-pipelines/utils"
+
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/test-infra-definitions/components/datadog/agentparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/components/datadog/agentparams"
+	scenec2 "github.com/DataDog/datadog-agent/test/e2e-framework/scenarios/aws/ec2"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/e2e"
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/environments"
-	awshost "github.com/DataDog/datadog-agent/test/new-e2e/pkg/provisioners/aws/host"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/e2e"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/environments"
+	awshost "github.com/DataDog/datadog-agent/test/e2e-framework/testing/provisioners/aws/host"
 )
 
 // LinuxFakeintakeSuite defines a test suite for the log agent interacting with a virtual machine and fake intake.
@@ -33,17 +37,33 @@ var logConfig string
 const (
 	logFileName = "hello-world.log"
 	logFilePath = utils.LinuxLogsFolderPath + "/" + logFileName
+
+	iisLogFileName = "iis-w3c.log"
+	iisLogFilePath = utils.LinuxLogsFolderPath + "/" + iisLogFileName
+	iisService     = "iis-w3c"
+	// Distinctive substrings from consecutive IIS W3C records. A concatenated
+	// intake message contains both.
+	iisGetToken  = "GET /ZenIT/Service/v13/core/Consent"
+	iisPostToken = "POST /ZenIT/Service/v13/core/Logger"
 )
+
+// iisW3CRecords is a timestamped #Date header plus two 10.1.48.10 records.
+// CombiningAggregator only concatenates aggregate lines onto an open
+// startGroup, so the header is required to reproduce the regression.
+const iisW3CRecords = `#Date: 2026-08-11 10:34:49
+2026-08-11 10:34:49 W3SVC1 10.1.48.10 GET /ZenIT/Service/v13/core/Consent land=DE 443 ndl\SVC-Zenit-NDL0167 10.1.48.122 Mozilla/5.0 200 0 0 19571 1051
+2026-08-11 10:34:50 W3SVC1 10.1.48.10 POST /ZenIT/Service/v13/core/Logger - 443 ndl\SVC-Zenit-NDL0167 10.1.48.122 Mozilla/5.0 204 0 0 504 6`
 
 // TestLinuxVMFileTailingSuite runs the E2E test suite for the log agent with a Linux VM and fake intake.
 func TestLinuxVMFileTailingSuite(t *testing.T) {
 	options := []e2e.SuiteOption{
 		e2e.WithProvisioner(
 			awshost.Provisioner(
-				awshost.WithAgentOptions(
-					agentparams.WithLogs(),
-					agentparams.WithIntegration("custom_logs.d", logConfig),
-				))),
+				awshost.WithRunOptions(
+					scenec2.WithAgentOptions(
+						agentparams.WithLogs(),
+						agentparams.WithIntegration("custom_logs.d", logConfig),
+					)))),
 	}
 	t.Parallel()
 	e2e.Run(t, &LinuxFakeintakeSuite{}, options...)
@@ -56,19 +76,18 @@ func (s *LinuxFakeintakeSuite) BeforeTest(suiteName, testName string) {
 
 	// Ensure no logs are present in fakeintake before testing starts
 	s.EventuallyWithT(func(c *assert.CollectT) {
-		logs, err := s.Env().FakeIntake.Client().FilterLogs("hello")
-		if !assert.NoError(c, err, "Unable to filter logs by the service 'hello'.") {
-			return
-		}
-		// If logs are found, print their content for debugging
-		if !assert.Empty(c, logs, "Logs were found when none were expected.") {
-			cat, _ := s.Env().RemoteHost.Execute(fmt.Sprintf("cat %s && cat %s/hello-world-2.log", logFilePath, utils.LinuxLogsFolderPath))
-			s.T().Logf("Logs detected when none were expected: %v", cat)
+		for _, service := range []string{"hello", iisService} {
+			logs, err := s.Env().FakeIntake.Client().FilterLogs(service)
+			require.NoError(c, err, "Unable to filter logs by the service '%s'.", service)
+			if !assert.Empty(c, logs, "Logs were found for service '%s' when none were expected.", service) {
+				cat, _ := s.Env().RemoteHost.Execute(fmt.Sprintf("cat %s %s %s/hello-world-2.log 2>/dev/null || true", logFilePath, iisLogFilePath, utils.LinuxLogsFolderPath))
+				s.T().Logf("Logs detected when none were expected: %v", cat)
+			}
 		}
 	}, 2*time.Minute, 10*time.Second)
 
 	// Create a new log folder location
-	s.Env().RemoteHost.MustExecute(fmt.Sprintf("sudo mkdir -p %s", utils.LinuxLogsFolderPath))
+	s.Env().RemoteHost.MustExecute("sudo mkdir -p " + utils.LinuxLogsFolderPath)
 }
 
 func (s *LinuxFakeintakeSuite) TearDownSuite() {
@@ -103,8 +122,8 @@ func (s *LinuxFakeintakeSuite) TestLinuxLogTailing() {
 
 func (s *LinuxFakeintakeSuite) testLogCollection() {
 	t := s.T()
-	// Create a new log file with permissionn inaccessible to the agent
-	s.Env().RemoteHost.MustExecute(fmt.Sprintf("sudo touch %s", logFilePath))
+	// Create a new log file with permissions accessible to the agent
+	s.Env().RemoteHost.MustExecute("sudo touch " + logFilePath)
 
 	// Adjust permissions of new log file before log generation
 	output, err := s.Env().RemoteHost.Execute(fmt.Sprintf("sudo chmod +r %s && echo true", logFilePath))
@@ -112,14 +131,16 @@ func (s *LinuxFakeintakeSuite) testLogCollection() {
 	assert.NoErrorf(t, err, "Unable to adjust permissions for the log file '%s'.", logFilePath)
 	assert.Equalf(t, "true", strings.TrimSpace(output), "Unable to adjust permissions for the log file '%s'.", logFilePath)
 
-	// t.Logf("Permissions granted for new log file.")
+	// Verify the tailer is in OK state before generating logs
+	utils.AssertAgentTailerOK(s, logFileName)
+
 	// Generate log
 	utils.AppendLog(s, logFileName, "hello-world", 1)
 
 	// Given expected tags
 	expectedTags := []string{
-		fmt.Sprintf("filename:%s", logFileName),
-		fmt.Sprintf("dirname:%s", utils.LinuxLogsFolderPath),
+		"filename:" + logFileName,
+		"dirname:" + utils.LinuxLogsFolderPath,
 	}
 	// Check intake for new logs
 	utils.CheckLogsExpected(s.T(), s.Env().FakeIntake, "hello", "hello-world", expectedTags)
@@ -139,21 +160,20 @@ func (s *LinuxFakeintakeSuite) testLogNoPermission() {
 	// => Restart the agent to force it to reopen the file
 	s.Env().RemoteHost.Execute("sudo service datadog-agent restart")
 
+	// Verify tailer is in Error state due to permission issue
+	utils.AssertAgentTailerError(s, logFileName)
+
 	// Generate logs and check the intake for no new logs because of revoked permissions
-	s.EventuallyWithT(func(c *assert.CollectT) {
-		agentReady := s.Env().Agent.Client.IsReady()
-		if assert.Truef(c, agentReady, "Agent is not ready after restart") {
-			// Generate log
-			utils.AppendLog(s, logFileName, "access-denied", 1)
-			// Check intake for new logs
-			utils.CheckLogsNotExpected(s.T(), s.Env().FakeIntake, "hello", "access-denied")
-		}
-	}, 2*time.Minute, 5*time.Second)
+	utils.AppendLog(s, logFileName, "access-denied", 1)
+	utils.CheckLogsNotExpected(s.T(), s.Env().FakeIntake, "hello", "access-denied")
 }
 
 func (s *LinuxFakeintakeSuite) testLogCollectionAfterPermission() {
 	t := s.T()
 	utils.CheckLogFilePresence(s, logFileName)
+
+	// Verify the tailer is in an error state before granting permissions
+	utils.AssertAgentTailerError(s, logFileName)
 
 	// Generate logs
 	utils.AppendLog(s, logFileName, "hello-after-permission-world", 1)
@@ -163,6 +183,9 @@ func (s *LinuxFakeintakeSuite) testLogCollectionAfterPermission() {
 	assert.NoErrorf(t, err, "Unable to adjust permissions for the log file '%s'.", logFilePath)
 	assert.Equalf(t, "true", strings.TrimSpace(output), "Unable to adjust permissions for the log file '%s'.", logFilePath)
 	t.Logf("Permissions granted for log file.")
+
+	// Verify tailer transitions to OK state after permissions are granted
+	utils.AssertAgentTailerOK(s, logFileName)
 
 	// Check intake for new logs
 	utils.CheckLogsExpected(s.T(), s.Env().FakeIntake, "hello", "hello-after-permission-world", []string{})
@@ -182,8 +205,9 @@ func (s *LinuxFakeintakeSuite) testLogCollectionBeforePermission() {
 	assert.NoErrorf(t, err, "Unable to adjust permissions for the log file '%s'.", logFilePath)
 	assert.Equalf(t, "true", strings.TrimSpace(output), "Unable to adjust permissions for the log file '%s'.", logFilePath)
 	t.Logf("Permissions granted.")
-	// Wait for the agent to tail the log file since there is a delay between permissions being granted and the agent tailing the log file
-	time.Sleep(1000 * time.Millisecond)
+
+	// Wait for the agent to tail the log file and verify it's in OK state
+	utils.AssertAgentTailerOK(s, logFileName)
 
 	// Generate logs
 	utils.AppendLog(s, logFileName, "access-granted", 1)
@@ -209,9 +233,51 @@ func (s *LinuxFakeintakeSuite) testLogRecreateRotation() {
 	assert.Equalf(t, "true", strings.TrimSpace(output), "Unable to adjust permissions for the log file '%s'.", logFilePath)
 	t.Logf("Permissions granted for new log file.")
 
+	// Verify tailer is in OK state for the rotated file before generating logs
+	utils.AssertAgentTailerOK(s, logFileName)
+
 	// Generate new logs
 	utils.AppendLog(s, logFileName, "hello-world-new-content", 1)
 
 	// Check intake for new logs
 	utils.CheckLogsExpected(s.T(), s.Env().FakeIntake, "hello", "hello-world-new-content", []string{})
+}
+
+// TestIISW3CRecordsStaySeparate writes consecutive IIS W3C records through
+// file tailing with auto multiline enabled and asserts fakeintake receives
+// them as separate messages. The unit pipeline test constructs the
+// preprocessor directly and cannot catch a wiring or config regression.
+func (s *LinuxFakeintakeSuite) TestIISW3CRecordsStaySeparate() {
+	t := s.T()
+
+	s.Env().RemoteHost.MustExecute("sudo touch " + iisLogFilePath)
+	output, err := s.Env().RemoteHost.Execute(fmt.Sprintf("sudo chmod +r %s && echo true", iisLogFilePath))
+	require.NoError(t, err, "Unable to adjust permissions for the log file '%s'.", iisLogFilePath)
+	require.Equal(t, "true", strings.TrimSpace(output), "Unable to adjust permissions for the log file '%s'.", iisLogFilePath)
+
+	utils.AssertAgentTailerOK(s, iisLogFileName)
+	utils.AppendLog(s, iisLogFileName, iisW3CRecords, 1)
+
+	s.EventuallyWithT(func(c *assert.CollectT) {
+		logs, err := s.Env().FakeIntake.Client().FilterLogs(iisService)
+		require.NoError(c, err, "Unable to filter logs by the service '%s'.", iisService)
+
+		var getOnly, postOnly, combined int
+		for _, log := range logs {
+			hasGet := strings.Contains(log.Message, iisGetToken)
+			hasPost := strings.Contains(log.Message, iisPostToken)
+			switch {
+			case hasGet && hasPost:
+				combined++
+			case hasGet:
+				getOnly++
+			case hasPost:
+				postOnly++
+			}
+		}
+
+		require.GreaterOrEqual(c, getOnly, 1, "GET IIS record was not received as its own message; got %d logs for service %s", len(logs), iisService)
+		require.GreaterOrEqual(c, postOnly, 1, "POST IIS record was not received as its own message; got %d logs for service %s", len(logs), iisService)
+		assert.Zero(c, combined, "GET and POST IIS records were concatenated into one intake message")
+	}, 2*time.Minute, 10*time.Second)
 }

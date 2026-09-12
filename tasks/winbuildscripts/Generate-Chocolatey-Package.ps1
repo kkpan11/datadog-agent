@@ -42,12 +42,18 @@ Param(
     [bool] $InstallDeps = $true
 )
 
+. "$PSScriptRoot\common.ps1"
+
 $ErrorActionPreference = 'Stop';
 Set-Location c:\mnt
 
+if ($env:CI) {
+    Initialize-CIIdentity
+}
+
 if ($InstallDeps) {
     # Install chocolatey
-    $env:chocolateyUseWindowsCompression = 'true'; Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+    $env:chocolateyVersion = '2.7.1'; $env:chocolateyUseWindowsCompression = 'true'; Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
     # Install dev tools, including invoke
     pip3 install dda
     dda self dep sync -f legacy-tasks
@@ -58,7 +64,7 @@ $outputDirectory = "$repoRoot\build-out"
 if (![string]::IsNullOrEmpty($VersionOverride)) {
     $rawAgentVersion = $VersionOverride
 } else {
-    $rawAgentVersion = (dda inv -- agent.version --url-safe --major-version 7)
+    $rawAgentVersion = (dda inv -- agent.version --url-safe)
 }
 $copyright = "Datadog {0}" -f (Get-Date).Year
 

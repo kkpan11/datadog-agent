@@ -11,7 +11,7 @@ package trivy
 import (
 	"testing"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -54,59 +54,22 @@ func TestExtractLayersFromOverlayFSMounts(t *testing.T) {
 			},
 			want: []string{"/path/to/upper1", "/path/to/lower1", "/path/to/lower2"},
 		},
+		{
+			// A single-layer image is exposed by containerd as a single bind mount
+			// (no lowerdir/upperdir); its only layer is the mount source.
+			name:   "Single-layer bind mount",
+			mounts: []mount.Mount{{Type: "bind", Source: "/path/to/snapshots/132/fs", Options: []string{"ro", "rbind"}}},
+			want:   []string{"/path/to/snapshots/132/fs"},
+		},
+		{
+			// Overlay options take precedence; the mount source is not a layer path.
+			name:   "Overlay mount source ignored",
+			mounts: []mount.Mount{{Type: "overlay", Source: "overlay", Options: []string{"lowerdir=/path/to/lower"}}},
+			want:   []string{"/path/to/lower"},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, extractLayersFromOverlayFSMounts(tt.mounts))
-		})
-	}
-}
-
-func TestLooselyCompareAnalyzers(t *testing.T) {
-	entries := []struct {
-		name     string
-		given    []string
-		against  []string
-		expected bool
-	}{
-		{
-			name:     "empty lists",
-			expected: true,
-		},
-		{
-			name:     "os simple",
-			given:    []string{"os"},
-			against:  []string{"os"},
-			expected: true,
-		},
-		{
-			name:     "os duplicated",
-			given:    []string{"os", "os"},
-			against:  []string{"os"},
-			expected: true,
-		},
-		{
-			name:     "os wrong",
-			given:    []string{"languages"},
-			against:  []string{"os"},
-			expected: false,
-		},
-		{
-			name:     "languages and os",
-			given:    []string{"os", "languages"},
-			against:  []string{"os", "languages"},
-			expected: true,
-		},
-		{
-			name:     "languages and os 2",
-			given:    []string{"languages", "os"},
-			against:  []string{"os", "languages"},
-			expected: true,
-		},
-	}
-
-	for _, entry := range entries {
-		t.Run(entry.name, func(t *testing.T) {
-			assert.Equal(t, entry.expected, looselyCompareAnalyzers(entry.given, entry.against))
 		})
 	}
 }

@@ -1,0 +1,56 @@
+---
+.lint_script:
+  - dda inv -- -e linter.go --cpus $KUBERNETES_CPU_REQUEST --debug $FLAVORS $EXTRA_OPTS
+
+.linux_lint:
+  extends: .bazel:defs:cache:progressive
+  stage: lint
+  needs: ["go_deps"]
+  variables:
+    FLAVORS: '--flavor base'
+    KUBERNETES_CPU_REQUEST: 16
+    KUBERNETES_MEMORY_REQUEST: 32Gi
+    KUBERNETES_MEMORY_LIMIT: 32Gi
+  before_script:
+    - !reference [.retrieve_linux_go_deps]
+  script:
+    - !reference [.lint_script]
+
+.linux_x64:
+  image: registry.ddbuild.io/ci/datadog-agent-buildimages/linux$CI_IMAGE_LINUX_SUFFIX:$CI_IMAGE_LINUX
+  tags: ["arch:amd64", "specific:true"]
+
+.linux_arm64:
+  image: registry.ddbuild.io/ci/datadog-agent-buildimages/linux$CI_IMAGE_LINUX_SUFFIX:$CI_IMAGE_LINUX
+  tags: ["arch:arm64", "specific:true"]
+
+lint_linux-x64:
+  extends:
+    - .linux_lint
+    - .linux_x64
+
+lint_linux-arm64:
+  extends:
+    - .linux_lint
+    - .linux_arm64
+
+lint_flavor_iot_linux-x64:
+  extends:
+    - .linux_lint
+    - .linux_x64
+  variables:
+    FLAVORS: '--flavor iot'
+
+lint_flavor_dogstatsd_linux-x64:
+  extends:
+    - .linux_lint
+    - .linux_x64
+  variables:
+    FLAVORS: '--flavor dogstatsd'
+
+lint_flavor_heroku_linux-x64:
+  extends:
+    - .linux_lint
+    - .linux_x64
+  variables:
+    FLAVORS: '--flavor heroku'

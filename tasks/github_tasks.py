@@ -1,181 +1,53 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
-import re
-import time
 from collections import Counter
-from functools import lru_cache
 
 from invoke.context import Context
 from invoke.exceptions import Exit
 from invoke.tasks import task
 
-from tasks.libs.ciproviders.github_actions_tools import (
-    download_artifacts,
-    download_with_retry,
-    follow_workflow_run,
-    print_failed_jobs_logs,
-    print_workflow_conclusion,
-    trigger_macos_workflow,
-    trigger_windows_bump_workflow,
-)
 from tasks.libs.common.color import Color, color_message
-from tasks.libs.common.constants import DEFAULT_INTEGRATIONS_CORE_BRANCH
-from tasks.libs.common.datadog_api import create_gauge, send_event, send_metrics
-from tasks.libs.common.git import get_default_branch
-from tasks.libs.common.utils import get_git_pretty_ref
-from tasks.libs.owners.linter import codeowner_has_orphans, directory_has_packages_without_owner
+from tasks.libs.common.datadog_api import send_event
+from tasks.libs.owners.linter import (
+    ai_artefacts_have_owner,
+    codeowner_has_orphans,
+    directory_has_packages_without_owner,
+    skills_use_agents_directory,
+)
 from tasks.libs.owners.parsing import read_owners
-from tasks.libs.pipeline.notifications import GITHUB_SLACK_MAP
-from tasks.libs.releasing.version import RELEASE_JSON_DEPENDENCIES, current_version
+from tasks.libs.pipeline.notifications import DEFAULT_SLACK_CHANNEL, GITHUB_SLACK_MAP
 from tasks.libs.types.types import PermissionCheck
-from tasks.release import _get_release_json_value
 
-ALL_TEAMS = '@datadog/agent-all'
-
-
-@lru_cache(maxsize=None)
-def concurrency_key():
-    current_ref = get_git_pretty_ref()
-
-    # We want workflows to run to completion on the default branch and release branches
-    if re.search(rf'^({get_default_branch()}|\d+\.\d+\.x)$', current_ref):
-        return None
-
-    return current_ref
-
-
-def _trigger_macos_workflow(destination=None, retry_download=0, retry_interval=0, **kwargs):
-    github_action_ref = _get_release_json_value(f'{RELEASE_JSON_DEPENDENCIES}::MACOS_BUILD_VERSION')
-
-    run = trigger_macos_workflow(
-        github_action_ref=github_action_ref,
-        concurrency_key=concurrency_key(),
-        **kwargs,
-    )
-
-    workflow_conclusion, workflow_url = follow_workflow_run(run)
-
-    if workflow_conclusion == "failure":
-        print_failed_jobs_logs(run)
-
-    print_workflow_conclusion(workflow_conclusion, workflow_url)
-
-    if destination:
-        download_with_retry(download_artifacts, run, destination, retry_download, retry_interval)
-
-    return workflow_conclusion
+ALL_TEAMS = '@datadog/agent-community-eng'
 
 
 @task
-def trigger_macos(
-    _,
-    workflow_type="build",
-    datadog_agent_ref=None,
-    major_version="7",
-    destination=".",
-    version_cache=None,
-    retry_download=3,
-    retry_interval=10,
-    integrations_core_ref=DEFAULT_INTEGRATIONS_CORE_BRANCH,
-):
+def is_pr_ready(ctx, git_ref: str, target_branch: str | None = None):
+    """Exit with code 0 if the PR for the given branch exists and is ready (not draft), 1 otherwise.
+
+    If --target-branch is set, also checks that the PR targets the given branch.
     """
-    Args:
-        datadog_agent_ref: If None, will be the default branch.
-    """
+    from tasks.libs.ciproviders.github_api import GithubAPI
 
-    datadog_agent_ref = datadog_agent_ref or get_default_branch()
-
-    if workflow_type == "build":
-        conclusion = _trigger_macos_workflow(
-            destination,
-            retry_download,
-            retry_interval,
-            workflow_name="macos.yaml",
-            datadog_agent_ref=datadog_agent_ref,
-            major_version=major_version,
-            # Send pipeline id and bucket branch so that the package version
-            # can be constructed properly for nightlies.
-            gitlab_pipeline_id=os.environ.get("CI_PIPELINE_ID", None),
-            bucket_branch=os.environ.get("BUCKET_BRANCH", None),
-            version_cache_file_content=version_cache,
-            integrations_core_ref=integrations_core_ref,
-        )
-    else:
-        raise Exit(f"Unsupported workflow type: {workflow_type}", code=1)
-    if conclusion != "success":
-        raise Exit(message=f"Macos {workflow_type} workflow {conclusion}", code=1)
-
-
-def _update_windows_runner_version(new_version=None, repo="buildenv"):
-    if new_version is None:
-        raise Exit(message="workflow needs the 'new_version' field value to be not None")
-    args_per_repo = {
-        "buildenv": {
-            "workflow_name": "runner-bump.yml",
-            "github_action_ref": "master",
-        },
-        "ci-platform-machine-images": {
-            "workflow_name": "windows-runner-agent-bump.yml",
-            "github_action_ref": "main",
-        },
-    }
-
-    run = trigger_windows_bump_workflow(
-        repo=repo,
-        workflow_name=args_per_repo[repo]["workflow_name"],
-        github_action_ref=args_per_repo[repo]["github_action_ref"],
-        new_version=new_version,
-    )
-    # We are only waiting 0.5min between each status check because buildenv
-    # or ci-platform-machine-images are much faster than macOS builds
-    full_repo = f"DataDog/{repo}"
-    workflow_conclusion, workflow_url = follow_workflow_run(run, full_repo, 0.5)
-
-    if workflow_conclusion != "success":
-        if workflow_conclusion == "failure":
-            print_failed_jobs_logs(run)
-        return workflow_conclusion
-
-    print_workflow_conclusion(workflow_conclusion, workflow_url)
-
-    download_with_retry(download_artifacts, run, ".", 3, 5, full_repo)
-
-    with open("PR_URL_ARTIFACT") as f:
-        PR_URL = f.read().strip()
-
-    if not PR_URL:
-        raise Exit(message="Failed to fetch artifact from the workflow. (Empty artifact)")
-
-    message = f":robobits: A new windows-runner bump PR to {new_version} has been generated. Please take a look :frog-review:\n:pr: {PR_URL} :ty:"
-
-    from slack_sdk import WebClient
-
-    client = WebClient(token=os.environ["SLACK_DATADOG_AGENT_BOT_TOKEN"])
-    client.chat_postMessage(channel="ci-infra-support", text=message)
-    return workflow_conclusion
+    github = GithubAPI()
+    prs = list(github.get_pr_for_branch(git_ref))
+    if not prs:
+        print(color_message(f"No open PR found for branch {git_ref!r}", "yellow"))
+        raise Exit(code=1)
+    if prs[0].draft:
+        print(color_message(f"PR for branch {git_ref!r} is a draft", "yellow"))
+        raise Exit(code=1)
+    if target_branch and prs[0].base.ref != target_branch:
+        print(color_message(f"PR for branch {git_ref!r} targets {prs[0].base.ref!r}, not {target_branch!r}", "yellow"))
+        raise Exit(code=1)
+    print(color_message(f"PR for branch {git_ref!r} is ready", "green"))
 
 
 @task
-def update_windows_runner_version(
-    ctx,
-    new_version=None,
-):
-    """
-    Trigger a workflow on the buildenv and ci-platform-machine-images repositories to bump windows gitlab runner
-    """
-    if new_version is None:
-        new_version = str(current_version(ctx, "7"))
-
-    for repo in ["buildenv", "ci-platform-machine-images"]:
-        conclusion = _update_windows_runner_version(new_version, repo)
-        if conclusion != "success":
-            raise Exit(message=f"Windows runner bump workflow {conclusion} for {repo}", code=1)
-
-
-@task
-def lint_codeowner(_, owners_file=".github/CODEOWNERS"):
+def lint_codeowner(ctx, owners_file=".github/CODEOWNERS"):
     """
     Run multiple checks on the provided CODEOWNERS file
     """
@@ -190,7 +62,12 @@ def lint_codeowner(_, owners_file=".github/CODEOWNERS"):
     owners = read_owners(owners_file)
 
     # Define linters
-    linters = [directory_has_packages_without_owner, codeowner_has_orphans]
+    linters = [
+        directory_has_packages_without_owner,
+        codeowner_has_orphans,
+        functools.partial(ai_artefacts_have_owner, ctx),
+        functools.partial(skills_use_agents_directory, ctx),
+    ]
 
     # Execute linters
     for linter in linters:
@@ -213,34 +90,13 @@ def get_milestone_id(_, milestone):
     print(m.number)
 
 
-@task
-def send_rate_limit_info_datadog(_, pipeline_id, app_instance):
-    from tasks.libs.ciproviders.github_api import GithubAPI
+def _get_teams(changed_files, owners_file='.github/CODEOWNERS', best_teams_only=True) -> list[str]:
+    """Returns a list of teams that are responsible for changed files
 
-    gh = GithubAPI()
-    rate_limit_info = gh.get_rate_limit_info()
-    print(f"Remaining rate limit for app instance {app_instance}: {rate_limit_info[0]}/{rate_limit_info[1]}")
-    metric = create_gauge(
-        metric_name='github.rate_limit.remaining',
-        timestamp=int(time.time()),
-        value=rate_limit_info[0],
-        tags=[
-            'source:github',
-            'repository:datadog-agent',
-            f'app_instance:{app_instance}',
-        ],
-    )
-    send_metrics([metric])
-
-
-@task
-def get_token_from_app(_, app_id_env='GITHUB_APP_ID', pkey_env='GITHUB_KEY_B64'):
-    from .libs.ciproviders.github_api import GithubAPI
-
-    GithubAPI.get_token_from_app(app_id_env, pkey_env)
-
-
-def _get_teams(changed_files, owners_file='.github/CODEOWNERS') -> list[str]:
+    :param changed_files: list of changed files
+    :param owners_file: path to the CODEOWNERS file
+    :param best_teams_only: if True, returns only the teams with the most changed files
+    """
     codeowners = read_owners(owners_file)
 
     team_counter = Counter()
@@ -253,9 +109,9 @@ def _get_teams(changed_files, owners_file='.github/CODEOWNERS') -> list[str]:
         return []
 
     _, best_count = team_count[0]
-    best_teams = [team.casefold() for (team, count) in team_count if count == best_count]
-
-    return best_teams
+    if best_teams_only:
+        return [team.casefold() for (team, count) in team_count if count == best_count]
+    return [team.casefold() for (team, _) in team_count]
 
 
 def _get_team_labels():
@@ -274,30 +130,31 @@ def _get_team_labels():
 def assign_team_label(_, pr_id=-1):
     """
     Assigns the github team label name if teams can
-    be deduced from the changed files
+    be deduced from the changed files.
+    Removes the team/triage label if it exists.
     """
     from tasks.libs.ciproviders.github_api import GithubAPI
 
     gh = GithubAPI('DataDog/datadog-agent')
-
-    labels = gh.get_pr_labels(pr_id)
-
-    # Skip if necessary
-    if 'qa/done' in labels or 'qa/no-code-change' in labels:
-        print('Qa done or no code change, skipping')
-        return
-
-    if any(label.startswith('team/') for label in labels):
-        print('This PR already has a team label, skipping')
-        return
-
-    # Find team
-    teams = _get_teams(gh.get_pr_files(pr_id))
+    # Fetch all teams first, and early return if no team is found
+    teams = _get_teams(gh.get_pr_files(pr_id), best_teams_only=False)
     if teams == []:
         print('No team found')
         return
 
+    # Remove 'team/triage' label if it exists
+    if 'team/triage' in gh.get_pr_labels(pr_id):
+        _remove_pr_label(gh, pr_id, 'team/triage')
+
     _assign_pr_team_labels(gh, pr_id, teams)
+
+
+def _remove_pr_label(gh, pr_id, label):
+    """
+    Remove a label from a pull request
+    """
+    pr = gh.get_pr(pr_id)
+    pr.remove_from_labels(label)
 
 
 def _assign_pr_team_labels(gh, pr_id, teams):
@@ -393,7 +250,9 @@ def pr_commenter(
     _,
     title: str,
     body: str = '',
-    pr_id: int | None = None,
+    body_file: str = '',
+    pr_id: int = 0,
+    pr=None,
     verbose: bool = True,
     delete: bool = False,
     force_delete: bool = False,
@@ -405,6 +264,7 @@ def pr_commenter(
     The title is used to identify the comment to update.
 
     - pr_id: If None, will use $CI_COMMIT_BRANCH to identify which PR to comment on.
+    - pr: Pass an existing PR object to avoid an additional GitHub API call.
     - delete: If True and the body is empty, will delete the comment.
     - force_delete: Won't throw error if the comment to delete is not found.
     - echo: Print comment content to stdout.
@@ -415,6 +275,15 @@ def pr_commenter(
 
     from tasks.libs.ciproviders.github_api import GithubAPI
 
+    assert not body_file or not body, "Use either body or body_file, not both"
+
+    if body_file:
+        with open(body_file) as f:
+            body = f.read()
+
+    if force_delete:
+        delete = True
+
     if not body and not delete:
         return
 
@@ -422,16 +291,18 @@ def pr_commenter(
 
     github = GithubAPI()
 
-    if pr_id is None:
-        branch = os.environ["CI_COMMIT_BRANCH"]
-        prs = list(github.get_pr_for_branch(branch))
-        if len(prs) == 0 and not fail_on_pr_missing:
-            print(f'{color_message("Warning", Color.ORANGE)}: No PR found for branch {branch}, skipping PR comment')
-            return
-        assert len(prs) == 1, f"Expected 1 PR for branch {branch}, found {len(prs)} PRs"
-        pr = prs[0]
-    else:
-        pr = github.get_pr(pr_id)
+    # Use provided PR object if available, otherwise fetch from API
+    if pr is None:
+        if pr_id == 0:
+            branch = os.environ["CI_COMMIT_BRANCH"]
+            prs = list(github.get_pr_for_branch(branch))
+            if len(prs) == 0 and not fail_on_pr_missing:
+                print(f'{color_message("Warning", Color.ORANGE)}: No PR found for branch {branch}, skipping PR comment')
+                return
+            assert len(prs) == 1, f"Expected 1 PR for branch {branch}, found {len(prs)} PRs"
+            pr = prs[0]
+        else:
+            pr = github.get_pr(pr_id)
 
     # Created / updated / deleted comment
     action = ''
@@ -534,10 +405,12 @@ tags: {tags}''')
     print(f"Event sent to Datadog for PR #{pr.number}")
 
 
-def extract_test_qa_description(pr_body: str) -> str:
+def extract_test_qa_description(pr_body: str | None) -> str:
     """
     Extract the test/QA description section from the PR body
     """
+    if not pr_body:
+        return ''
     # Extract the test/QA description section from the PR body
     # Based on PULL_REQUEST_TEMPLATE.md
     pr_body_lines = pr_body.splitlines()
@@ -588,7 +461,7 @@ def agenttelemetry_list_change_ack_check(_, pr_id=-1):
     files = gh.get_pr_files(pr_id)
     if "comp/core/agenttelemetry/impl/config.go" in files:
         if "need-change/agenttelemetry-governance" not in labels:
-            message = f"{color_message('Error', 'red')}: If you change the `comp/core/agenttelemetry/impl/config.go` file, you need to add `need-change/agenttelemetry-governance` label. If you have access, pleas follow the instructions specified in https://datadoghq.atlassian.net/wiki/spaces/ASUP/pages/4340679635/Agent+Telemetry+Governance"
+            message = f"{color_message('Error', 'red')}: If you change the `comp/core/agenttelemetry/impl/config.go` file, you need to add `need-change/agenttelemetry-governance` label. If you have access, please follow the instructions specified in https://datadoghq.atlassian.net/wiki/spaces/ASUP/pages/4340679635/Agent+Telemetry+Governance"
             raise Exit(message, code=1)
         else:
             print(
@@ -687,7 +560,9 @@ query {
 
 
 @task
-def check_permissions(_, name: str, check: PermissionCheck = PermissionCheck.REPO, channel: str = "agent-devx-ops"):
+def check_permissions(
+    _, name: str, check: PermissionCheck = PermissionCheck.REPO, channel: str = DEFAULT_SLACK_CHANNEL
+):
     """
     Check the permissions on a given repository or team.
       - list contributing teams on the repository or subteams
@@ -703,7 +578,7 @@ def check_permissions(_, name: str, check: PermissionCheck = PermissionCheck.REP
         gh = GithubAPI()
         root = gh.get_team(name)
         depth = None
-        admins = root.get_members(role='maintainer')
+        admins = list(root.get_members(role='maintainer'))
     else:
         gh = GithubAPI(f"datadog/{name}")
         root = gh._repository

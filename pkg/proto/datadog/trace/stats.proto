@@ -101,4 +101,12 @@ message ClientGroupedStats {
 	repeated string peer_tags = 16;
 	Trilean is_trace_root = 17; // this field's value is equal to span's ParentID == 0.
 	string GRPC_status_code = 18;
+	string HTTP_method = 19; // HTTP method of the request
+	string HTTP_endpoint = 20; // Http route or quantized/simplified URL path
+	string service_source = 21; // @inject_tag: msg:"srv_src"
+	// used to identify service override origin
+	// Deprecated: use additional_metric_tags (field 23) instead.
+	repeated string span_derived_primary_tags = 22;
+	// additional_metric_tags are tags sent by tracers to be used as additional dimensions for stats aggregation
+	repeated string additional_metric_tags = 23;
 }

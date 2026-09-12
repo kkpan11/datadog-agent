@@ -3,10 +3,10 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build test
+//go:build windows
 
-// Package processcollector implements the remote process collector for
-// Workloadmeta.
+// Package processcollector implements the remote process collector for Workloadmeta on Windows.
+// This collector is not used on non-Windows platforms.
 package processcollector
 
 import (
@@ -16,15 +16,17 @@ import (
 	"testing"
 	"time"
 
+	"errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
-	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
-	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
 	"github.com/DataDog/datadog-agent/comp/core/workloadmeta/collectors/internal/remote"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	workloadmetafxmock "github.com/DataDog/datadog-agent/comp/core/workloadmeta/fx-mock"
@@ -63,7 +65,7 @@ func (s *mockServer) StreamEntities(_ *pbgo.ProcessStreamEntitiesRequest, out pb
 	// Handle error response for the first request
 	if s.errorResponse {
 		s.errorResponse = false // Reset error response for subsequent requests
-		return xerrors.New("dummy first error")
+		return errors.New("dummy first error")
 	}
 
 	for _, response := range s.responses {
@@ -246,18 +248,17 @@ func TestCollection(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Create ipc component for the client
-			ipcmock.New(t)
-
-			overrides := map[string]interface{}{
-				"language_detection.enabled":               true,
-				"process_config.run_in_core_agent.enabled": false,
-			}
+			ipcComp := ipcmock.New(t)
 
 			// We do not inject any collectors here; we instantiate
 			// and initialize it out-of-band below. That's OK.
 			mockStore := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
-				core.MockBundle(),
-				fx.Replace(config.MockParams{Overrides: overrides}),
+				fx.Provide(func(t testing.TB) log.Component { return logmock.New(t) }),
+				fx.Provide(func(t testing.TB) config.Component {
+					return config.NewMockWithOverrides(t, map[string]interface{}{
+						"language_detection.enabled": true,
+					})
+				}),
 				workloadmetafxmock.MockModule(workloadmeta.Params{AgentType: workloadmeta.Remote}),
 			))
 
@@ -269,7 +270,7 @@ func TestCollection(t *testing.T) {
 			server := newMockServer(ctx, test.serverResponses, test.errorResponse)
 			defer server.stop()
 
-			grpcServer := grpc.NewServer()
+			grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(ipcComp.GetTLSServerConfig())))
 			pbgo.RegisterProcessEntityStreamServer(grpcServer, server)
 
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -290,8 +291,10 @@ func TestCollection(t *testing.T) {
 				StreamHandler: &streamHandler{
 					Reader: mockStore.GetConfig(),
 					port:   port,
+					ipc:    ipcComp,
 				},
-				Insecure: true,
+				Config: mockStore.GetConfig(),
+				IPC:    ipcComp,
 			}
 
 			mockStore.Notify(test.preEvents)

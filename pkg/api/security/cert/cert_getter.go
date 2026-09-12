@@ -9,7 +9,12 @@ package cert
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"fmt"
+	"net"
 	"path/filepath"
 
 	configModel "github.com/DataDog/datadog-agent/pkg/config/model"
@@ -35,11 +40,29 @@ func getCertFilepath(config configModel.Reader) string {
 	return filepath.Join(filepath.Dir(config.ConfigFileUsed()), defaultCertFileName)
 }
 
-type certificateFactory struct {
+// PersistCertFilepath stores the resolved ipc_cert_file_path back into the config when the
+// setting was left at its empty default, so the configstream snapshot carries a concrete
+// absolute path that remote agents can resolve regardless of their own cwd.
+func PersistCertFilepath(config configModel.ReaderWriter) {
+	if config.GetString("ipc_cert_file_path") != "" {
+		return
+	}
+	resolved := getCertFilepath(config)
+	if abs, err := filepath.Abs(resolved); err == nil {
+		resolved = abs
+	}
+	config.Set("ipc_cert_file_path", resolved, configModel.SourceConfigPostInit)
 }
 
-func (certificateFactory) Generate() (Certificate, []byte, error) {
-	cert, err := generateCertKeyPair()
+type certificateFactory struct {
+	caCert             *x509.Certificate
+	caPrivKey          any // x509.ParsePKCS8PrivateKey returns as the private key any, and x509.CreateCertificate takes any as the private key argument
+	additionalIPs      []net.IP
+	additionalDNSNames []string
+}
+
+func (f certificateFactory) Generate() (Certificate, []byte, error) {
+	cert, err := generateCertKeyPair(f.caCert, f.caPrivKey, f.additionalIPs, f.additionalDNSNames)
 	return cert, bytes.Join([][]byte{cert.cert, cert.key}, []byte{}), err
 }
 
@@ -63,14 +86,103 @@ func (certificateFactory) Deserialize(raw []byte) (Certificate, error) {
 }
 
 // FetchIPCCert loads certificate file used to authenticate IPC communicates
-func FetchIPCCert(config configModel.Reader) ([]byte, []byte, error) {
+func FetchIPCCert(config configModel.Reader) (*tls.Config, *tls.Config, *tls.Config, error) {
+	// Read cluster CA configuration and files once
+	caData, err := readClusterCAConfig(config)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error reading cluster CA config: %w", err)
+	}
+
+	// Build cluster client TLS configuration using pre-read CA data
+	clusterClientConfig, err := caData.buildClusterClientTLSConfig()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error building cluster client TLS config: %w", err)
+	}
+
 	cert, err := filesystem.TryFetchArtifact(getCertFilepath(config), &certificateFactory{}) // TODO IPC: replace this call by FetchArtifact to retry until the artifact is successfully retrieved or the context is done
-	return cert.cert, cert.key, err
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error while fetching IPC cert: %w", err)
+	}
+
+	clientConfig, serverConfig, err := GetTLSConfigFromCert(cert.cert, cert.key)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error while setting TLS configs: %w", err)
+	}
+	return clientConfig, serverConfig, clusterClientConfig, nil
 }
 
 // FetchOrCreateIPCCert loads or creates certificate file used to authenticate IPC communicates
 // It takes a context to allow for cancellation or timeout of the operation
-func FetchOrCreateIPCCert(ctx context.Context, config configModel.Reader) ([]byte, []byte, error) {
-	cert, err := filesystem.FetchOrCreateArtifact(ctx, getCertFilepath(config), &certificateFactory{})
-	return cert.cert, cert.key, err
+func FetchOrCreateIPCCert(ctx context.Context, config configModel.Reader) (*tls.Config, *tls.Config, *tls.Config, error) {
+	// Read cluster CA configuration and files once
+	caData, err := readClusterCAConfig(config)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error reading cluster CA config: %w", err)
+	}
+
+	// Build cluster client TLS configuration using pre-read CA data
+	clusterClientConfig, err := caData.buildClusterClientTLSConfig()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error building cluster client TLS config: %w", err)
+	}
+
+	// Setup certificate factory with cluster CA and SANs
+	var certificateFactory certificateFactory
+	if err := caData.setupCertificateFactoryWithClusterCA(config, &certificateFactory); err != nil {
+		return nil, nil, nil, fmt.Errorf("error setting up certificate factory with cluster CA: %w", err)
+	}
+
+	cert, err := filesystem.FetchOrCreateArtifact(ctx, getCertFilepath(config), certificateFactory)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error while fetching or creating IPC cert: %w", err)
+	}
+
+	clientConfig, serverConfig, err := GetTLSConfigFromCert(cert.cert, cert.key)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error while setting TLS configs: %w", err)
+	}
+	return clientConfig, serverConfig, clusterClientConfig, err
+}
+
+// LoadClientTLSConfigFromPath reads the PEM at certPath and returns a client TLS config.
+// No config component, no cluster CA handling — for callers that already know the path.
+func LoadClientTLSConfigFromPath(certPath string) (*tls.Config, error) {
+	cert, err := filesystem.TryFetchArtifact(certPath, &certificateFactory{})
+	if err != nil {
+		return nil, fmt.Errorf("read IPC cert at %s: %w", certPath, err)
+	}
+	clientConfig, _, err := GetTLSConfigFromCert(cert.cert, cert.key)
+	if err != nil {
+		return nil, fmt.Errorf("build client TLS config: %w", err)
+	}
+	return clientConfig, nil
+}
+
+// GetTLSConfigFromCert returns the TLS configs for the client and server using the provided IPC certificate and key.
+// It returns the client and server TLS configurations, or an error if the certificate or key cannot be parsed.
+// It expects the certificate and key to be in PEM format.
+func GetTLSConfigFromCert(ipccert, ipckey []byte) (*tls.Config, *tls.Config, error) {
+	certPool := x509.NewCertPool()
+	if ok := certPool.AppendCertsFromPEM(ipccert); !ok {
+		return nil, nil, errors.New("Unable to generate certPool from PEM IPC cert")
+	}
+	tlsCert, err := tls.X509KeyPair(ipccert, ipckey)
+	if err != nil {
+		return nil, nil, errors.New("Unable to generate x509 cert from PERM IPC cert and key")
+	}
+
+	clientTLSConfig := &tls.Config{
+		RootCAs:      certPool,
+		Certificates: []tls.Certificate{tlsCert},
+	}
+
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		// The server verify client certificate if given, this is useful to enable mTLS for a subsection of the API
+		ClientAuth: tls.VerifyClientCertIfGiven,
+		// The server will accept any client certificate signed by the IPC CA
+		ClientCAs: certPool,
+	}
+
+	return clientTLSConfig, serverTLSConfig, nil
 }

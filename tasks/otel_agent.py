@@ -1,26 +1,29 @@
 import os
 import re
 import shutil
+import sys
 
 from invoke import task
 from invoke.exceptions import Exit
 
 from tasks.build_tags import get_default_build_tags
-from tasks.libs.common.utils import REPO_PATH, bin_name, get_version_ldflags
+from tasks.flavor import AgentFlavor
+from tasks.libs.build.bazel import build_binary_with_bazel
+from tasks.libs.common.go import go_build
+from tasks.libs.common.utils import REPO_PATH, bin_name, get_build_flags
+from tasks.windows_resources import build_messagetable, build_rc, versioninfo_vars
 
 BIN_NAME = "otel-agent"
 CFG_NAME = "otel-config.yaml"
 BIN_DIR = os.path.join(".", "bin", "otel-agent")
 BIN_PATH = os.path.join(BIN_DIR, bin_name("otel-agent"))
-DDOT_DEV_AGENT_TAG = "nightly-full-main-jmx"
-DDOT_DEV_AGENT_BRANCH = "main"
 DDOT_AGENT_IMAGE_NAME = "datadog/agent"
 DDOT_AGENT_TAG = "main-ddot"
 DDOT_BYOC_DOCKERFILE = os.path.join("Dockerfiles", "agent-ddot", "Dockerfile.agent-otel")
 
 
 @task
-def byoc_release(ctx, image=DDOT_DEV_AGENT_TAG, branch=DDOT_DEV_AGENT_BRANCH, repo=DDOT_AGENT_IMAGE_NAME):
+def byoc_release(ctx, version: str):
     """
     Modify dockerfile
     """
@@ -29,33 +32,66 @@ def byoc_release(ctx, image=DDOT_DEV_AGENT_TAG, branch=DDOT_DEV_AGENT_BRANCH, re
 
     with open(DDOT_BYOC_DOCKERFILE, 'w') as file:
         for line in contents:
-            if re.search("^ARG AGENT_REPO=.*$", line):
-                line = f"ARG AGENT_REPO={repo}\n"
-            elif re.search("^ARG AGENT_VERSION=.*$", line):
-                line = f"ARG AGENT_VERSION={image}\n"
-            elif re.search("^ARG AGENT_BRANCH=.*$", line):
-                line = f"ARG AGENT_BRANCH={branch}\n"
-
+            if re.search("^ARG AGENT_VERSION=.*$", line):
+                line = f"ARG AGENT_VERSION={version}\n"
             file.write(line)
 
 
 @task
-def build(ctx, byoc=False):
+def build(ctx, byoc=False, flavor=AgentFlavor.base.name, enable_bazel=False):
     """
     Build the otel agent
     """
 
-    if os.path.exists(BIN_PATH):
-        os.remove(BIN_PATH)
+    # When cross-compiling for Windows on Linux, bin_name() returns "otel-agent"
+    # (no .exe) because it checks sys.platform, not GOOS. Compute the correct
+    # output path here so Go writes otel-agent.exe for Windows targets.
+    cross_compiling_windows = sys.platform != 'win32' and os.environ.get('GOOS') == 'windows'
+    if cross_compiling_windows:
+        bin_path = os.path.join(BIN_DIR, "otel-agent.exe")
+    else:
+        bin_path = BIN_PATH
 
-    env = {"GO111MODULE": "on"}
-    build_tags = get_default_build_tags(build="otel-agent")
-    ldflags = get_version_ldflags(ctx, major_version='7')
-    ldflags += f' -X github.com/DataDog/datadog-agent/cmd/otel-agent/command.BYOC={byoc}'
+    if os.path.exists(bin_path):
+        os.remove(bin_path)
 
-    cmd = f"go build -mod=readonly -tags=\"{' '.join(build_tags)}\" -ldflags=\"{ldflags}\" -o {BIN_PATH} {REPO_PATH}/cmd/otel-agent"
+    flavor = AgentFlavor[flavor]
 
-    ctx.run(cmd, env=env)
+    if enable_bazel:
+        if byoc:
+            raise NotImplementedError("--enable-bazel does not support --byoc.")
+        if cross_compiling_windows:
+            raise NotImplementedError("--enable-bazel does not support cross compiling.")
+        bazel_args = [f"--//packages/agent:flavor={flavor.name}"]
+        build_binary_with_bazel("//cmd/otel-agent:otel-agent", args=bazel_args, bin_path=bin_path)
+    else:
+        ldflags, gcflags, env = get_build_flags(ctx)
+        build_tags = get_default_build_tags(build="otel-agent", flavor=flavor)
+        ldflags += f' -X github.com/DataDog/datadog-agent/cmd/otel-agent/command.BYOC={byoc}'
+
+        # generate windows resources
+        if sys.platform == 'win32' or cross_compiling_windows:
+            build_messagetable(ctx)
+            vars = versioninfo_vars(ctx)
+            build_rc(
+                ctx,
+                "cmd/otel-agent/windows_resources/otel-agent.rc",
+                vars=vars,
+                out="cmd/otel-agent/rsrc.syso",
+            )
+
+        go_build(
+            ctx,
+            f"{REPO_PATH}/cmd/otel-agent",
+            mod="readonly",
+            build_tags=build_tags,
+            ldflags=ldflags,
+            gcflags=gcflags,
+            bin_path=bin_path,
+            check_deadcode=os.getenv("DEPLOY_AGENT") == "true",
+            coverage=os.getenv("E2E_COVERAGE_PIPELINE") == "true",
+            env=env,
+        )
 
     dist_folder = os.path.join(BIN_DIR, "dist")
     if os.path.exists(dist_folder):
@@ -95,13 +131,3 @@ def image_build(ctx, arch='amd64', base_version='latest', tag=DDOT_AGENT_TAG, pu
 
     os.remove(os.path.join(build_context, BIN_NAME))
     os.remove(os.path.join(build_context, CFG_NAME))
-
-
-@task
-def integration_test(ctx):
-    """
-    Run the otel integration test
-    """
-    cmd = """go test -timeout 0s -tags otlp,test -run ^TestIntegration$ \
-        github.com/DataDog/datadog-agent/comp/otelcol/otlp/integrationtest -v"""
-    ctx.run(cmd)

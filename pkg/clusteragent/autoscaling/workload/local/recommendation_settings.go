@@ -9,10 +9,10 @@
 package local
 
 import (
+	"errors"
 	"fmt"
 
 	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
-	datadoghq "github.com/DataDog/datadog-operator/api/datadoghq/v1alpha2"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -37,7 +37,7 @@ type resourceRecommenderSettings struct {
 	fallbackStaleDataThreshold int64
 }
 
-func newResourceRecommenderSettings(fallbackSettings *datadoghq.DatadogFallbackPolicy, objective datadoghqcommon.DatadogPodAutoscalerObjective) (*resourceRecommenderSettings, error) {
+func newResourceRecommenderSettings(objective datadoghqcommon.DatadogPodAutoscalerObjective) (*resourceRecommenderSettings, error) {
 	var recSettings *resourceRecommenderSettings
 	var err error
 
@@ -51,21 +51,21 @@ func newResourceRecommenderSettings(fallbackSettings *datadoghq.DatadogFallbackP
 		if err != nil {
 			return nil, err
 		}
+	} else if objective.Type == datadoghqcommon.DatadogPodAutoscalerCustomQueryObjectiveType {
+		// CustomQueryObjective is ignored by the local recommender
+		return nil, nil
 	} else {
 		return nil, fmt.Errorf("Invalid target type: %s", objective.Type)
 	}
 
-	recSettings, err = getOptionsFromFallback(recSettings, fallbackSettings)
-	if err != nil {
-		return nil, err
-	}
+	recSettings.fallbackStaleDataThreshold = defaultStaleDataThresholdSeconds
 
 	return recSettings, nil
 }
 
 func getOptionsFromPodResource(target *datadoghqcommon.DatadogPodAutoscalerPodResourceObjective) (*resourceRecommenderSettings, error) {
 	if target == nil {
-		return nil, fmt.Errorf("nil target")
+		return nil, errors.New("nil target")
 	}
 
 	if err := validateTarget(target.Value.Type, target.Name, target.Value); err != nil {
@@ -82,7 +82,7 @@ func getOptionsFromPodResource(target *datadoghqcommon.DatadogPodAutoscalerPodRe
 
 func getOptionsFromContainerResource(target *datadoghqcommon.DatadogPodAutoscalerContainerResourceObjective) (*resourceRecommenderSettings, error) {
 	if target == nil {
-		return nil, fmt.Errorf("nil target")
+		return nil, errors.New("nil target")
 	}
 
 	if err := validateTarget(target.Value.Type, target.Name, target.Value); err != nil {
@@ -117,26 +117,10 @@ func validateTarget(targetType datadoghqcommon.DatadogPodAutoscalerObjectiveValu
 
 func validateUtilizationValue(value datadoghqcommon.DatadogPodAutoscalerObjectiveValue) error {
 	if value.Utilization == nil {
-		return fmt.Errorf("missing utilization value")
+		return errors.New("missing utilization value")
 	}
 	if *value.Utilization < 1 || *value.Utilization > 100 {
-		return fmt.Errorf("utilization value must be between 1 and 100")
+		return errors.New("utilization value must be between 1 and 100")
 	}
 	return nil
-}
-
-func getOptionsFromFallback(recSettings *resourceRecommenderSettings, fallbackSettings *datadoghq.DatadogFallbackPolicy) (*resourceRecommenderSettings, error) {
-	// If no values are provided, we want to use the default value
-	recSettings.fallbackStaleDataThreshold = defaultStaleDataThresholdSeconds
-
-	if fallbackSettings == nil {
-		return recSettings, nil
-	}
-
-	// Override with custom threshold if provided
-	if fallbackSettings.Horizontal.Triggers.StaleRecommendationThresholdSeconds > 0 {
-		recSettings.fallbackStaleDataThreshold = int64(fallbackSettings.Horizontal.Triggers.StaleRecommendationThresholdSeconds)
-	}
-
-	return recSettings, nil
 }

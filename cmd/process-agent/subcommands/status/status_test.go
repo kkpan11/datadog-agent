@@ -18,15 +18,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-agent/cmd/process-agent/command"
-	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/hostimpl/utils"
+	ipcmock "github.com/DataDog/datadog-agent/comp/core/ipc/mock"
+	hostMetadataUtils "github.com/DataDog/datadog-agent/comp/metadata/host/impl/utils"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/process/util/status"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
 
-func fakeStatusServer(t *testing.T, stats status.Status) *httptest.Server {
+func fakeStatusServer(t *testing.T, ipcMock *ipcmock.IPCMock, stats status.Status) *httptest.Server {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		b, err := json.Marshal(stats)
@@ -36,7 +37,7 @@ func fakeStatusServer(t *testing.T, stats status.Status) *httptest.Server {
 		require.NoError(t, err)
 	}
 
-	return httptest.NewServer(http.HandlerFunc(handler))
+	return ipcMock.NewMockServer(http.HandlerFunc(handler))
 }
 
 func TestStatus(t *testing.T) {
@@ -49,12 +50,13 @@ func TestStatus(t *testing.T) {
 		Expvars: status.ProcessExpvars{},
 	}
 
-	server := fakeStatusServer(t, statusInfo)
-	defer server.Close()
+	ipcMock := ipcmock.New(t)
+
+	server := fakeStatusServer(t, ipcMock, statusInfo)
 
 	// Build the actual status
 	var statusBuilder strings.Builder
-	getAndWriteStatus(log.NoopLogger, server.URL, &statusBuilder)
+	getAndWriteStatus(log.NoopLogger, ipcMock.GetClient(), server.URL, &statusBuilder)
 
 	expectedOutput := string(`
 	{
@@ -85,7 +87,9 @@ func TestStatus(t *testing.T) {
 			"logs": null,
 			"install-method": null,
 			"proxy-info": null,
-			"otlp": null
+			"otlp": null,
+			"fips_mode": false,
+			"fips_proxy_enabled": false
 			}
 		},
 		"expvars": {
@@ -111,12 +115,10 @@ func TestStatus(t *testing.T) {
 			"rtprocess_queue_size": 0,
 			"connections_queue_size": 0,
 			"event_queue_size": 0,
-			"pod_queue_size": 0,
 			"process_queue_bytes": 0,
 			"rtprocess_queue_bytes": 0,
 			"connections_queue_bytes": 0,
 			"event_queue_bytes": 0,
-			"pod_queue_bytes": 0,
 			"container_id": "",
 			"proxy_url": "",
 			"log_file": "",
@@ -139,14 +141,16 @@ func TestStatus(t *testing.T) {
 func TestNotRunning(t *testing.T) {
 	// Use different ports in case the host is running a real agent
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("process_config.cmd_port", 8082)
+	cfg.SetInTest("process_config.cmd_port", 8082)
 
-	addressPort, err := pkgconfigsetup.GetProcessAPIAddressPort(cfg)
+	addressPort, err := pkgconfighelper.GetProcessAPIAddressPort(cfg)
 	require.NoError(t, err)
 	statusURL := fmt.Sprintf("https://%s/agent/status", addressPort)
 
+	ipcMock := ipcmock.New(t)
+
 	var b strings.Builder
-	getAndWriteStatus(log.NoopLogger, statusURL, &b)
+	getAndWriteStatus(log.NoopLogger, ipcMock.GetClient(), statusURL, &b)
 
 	assert.Equal(t, notRunning, b.String())
 }
@@ -155,8 +159,8 @@ func TestNotRunning(t *testing.T) {
 // a connection error
 func TestError(t *testing.T) {
 	cfg := configmock.New(t)
-	cfg.SetWithoutSource("cmd_host", "8.8.8.8") // Non-local ip address will cause error in `GetIPCAddress`
-	_, ipcError := pkgconfigsetup.GetIPCAddress(cfg)
+	cfg.SetInTest("cmd_host", "8.8.8.8") // Non-local ip address will cause error in `GetIPCAddress`
+	_, ipcError := pkgconfighelper.GetIPCAddress(cfg)
 
 	var errText, expectedErrText strings.Builder
 	url, err := getStatusURL()

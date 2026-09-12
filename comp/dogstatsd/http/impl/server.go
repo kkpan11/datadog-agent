@@ -1,0 +1,107 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+// Package httpimpl contains dogstatsd http server implementation
+package httpimpl
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+
+	"github.com/DataDog/datadog-agent/comp/core/config"
+	hostname "github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	filterlist "github.com/DataDog/datadog-agent/comp/filterlist/def"
+	"github.com/DataDog/datadog-agent/pkg/metrics"
+)
+
+type server struct {
+	config     config.Component
+	log        log.Component
+	tagger     tagger.Component
+	hostname   hostname.Component
+	filterList filterlist.Component
+	telemetry  *telemetryStore
+	out        serializer
+
+	http *http.Server
+}
+
+type serializer interface {
+	SendIterableSeries(metrics.SerieSource) error
+	SendSketch(metrics.SketchesSource) error
+}
+
+func (s *server) start(ctx context.Context) error {
+	if !s.config.GetBool("dogstatsd_experimental_http.enabled") {
+		s.log.Debug("dogstatsd http server disabled")
+		return nil
+	}
+
+	hostname, err := s.hostname.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("error fetching hostname: %w", err)
+	}
+
+	// One semaphore shared by every handler, so the limit applies to the process
+	// rather than to each endpoint.
+	sem := newSemaphore(s.config.GetInt("dogstatsd_experimental_http.max_concurrent_requests"))
+
+	newBase := func(endpoint string) handlerBase {
+		return handlerBase{
+			log:            s.log,
+			tagger:         s.tagger,
+			hostname:       hostname,
+			filterList:     s.filterList,
+			out:            s.out,
+			tlm:            s.telemetry.forEndpoint(endpoint),
+			sem:            sem,
+			maxPayloadSize: s.config.GetInt64("dogstatsd_experimental_http.max_payload_size"),
+		}
+	}
+
+	mux := &http.ServeMux{}
+	mux.Handle("POST /series", &seriesHandler{newBase("series")})
+	mux.Handle("POST /sketches", &sketchesHandler{newBase("sketches")})
+
+	var p http.Protocols
+	p.SetHTTP1(true)
+	p.SetUnencryptedHTTP2(true)
+	s.http = &http.Server{
+		Handler:   mux,
+		Protocols: &p,
+		// Also sets IdleTimeout
+		ReadTimeout: s.config.GetDuration("dogstatsd_experimental_http.read_timeout"),
+	}
+
+	addr := s.config.GetString("dogstatsd_experimental_http.listen_address")
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to create dogstatsd http server on %q: %w", addr, err)
+	}
+
+	s.log.Debugf("starting dogstatsd http server on %q", addr)
+
+	go func() {
+		err := s.http.Serve(listener)
+		if err == http.ErrServerClosed {
+			s.log.Debugf("dogstatsd http server stopped normally")
+		} else {
+			s.log.Errorf("dogstatsd http server stopped with error: %v", err)
+		}
+	}()
+
+	return nil
+}
+
+func (s *server) stop(ctx context.Context) error {
+	if s.http == nil {
+		return nil
+	}
+	return s.http.Shutdown(ctx)
+}

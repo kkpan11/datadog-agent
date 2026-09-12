@@ -25,7 +25,7 @@ import (
 )
 
 func payloadToString(payload []byte, cfg config.Component) string {
-	compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: cfg}).Comp
+	compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: cfg}).Comp
 	p, err := compressor.Decompress(payload)
 	if err != nil {
 		return err.Error()
@@ -43,10 +43,10 @@ func TestCompressorSimple(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 			maxPayloadSize := mockConfig.GetInt("serializer_max_payload_size")
 			maxUncompressedSize := mockConfig.GetInt("serializer_max_uncompressed_payload_size")
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			c, err := NewCompressor(
 				&bytes.Buffer{}, &bytes.Buffer{},
 				maxPayloadSize, maxUncompressedSize,
@@ -64,6 +64,32 @@ func TestCompressorSimple(t *testing.T) {
 	}
 }
 
+func TestCompressorLimits(t *testing.T) {
+	mockConfig := mock.New(t)
+	mockConfig.SetInTest("serializer_compressor_kind", "zstd")
+	maxPayloadSize := mockConfig.GetInt("serializer_max_payload_size")
+	maxUncompressedSize := mockConfig.GetInt("serializer_max_uncompressed_payload_size")
+
+	compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
+	c, err := NewCompressor(
+		&bytes.Buffer{}, &bytes.Buffer{},
+		maxPayloadSize, maxUncompressedSize,
+		[]byte("headerheader"), []byte("footerfooter"), []byte(","), compressor)
+
+	require.NoError(t, err)
+
+	//nolint:revive // https://github.com/mgechev/revive/issues/386
+	for c.AddItem([]byte("contentontent")) == nil {
+	}
+
+	p, err := c.Close()
+	require.NoError(t, err)
+	require.Less(t, len(p), maxPayloadSize)
+	d, err := compressor.Decompress(p)
+	require.NoError(t, err)
+	require.Less(t, len(d), maxUncompressedSize)
+}
+
 // With an empty payload, AddItem should never return "ErrPayloadFull"
 // ErrItemTooBig is a more appropriate error code if the item cannot
 // be added to an empty compressor
@@ -78,9 +104,9 @@ func TestCompressorAddItemErrCodeWithEmptyCompressor(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			checkAddItemErrCode := func(maxPayloadSize, maxUncompressedSize, dataLen int) {
 				c, err := NewCompressor(
 					&bytes.Buffer{}, &bytes.Buffer{},
@@ -132,9 +158,9 @@ func TestOnePayloadSimple(t *testing.T) {
 			}
 
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			builder := NewJSONPayloadBuilder(true, mockConfig, compressor, logger)
 			payloads, err := BuildJSONPayload(builder, m)
 			require.NoError(t, err)
@@ -150,7 +176,7 @@ func TestMaxCompressedSizePayload(t *testing.T) {
 		kind           string
 		maxPayloadSize int
 	}{
-		"zlib": {kind: compression.ZlibKind, maxPayloadSize: 22},
+		"zlib": {kind: compression.ZlibKind, maxPayloadSize: 27},
 		"zstd": {kind: compression.ZstdKind, maxPayloadSize: 90},
 	}
 	logger := logmock.New(t)
@@ -162,9 +188,9 @@ func TestMaxCompressedSizePayload(t *testing.T) {
 				Footer: "]}",
 			}
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 			mockConfig.SetDefault("serializer_max_payload_size", tc.maxPayloadSize)
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			builder := NewJSONPayloadBuilder(true, mockConfig, compressor, logger)
 			payloads, err := BuildJSONPayload(builder, m)
 			require.NoError(t, err)
@@ -187,10 +213,10 @@ func TestZstdCompressionLevel(t *testing.T) {
 				Footer: "]}",
 			}
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", "zstd")
+			mockConfig.SetInTest("serializer_compressor_kind", "zstd")
 			mockConfig.SetDefault("serializer_zstd_compressor_level", level)
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			builder := NewJSONPayloadBuilder(true, mockConfig, compressor, logger)
 			payloads, err := BuildJSONPayload(builder, m)
 			require.NoError(t, err)
@@ -206,7 +232,7 @@ func TestTwoPayload(t *testing.T) {
 		kind           string
 		maxPayloadSize int
 	}{
-		"zlib": {kind: compression.ZlibKind, maxPayloadSize: 22},
+		"zlib": {kind: compression.ZlibKind, maxPayloadSize: 27},
 		"zstd": {kind: compression.ZstdKind, maxPayloadSize: 70},
 	}
 	logger := logmock.New(t)
@@ -219,9 +245,9 @@ func TestTwoPayload(t *testing.T) {
 			}
 			mockConfig := mock.New(t)
 			mockConfig.SetDefault("serializer_max_payload_size", tc.maxPayloadSize)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			builder := NewJSONPayloadBuilder(true, mockConfig, compressor, logger)
 			payloads, err := BuildJSONPayload(builder, m)
 			require.NoError(t, err)
@@ -249,9 +275,9 @@ func TestLockedCompressorProducesSamePayloads(t *testing.T) {
 				Footer: "]}",
 			}
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			builderLocked := NewJSONPayloadBuilder(true, mockConfig, compressor, logger)
 			builderUnLocked := NewJSONPayloadBuilder(false, mockConfig, compressor, logger)
 			payloads1, err := BuildJSONPayload(builderLocked, m)
@@ -269,17 +295,17 @@ func TestBuildWithOnErrItemTooBigPolicyMetadata(t *testing.T) {
 		kind                       string
 		maxUncompressedPayloadSize int
 	}{
-		"zlib": {kind: compression.ZlibKind, maxUncompressedPayloadSize: 40},
+		"zlib": {kind: compression.ZlibKind, maxUncompressedPayloadSize: 45},
 		"zstd": {kind: compression.ZstdKind, maxUncompressedPayloadSize: 170},
 	}
 	logger := logmock.New(t)
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mockConfig := mock.New(t)
-			mockConfig.SetWithoutSource("serializer_compressor_kind", tc.kind)
-			mockConfig.SetWithoutSource("serializer_max_uncompressed_payload_size", tc.maxUncompressedPayloadSize)
+			mockConfig.SetInTest("serializer_compressor_kind", tc.kind)
+			mockConfig.SetInTest("serializer_max_uncompressed_payload_size", tc.maxUncompressedPayloadSize)
 
-			compressor := metricscompression.NewCompressorReq(metricscompression.Requires{Cfg: mockConfig}).Comp
+			compressor := metricscompression.NewComponent(metricscompression.Requires{Cfg: mockConfig}).Comp
 			marshaler := &IterableStreamJSONMarshalerMock{index: 0, maxIndex: 100}
 			builder := NewJSONPayloadBuilder(false, mockConfig, compressor, logger)
 			payloads, err := builder.BuildWithOnErrItemTooBigPolicy(

@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package tracer
 
@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 	"unsafe"
@@ -21,12 +23,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/maps"
 	"github.com/DataDog/datadog-agent/pkg/network"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/netlink"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -46,8 +49,8 @@ var ciliumConntrackerTelemetry = struct {
 	getsDuration telemetry.Histogram
 	getsTotal    telemetry.Counter
 }{
-	telemetry.NewHistogram(ciliumConntrackerModuleName, "gets_duration_nanoseconds", []string{}, "Histogram measuring the time spent retrieving connection tuples from the EBPF map", defaultBuckets),
-	telemetry.NewCounter(ciliumConntrackerModuleName, "gets_total", []string{}, "Counter measuring the total number of attempts to get connection tuples from the EBPF map"),
+	telemetryimpl.GetCompatComponent().NewHistogram(ciliumConntrackerModuleName, "gets_duration_nanoseconds", []string{}, "Histogram measuring the time spent retrieving connection tuples from the EBPF map", defaultBuckets),
+	telemetryimpl.GetCompatComponent().NewCounter(ciliumConntrackerModuleName, "gets_total", []string{}, "Counter measuring the total number of attempts to get connection tuples from the EBPF map"),
 }
 
 type tupleKey4 struct {
@@ -106,28 +109,19 @@ type ciliumLoadBalancerConntracker struct {
 
 func newCiliumLoadBalancerConntracker(cfg *config.Config) (netlink.Conntracker, error) {
 	if !cfg.EnableCiliumLBConntracker {
-		return netlink.NewNoOpConntracker(), nil
+		log.Info("cilium conntracker disabled")
+		return nil, nil
 	}
 
-	ctTCP, err := ebpf.LoadPinnedMap("/sys/fs/bpf/tc/globals/cilium_ct4_global", &ebpf.LoadPinOptions{
-		ReadOnly: true,
-	})
+	ctTCP, ctUDP, backends, err := loadMaps()
 	if err != nil {
-		return nil, fmt.Errorf("error loading pinned ct TCP map: %w", err)
-	}
+		// special case where we couldn't find at least one map
+		if os.IsNotExist(err) {
+			log.Info("not loading cilium conntracker since cilium maps are not present")
+			return nil, nil
+		}
 
-	ctUDP, err := ebpf.LoadPinnedMap("/sys/fs/bpf/tc/globals/cilium_ct_any4_global", &ebpf.LoadPinOptions{
-		ReadOnly: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error loading pinned ct UDP map: %w", err)
-	}
-
-	backends, err := ebpf.LoadPinnedMap("/sys/fs/bpf/tc/globals/cilium_lb4_backends_v3", &ebpf.LoadPinOptions{
-		ReadOnly: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error loading pinned backends map: %w", err)
+		return nil, err
 	}
 
 	clb := &ciliumLoadBalancerConntracker{
@@ -158,7 +152,62 @@ func newCiliumLoadBalancerConntracker(cfg *config.Config) (netlink.Conntracker, 
 		}
 	}()
 
+	log.Info("cilium conntracker initialized")
 	return clb, nil
+}
+
+// ciliumBPFRoot returns the root of the bpffs where cilium maps are pinned.
+// The system-probe container has a volume mounted at /sys/fs/bpf pointing directly to the host's bpffs.
+//
+// bpffs is a separate virtual filesystem, meaning that since /host is not a recursive
+// bind mount, it's not going to have /host/sys/fs/bpf, it will just be missing.
+func ciliumBPFRoot() string {
+	return "/sys/fs/bpf"
+}
+
+func loadMaps() (ctTCP, ctUDP, backends *ebpf.Map, err error) {
+	defer func() {
+		if err != nil {
+			ctTCP.Close()
+			ctUDP.Close()
+			backends.Close()
+		}
+	}()
+
+	bpffsRoot := ciliumBPFRoot()
+	ctTCP, err = loadMap(filepath.Join(bpffsRoot, "tc/globals/cilium_ct4_global"))
+	if ctTCP == nil {
+		return nil, nil, nil, err
+	}
+
+	ctUDP, err = loadMap(filepath.Join(bpffsRoot, "tc/globals/cilium_ct_any4_global"))
+	if ctUDP == nil {
+		return nil, nil, nil, err
+	}
+
+	backends, err = loadMap(filepath.Join(bpffsRoot, "tc/globals/cilium_lb4_backends_v3"))
+	if backends == nil {
+		return nil, nil, nil, err
+	}
+
+	return ctTCP, ctUDP, backends, nil
+}
+
+func loadMap(path string) (m *ebpf.Map, err error) {
+	// check if the path exists first, since the errors returned
+	// from LoadPinnedMap are not consistent if it doesn't
+	if _, err = os.Stat(path); err != nil {
+		return nil, err
+	}
+
+	m, err = ebpf.LoadPinnedMap(path, &ebpf.LoadPinOptions{
+		ReadOnly: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error loading pinned cilium map at %s: %w", path, err)
+	}
+
+	return m, nil
 }
 
 func ntohs(n uint16) uint16 {
@@ -290,6 +339,7 @@ func (clb *ciliumLoadBalancerConntracker) Close() {
 		clb.stop <- struct{}{}
 		<-clb.stop
 		clb.ctTCP.Map().Close()
+		clb.ctUDP.Map().Close()
 		clb.backends.Map().Close()
 	})
 }

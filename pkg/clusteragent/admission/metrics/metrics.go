@@ -9,7 +9,8 @@
 package metrics
 
 import (
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -33,37 +34,43 @@ const (
 	StatusError   = "error"
 )
 
+// Image resolution capability tags for operational context
+const (
+	DigestResolutionEnabled  = "enabled"  // Digest resolution available (rollout active)
+	DigestResolutionDisabled = "disabled" // Digest resolution unavailable (fallback expected)
+)
+
 // Telemetry metrics
 var (
-	ReconcileSuccess = telemetry.NewGaugeWithOpts("admission_webhooks", "reconcile_success",
+	ReconcileSuccess = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "reconcile_success",
 		[]string{"controller"}, "Number of reconcile success per controller.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	ReconcileErrors = telemetry.NewGaugeWithOpts("admission_webhooks", "reconcile_errors",
+	ReconcileErrors = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "reconcile_errors",
 		[]string{"controller"}, "Number of reconcile errors per controller.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	CertificateDuration = telemetry.NewGaugeWithOpts("admission_webhooks", "certificate_expiry",
+	CertificateDuration = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "certificate_expiry",
 		[]string{}, "Time left before the certificate expires in hours.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	ValidationAttempts = telemetry.NewGaugeWithOpts("admission_webhooks", "validation_attempts",
+	ValidationAttempts = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "validation_attempts",
 		[]string{"webhook_name", "status", "validated", "error"}, "Number of pod validation attempts by validation type",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	MutationAttempts = telemetry.NewGaugeWithOpts("admission_webhooks", "mutation_attempts",
+	MutationAttempts = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "mutation_attempts",
 		[]string{"mutation_type", "status", "injected", "error"}, "Number of pod mutation attempts by mutation type",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	WebhooksReceived = telemetry.NewCounterWithOpts(
+	WebhooksReceived = telemetryimpl.GetCompatComponent().NewCounterWithOpts(
 		"admission_webhooks",
 		"webhooks_received",
 		[]string{"mutation_type", "webhook_name", "webhook_type"},
 		"Number of webhook requests received.",
 		telemetry.Options{NoDoubleUnderscoreSep: true},
 	)
-	GetOwnerCacheHit = telemetry.NewGaugeWithOpts("admission_webhooks", "owner_cache_hit",
+	GetOwnerCacheHit = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "owner_cache_hit",
 		[]string{"resource"}, "Number of cache hits while getting pod's owner object.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	GetOwnerCacheMiss = telemetry.NewGaugeWithOpts("admission_webhooks", "owner_cache_miss",
+	GetOwnerCacheMiss = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "owner_cache_miss",
 		[]string{"resource"}, "Number of cache misses while getting pod's owner object.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	WebhooksResponseDuration = telemetry.NewHistogramWithOpts(
+	WebhooksResponseDuration = telemetryimpl.GetCompatComponent().NewHistogramWithOpts(
 		"admission_webhooks",
 		"response_duration",
 		[]string{"mutation_type", "webhook_name", "webhook_type"},
@@ -71,39 +78,52 @@ var (
 		prometheus.DefBuckets, // The default prometheus buckets are adapted to measure response time
 		telemetry.Options{NoDoubleUnderscoreSep: true},
 	)
-	LibInjectionAttempts = telemetry.NewCounterWithOpts("admission_webhooks", "library_injection_attempts",
+	WebhooksRequestSize = telemetryimpl.GetCompatComponent().NewHistogramWithOpts(
+		"admission_webhooks",
+		"request_size_bytes",
+		[]string{"webhook_name", "webhook_type"},
+		"Admission webhook request body size distribution (in bytes), from the declared Content-Length.",
+		[]float64{1 << 10, 4 << 10, 16 << 10, 64 << 10, 256 << 10, 1 << 20, 2 << 20, 4 << 20, 7 << 20, 16 << 20},
+		telemetry.Options{NoDoubleUnderscoreSep: true},
+	)
+	LibInjectionAttempts = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "library_injection_attempts",
 		[]string{"language", "injected", "auto_detected", "injection_type"}, "Number of pod library injection attempts by language and injection type",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	LibInjectionErrors = telemetry.NewCounterWithOpts("admission_webhooks", "library_injection_errors",
+	LibInjectionErrors = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "library_injection_errors",
 		[]string{"language", "auto_detected", "injection_type"}, "Number of library injection failures by language and injection type",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	CWSExecInstrumentationAttempts = telemetry.NewHistogramWithOpts(
-		"admission_webhooks",
-		"cws_exec_instrumentation_attempts",
-		[]string{"mode", "injected", "reason"},
-		"Distribution of exec requests instrumentation attempts by CWS Instrumentation mode",
-		prometheus.LinearBuckets(0, 1, 1),
+	CWSPodMutationAttempts = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "cws_pod_mutation_attempts",
+		[]string{"mode", "injected", "reason"}, "Count of pod mutation attempts per CWS instrumentation mode",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	CWSPodInstrumentationAttempts = telemetry.NewHistogramWithOpts(
-		"admission_webhooks",
-		"cws_pod_instrumentation_attempts",
-		[]string{"mode", "injected", "reason"},
-		"Distribution of pod requests instrumentation attempts by CWS Instrumentation mode",
-		prometheus.LinearBuckets(0, 1, 1),
+	CWSExecMutationAttempts = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "cws_exec_mutation_attempts",
+		[]string{"mode", "injected", "reason"}, "Count of exec mutation attempts per CWS instrumentation mode",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	RemoteConfigs = telemetry.NewGaugeWithOpts("admission_webhooks", "rc_provider_configs",
+	CWSResponseDuration = telemetryimpl.GetCompatComponent().NewHistogramWithOpts(
+		"admission_webhooks",
+		"cws_response_duration",
+		[]string{"mode", "webhook_name", "type", "success", "injected"},
+		"CWS Webhook response duration distribution (in seconds).",
+		prometheus.DefBuckets, // The default prometheus buckets are adapted to measure response time
+		telemetry.Options{NoDoubleUnderscoreSep: true},
+	)
+	RemoteConfigs = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "rc_provider_configs",
 		[]string{}, "Number of valid remote configurations.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	InvalidRemoteConfigs = telemetry.NewGaugeWithOpts("admission_webhooks", "rc_provider_configs_invalid",
+	InvalidRemoteConfigs = telemetryimpl.GetCompatComponent().NewGaugeWithOpts("admission_webhooks", "rc_provider_configs_invalid",
 		[]string{}, "Number of invalid remote configurations.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	PatchAttempts = telemetry.NewCounterWithOpts("admission_webhooks", "patcher_attempts",
+	PatchAttempts = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "patcher_attempts",
 		[]string{}, "Number of patch attempts.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	PatchCompleted = telemetry.NewCounterWithOpts("admission_webhooks", "patcher_completed",
+	PatchCompleted = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "patcher_completed",
 		[]string{}, "Number of completed patch attempts.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
-	PatchErrors = telemetry.NewCounterWithOpts("admission_webhooks", "patcher_errors",
+	PatchErrors = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "patcher_errors",
 		[]string{}, "Number of patch errors.",
 		telemetry.Options{NoDoubleUnderscoreSep: true})
+
+	// Image resolution tracking for gradual rollout monitoring
+	ImageResolutionAttempts = telemetryimpl.GetCompatComponent().NewCounterWithOpts("admission_webhooks", "image_resolution_attempts",
+		[]string{"repository", "tag", "bucket", "outcome"}, "Number of image resolution attempts by repository, tag, bucket, and resolution outcome",
+		telemetry.Options{})
 )

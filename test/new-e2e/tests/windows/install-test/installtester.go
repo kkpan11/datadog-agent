@@ -6,17 +6,17 @@
 package installtest
 
 import (
-	"fmt"
+	"errors"
 	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
-	utilscommon "github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/common"
-	agentClient "github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client"
-	agentClientParams "github.com/DataDog/datadog-agent/test/new-e2e/pkg/utils/e2e/client/agentclientparams"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
+	utilscommon "github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/common"
+	agentClient "github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client"
+	agentClientParams "github.com/DataDog/datadog-agent/test/e2e-framework/testing/utils/e2e/client/agentclientparams"
 	"github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-platform/common"
 	commonHelper "github.com/DataDog/datadog-agent/test/new-e2e/tests/agent-platform/common/helper"
 	windows "github.com/DataDog/datadog-agent/test/new-e2e/tests/windows/common"
@@ -72,7 +72,7 @@ func NewTester(context utilscommon.Context, host *components.RemoteHost, opts ..
 	}
 
 	if t.expectedAgentVersion == "" {
-		return nil, fmt.Errorf("expectedAgentVersion is required")
+		return nil, errors.New("expectedAgentVersion is required")
 	}
 
 	// Ensure the expected version is well formed
@@ -164,11 +164,16 @@ func (t *Tester) runTestsForKitchenCompat(tt *testing.T) {
 		common.CheckIntegrationInstall(tt, t.InstallTestClient)
 
 		tt.Run("default python version", func(tt *testing.T) {
-			expected := common.ExpectedPythonVersion3
+			// python is lazy loaded and not running as default
+			expected := common.ExpectedUnloadedPython
 			if t.ExpectPython2Installed() {
 				expected = common.ExpectedPythonVersion2
 			}
 			common.CheckAgentPython(tt, t.InstallTestClient, expected)
+
+			// this sets python_lazy_loading: false so we can check the version installed
+			common.SetAgentPythonMajorVersion(tt, t.InstallTestClient, "3")
+			common.CheckAgentPython(tt, t.InstallTestClient, common.ExpectedPythonVersion3)
 		})
 
 		if t.ExpectPython2Installed() {
@@ -194,6 +199,8 @@ func (t *Tester) runTestsForKitchenCompat(tt *testing.T) {
 				common.CheckCWSBehaviour(tt, t.InstallTestClient)
 			})
 		}
+
+		// TODO(ADP): Update this for Windows when we add Windows support to ADP.
 	})
 }
 
@@ -293,6 +300,24 @@ func (t *Tester) testCurrentVersionExpectations(tt *testing.T) {
 		}
 	})
 
+	tt.Run("config files contain template comments", func(tt *testing.T) {
+		// Verify that config files created by the MSI contain the commented-out
+		// example options from the .example templates, not just bare keys.
+		configTemplateMarkers := map[string]string{
+			"datadog.yaml":        "## Basic Configuration ##",
+			"system-probe.yaml":   "## System Probe Configuration ##",
+			"security-agent.yaml": "## Runtime Security configuration ##",
+		}
+		for configFile, marker := range configTemplateMarkers {
+			configPath := filepath.Join(t.expectedConfigRoot, configFile)
+			content, err := t.host.ReadFile(configPath)
+			if assert.NoError(tt, err, "should read %s", configFile) {
+				assert.Contains(tt, string(content), marker,
+					"%s should contain template comments from %s.example", configFile, configFile)
+			}
+		}
+	})
+
 	tt.Run("creates bin files", func(tt *testing.T) {
 		expected := getExpectedBinFilesForAgentMajorVersion(t.expectedAgentMajorVersion)
 		for _, binPath := range expected {
@@ -300,6 +325,23 @@ func (t *Tester) testCurrentVersionExpectations(tt *testing.T) {
 			_, err := t.host.Lstat(binPath)
 			assert.NoError(tt, err, "install should create %s bin file", binPath)
 		}
+	})
+
+	tt.Run("creates adp process manager config", func(tt *testing.T) {
+		adpProcmgrConfigPath := filepath.Join(t.expectedInstallPath, "processes.d", "datadog-agent-data-plane.yaml")
+		_, err := t.host.Lstat(adpProcmgrConfigPath)
+		assert.NoError(tt, err, "install should create %s", adpProcmgrConfigPath)
+	})
+
+	tt.Run("creates par process manager config", func(tt *testing.T) {
+		parBin := filepath.Join(t.expectedInstallPath, "bin", "agent", "privateactionrunner.exe")
+		exists, err := t.host.FileExists(parBin)
+		if !assert.NoError(tt, err) || !exists {
+			tt.Skip("privateactionrunner.exe not installed; skipping PAR procmgr config assertion")
+		}
+		parProcmgrConfigPath := filepath.Join(t.expectedInstallPath, "processes.d", "datadog-agent-action.yaml")
+		_, err = t.host.Lstat(parProcmgrConfigPath)
+		assert.NoError(tt, err, "install should create %s", parProcmgrConfigPath)
 	})
 
 	tt.Run("removes embedded extraction artifacts", func(tt *testing.T) {
@@ -455,6 +497,7 @@ func (t *Tester) testUninstalledFilePermissions(tt *testing.T) {
 			windows.AssertEqualAccessSecurity(tt, tc.path, tc.expectedSecurity(tt), out)
 		})
 	}
+	windowsAgent.TestHasNoWorldWritablePaths(tt, t.host, []string{t.expectedConfigRoot})
 
 	// C:\Program Files\Datadog\Datadog Agent (InstallPath)
 	// doesn't exist after uninstall so don't need to test
@@ -605,11 +648,13 @@ func (t *Tester) testInstalledFilePermissions(tt *testing.T, ddAgentUserIdentity
 			"%s should not have permissions on %s", ddAgentUserIdentity, t.expectedInstallPath)
 	}
 	assert.False(tt, out.AreAccessRulesProtected, "%s should inherit access rules", t.expectedInstallPath)
+
+	windowsAgent.TestAgentHasNoWorldWritablePaths(tt, t.host)
 }
 
 // TestInstallExpectations tests the current agent installation meets the expectations provided to the Tester
 func (t *Tester) TestInstallExpectations(tt *testing.T) bool {
-	return tt.Run(fmt.Sprintf("test %s", t.agentPackage.AgentVersion()), func(tt *testing.T) {
+	return tt.Run("test "+t.agentPackage.AgentVersion(), func(tt *testing.T) {
 		if !tt.Run("running expected agent version", func(tt *testing.T) {
 			installedVersion, err := t.InstallTestClient.GetAgentVersion()
 			require.NoError(tt, err, "should get agent version")

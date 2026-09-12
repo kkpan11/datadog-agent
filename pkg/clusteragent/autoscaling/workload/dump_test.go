@@ -10,6 +10,7 @@ package workload
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -33,15 +34,16 @@ import (
 
 func TestDump(t *testing.T) {
 	config := config.NewMock(t)
-	config.SetWithoutSource("autoscaling.workload.enabled", true)
+	config.SetInTest("autoscaling.workload.enabled", true)
 	testTime := time.Now()
 	f := newFixture(t, testTime)
 	InitDumper(f.store)
 
 	dpai := createFakePodAutoscaler(testTime)
 
-	f.store.Set("default/dpa-0", dpai.Build(), "")
-	_, found := f.store.Get("default/dpa-0")
+	item, _ := f.store.Get("default/dpa-0")
+	item.Upsert(dpai.Build(), "")
+	_, found := f.store.Peek("default/dpa-0")
 	assert.True(t, found)
 
 	dump := Dump()
@@ -58,6 +60,7 @@ default/dpa-0
 Creation Timestamp: 0001-01-01 00:00:00 +0000 UTC
 Generation: 1
 Settings Timestamp: 0001-01-01 00:00:00 +0000 UTC
+Burstable: false
 
 ----------- PodAutoscaler Spec -----------
 Target Ref: {Deployment app-0 apps/v1}
@@ -78,6 +81,7 @@ Scale Down Stabilization Window: 10
 ----------- PodAutoscaler Local Fallback -----------
 Horizontal Fallback Enabled: true
 Horizontal Fallback Stale Recommendation Threshold: 600
+Horizontal Fallback Scaling Direction: ScaleUp
 
 ----------- PodAutoscaler Constraints -----------
 Min Replicas: 1
@@ -154,10 +158,21 @@ Error: <nil>
 ----------- PodAutoscaler Status -----------
 Error: test error
 --------------------------------
-Horizontal Last Action: Timestamp: %[1]s
+Horizontal Last Action: Timestamp: %[2]s
 From Replicas: 2
 To Replicas: 3
 Recommended Replicas: 3
+Horizontal Last Action: Timestamp: %[1]s
+From Replicas: 3
+To Replicas: 4
+Recommended Replicas: 4
+--------------------------------
+Horizontal Last Recommendation: Source: Autoscaling
+GeneratedAt: %[1]s
+Replicas: 100
+Horizontal Last Recommendation: Source: Autoscaling
+GeneratedAt: %[1]s
+Replicas: 102
 --------------------------------
 Vertical Last Action Error: test vertical last action error
 Vertical Last Action: Timestamp: %[1]s
@@ -169,7 +184,7 @@ Endpoint: https://custom-recommender.com
 Settings: map[key:value]
 
 ===
-`, testTime.String())
+`, testTime.String(), testTime.Add(-1*time.Second).String())
 	compareTestOutput(t, expectedOutput, output)
 }
 
@@ -235,7 +250,7 @@ func createFakePodAutoscaler(testTime time.Time) model.FakePodAutoscalerInternal
 			},
 			Constraints: &datadoghqcommon.DatadogPodAutoscalerConstraints{
 				MinReplicas: pointer.Ptr(int32(1)),
-				MaxReplicas: int32(10),
+				MaxReplicas: pointer.Ptr(int32(10)),
 				Containers: []datadoghqcommon.DatadogPodAutoscalerContainerConstraints{
 					{
 						Name:    "app",
@@ -259,6 +274,7 @@ func createFakePodAutoscaler(testTime time.Time) model.FakePodAutoscalerInternal
 					Triggers: datadoghq.HorizontalFallbackTriggers{
 						StaleRecommendationThresholdSeconds: 600,
 					},
+					Direction: datadoghq.DatadogPodAutoscalerFallbackDirectionScaleUp,
 				},
 			},
 			Objectives: []datadoghqcommon.DatadogPodAutoscalerObjective{
@@ -309,9 +325,9 @@ func createFakePodAutoscaler(testTime time.Time) model.FakePodAutoscalerInternal
 					},
 				},
 			},
-			VerticalError:   fmt.Errorf("test vertical error"),
+			VerticalError:   errors.New("test vertical error"),
 			HorizontalError: nil,
-			Error:           fmt.Errorf("test error"),
+			Error:           errors.New("test error"),
 		},
 		MainScalingValues: model.ScalingValues{
 			Horizontal: &model.HorizontalScalingValues{
@@ -373,10 +389,28 @@ func createFakePodAutoscaler(testTime time.Time) model.FakePodAutoscalerInternal
 		},
 		HorizontalLastActions: []datadoghqcommon.DatadogPodAutoscalerHorizontalAction{
 			{
-				Time:                metav1.Time{Time: testTime},
+				Time:                metav1.Time{Time: testTime.Add(-1 * time.Second)},
 				FromReplicas:        2,
 				ToReplicas:          3,
 				RecommendedReplicas: ptr.To(int32(3)),
+			},
+			{
+				Time:                metav1.Time{Time: testTime},
+				FromReplicas:        3,
+				ToReplicas:          4,
+				RecommendedReplicas: ptr.To(int32(4)),
+			},
+		},
+		HorizontalLastRecommendations: []datadoghqcommon.DatadogPodAutoscalerHorizontalRecommendation{
+			{
+				Source:      datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+				GeneratedAt: metav1.NewTime(testTime),
+				Replicas:    100,
+			},
+			{
+				Source:      datadoghqcommon.DatadogPodAutoscalerAutoscalingValueSource,
+				GeneratedAt: metav1.NewTime(testTime),
+				Replicas:    102,
 			},
 		},
 		VerticalLastAction: &datadoghqcommon.DatadogPodAutoscalerVerticalAction{
@@ -384,17 +418,13 @@ func createFakePodAutoscaler(testTime time.Time) model.FakePodAutoscalerInternal
 			Version: "1",
 			Type:    datadoghqcommon.DatadogPodAutoscalerRolloutTriggeredVerticalActionType,
 		},
-		VerticalLastActionError: fmt.Errorf("test vertical last action error"),
-		Error:                   fmt.Errorf("test error"),
+		VerticalLastActionError: errors.New("test vertical last action error"),
+		Error:                   errors.New("test error"),
 	}
 }
 
 func compareTestOutput(t *testing.T, expected, actual string) {
 	expected = strings.ReplaceAll(expected, " ", "")
-	expected = strings.ReplaceAll(expected, "GMT", "UTC")
-
 	actual = strings.ReplaceAll(actual, " ", "")
-	actual = strings.ReplaceAll(actual, "GMT", "UTC")
-
 	assert.Equal(t, expected, actual)
 }

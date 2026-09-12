@@ -126,17 +126,22 @@ def gracefully_cancel_pipeline(repo: Project, pipeline: ProjectPipeline, force_c
     - Cancel all the jobs that did not start to run yet
     - Do not cancel jobs containing 'cleanup' in their name
     - Jobs in the stages specified in 'force_cancel_stages' variables will always be canceled even if running
+    - Do not cancel jobs in the no_cancel_override list
     """
 
     jobs = pipeline.jobs.list(per_page=100, all=True)
     kmt_cleanup_jobs_to_run: set[str] = set()
     jobs_by_name: dict[str, ProjectJob] = {}
+    no_cancel_override: list[str] = ["dev_deploy-host-profiler-devtest"]
 
     for job in jobs:
         jobs_by_name[job.name] = cast(ProjectJob, job)
 
+        if job.name in no_cancel_override:
+            continue
+
         if job.stage in force_cancel_stages or (
-            job.status not in ["running", "canceled", "success"] and "cleanup" not in job.name
+            job.status not in ["running", "canceled", "success", "manual"] and "cleanup" not in job.name
         ):
             repo.jobs.get(job.id, lazy=True).cancel()
 
@@ -173,7 +178,7 @@ def trigger_agent_pipeline(
     e2e_tests=False,
     kmt_tests=False,
     rc_build=False,
-    rc_k8s_deployments=False,
+    run_flaky_tests=False,
 ) -> ProjectPipeline:
     """
     Trigger a pipeline on the datadog-agent repositories. Multiple options are available:
@@ -181,6 +186,7 @@ def trigger_agent_pipeline(
     - run a pipeline with all e2e tests,
     - run a pipeline with all end-to-end tests,
     - run a deploy pipeline (includes all builds & e2e tests + uploads artifacts to staging repositories);
+    - run a pipeline that does not skip flaky tests (by default, known flaky tests are skipped).
     """
 
     ref = ref or get_default_branch()
@@ -213,8 +219,8 @@ def trigger_agent_pipeline(
     if rc_build:
         args["RC_BUILD"] = "true"
 
-    if rc_k8s_deployments:
-        args["RC_K8S_DEPLOYMENTS"] = "true"
+    if run_flaky_tests:
+        args["GO_TEST_SKIP_FLAKE"] = "false"
 
     print(
         "Creating pipeline for datadog-agent on branch/tag {} with args:\n{}".format(  # noqa: FS002

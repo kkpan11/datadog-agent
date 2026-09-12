@@ -14,16 +14,18 @@ from pathlib import Path
 from invoke import task
 from invoke.exceptions import Exit
 
-from tasks.build_tags import build_tags, filter_incompatible_tags, get_build_tags, get_default_build_tags
-from tasks.commands.docker import AGENT_REPOSITORY_PATH, DockerCLI
+from tasks.build_tags import build_tags, compute_build_tags_for_flavor
+from tasks.commands.docker import DockerCLI
 from tasks.flavor import AgentFlavor
 from tasks.libs.common.color import Color, color_message
 from tasks.libs.common.utils import is_installed
 
 DEVCONTAINER_DIR = ".devcontainer"
 DEVCONTAINER_FILE = "devcontainer.json"
-DEVCONTAINER_NAME = "datadog_agent_devcontainer"
-DEVCONTAINER_IMAGE = "registry.ddbuild.io/ci/datadog-agent-devenv:1-arm64"
+DEVCONTAINER_NAME = "datadog-agent-devcontainer"
+# This is our standard Linux developer environment image, built from the buildimages
+# repo (https://github.com/DataDog/datadog-agent-buildimages/tree/main/dev-envs/linux).
+DEVCONTAINER_IMAGE = "datadog/agent-dev-env-linux"
 
 
 class SkaffoldProfile(Enum):
@@ -40,7 +42,8 @@ def setup(
     build_exclude=None,
     skaffoldProfile=None,
     flavor=AgentFlavor.base.name,
-    image='',
+    image=DEVCONTAINER_IMAGE,
+    claude_code=False,
 ):
     """
     Generate or Modify devcontainer settings file for this project.
@@ -51,13 +54,9 @@ def setup(
         print(f'{", ".join(build_tags[flavor].keys())} \n')
         return
 
-    build_include = (
-        get_default_build_tags(build=target, flavor=flavor, platform='linux')
-        if build_include is None
-        else filter_incompatible_tags(build_include.split(","))
+    use_tags = compute_build_tags_for_flavor(
+        build=target, flavor=flavor, build_include=build_include, build_exclude=build_exclude, platform='linux'
     )
-    build_exclude = [] if build_exclude is None else build_exclude.split(",")
-    use_tags = get_build_tags(build_include, build_exclude)
     use_tags.append("test")  # always include the test tag for autocompletion in vscode
 
     if not os.path.exists(DEVCONTAINER_DIR):
@@ -69,9 +68,11 @@ def setup(
         with open(fullpath) as sf:
             devcontainer = json.load(sf, object_pairs_hook=OrderedDict)
 
+    # sort the list of tags, to quickly identify changes in generated build tags
+    use_tags.sort()
     local_build_tags = ",".join(use_tags)
 
-    devcontainer["name"] = "Datadog-Agent-DevEnv"
+    devcontainer["name"] = "Datadog Agent Development Container"
     if image:
         devcontainer["image"] = image
         if devcontainer.get("build"):
@@ -88,28 +89,59 @@ def setup(
         "--security-opt",
         "seccomp=unconfined",
         "-w",
-        "/workspaces/datadog-agent",
+        "/workspaces/${localWorkspaceFolderBasename}",
         "--name",
-        "datadog_agent_devcontainer",
+        "datadog-agent-devcontainer",
     ]
+    if devcontainer.get("image") and "amd64" in devcontainer["image"].casefold():
+        devcontainer["runArgs"].append("--platform=linux/amd64")
+    if sys.platform != "win32":
+        # The image's entrypoint realigns its user to this UID/GID so writes to bind
+        # mounts keep host ownership. We pass them as explicit `docker run` env vars
+        # because no devcontainer variable resolves to the host UID/GID. (`os.getuid`/
+        # `os.getgid` are absent on Windows, but the platform check short-circuits first.)
+        devcontainer["runArgs"] += ["-e", f"HOST_UID={os.getuid()}", "-e", f"HOST_GID={os.getgid()}"]
     devcontainer["features"] = {}
-    devcontainer["remoteUser"] = "datadog"
+    # Keep the image's entrypoint, which realigns `dd` to the host's UID/GID and runs
+    # the image's startup before exec'ing its long-running command. Otherwise the dev
+    # container CLI replaces the entrypoint with its own keep-alive command and skips
+    # that setup.
+    devcontainer["overrideCommand"] = False
+    # The image provides this user, and its entrypoint realigns it to the host's UID/GID
+    # (via HOST_UID/HOST_GID above).
+    devcontainer["remoteUser"] = "dd"
+    # The host home directory is `USERPROFILE` on Windows and `HOME` elsewhere. We use a
+    # single variable rather than concatenating both, because some Windows shells also
+    # set `HOME`, which would otherwise produce a doubled, invalid path.
+    home_env = "${localEnv:USERPROFILE}" if sys.platform == "win32" else "${localEnv:HOME}"
     devcontainer["mounts"] = [
-        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached",
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+        f"source={home_env}/.ssh,target=/home/dd/.ssh,type=bind",
     ]
     devcontainer["customizations"] = {
         "vscode": {
             "settings": {
                 "go.toolsManagement.checkForUpdates": "local",
                 "go.useLanguageServer": True,
-                "go.gopath": "/home/datadog/go",
-                "go.goroot": "/usr/local/go",
+                # GOPATH and GOROOT are auto-detected from the image's environment, so
+                # they are intentionally left unset here.
                 "go.buildTags": local_build_tags,
                 "go.testTags": local_build_tags,
-                "go.lintTool": "golangci-lint",
+                "go.lintTool": "bazelisk",
                 "go.lintOnSave": "package",
                 "go.lintFlags": [
+                    "run",
+                    "//internal/tools:golangci-lint",
+                    "--",
+                    # add vscode-go default args, see:
+                    # https://github.com/golang/vscode-go/blob/master/extension/src/diagnostics/goLint.ts#L122-L163
+                    "run",
+                    "--issues-exit-code=0",
+                    "--output.text.print-issued-lines=false",
+                    "--show-stats=false",
+                    "--output.text.path=stdout",
+                    "--path-mode=abs",
+                    # then our own
                     "--build-tags",
                     local_build_tags,
                 ],
@@ -122,20 +154,54 @@ def setup(
         }
     }
 
-    # onCreateCommond runs the install-tools and deps tasks only when the devcontainer is created and not each time
-    # the container is started
+    # onCreateCommand runs the install-tools and deps tasks only when the devcontainer is created and not each time
+    # the container is started. Set the github token to prevent rate limiting on creation.
     devcontainer["onCreateCommand"] = (
-        f"git config --global --add safe.directory {AGENT_REPOSITORY_PATH} && dda inv -- -e install-tools && dda inv -- -e deps"
+        # The image rewrites github.com to SSH so it can clone private repos, but the
+        # devcontainer authenticates over HTTPS with GITHUB_TOKEN, so we undo that
+        # rewrite (the `|| true` tolerates its absence if the image stops setting it).
+        # See https://github.com/DataDog/datadog-agent-buildimages/blob/main/dev-envs/linux/ssh.sh
+        "git config --global --unset url.ssh://git@github.com/.insteadOf || true"
+        " && git config --global --add safe.directory /workspaces/${localWorkspaceFolderBasename}"
+        " && dda config set github.auth.token \"$GITHUB_TOKEN\""
+        " && dda inv -- -e install-tools && dda inv -- -e deps"
     )
 
     devcontainer["containerEnv"] = {
+        "GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}",
         "GITLAB_TOKEN": "${localEnv:GITLAB_TOKEN}",
     }
 
     configure_skaffold(devcontainer, SkaffoldProfile(skaffoldProfile))
+    configure_claude_code(devcontainer, claude_code)
+
+    # Add per user configuration
+    user_config_path = Path.home() / ".devcontainer" / "agent_overrides.json"
+    if os.path.exists(user_config_path):
+        with open(user_config_path) as sf:
+            user_config = json.load(sf)
+            more_mounts = user_config.get("mounts")
+            if more_mounts:
+                devcontainer["mounts"].append(more_mounts)
+            more_create = user_config.get("onCreate")
+            if more_create:
+                devcontainer["onCreateCommand"] = devcontainer["onCreateCommand"] + " && " + " && ".join(more_create)
 
     with open(fullpath, "w") as sf:
-        json.dump(devcontainer, sf, indent=4, sort_keys=False, separators=(',', ': '))
+        json.dump(devcontainer, sf, indent=4, sort_keys=True, separators=(',', ': '))
+
+
+def configure_claude_code(devcontainer: dict, claude_code: bool):
+    if claude_code:
+        # create folder .devcontainer/claude-data/.claude if not exists
+        claude_data_path = Path.home() / ".devcontainer" / "claude-data"
+        Path(claude_data_path).mkdir(parents=True, exist_ok=True)
+        devcontainer["mounts"].append(
+            "source=${localWorkspaceFolder}/.devcontainer/claude-data/,target=/home/dd/.claude,type=bind"
+        )
+
+        devcontainer["features"]["ghcr.io/devcontainers/features/node:1"] = {}
+        devcontainer["features"]["ghcr.io/anthropics/devcontainer-features/claude-code:1.0"] = {}
 
 
 def configure_skaffold(devcontainer: dict, profile: SkaffoldProfile):
@@ -168,6 +234,9 @@ def configure_skaffold(devcontainer: dict, profile: SkaffoldProfile):
                 "cloudcode.updateAdcOnLogin": False,
                 "cloudcode.useGcloudAuthSkaffold": False,
                 "cloudcode.yaml.validate": False,
+                # TODO: for now we need to keep it else the cloudrun plugin is broken
+                # "geminicodeassist.enable": False,
+                "geminicodeassist.enableTelemetry": False,
             }
             devcontainer["customizations"]["vscode"]["settings"].update(additional_settings)
 

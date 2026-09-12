@@ -6,6 +6,7 @@ from collections import OrderedDict
 
 from invoke.exceptions import Exit
 
+from tasks.libs.ciproviders.gitlab_api import get_buildimages_version
 from tasks.libs.common.constants import TAG_FOUND_TEMPLATE
 from tasks.libs.common.git import get_default_branch, is_agent6
 from tasks.libs.releasing.documentation import _stringify_config
@@ -29,23 +30,19 @@ INTEGRATIONS_CORE_JSON_FIELD = "INTEGRATIONS_CORE_VERSION"
 RELEASE_JSON_FIELDS_TO_UPDATE = [
     INTEGRATIONS_CORE_JSON_FIELD,
     "OMNIBUS_RUBY_VERSION",
-    "MACOS_BUILD_VERSION",
 ]
 
 UNFREEZE_REPO_AGENT = "datadog-agent"
-INTERNAL_DEPS_REPOS = ["omnibus-ruby", "datadog-agent-macos-build"]
+INTERNAL_DEPS_REPOS = ["omnibus-ruby"]
 DEPENDENT_REPOS = INTERNAL_DEPS_REPOS + ["integrations-core"]
 ALL_REPOS = DEPENDENT_REPOS + [UNFREEZE_REPO_AGENT]
-UNFREEZE_REPOS = INTERNAL_DEPS_REPOS + [UNFREEZE_REPO_AGENT] + ["datadog-agent-buildimages"]
 DEFAULT_BRANCHES = {
     "omnibus-ruby": "datadog-5.5.0",
-    "datadog-agent-macos-build": "master",
     "datadog-agent": "main",
-    "datadog-agent-buildimages": "main",
+    "datadog-agent-buildimages": get_buildimages_version(),
 }
 DEFAULT_BRANCHES_AGENT6 = {
     "omnibus-ruby": "6.53.x",
-    "datadog-agent-macos-build": "6.53.x",
     "datadog-agent": "6.53.x",
 }
 
@@ -130,7 +127,6 @@ def _update_release_json_entry(
     jmxfetch_version,
     jmxfetch_shasum,
     security_agent_policies_version,
-    macos_build_version,
     windows_ddnpm_driver,
     windows_ddnpm_version,
     windows_ddnpm_shasum,
@@ -146,19 +142,24 @@ def _update_release_json_entry(
     print(f"Windows DDNPM's SHA256 is {windows_ddnpm_shasum}")
     print(f"Windows DDPROCMON's SHA256 is {windows_ddprocmon_shasum}")
 
-    new_version_config = OrderedDict()
+    new_version_config = {}
     new_version_config["INTEGRATIONS_CORE_VERSION"] = integrations_version
     new_version_config["OMNIBUS_RUBY_VERSION"] = omnibus_ruby_version
     new_version_config["JMXFETCH_VERSION"] = jmxfetch_version
     new_version_config["JMXFETCH_HASH"] = jmxfetch_shasum
     new_version_config["SECURITY_AGENT_POLICIES_VERSION"] = security_agent_policies_version
-    new_version_config["MACOS_BUILD_VERSION"] = macos_build_version
     new_version_config["WINDOWS_DDNPM_DRIVER"] = windows_ddnpm_driver
     new_version_config["WINDOWS_DDNPM_VERSION"] = windows_ddnpm_version
     new_version_config["WINDOWS_DDNPM_SHASUM"] = windows_ddnpm_shasum
     new_version_config["WINDOWS_DDPROCMON_DRIVER"] = windows_ddprocmon_driver
     new_version_config["WINDOWS_DDPROCMON_VERSION"] = windows_ddprocmon_version
     new_version_config["WINDOWS_DDPROCMON_SHASUM"] = windows_ddprocmon_shasum
+
+    # TODO Agent Delivery: Check with AMP how we handle ADP in that file during the release process
+    # Add all the other keys from the previous entry that are not explicitly set here
+    for key in release_json[RELEASE_JSON_DEPENDENCIES]:
+        if key not in new_version_config:
+            new_version_config[key] = release_json[RELEASE_JSON_DEPENDENCIES][key]
 
     # Necessary if we want to maintain the JSON order, so that humans don't get confused
     new_release_json = OrderedDict()
@@ -168,7 +169,7 @@ def _update_release_json_entry(
         new_release_json[key] = value
 
     # Then update the entry
-    new_release_json[RELEASE_JSON_DEPENDENCIES] = _stringify_config(new_version_config)
+    new_release_json[RELEASE_JSON_DEPENDENCIES] = _stringify_config(OrderedDict(sorted(new_version_config.items())))
 
     return new_release_json
 
@@ -216,15 +217,6 @@ def _update_release_json(release_json, new_version: Version, max_version: Versio
         check_for_rc,
     )
 
-    macos_build_version = _fetch_dependency_repo_version(
-        "datadog-agent-macos-build",
-        new_version,
-        max_version,
-        allowed_major_versions,
-        compatible_version_re,
-        check_for_rc,
-    )
-
     # Part 2: repositories which have their own version scheme
 
     # jmxfetch version is updated directly by the AML team
@@ -253,7 +245,6 @@ def _update_release_json(release_json, new_version: Version, max_version: Versio
         jmxfetch_version,
         jmxfetch_shasum,
         security_agent_policies_version,
-        macos_build_version,
         windows_ddnpm_driver,
         windows_ddnpm_version,
         windows_ddnpm_shasum,
@@ -289,17 +280,6 @@ def _get_release_json_value(key):
         release_json = release_json.get(element)
 
     return release_json
-
-
-def set_new_release_branch(branch):
-    rj = load_release_json()
-
-    rj["base_branch"] = branch
-
-    for field in RELEASE_JSON_FIELDS_TO_UPDATE:
-        rj[RELEASE_JSON_DEPENDENCIES][field] = f"{branch}"
-
-    _save_release_json(rj)
 
 
 def set_current_milestone(milestone):

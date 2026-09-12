@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/DataDog/datadog-agent/pkg/config/env"
+	"github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/cache"
@@ -30,14 +31,12 @@ const (
 	clusterIDEnv = "DD_ORCHESTRATOR_CLUSTER_ID"
 )
 
-// validClusterName matches exactly the same naming rule as the one enforced by GKE:
-// https://cloud.google.com/kubernetes-engine/docs/reference/rest/v1beta1/projects.locations.clusters#Cluster.FIELDS.name
 // The cluster name can be up to 40 characters with the following restrictions:
-// * Lowercase letters, numbers, dots and hyphens only.
-// * Must start with a letter.
-// * Must end with a number or a letter.
-// * Must be a valid FQDN (without trailing period)
-var validClusterName = regexp.MustCompile(`^([a-z]([a-z0-9\-]*[a-z0-9])?\.)*([a-z]([a-z0-9\-]*[a-z0-9])?)$`)
+// * Must contain only lowercase letters, numbers, dots, hyphens and underscores.
+// * Must start with an alphanumeric character.
+// * Must end with an alphanumeric character.
+// * Must be FQDN-like, without a trailing period.
+var validClusterName = regexp.MustCompile(`^([a-z0-9]([a-z0-9\-_]*[a-z0-9])?\.)*([a-z0-9]([a-z0-9\-_]*[a-z0-9])?)$`)
 
 type clusterNameData struct {
 	clusterName string
@@ -81,12 +80,18 @@ func getClusterName(ctx context.Context, data *clusterNameData, hostname string)
 			// the host alias "hostname-clustername" must not exceed 255 chars
 			hostAlias := hostname + "-" + data.clusterName
 			if !validClusterName.MatchString(data.clusterName) || len(hostAlias) > 255 {
-				log.Errorf("\"%s\" isn’t a valid cluster name. It must be dot-separated tokens where tokens "+
-					"start with a lowercase letter followed by lowercase letters, numbers, or "+
-					"hyphens, and cannot end with a hyphen nor have a dot adjacent to a hyphen and \"%s\" must not "+
-					"exceed 255 chars", data.clusterName, hostAlias)
+				log.Errorf("\"%s\" isn't a valid cluster name. The cluster name can be up to 40 characters with the following restrictions:\n"+
+					"\t- must contain only lowercase letters, numbers, dots, hyphens and underscores, \n"+
+					"\t- must start with an alphanumeric character, \n"+
+					"\t- must end with an alphanumeric character, \n"+
+					"\t- must be FQDN-like, without a trailing period, \n"+
+					"and \"%s\" must not exceed 255 chars", data.clusterName, hostAlias)
 				log.Errorf("As a consequence, the cluster name provided by the config will be ignored")
 				data.clusterName = ""
+			} else if !IsRFC1123CompliantClusterName(data.clusterName) {
+				RFC1123CompliantClusterName := MakeClusterNameRFC1123Compliant(data.clusterName)
+				log.Warnf("Cluster name \"%s\" is not RFC 1123 compliant, it will be converted to \"%s\"", data.clusterName, RFC1123CompliantClusterName)
+				data.clusterName = RFC1123CompliantClusterName
 			}
 		}
 
@@ -113,14 +118,19 @@ func getClusterName(ctx context.Context, data *clusterNameData, hostname string)
 			}
 		}
 
+		// Cluster check runners aren't scheduled on a specific node and don't have a
+		// reachable local kubelet, so skip the node-label based auto discovery to avoid
+		// noisy "Impossible to reach Kubelet" warnings.
 		var clusterName string
-		nodeInfo, err := hostinfo.NewNodeInfo()
-		if err != nil {
-			log.Debugf("Unable to auto discover the cluster name from node label : %s", err)
-		} else {
-			clusterName, err = nodeInfo.GetNodeClusterNameLabel(ctx, data.clusterName)
+		if !helper.IsCLCRunner(pkgconfigsetup.Datadog()) {
+			nodeInfo, err := hostinfo.NewNodeInfo()
 			if err != nil {
 				log.Debugf("Unable to auto discover the cluster name from node label : %s", err)
+			} else {
+				clusterName, err = nodeInfo.GetNodeClusterNameLabel(ctx, data.clusterName)
+				if err != nil {
+					log.Debugf("Unable to auto discover the cluster name from node label : %s", err)
+				}
 			}
 		}
 		if len(clusterName) > 0 {

@@ -30,10 +30,11 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
+	secrets "github.com/DataDog/datadog-agent/comp/core/secrets/def"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	secagent "github.com/DataDog/datadog-agent/pkg/security/agent"
 	"github.com/DataDog/datadog-agent/pkg/security/clihelpers"
+	"github.com/DataDog/datadog-agent/pkg/security/proto/api/transform"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	httputils "github.com/DataDog/datadog-agent/pkg/util/http"
 	"github.com/DataDog/datadog-agent/pkg/version"
@@ -57,6 +58,7 @@ func commonPolicyCommands(globalParams *command.GlobalParams) []*cobra.Command {
 	commonPolicyCmd.AddCommand(commonCheckPoliciesCommands(globalParams)...)
 	commonPolicyCmd.AddCommand(commonReloadPoliciesCommands(globalParams)...)
 	commonPolicyCmd.AddCommand(downloadPolicyCommands(globalParams)...)
+	commonPolicyCmd.AddCommand(dumpLoadedPoliciesCommands(globalParams)...)
 
 	return []*cobra.Command{commonPolicyCmd}
 }
@@ -83,9 +85,8 @@ func evalCommands(globalParams *command.GlobalParams) []*cobra.Command {
 			return fxutil.OneShot(evalRule,
 				fx.Supply(evalArgs),
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "off", false)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "off", false)}),
 				core.Bundle(),
 			)
 		},
@@ -116,9 +117,8 @@ func commonCheckPoliciesCommands(globalParams *command.GlobalParams) []*cobra.Co
 			return fxutil.OneShot(checkPolicies,
 				fx.Supply(cliParams),
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "off", false)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "off", false)}),
 				core.Bundle(),
 			)
 		},
@@ -133,16 +133,15 @@ func commonCheckPoliciesCommands(globalParams *command.GlobalParams) []*cobra.Co
 	return []*cobra.Command{commonCheckPoliciesCmd}
 }
 
-func commonReloadPoliciesCommands(_ *command.GlobalParams) []*cobra.Command {
+func commonReloadPoliciesCommands(globalParams *command.GlobalParams) []*cobra.Command {
 	commonReloadPoliciesCmd := &cobra.Command{
 		Use:   "reload",
 		Short: "Reload policies",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return fxutil.OneShot(reloadRuntimePolicies,
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "info", true)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "info", true)}),
 				core.Bundle(),
 			)
 		},
@@ -150,17 +149,16 @@ func commonReloadPoliciesCommands(_ *command.GlobalParams) []*cobra.Command {
 	return []*cobra.Command{commonReloadPoliciesCmd}
 }
 
-// nolint: deadcode, unused
-func selfTestCommands(_ *command.GlobalParams) []*cobra.Command {
+//nolint:unused
+func selfTestCommands(globalParams *command.GlobalParams) []*cobra.Command {
 	selfTestCmd := &cobra.Command{
 		Use:   "self-test",
 		Short: "Run runtime self test",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return fxutil.OneShot(runRuntimeSelfTest,
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "info", true)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "info", true)}),
 				core.Bundle(),
 			)
 		},
@@ -189,9 +187,8 @@ func downloadPolicyCommands(globalParams *command.GlobalParams) []*cobra.Command
 			return fxutil.OneShot(downloadPolicy,
 				fx.Supply(downloadPolicyArgs),
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams(globalParams.ConfFilePath),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "off", false)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "off", false)}),
 				core.Bundle(),
 			)
 		},
@@ -199,9 +196,73 @@ func downloadPolicyCommands(globalParams *command.GlobalParams) []*cobra.Command
 
 	downloadPolicyCmd.Flags().BoolVar(&downloadPolicyArgs.check, "check", false, "Check policies after downloading")
 	downloadPolicyCmd.Flags().StringVar(&downloadPolicyArgs.outputPath, "output-path", "", "Output path for downloaded policies")
-	downloadPolicyCmd.Flags().StringVar(&downloadPolicyArgs.source, "source", "all", `Specify wether should download the custom, default or all policies. allowed: "all", "default", "custom"`)
+	downloadPolicyCmd.Flags().StringVar(&downloadPolicyArgs.source, "source", "all", `Specify whether should download the custom, default or all policies. allowed: "all", "default", "custom"`)
 
 	return []*cobra.Command{downloadPolicyCmd}
+}
+
+type dumpLoadedPoliciesCliParams struct {
+	*command.GlobalParams
+
+	outputPath     string
+	includeBundled bool
+}
+
+func dumpLoadedPoliciesCommands(globalParams *command.GlobalParams) []*cobra.Command {
+	cliParams := &dumpLoadedPoliciesCliParams{
+		GlobalParams: globalParams,
+	}
+
+	dumpLoadedPoliciesCmd := &cobra.Command{
+		Use:   "dump",
+		Short: "Dump the currently loaded policies as JSON",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return fxutil.OneShot(dumpLoadedPolicies,
+				fx.Supply(cliParams),
+				fx.Supply(core.BundleParams{
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "off", false)}),
+				core.Bundle(),
+			)
+		},
+	}
+
+	dumpLoadedPoliciesCmd.Flags().StringVar(&cliParams.outputPath, "output", "", "Path to write JSON output (default: stdout)")
+	dumpLoadedPoliciesCmd.Flags().BoolVar(&cliParams.includeBundled, "include-bundled", false, "Include bundled policies in the output")
+
+	return []*cobra.Command{dumpLoadedPoliciesCmd}
+}
+
+func dumpLoadedPolicies(_ log.Component, _ config.Component, _ secrets.Component, cliParams *dumpLoadedPoliciesCliParams) error {
+	client, err := secagent.NewRuntimeSecurityCmdClient()
+	if err != nil {
+		return fmt.Errorf("unable to create a runtime security client instance: %w", err)
+	}
+	defer client.Close()
+
+	response, err := client.GetLoadedPolicies(cliParams.includeBundled)
+	if err != nil {
+		return fmt.Errorf("unable to get loaded policies: %w", err)
+	}
+
+	if len(response.Error) > 0 {
+		return fmt.Errorf("get loaded policies request failed: %s", response.Error)
+	}
+
+	var writer io.Writer
+	if cliParams.outputPath == "" || cliParams.outputPath == "-" {
+		writer = os.Stdout
+	} else {
+		f, err := os.Create(cliParams.outputPath)
+		if err != nil {
+			return fmt.Errorf("unable to create output file: %w", err)
+		}
+		defer f.Close()
+		writer = f
+	}
+
+	_, err = fmt.Fprintln(writer, response.Policies)
+	return err
 }
 
 //nolint:unused // TODO(SEC) Fix unused linter
@@ -225,9 +286,8 @@ func processCacheCommands(globalParams *command.GlobalParams) []*cobra.Command {
 			return fxutil.OneShot(dumpProcessCache,
 				fx.Supply(cliParams),
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "info", true)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "info", true)}),
 				core.Bundle(),
 			)
 		},
@@ -264,9 +324,8 @@ func networkNamespaceCommands(globalParams *command.GlobalParams) []*cobra.Comma
 			return fxutil.OneShot(dumpNetworkNamespace,
 				fx.Supply(cliParams),
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "info", true)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "info", true)}),
 				core.Bundle(),
 			)
 		},
@@ -283,7 +342,7 @@ func networkNamespaceCommands(globalParams *command.GlobalParams) []*cobra.Comma
 }
 
 //nolint:unused // TODO(SEC) Fix unused linter
-func discardersCommands(_ *command.GlobalParams) []*cobra.Command {
+func discardersCommands(globalParams *command.GlobalParams) []*cobra.Command {
 
 	dumpDiscardersCmd := &cobra.Command{
 		Use:   "dump",
@@ -291,9 +350,8 @@ func discardersCommands(_ *command.GlobalParams) []*cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return fxutil.OneShot(dumpDiscarders,
 				fx.Supply(core.BundleParams{
-					ConfigParams: config.NewAgentParams("", config.WithConfigMissingOK(true)),
-					SecretParams: secrets.NewDisabledParams(),
-					LogParams:    log.ForOneShot("SYS-PROBE", "info", true)}),
+					ConfigParams: config.NewAgentParams(globalParams.DatadogConfFilePath()),
+					LogParams:    log.ForOneShot(command.LoggerName, "info", true)}),
 				core.Bundle(),
 			)
 		},
@@ -308,9 +366,9 @@ func discardersCommands(_ *command.GlobalParams) []*cobra.Command {
 	return []*cobra.Command{discardersCmd}
 }
 
-// nolint: deadcode, unused
+//nolint:unused
 func dumpProcessCache(_ log.Component, _ config.Component, _ secrets.Component, processCacheDumpArgs *processCacheDumpCliParams) error {
-	client, err := secagent.NewRuntimeSecurityClient()
+	client, err := secagent.NewRuntimeSecurityCmdClient()
 	if err != nil {
 		return fmt.Errorf("unable to create a runtime security client instance: %w", err)
 	}
@@ -328,7 +386,7 @@ func dumpProcessCache(_ log.Component, _ config.Component, _ secrets.Component, 
 
 //nolint:unused // TODO(SEC) Fix unused linter
 func dumpNetworkNamespace(_ log.Component, _ config.Component, _ secrets.Component, dumpNetworkNamespaceArgs *dumpNetworkNamespaceCliParams) error {
-	client, err := secagent.NewRuntimeSecurityClient()
+	client, err := secagent.NewRuntimeSecurityCmdClient()
 	if err != nil {
 		return fmt.Errorf("unable to create a runtime security client instance: %w", err)
 	}
@@ -351,10 +409,10 @@ func dumpNetworkNamespace(_ log.Component, _ config.Component, _ secrets.Compone
 func checkPolicies(_ log.Component, _ config.Component, args *checkPoliciesCliParams) error {
 	if args.evaluateAllPolicySources {
 		if args.windowsModel {
-			return errors.New("unable to evaluator loaded policies using the windows model")
+			return errors.New("unable to evaluate loaded policies using the windows model")
 		}
 
-		client, err := secagent.NewRuntimeSecurityClient()
+		client, err := secagent.NewRuntimeSecurityCmdClient()
 		if err != nil {
 			return fmt.Errorf("unable to create a runtime security client instance: %w", err)
 		}
@@ -369,7 +427,7 @@ func checkPolicies(_ log.Component, _ config.Component, args *checkPoliciesCliPa
 	}, os.Stdout)
 }
 
-func checkPoliciesLoaded(client secagent.SecurityModuleClientWrapper, writer io.Writer) error {
+func checkPoliciesLoaded(client secagent.SecurityModuleCmdClientWrapper, writer io.Writer) error {
 	output, err := client.GetRuleSetReport()
 	if err != nil {
 		return fmt.Errorf("unable to send request to system-probe: %w", err)
@@ -379,7 +437,7 @@ func checkPoliciesLoaded(client secagent.SecurityModuleClientWrapper, writer io.
 	}
 
 	// extract and report the filters
-	transformedOutput := output.GetRuleSetReportMessage().GetFilters().FromProtoToFilterReport()
+	transformedOutput := transform.FromProtoToFilterReport(output.GetRuleSetReportMessage().GetFilters())
 
 	content, _ := json.MarshalIndent(transformedOutput, "", "\t")
 	_, err = fmt.Fprintf(writer, "%s\n", string(content))
@@ -399,9 +457,9 @@ func evalRule(_ log.Component, _ config.Component, _ secrets.Component, evalArgs
 	})
 }
 
-// nolint: deadcode, unused
+//nolint:unused
 func runRuntimeSelfTest(_ log.Component, _ config.Component, _ secrets.Component) error {
-	client, err := secagent.NewRuntimeSecurityClient()
+	client, err := secagent.NewRuntimeSecurityCmdClient()
 	if err != nil {
 		return fmt.Errorf("unable to create a runtime security client instance: %w", err)
 	}
@@ -421,7 +479,7 @@ func runRuntimeSelfTest(_ log.Component, _ config.Component, _ secrets.Component
 }
 
 func reloadRuntimePolicies(_ log.Component, _ config.Component, _ secrets.Component) error {
-	client, err := secagent.NewRuntimeSecurityClient()
+	client, err := secagent.NewRuntimeSecurityCmdClient()
 	if err != nil {
 		return fmt.Errorf("unable to create a runtime security client instance: %w", err)
 	}
@@ -500,6 +558,7 @@ func downloadPolicy(log log.Component, config config.Component, _ secrets.Compon
 	if err != nil {
 		return err
 	}
+	defer res.Body.Close()
 
 	resBytes, err := io.ReadAll(res.Body)
 	if err != nil {
@@ -509,7 +568,6 @@ func downloadPolicy(log log.Component, config config.Component, _ secrets.Compon
 	if res.StatusCode != 200 {
 		return fmt.Errorf("failed to download policies: %s (error code %d)", string(resBytes), res.StatusCode)
 	}
-	defer res.Body.Close()
 
 	// Unzip the downloaded file containing both default and custom policies
 	reader, err := zip.NewReader(bytes.NewReader(resBytes), int64(len(resBytes)))
@@ -562,7 +620,7 @@ func downloadPolicy(log log.Component, config config.Component, _ secrets.Compon
 	}
 
 	// Extract and merge rules from custom policies
-	var customRules string
+	var customRulesBuilder strings.Builder
 	for _, customPolicy := range customPolicies {
 		customPolicyLines := strings.Split(customPolicy, "\n")
 		rulesIndex := -1
@@ -573,9 +631,11 @@ func downloadPolicy(log log.Component, config config.Component, _ secrets.Compon
 			}
 		}
 		if rulesIndex != -1 && rulesIndex+1 < len(customPolicyLines) {
-			customRules += "\n" + strings.Join(customPolicyLines[rulesIndex+1:], "\n")
+			customRulesBuilder.WriteString("\n")
+			customRulesBuilder.WriteString(strings.Join(customPolicyLines[rulesIndex+1:], "\n"))
 		}
 	}
+	customRules := customRulesBuilder.String()
 
 	// Output depending on user's specification
 	var outputContent string
@@ -602,9 +662,9 @@ func downloadPolicy(log log.Component, config config.Component, _ secrets.Compon
 	return err
 }
 
-// nolint: deadcode, unused
+//nolint:unused
 func dumpDiscarders(_ log.Component, _ config.Component, _ secrets.Component) error {
-	runtimeSecurityClient, err := secagent.NewRuntimeSecurityClient()
+	runtimeSecurityClient, err := secagent.NewRuntimeSecurityCmdClient()
 	if err != nil {
 		return fmt.Errorf("unable to create a runtime security client instance: %w", err)
 	}

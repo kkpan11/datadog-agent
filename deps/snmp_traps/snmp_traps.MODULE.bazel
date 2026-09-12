@@ -1,0 +1,15 @@
+# snmp-traps
+#
+# Built by github.com/DataDog/ndm-traps-db's CI and published to MASS.
+# See https://datadoghq.atlassian.net/wiki/spaces/II/pages/2438791252/Traps+Database
+# for how to publish a new version and bump this pin.
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_file(
+    name = "snmp_traps",
+    sha256 = "4d6fb613032ce45fb2ea717b2a330c658c661383516be815cf6afde7eaa68291",
+    urls = [
+        "https://mass-read.us1.ddbuild.io/internal/artifact/ndm-traps-db/v115323823-bbb629e5/dd_traps_db.json.gz",
+    ],
+)

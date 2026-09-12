@@ -8,60 +8,70 @@
 package mocksender
 
 import (
+	"slices"
+
 	"github.com/DataDog/datadog-agent/pkg/collector/check/stats"
 	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/pkg/metrics/servicecheck"
 	"github.com/DataDog/datadog-agent/pkg/serializer/types"
+	"github.com/DataDog/datadog-agent/pkg/util/infratags"
 )
+
+func (m *MockSender) tagsWithCheckTags(tags []string) []string {
+	if len(m.checkTags) == 0 {
+		return tags
+	}
+	return slices.Concat(tags, m.checkTags)
+}
 
 // Rate adds a rate type to the mock calls.
 func (m *MockSender) Rate(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // Count adds a count type to the mock calls.
 func (m *MockSender) Count(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // MonotonicCount adds a monotonic count type to the mock calls.
 func (m *MockSender) MonotonicCount(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // MonotonicCountWithFlushFirstValue adds a monotonic count type to the mock calls with flushFirstValue parameter
 func (m *MockSender) MonotonicCountWithFlushFirstValue(metric string, value float64, hostname string, tags []string, flushFirstValue bool) {
-	m.Called(metric, value, hostname, tags, flushFirstValue)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags), flushFirstValue)
 }
 
 // Counter adds a counter type to the mock calls.
 func (m *MockSender) Counter(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // Histogram adds a histogram type to the mock calls.
 func (m *MockSender) Histogram(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // Historate adds a historate type to the mock calls.
 func (m *MockSender) Historate(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // Gauge adds a gauge type to the mock calls.
 func (m *MockSender) Gauge(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // Distribution adds a distribution type to the mock calls.
 func (m *MockSender) Distribution(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // GaugeNoIndex adds a gauge type to the mock calls that is not indexed.
 func (m *MockSender) GaugeNoIndex(metric string, value float64, hostname string, tags []string) {
-	m.Called(metric, value, hostname, tags)
+	m.Called(metric, value, hostname, m.tagsWithCheckTags(tags))
 }
 
 // ServiceCheck enables the service check mock call.
@@ -84,6 +94,11 @@ func (m *MockSender) EventPlatformEvent(rawEvent []byte, eventType string) {
 	m.Called(rawEvent, eventType)
 }
 
+// OpenmetricsBucket enables the openmetrics bucket mock call.
+func (m *MockSender) OpenmetricsBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool) {
+	m.Called(metric, value, lowerBound, upperBound, monotonic, hostname, tags, flushFirstValue)
+}
+
 // HistogramBucket enables the histogram bucket mock call.
 func (m *MockSender) HistogramBucket(metric string, value int64, lowerBound, upperBound float64, monotonic bool, hostname string, tags []string, flushFirstValue bool) {
 	m.Called(metric, value, lowerBound, upperBound, monotonic, hostname, tags, flushFirstValue)
@@ -95,8 +110,17 @@ func (m *MockSender) Commit() {
 }
 
 // SetCheckCustomTags enables the set of check custom tags mock call.
+// Tags are stored so that subsequent metric calls append them, mirroring
+// the real checkSender.sendMetricSample behavior.
 func (m *MockSender) SetCheckCustomTags(tags []string) {
+	m.checkTags = tags
 	m.Called(tags)
+}
+
+// SetInfraTagger sets the infra mode tagger on the mock sender.
+func (m *MockSender) SetInfraTagger(tagger *infratags.Tagger) {
+	m.infraTagger = tagger
+	m.Called(tagger)
 }
 
 // SetCheckService enables the setting of check service mock call.
@@ -104,7 +128,6 @@ func (m *MockSender) SetCheckService(service string) {
 	m.Called(service)
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func (m *MockSender) SetNoIndex(noIndex bool) {
 	m.Called(noIndex)
 }

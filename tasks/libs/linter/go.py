@@ -1,11 +1,12 @@
 """Linting-related tasks for go files"""
 
-import os
+import posixpath
 
 from tasks.build_tags import compute_build_tags_for_flavor
 from tasks.flavor import AgentFlavor
 from tasks.go import run_golangci_lint
 from tasks.modules import GoModule
+from tasks.schema.generate import codegen as schema_codegen
 from tasks.test_core import LintResult
 
 
@@ -22,15 +23,14 @@ def run_lint_go(
     timeout=None,
     golangci_lint_kwargs="",
     headless_mode=False,
-    include_sds=False,
     verbose=False,
+    recursive=True,
 ):
     linter_tags = build_tags or compute_build_tags_for_flavor(
         flavor=flavor,
         build=build,
         build_include=build_include,
         build_exclude=build_exclude,
-        include_sds=include_sds,
     )
 
     lint_result, execution_times = lint_flavor(
@@ -44,6 +44,7 @@ def run_lint_go(
         golangci_lint_kwargs=golangci_lint_kwargs,
         headless_mode=headless_mode,
         verbose=verbose,
+        recursive=recursive,
     )
 
     return lint_result, execution_times
@@ -60,8 +61,12 @@ def lint_flavor(
     golangci_lint_kwargs: str = "",
     headless_mode: bool = False,
     verbose: bool = False,
+    recursive: bool = True,
 ):
     """Runs linters for given flavor, build tags, and modules."""
+
+    # TODO: remove once Bazel is used to build the Agent
+    schema_codegen(ctx)
 
     # Compute full list of targets to run linters against
     targets = []
@@ -70,7 +75,7 @@ def lint_flavor(
         if not module.should_test():
             continue
         for target in module.lint_targets:
-            target_path = os.path.join(module.path, target)
+            target_path = posixpath.normpath(posixpath.join(module.path, target))
             if not target_path.startswith('./'):
                 target_path = f"./{target_path}"
             targets.append(target_path)
@@ -88,10 +93,11 @@ def lint_flavor(
         golangci_lint_kwargs=golangci_lint_kwargs,
         headless_mode=headless_mode,
         verbose=verbose,
+        recursive=recursive,
     )
     for lint_result in lint_results:
         result.lint_outputs.append(lint_result)
-        if lint_result.exited != 0:
+        if lint_result.returncode != 0:
             result.failed = True
 
     return result, execution_times

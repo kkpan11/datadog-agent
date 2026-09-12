@@ -3,7 +3,6 @@
 
 #include "constants/enums.h"
 #include "helpers/activity_dump.h"
-#include "helpers/container.h"
 #include "helpers/process.h"
 
 #include "context.h"
@@ -30,22 +29,33 @@ __attribute__((always_inline)) struct dns_event_t *reset_dns_event(struct __sk_b
     // process context
     fill_network_process_context_from_pkt(&evt->process, pkt);
 
+    // reset and fill span context unconditionally
+    reset_span_context(&evt->span, &evt->go_labels);
+
+    u64 sched_cls_has_current_pid_tgid_helper = 0;
+    LOAD_CONSTANT("sched_cls_has_current_pid_tgid_helper", sched_cls_has_current_pid_tgid_helper);
+    if (sched_cls_has_current_pid_tgid_helper) {
+        fill_span_context(&evt->span, &evt->go_labels);
+    }
+
     // network context
     fill_network_context(&evt->network, skb, pkt);
 
     struct proc_cache_t *entry = get_proc_cache(evt->process.pid);
-    if (entry == NULL) {
-        evt->container.container_id[0] = 0;
-    } else {
-        copy_container_id_no_tracing(entry->container.container_id, &evt->container.container_id);
-        evt->container.cgroup_context = entry->container.cgroup_context;
-    }
+    fill_cgroup_context(entry, &evt->cgroup);
 
     // should we sample this event for activity dumps ?
     struct activity_dump_config *config = lookup_or_delete_traced_pid(evt->process.pid, bpf_ktime_get_ns(), NULL);
     if (config) {
         if (mask_has_event(config->event_mask, EVENT_DNS)) {
             evt->event.flags |= EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE;
+        }
+    }
+
+    // rate limit only
+    if (!(evt->event.flags & EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE)) {
+        if (approve_dns_sample(evt->process.pid) == SAMPLED) {
+            evt->event.flags |= EVENT_FLAGS_ACTIVITY_DUMP_SAMPLE | EVENT_FLAGS_SAVED_BY_AD;
         }
     }
 

@@ -10,12 +10,14 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
-	logcomp "github.com/DataDog/datadog-agent/comp/core/log/def"
-	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/helper"
+	configsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/util/hostname/validate"
 	"github.com/DataDog/datadog-agent/pkg/util/kubelet"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
-	"github.com/DataDog/datadog-agent/pkg/util/sort"
+	utilsort "github.com/DataDog/datadog-agent/pkg/util/sort"
 
 	"github.com/DataDog/datadog-agent/pkg/util/ec2"
 
@@ -46,25 +48,25 @@ var cloudProviderDetectors = []cloudProviderDetector{
 }
 
 // DetectCloudProvider detects the cloud provider where the agent is running in order:
-func DetectCloudProvider(ctx context.Context, collectAccountID bool, l logcomp.Component) (string, string) {
+func DetectCloudProvider(ctx context.Context, collectAccountID bool) (string, string) {
 	for _, cloudDetector := range cloudProviderDetectors {
 		if cloudDetector.callback(ctx) {
-			l.Infof("Cloud provider %s detected", cloudDetector.name)
+			log.Infof("Cloud provider %s detected", cloudDetector.name)
 
 			// fetch the account ID for this cloud provider
 			if collectAccountID && cloudDetector.accountIDCallback != nil {
 				accountID, err := cloudDetector.accountIDCallback(ctx)
 				if err != nil {
-					l.Debugf("Could not detect cloud provider account ID: %v", err)
+					log.Debugf("Could not detect cloud provider account ID: %v", err)
 				} else if accountID != "" {
-					l.Infof("Detecting cloud provider account ID from %s: %+q", cloudDetector.name, accountID)
+					log.Infof("Detecting cloud provider account ID from %s: %+q", cloudDetector.name, accountID)
 					return cloudDetector.name, accountID
 				}
 			}
 			return cloudDetector.name, ""
 		}
 	}
-	l.Info("No cloud provider detected")
+	log.Info("No cloud provider detected")
 	return "", ""
 }
 
@@ -95,56 +97,176 @@ func GetCloudProviderNTPHosts(ctx context.Context) []string {
 }
 
 type cloudProviderAliasesDetector struct {
-	name     string
-	callback func(context.Context) ([]string, error)
+	name       string
+	isCloudEnv bool
+	// requiresKubelet marks detectors that route through the shared kubelet
+	// client singleton. Cluster Checks Runners are Deployment replicas, not
+	// DaemonSets, so they are never colocated with a node's kubelet and can
+	// never reach it; these detectors are skipped entirely on CCRs.
+	requiresKubelet bool
+	callback        func(context.Context) ([]string, error)
 }
 
 // getValidHostAliases is an alias from pkg config
-func getValidHostAliases(ctx context.Context) ([]string, error) {
-	return pkgconfigsetup.GetValidHostAliases(ctx, pkgconfigsetup.Datadog())
+func getValidHostAliases(_ context.Context) ([]string, error) {
+	aliases := []string{}
+	for _, alias := range configsetup.Datadog().GetStringSlice("host_aliases") {
+		if err := validate.ValidHostname(alias); err == nil {
+			aliases = append(aliases, alias)
+		} else {
+			log.Warnf("skipping invalid host alias '%s': %s", alias, err)
+		}
+	}
+
+	return aliases, nil
 }
 
 var hostAliasesDetectors = []cloudProviderAliasesDetector{
 	{name: "config", callback: getValidHostAliases},
-	{name: alibaba.CloudProviderName, callback: alibaba.GetHostAliases},
-	{name: ec2.CloudProviderName, callback: ec2.GetHostAliases},
-	{name: azure.CloudProviderName, callback: azure.GetHostAliases},
-	{name: gce.CloudProviderName, callback: gce.GetHostAliases},
-	{name: cloudfoundry.CloudProviderName, callback: cloudfoundry.GetHostAliases},
-	{name: "kubelet", callback: kubelet.GetHostAliases},
-	{name: tencent.CloudProviderName, callback: tencent.GetHostAliases},
-	{name: oracle.CloudProviderName, callback: oracle.GetHostAliases},
-	{name: ibm.CloudProviderName, callback: ibm.GetHostAliases},
-	{name: kubernetes.CloudProviderName, callback: kubernetes.GetHostAliases},
+	{name: alibaba.CloudProviderName, isCloudEnv: true, callback: alibaba.GetHostAliases},
+	{name: ec2.CloudProviderName, isCloudEnv: true, callback: ec2.GetHostAliases},
+	{name: azure.CloudProviderName, isCloudEnv: true, callback: azure.GetHostAliases},
+	{name: gce.CloudProviderName, isCloudEnv: true, callback: gce.GetHostAliases},
+	{name: cloudfoundry.CloudProviderName, isCloudEnv: true, callback: cloudfoundry.GetHostAliases},
+	{name: "kubelet", requiresKubelet: true, callback: kubelet.GetHostAliases},
+	{name: tencent.CloudProviderName, isCloudEnv: true, callback: tencent.GetHostAliases},
+	{name: oracle.CloudProviderName, isCloudEnv: true, callback: oracle.GetHostAliases},
+	{name: ibm.CloudProviderName, isCloudEnv: true, callback: ibm.GetHostAliases},
+	{name: kubernetes.CloudProviderName, requiresKubelet: true, callback: kubernetes.GetHostAliases},
 }
 
-// GetHostAliases returns the hostname aliases from different provider
-func GetHostAliases(ctx context.Context) []string {
+var (
+	hostAliasMutex   = sync.Mutex{}
+	hostAliasLogOnce = true
+)
+
+// GetHostAliases returns the hostname aliases and the name of the possible cloud providers
+func GetHostAliases(ctx context.Context) ([]string, string) {
 	aliases := []string{}
+	cloudprovider := ""
+	isCLCRunner := helper.IsCLCRunner(configsetup.Datadog())
 
 	// cloud providers endpoints can take a few seconds to answer. We're using a WaitGroup to call all of them
 	// concurrently since GetHostAliases is called during the agent startup and is blocking.
 	var wg sync.WaitGroup
-	m := sync.Mutex{}
 
-	for _, cloudAliasesDetector := range hostAliasesDetectors {
+	for _, hostAliasesDetector := range hostAliasesDetectors {
+		if isCLCRunner && hostAliasesDetector.requiresKubelet {
+			// Skip probing the kubelet client singleton: it can never succeed on a
+			// CCR and would otherwise trigger its exponential-backoff retrier and
+			// its "Impossible to reach Kubelet" warning for no benefit.
+			log.Debugf("Skipping %s Host Alias: Agent is a Cluster Checks Runner and has no reachable local Kubelet", hostAliasesDetector.name)
+			continue
+		}
+
 		wg.Add(1)
-		go func(cloudAliasesDetector cloudProviderAliasesDetector) {
+		go func(hostAliasesDetector cloudProviderAliasesDetector) {
 			defer wg.Done()
 
-			cloudAliases, err := cloudAliasesDetector.callback(ctx)
+			cloudAliases, err := hostAliasesDetector.callback(ctx)
 			if err != nil {
-				log.Debugf("No %s Host Alias: %s", cloudAliasesDetector.name, err)
+				log.Debugf("No %s Host Alias: %s", hostAliasesDetector.name, err)
 			} else if len(cloudAliases) > 0 {
-				m.Lock()
+				hostAliasMutex.Lock()
 				aliases = append(aliases, cloudAliases...)
-				m.Unlock()
+				if hostAliasesDetector.isCloudEnv {
+					if cloudprovider == "" {
+						cloudprovider = hostAliasesDetector.name
+					} else if hostAliasLogOnce {
+						log.Warnf("Ambiguous cloud provider: %s or %s", cloudprovider, hostAliasesDetector.name)
+						hostAliasLogOnce = false
+					}
+				}
+				hostAliasMutex.Unlock()
 			}
-		}(cloudAliasesDetector)
+		}(hostAliasesDetector)
 	}
 	wg.Wait()
 
-	return sort.UniqInPlace(aliases)
+	return utilsort.UniqInPlace(aliases), cloudprovider
+}
+
+type cloudProviderCCRIDDetector func(context.Context) (string, error)
+
+var hostCCRIDDetectors = map[string]cloudProviderCCRIDDetector{
+	azure.CloudProviderName:  azure.GetHostCCRID,
+	ec2.CloudProviderName:    ec2.GetHostCCRID,
+	gce.CloudProviderName:    gce.GetHostCCRID,
+	oracle.CloudProviderName: oracle.GetHostCCRID,
+}
+
+// GetHostCCRID returns the host CCRID from the first provider that works
+func GetHostCCRID(ctx context.Context, detectedCloud string) string {
+	if detectedCloud == "" {
+		log.Infof("No Host CCRID, no cloudprovider detected")
+		return ""
+	}
+
+	// Try the cloud that was previously detected
+	if callback, found := hostCCRIDDetectors[detectedCloud]; found {
+		hostCCRID, err := callback(ctx)
+		if err != nil {
+			log.Debugf("Could not fetch %s Host CCRID: %s", detectedCloud, err)
+			return ""
+		}
+		return hostCCRID
+	}
+	// When running in k8s, kubelet may be detected by GetHostAliases (this is
+	// non-deterministic). For such cases, we try each of the possible CCRID
+	// cloud providers that we know about.
+	var wg sync.WaitGroup
+	m := sync.Mutex{}
+	hostCCRID := ""
+
+	// Call each cloud provider concurrently, since this is called during startup
+	for _, ccridDetector := range hostCCRIDDetectors {
+		wg.Add(1)
+		go func(ccridDetector cloudProviderCCRIDDetector) {
+			defer wg.Done()
+
+			ccrid, err := ccridDetector(ctx)
+			if err == nil {
+				m.Lock()
+				hostCCRID = ccrid
+				m.Unlock()
+			}
+		}(ccridDetector)
+	}
+	wg.Wait()
+
+	if hostCCRID == "" {
+		log.Infof("No Host CCRID found for cloudprovider: %q", detectedCloud)
+	}
+	return hostCCRID
+}
+
+type cloudProviderInstanceTypeDetector func(context.Context) (string, error)
+
+var hostInstanceTypeDetectors = map[string]cloudProviderInstanceTypeDetector{
+	ec2.CloudProviderName:    ec2.GetInstanceType,
+	gce.CloudProviderName:    gce.GetInstanceType,
+	oracle.CloudProviderName: oracle.GetInstanceType,
+	azure.CloudProviderName:  azure.GetInstanceType,
+}
+
+// GetInstanceType returns the instance type from the first cloud provider that works.
+func GetInstanceType(ctx context.Context, detectedCloud string) string {
+	if detectedCloud == "" {
+		log.Infof("No instance type detected, no cloud provider detected")
+		return ""
+	}
+
+	if callback, found := hostInstanceTypeDetectors[detectedCloud]; found {
+		instanceType, err := callback(ctx)
+		if err != nil {
+			log.Infof("Could not fetch instance type for %s: %s", detectedCloud, err)
+			return ""
+		}
+		return instanceType
+	}
+
+	log.Debugf("getting instance type from cloud provider %q is not supported", detectedCloud)
+	return ""
 }
 
 // GetPublicIPv4 returns the public IPv4 from different providers
@@ -190,4 +312,65 @@ func GetHostID(ctx context.Context, cloudProviderName string) string {
 		return callback(ctx)
 	}
 	return ""
+}
+
+type cloudProviderPreemptionDetector func(context.Context) (time.Time, error)
+
+var preemptionDetectors = map[string]cloudProviderPreemptionDetector{
+	ec2.CloudProviderName: ec2.GetSpotTerminationTime,
+}
+
+var rebalanceDetectors = map[string]cloudProviderPreemptionDetector{
+	ec2.CloudProviderName: ec2.GetRebalanceRecommendationTime,
+}
+
+// ErrNotPreemptible is returned when the instance is not a preemptible instance
+// (e.g., not an AWS Spot instance, not a GCE Preemptible instance).
+// When this error is returned, callers should stop polling for preemption events.
+var ErrNotPreemptible = errors.New("instance is not preemptible")
+
+// ErrPreemptionUnsupported is returned when preemption detection is not supported
+// for the given cloud provider.
+var ErrPreemptionUnsupported = errors.New("preemption detection not supported for this cloud provider")
+
+// GetPreemptionTerminationTime returns the scheduled termination time for a preemptible instance
+// (e.g., AWS Spot, GCE Preemptible, Azure Spot).
+// Returns ErrNotPreemptible if the instance is not preemptible.
+// Returns ErrPreemptionUnsupported if the cloud provider doesn't support preemption detection.
+// For now only EC2 is supported.
+func GetPreemptionTerminationTime(ctx context.Context, cloudProviderName string) (time.Time, error) {
+	callback, found := preemptionDetectors[cloudProviderName]
+	if !found {
+		return time.Time{}, ErrPreemptionUnsupported
+	}
+
+	terminationTime, err := callback(ctx)
+	if err != nil {
+		// Map cloud-provider-specific errors to generic errors
+		if errors.Is(err, ec2.ErrNotSpotInstance) {
+			return time.Time{}, ErrNotPreemptible
+		}
+		return time.Time{}, err
+	}
+	return terminationTime, nil
+}
+
+// GetRebalanceRecommendationTime returns the time a rebalance recommendation was issued
+// for a preemptible instance (e.g., AWS Spot rebalance recommendation).
+// Returns ErrNotPreemptible if the instance is not preemptible.
+// Returns ErrPreemptionUnsupported if the cloud provider doesn't support rebalance detection.
+func GetRebalanceRecommendationTime(ctx context.Context, cloudProviderName string) (time.Time, error) {
+	callback, found := rebalanceDetectors[cloudProviderName]
+	if !found {
+		return time.Time{}, ErrPreemptionUnsupported
+	}
+
+	noticeTime, err := callback(ctx)
+	if err != nil {
+		if errors.Is(err, ec2.ErrNotSpotInstance) {
+			return time.Time{}, ErrNotPreemptible
+		}
+		return time.Time{}, err
+	}
+	return noticeTime, nil
 }

@@ -8,15 +8,20 @@
 package dns
 
 import (
-	"github.com/DataDog/datadog-agent/comp/core/telemetry"
+	"github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 )
 
 // NewReverseDNS starts snooping on DNS traffic to allow IP -> domain reverse resolution
 func NewReverseDNS(cfg *config.Config, telemetrycomp telemetry.Component) (ReverseDNS, error) {
-	packetSrc, err := newWindowsPacketSource(telemetrycomp)
+	packetSrc, err := newWindowsPacketSource(telemetrycomp, cfg.DNSMonitoringPortList)
 	if err != nil {
 		return nil, err
 	}
-	return newSocketFilterSnooper(cfg, packetSrc)
+	snoop, err := newSocketFilterSnooper(cfg, packetSrc, nil)
+	if err != nil {
+		return nil, err
+	}
+	snoop.startPolling()
+	return snoop, nil
 }

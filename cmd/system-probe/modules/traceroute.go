@@ -3,6 +3,8 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
+//go:build linux || windows || darwin
+
 package modules
 
 import (
@@ -12,15 +14,17 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/mux"
 	"google.golang.org/grpc"
 
+	traceroutelib "github.com/DataDog/datadog-traceroute/traceroute"
+
+	traceroutecomp "github.com/DataDog/datadog-agent/comp/networkpath/traceroute/def"
 	"github.com/DataDog/datadog-agent/pkg/networkpath/payload"
 	tracerouteutil "github.com/DataDog/datadog-agent/pkg/networkpath/traceroute/config"
-	"github.com/DataDog/datadog-agent/pkg/networkpath/traceroute/runner"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/api/module"
 	sysconfigtypes "github.com/DataDog/datadog-agent/pkg/system-probe/config/types"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -29,23 +33,16 @@ import (
 func init() { registerModule(Traceroute) }
 
 type traceroute struct {
-	runner *runner.Runner
+	runner traceroutecomp.Component
 }
 
 var (
 	_ module.Module = &traceroute{}
-
-	tracerouteConfigNamespaces = []string{"traceroute"}
 )
 
 func createTracerouteModule(_ *sysconfigtypes.Config, deps module.FactoryDependencies) (module.Module, error) {
-	runner, err := runner.New(deps.Telemetry, deps.Hostname)
-	if err != nil {
-		return &traceroute{}, err
-	}
-
 	return &traceroute{
-		runner: runner,
+		runner: deps.Traceroute,
 	}, nil
 }
 
@@ -54,6 +51,9 @@ func (t *traceroute) GetStats() map[string]interface{} {
 }
 
 func (t *traceroute) Register(httpMux *module.Router) error {
+	// Start platform-specific driver (Windows only, no-op on other platforms)
+	driverError := startPlatformDriver()
+
 	var runCounter atomic.Uint64
 
 	// TODO: what other config should be passed as part of this request?
@@ -61,23 +61,30 @@ func (t *traceroute) Register(httpMux *module.Router) error {
 		start := time.Now()
 		cfg, err := parseParams(req)
 		if err != nil {
-			log.Errorf("invalid params for host: %s: %s", cfg.DestHostname, err)
-			w.WriteHeader(http.StatusBadRequest)
+			handleTracerouteReqError(w, http.StatusBadRequest, fmt.Sprintf("invalid params for host: %s: %s", cfg.DestHostname, err))
+			return
+		}
+
+		if driverError != nil && !cfg.DisableWindowsDriver {
+			handleTracerouteReqError(w, http.StatusInternalServerError, fmt.Sprintf("failed to start platform driver: %s", driverError))
 			return
 		}
 
 		// Run traceroute
-		path, err := t.runner.RunTraceroute(context.Background(), cfg)
+		path, err := t.runner.Run(context.Background(), cfg)
 		if err != nil {
-			log.Errorf("unable to run traceroute for host: %s: %s", cfg.DestHostname, err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
+			classified := traceroutelib.ClassifyError(err)
+			errResp := traceroutelib.ErrorResponse{
+				Code:    classified.Code,
+				Message: classified.Message,
+			}
+			handleTracerouteStructuredError(w, http.StatusInternalServerError, errResp, cfg.DestHostname)
 			return
 		}
 
 		resp, err := json.Marshal(path)
 		if err != nil {
-			log.Errorf("unable to marshall traceroute response: %s", err)
-			w.WriteHeader(http.StatusInternalServerError)
+			handleTracerouteReqError(w, http.StatusInternalServerError, fmt.Sprintf("unable to marshall traceroute response: %s", err))
 			return
 		}
 		_, err = w.Write(resp)
@@ -97,7 +104,54 @@ func (t *traceroute) RegisterGRPC(_ grpc.ServiceRegistrar) error {
 	return nil
 }
 
-func (t *traceroute) Close() {}
+func (t *traceroute) Close() {
+	err := stopPlatformDriver()
+	if err != nil {
+		log.Errorf("failed to stop platform driver: %s", err)
+	}
+}
+
+func handleTracerouteReqError(w http.ResponseWriter, statusCode int, errString string) {
+	w.WriteHeader(statusCode)
+	log.Error(errString)
+	_, err := w.Write([]byte(errString))
+	if err != nil {
+		log.Errorf("unable to write traceroute error response: %s", err)
+	}
+}
+
+// userFacingMessages maps error codes to user-facing message formats aligned
+// with synthetics-worker so the UI shows the same text regardless of the
+// source. Messages may contain a %s placeholder for the destination hostname.
+var userFacingMessages = map[traceroutelib.ErrorCode]string{
+	traceroutelib.ErrCodeDNS:                      "Failed to resolve the host name %s.",
+	traceroutelib.ErrCodeTimeout:                  "The request timed out.",
+	traceroutelib.ErrCodeConnRefused:              "The connection to %s was refused by the remote host.",
+	traceroutelib.ErrCodeHostUnreach:              "The remote host %s is unreachable.",
+	traceroutelib.ErrCodeNetUnreach:               "The remote network for %s is unreachable.",
+	traceroutelib.ErrCodeDenied:                   "Permission denied.",
+	traceroutelib.ErrCodeInvalidRequest:           "Invalid request parameters.",
+	traceroutelib.ErrCodeFailedEncoding:           "Failed to encode the response.",
+	traceroutelib.ErrCodeUnknown:                  "An unknown error occurred.",
+	traceroutelib.ErrorCode("SACK_NOT_SUPPORTED"): "SACK is not supported for this target/source.",
+}
+
+func userFacingMessage(code traceroutelib.ErrorCode, host string, fallback string) string {
+	if format, ok := userFacingMessages[code]; ok {
+		return strings.ReplaceAll(format, "%s", host)
+	}
+	return fallback
+}
+
+func handleTracerouteStructuredError(w http.ResponseWriter, statusCode int, errResp traceroutelib.ErrorResponse, host string) {
+	log.Errorf("traceroute error for host %s: [%s] %s", host, errResp.Code, errResp.Message)
+	errResp.Message = userFacingMessage(errResp.Code, host, errResp.Message)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(errResp); err != nil {
+		log.Errorf("unable to write traceroute error response: %s", err)
+	}
+}
 
 func logTracerouteRequests(url *url.URL, runCount uint64, start time.Time) {
 	msg := fmt.Sprintf("Got request on %s?%s (count: %d): retrieved traceroute in %s", url.RawPath, url.RawQuery, runCount, time.Since(start))
@@ -110,8 +164,7 @@ func logTracerouteRequests(url *url.URL, runCount uint64, start time.Time) {
 }
 
 func parseParams(req *http.Request) (tracerouteutil.Config, error) {
-	vars := mux.Vars(req)
-	host := vars["host"]
+	host := req.PathValue("host")
 
 	query := req.URL.Query()
 
@@ -130,15 +183,31 @@ func parseParams(req *http.Request) (tracerouteutil.Config, error) {
 	protocol := query.Get("protocol")
 	tcpMethod := query.Get("tcp_method")
 	tcpSynParisTracerouteMode := query.Get("tcp_syn_paris_traceroute_mode")
+	disableWindowsDriver := query.Get("disable_windows_driver")
+	reverseDNS := query.Get("reverse_dns")
+	disableSourcePublicIPCollection := query.Get("disable_source_public_ip_collection")
+	tracerouteQueries, err := parseUint(query, "traceroute_queries", 32)
+	if err != nil {
+		return tracerouteutil.Config{}, fmt.Errorf("invalid traceroute_queries: %s", err)
+	}
+	e2eQueries, err := parseUint(query, "e2e_queries", 32)
+	if err != nil {
+		return tracerouteutil.Config{}, fmt.Errorf("invalid e2e_queries: %s", err)
+	}
 
 	return tracerouteutil.Config{
-		DestHostname:              host,
-		DestPort:                  uint16(port),
-		MaxTTL:                    uint8(maxTTL),
-		Timeout:                   time.Duration(timeout),
-		Protocol:                  payload.Protocol(protocol),
-		TCPMethod:                 payload.TCPMethod(tcpMethod),
-		TCPSynParisTracerouteMode: tcpSynParisTracerouteMode == "true",
+		DestHostname:                    host,
+		DestPort:                        uint16(port),
+		MaxTTL:                          uint8(maxTTL),
+		Timeout:                         time.Duration(timeout),
+		Protocol:                        payload.Protocol(protocol),
+		TCPMethod:                       payload.TCPMethod(tcpMethod),
+		TCPSynParisTracerouteMode:       tcpSynParisTracerouteMode == "true",
+		DisableWindowsDriver:            disableWindowsDriver == "true",
+		ReverseDNS:                      reverseDNS == "true",
+		DisableSourcePublicIPCollection: disableSourcePublicIPCollection == "true",
+		TracerouteQueries:               int(tracerouteQueries),
+		E2eQueries:                      int(e2eQueries),
 	}, nil
 }
 

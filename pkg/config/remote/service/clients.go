@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/clock"
+	"google.golang.org/protobuf/proto"
 
 	pbgo "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 )
@@ -19,9 +20,9 @@ type client struct {
 	pbClient *pbgo.Client
 }
 
-type cacheBypassClients struct {
-	clock    clock.Clock
-	requests chan chan struct{}
+// rateLimiter limits the number of requests that can be made in a given window.
+type rateLimiter struct {
+	clock clock.Clock
 
 	// Fixed window rate limiting
 	// It allows client requests spikes while limiting the global amount of request
@@ -31,7 +32,7 @@ type cacheBypassClients struct {
 	allowance      int
 }
 
-func (c *cacheBypassClients) Limit() bool {
+func (c *rateLimiter) Limit() bool {
 	now := c.clock.Now()
 	window := now.Truncate(c.windowDuration)
 
@@ -76,14 +77,22 @@ func (c *clients) seen(pbClient *pbgo.Client) {
 	defer c.m.Unlock()
 	now := c.clock.Now().UTC()
 	pbClient.LastSeen = uint64(now.UnixMilli())
+	// Store a copy: the caller may keep mutating pbClient after this returns.
+	pbCopy, ok := proto.Clone(pbClient).(*pbgo.Client)
+	if !ok {
+		// Unreachable: proto.Clone always returns the same concrete type.
+		pbCopy = pbClient
+	}
 	c.clients[pbClient.Id] = &client{
 		lastSeen: now,
-		pbClient: pbClient,
+		pbClient: pbCopy,
 	}
 }
 
 // active checks whether a certain client is active
 func (c *clients) active(pbClient *pbgo.Client) bool {
+	c.m.Lock()
+	defer c.m.Unlock()
 	client, ok := c.clients[pbClient.Id]
 	if !ok {
 		return false

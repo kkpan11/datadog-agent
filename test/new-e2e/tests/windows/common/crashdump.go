@@ -6,12 +6,16 @@
 package common
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/DataDog/datadog-agent/test/new-e2e/pkg/components"
+	"github.com/cenkalti/backoff/v7"
+
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/components"
 )
 
 const (
@@ -115,39 +119,129 @@ func ListWERDumps(host *components.RemoteHost, dumpFolder string) ([]WERDumpFile
 	return dumps, nil
 }
 
+const (
+	// crashDumpDownloadAttempts is how many times we try to pull a crash dump off the
+	// host before giving up. Host.GetFile does no retrying of its own and opens a fresh
+	// SFTP session per call, so a dropped connection gets a genuine second chance.
+	// Dumps are only produced when something crashed, so this costs nothing on the
+	// happy path.
+	crashDumpDownloadAttempts = 3
+
+	crashDumpRetryInitialInterval = 2 * time.Second
+	crashDumpRetryMaxInterval     = 10 * time.Second
+)
+
+// getFileWithRetry copies a remote file to dst, retrying a few times with backoff.
+func getFileWithRetry(host *components.RemoteHost, src string, dst string) error {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = crashDumpRetryInitialInterval
+	b.MaxInterval = crashDumpRetryMaxInterval
+	_, err := backoff.Retry(context.Background(), func() (any, error) {
+		return nil, host.GetFile(src, dst)
+	}, backoff.WithBackOff(b), backoff.WithMaxTries(crashDumpDownloadAttempts))
+	if err != nil {
+		return fmt.Errorf("gave up after %d attempts: %w", crashDumpDownloadAttempts, err)
+	}
+	return nil
+}
+
 // DownloadWERDump downloads a WER dump from a remote host and saves it to a local folder
 // with the format <host address>-<dump file name>
+//
+// The transfer is retried a few times before failing, since these dumps are the only
+// evidence we get of a crash and the copy is prone to transient SFTP failures.
 func DownloadWERDump(host *components.RemoteHost, dump WERDumpFile, outputDir string) (string, error) {
 	outName := fmt.Sprintf("%s-%s", host.Address, dump.FileName)
 	outPath := filepath.Join(outputDir, outName)
-	err := host.GetFile(dump.Path, outPath)
+	err := getFileWithRetry(host, dump.Path, outPath)
 	if err != nil {
 		return "", fmt.Errorf("error getting WER dump file %s: %w", dump.Path, err)
 	}
 	return outPath, nil
 }
 
-// DownloadAllWERDumps collects WER dumps from a folder on a remote host and saves them to a local folder
+// DownloadedWERDump pairs the source metadata for a WER dump with the local
+// artifact path produced by downloading it. Callers get both the image name
+// (for filtering against an ignore list) and the local path (for logs /
+// artifact pointers) in one record.
+//
+// Source.Path is the *remote* path on the test VM (e.g. C:\dumps\agent.exe.1234.dmp);
+// LocalPath is the path on the test runner (e.g. e2e-output/<host>-agent.exe.1234.dmp).
+type DownloadedWERDump struct {
+	Source    WERDumpFile
+	LocalPath string
+}
+
+// DefaultIgnoredCrashDumpImages is the denylist of process image names whose
+// WER crash dumps are recorded as artifacts but do NOT fail tests that use
+// PartitionDownloadedWERDumps. These are third-party processes whose crashes
+// have routinely been observed to be unrelated to Datadog agent behavior.
+//
+// Add entries here when a new noisy image is observed in CI. Comparison is
+// case-insensitive and tolerates names with or without a ".exe" suffix.
+var DefaultIgnoredCrashDumpImages = []string{
+	"svchost.exe",
+	"WmiPrvSE.exe",
+	"powershell.exe",
+	"TiWorker.exe",
+}
+
+// IsIgnoredCrashDump reports whether the dump's image name appears in ignore
+// (case-insensitive, tolerates names with or without a ".exe" suffix).
+func IsIgnoredCrashDump(dump DownloadedWERDump, ignore []string) bool {
+	name := normalizeImageName(dump.Source.ImageName)
+	for _, ign := range ignore {
+		if normalizeImageName(ign) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// PartitionDownloadedWERDumps splits dumps into (failing, ignored) using the
+// given ignore list. Use it to keep test assertions focused on dumps that
+// represent real agent regressions while still preserving the others as
+// downloaded artifacts.
+func PartitionDownloadedWERDumps(dumps []DownloadedWERDump, ignore []string) (failing, ignored []DownloadedWERDump) {
+	for _, d := range dumps {
+		if IsIgnoredCrashDump(d, ignore) {
+			ignored = append(ignored, d)
+		} else {
+			failing = append(failing, d)
+		}
+	}
+	return failing, ignored
+}
+
+func normalizeImageName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if !strings.HasSuffix(n, ".exe") {
+		n += ".exe"
+	}
+	return n
+}
+
+// DownloadAllWERDumps collects WER dumps from a folder on a remote host and saves them to a local folder.
 //
 // See DownloadWERDump for the naming convention used for the output files.
 //
 // This function continues collecting dumps even if some of them fail to be collected, and returns
 // an error with all the errors encountered.
-func DownloadAllWERDumps(host *components.RemoteHost, dumpFolder string, outputPath string) ([]string, error) {
+func DownloadAllWERDumps(host *components.RemoteHost, dumpFolder string, outputPath string) ([]DownloadedWERDump, error) {
 	return DownloadAllWERDumpsFunc(host, dumpFolder, outputPath,
 		// collect all dumps
 		func(_ WERDumpFile) bool { return true },
 	)
 }
 
-// DownloadAllWERDumpsFunc is like DownloadAllWERDumps, but allows to filter the dumps to collect
-func DownloadAllWERDumpsFunc(host *components.RemoteHost, dumpFolder string, outputPath string, f func(WERDumpFile) bool) ([]string, error) {
+// DownloadAllWERDumpsFunc is like DownloadAllWERDumps, but allows to filter the dumps to collect.
+func DownloadAllWERDumpsFunc(host *components.RemoteHost, dumpFolder string, outputPath string, f func(WERDumpFile) bool) ([]DownloadedWERDump, error) {
 	dumps, err := ListWERDumps(host, dumpFolder)
 	if err != nil {
 		return nil, err
 	}
 
-	collectedDumps := []string{}
+	collected := []DownloadedWERDump{}
 	var retErr error
 	for _, dump := range dumps {
 		if !f(dump) {
@@ -158,8 +252,107 @@ func DownloadAllWERDumpsFunc(host *components.RemoteHost, dumpFolder string, out
 			retErr = errors.Join(retErr, fmt.Errorf("error getting WER dump file %s: %w", dump.Path, err))
 			continue
 		}
-		collectedDumps = append(collectedDumps, outPath)
+		collected = append(collected, DownloadedWERDump{Source: dump, LocalPath: outPath})
 	}
 
-	return collectedDumps, retErr
+	return collected, retErr
+}
+
+// DownloadSystemCrashDump downloads a system crash dump from a remote host.
+func DownloadSystemCrashDump(host *components.RemoteHost, systemCrashDumpFile string, outputFile string) (string, error) {
+	if exists, _ := host.FileExists(systemCrashDumpFile); !exists {
+		return "", nil
+	}
+
+	// We cannot directly download the system crash dump file since it is under a protected directory.
+	// The dump needs to be copied to a temporary location first.
+	// Go's os.MkdirTemp is not suitable because it does not yield
+	// a proper local path for Powershell (e.g. /tmp/2173892461/SystemCrash.DMP)
+
+	tmpDir, err := host.GetTmpFolder()
+	if err != nil {
+		return "", fmt.Errorf("failed to get TMP folder: %w", err)
+	}
+
+	outName := filepath.Base(outputFile)
+	tmpPath := host.JoinPath(tmpDir, outName)
+
+	_, err = host.Execute(fmt.Sprintf("Copy-Item -Path \"%s\" -Destination \"%s\"", systemCrashDumpFile, tmpPath))
+	if err != nil {
+		return "", fmt.Errorf("error copying system crash dump file %s to %s: %w", systemCrashDumpFile, tmpPath, err)
+	}
+
+	// The framework may timeout trying to download the dump, so retry a few times.
+	err = getFileWithRetry(host, tmpPath, outputFile)
+
+	if err != nil {
+		return "", fmt.Errorf("error getting system crash dump file %s: %w", tmpPath, err)
+	}
+
+	return outputFile, nil
+}
+
+// EnableDriverVerifier enables standard verifier checks on the specified kernel drivers. Requires a reboot.
+func EnableDriverVerifier(host *components.RemoteHost, kernelDrivers []string) (string, error) {
+	var driverListBuilder strings.Builder
+
+	for _, driverName := range kernelDrivers {
+		if !strings.HasSuffix(driverName, ".sys") {
+			driverListBuilder.WriteString(driverName + ".sys ")
+		} else {
+			driverListBuilder.WriteString(driverName + " ")
+		}
+	}
+	driverList := driverListBuilder.String()
+
+	fmt.Println("Enabling driver verifier for: ", driverList)
+
+	// Driver verifier returns an error code of 2.
+	out, err := host.Execute("verifier /standard /driver " + driverList)
+	out = strings.TrimSpace(out)
+
+	return out, err
+}
+
+// RebootAndWait reboots the host and waits for it to boot
+func RebootAndWait(host *components.RemoteHost, b backoff.BackOff) error {
+	return waitForRebootFunc(host, b, func() error {
+		_, err := host.Execute("Restart-Computer -Force")
+		return err
+	})
+}
+
+// WaitForRebootFunc waits for the host to reboot
+func waitForRebootFunc(host *components.RemoteHost, b backoff.BackOff, rebootFunc func() error) error {
+	// get last boot time
+	out, err := host.Execute("(Get-CimInstance Win32_OperatingSystem).LastBootUpTime")
+	if err != nil {
+		return fmt.Errorf("failed to get last boot time: %w", err)
+	}
+	lastBootTime := strings.TrimSpace(out)
+	fmt.Println("last boot time:", lastBootTime)
+
+	// run the reboot function
+	err = rebootFunc()
+	if err != nil {
+		return fmt.Errorf("failed to reboot: %w", err)
+	}
+
+	_, err = backoff.Retry(context.Background(), func() (any, error) {
+		err := host.Reconnect()
+		if err != nil {
+			return nil, err
+		}
+		out, err = host.Execute("(Get-CimInstance Win32_OperatingSystem).LastBootUpTime")
+		if err != nil {
+			return nil, err
+		}
+		bootTime := strings.TrimSpace(out)
+		fmt.Println("current boot time:", bootTime)
+		if bootTime == lastBootTime {
+			return nil, errors.New("boot time has not changed")
+		}
+		return nil, nil
+	}, backoff.WithBackOff(b))
+	return err
 }

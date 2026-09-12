@@ -7,10 +7,10 @@ from invoke.context import Context
 from invoke.tasks import task
 
 from tasks.go import tidy
+from tasks.libs.build.bazel import bazel
 from tasks.libs.ciproviders.gitlab_api import update_gitlab_config
 from tasks.libs.common.color import color_message
 from tasks.libs.common.gomodules import get_default_modules
-from tasks.pkg_template import generate
 
 GO_VERSION_FILE = "./.go-version"
 
@@ -21,18 +21,18 @@ GO_VERSION_FILE = "./.go-version"
 # - is_bugfix is True if the version in the match is a bugfix version, False if it's a minor
 GO_VERSION_REFERENCES: list[tuple[str, str, str, bool]] = [
     (GO_VERSION_FILE, "", "", True),  # the version is the only content of the file
-    ("./tools/gdb/Dockerfile", "https://go.dev/dl/go", ".linux-amd64.tar.gz", True),
-    ("./test/fakeintake/Dockerfile", "FROM golang:", "-alpine", True),
+    ("./tools/gdb/Dockerfile", "https://go.dev/dl/go", ".linux-", True),
+    ("./test/fakeintake/Dockerfile", "GO_VERSION=", "", True),
     ("./tasks/unit_tests/modules_tests.py", 'Go": "', '",', False),
     ("./devenv/scripts/Install-DevEnv.ps1", '$go_version = "', '"', True),
-    ("./docs/dev/agent_dev_env.md", "[install Golang](https://golang.org/doc/install) version `", "`", True),
     ("./tasks/go.py", '"go version go', ' linux/amd64"', True),
-    ("./README.md", "[Go](https://golang.org/doc/install) ", ".", False),
     ("./test/fakeintake/docs/README.md", "[Golang ", "]", False),
     ("./cmd/process-agent/README.md", "`go >= ", "`", False),
     ("./pkg/logs/launchers/windowsevent/README.md", "install go ", "+,", False),
+    ("./tools/host-profiler/Dockerfile", "FROM golang:", "-trixie", True),
     ("./.wwhrd.yml", "raw.githubusercontent.com/golang/go/go", "/LICENSE", True),
     ("./go.work", "go ", "", True),
+    ("./Dockerfiles/agent-ddot/Dockerfile.agent-otel", "ARG GO_VERSION=", "", True),
 ]
 
 PATTERN_MAJOR_MINOR = r'1\.\d+'
@@ -69,7 +69,7 @@ def update_go(
     """
     import semver
 
-    if not semver.VersionInfo.isvalid(version):
+    if not semver.VersionInfo.isvalid(version):  # type: ignore[attr-defined]
         raise exceptions.Exit(f"The version {version} isn't valid.")
 
     current_version = _get_repo_go_version()
@@ -82,7 +82,7 @@ def update_go(
 
     if image_tag:
         try:
-            update_gitlab_config(".gitlab-ci.yml", image_tag, test=test)
+            update_gitlab_config(".gitlab-ci.yml", image_tag, test=test, windows=True)
         except RuntimeError as e:
             if warn:
                 print(color_message(f"WARNING: {str(e)}", "orange"))
@@ -90,22 +90,10 @@ def update_go(
                 raise
 
     _update_references(warn, version)
+    _bump_fakeintake_version()
     _update_go_mods(warn, version, include_otel_modules)
-
-    # check the installed go version before running tasks requiring the correct version
-    res = ctx.run("go version")
-    if res and res.stdout.startswith(f"go version go{version} "):
-        print("Updating the code in pkg/template...")
-        generate(ctx)
-        print("Running the tidy task...")
-        tidy(ctx)
-    else:
-        print(
-            color_message(
-                "WARNING: did not run `dda inv tidy` nor `dda inv pkg-template.generate` as the version of your `go` binary doesn't match the requested version",
-                "orange",
-            )
-        )
+    bazel("run", "//pkg/template:generate")
+    tidy(ctx)
 
     if release_note:
         releasenote_path = _create_releasenote(ctx, version)
@@ -172,6 +160,15 @@ def _get_pattern(pre_pattern: str, post_pattern: str, is_bugfix: bool) -> str:
     version_pattern = PATTERN_MAJOR_MINOR_BUGFIX if is_bugfix else PATTERN_MAJOR_MINOR
     pattern = rf'({re.escape(pre_pattern)}){version_pattern}({re.escape(post_pattern)})'
     return pattern
+
+
+def _bump_fakeintake_version() -> None:
+    from tasks.fakeintake import VERSION_FILE
+
+    with open(VERSION_FILE) as f:
+        current = int(f.read().strip()[1:])
+    with open(VERSION_FILE, "w") as f:
+        f.write(f"v{current + 1}\n")
 
 
 def _update_references(warn: bool, version: str, dry_run: bool = False):

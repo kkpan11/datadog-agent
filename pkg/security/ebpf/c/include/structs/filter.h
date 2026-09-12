@@ -17,10 +17,18 @@ struct approver_stats_t {
     u64 event_approved_by_basename;
     u64 event_approved_by_flag;
     u64 event_approved_by_auid;
+    u64 event_approved_by_in_upper_layer;
+};
+
+struct event_sample_stats_t {
+    u64 events_total;
+    u64 events_sampled;
+    u64 max_pressure;
 };
 
 struct basename_t {
-    char value[BASENAME_FILTER_SIZE];
+    u8 type; // enum BASENAME_APPROVER_TYPE
+    char value[BASENAME_FILTER_SIZE]; // including \0
 };
 
 struct event_mask_filter_t {
@@ -72,6 +80,11 @@ struct is_discarded_by_inode_t {
     u64 event_type;
     struct inode_discarder_t discarder;
     u64 now;
+};
+
+struct auid_discarder_params_t {
+    u64 event_mask;
+    u32 revision;
 };
 
 #endif

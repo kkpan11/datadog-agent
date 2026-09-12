@@ -170,7 +170,7 @@ func TestUpdate(t *testing.T) {
 				string(conventions.DeploymentEnvironmentKey): "prod",
 			},
 			metric:          BuildMetric[int64](metricSystemCPUPhysicalCount, 32),
-			expectedChanged: false,
+			expectedChanged: true,
 		},
 		{
 			// Same as #1, but missing some attributes
@@ -186,7 +186,7 @@ func TestUpdate(t *testing.T) {
 				string(conventions.DeploymentEnvironmentKey): "prod",
 			},
 			metric:          BuildMetric[float64](metricSystemCPUFrequency, 400_000_005.5),
-			expectedChanged: false,
+			expectedChanged: true, // new CPU frequency field counts as changed
 		},
 		{
 			// Same as #1 but wrong type and an update
@@ -239,22 +239,38 @@ func TestUpdate(t *testing.T) {
 				string(conventions.HostNameKey):      "host-2-hostname",
 				string(conventions.HostArchKey):      conventions.HostArchARM64.Value.AsString(),
 				"deployment.environment.name":        "staging",
+				"datadog.host.aliases":               []any{"host-2-hostid-alias-1", "host-2-hostid-alias-2"},
 			},
+			expectedChanged: true,
+		},
+		{
+			// Same host, new aliases
+			hostname: "host-2-hostid",
+			attributes: map[string]any{
+				string(conventions.CloudProviderKey): conventions.CloudProviderAzure.Value.AsString(),
+				string(conventions.HostIDKey):        "host-2-hostid",
+				string(conventions.HostNameKey):      "host-2-hostname",
+				string(conventions.HostArchKey):      conventions.HostArchARM64.Value.AsString(),
+				"deployment.environment.name":        "staging",
+				"datadog.host.aliases":               []any{"host-2-hostid-alias-1", "host-2-hostid-alias-2", "host-2-hostid-alias-3"},
+			},
+			expectedChanged: true,
 		},
 	}
 
 	hostMap := New()
 	for _, info := range hostInfo {
-		changed, _, err := hostMap.Update(info.hostname, testutils.NewResourceFromMap(t, info.attributes))
+		var metrics []pmetric.Metric
+		if info.metric != nil {
+			metrics = []pmetric.Metric{*info.metric}
+		}
+		changed, _, err := hostMap.UpdateWithMetrics(info.hostname, testutils.NewResourceFromMap(t, info.attributes), metrics)
 		assert.Equal(t, info.expectedChanged, changed)
 		if len(info.expectedErrs) > 0 {
 			errStrings := strings.Split(err.Error(), "\n")
 			assert.ElementsMatch(t, info.expectedErrs, errStrings)
 		} else {
 			assert.NoError(t, err)
-		}
-		if info.metric != nil {
-			hostMap.UpdateFromMetric(info.hostname, *info.metric)
 		}
 	}
 
@@ -307,7 +323,8 @@ func TestUpdate(t *testing.T) {
 		assert.Equal(t, md.InternalHostname, "host-2-hostid")
 		assert.Equal(t, md.Flavor, "otelcol-contrib")
 		assert.Equal(t, md.Meta, &payload.Meta{
-			Hostname: "host-2-hostid",
+			Hostname:    "host-2-hostid",
+			HostAliases: []string{"host-2-hostid-alias-1", "host-2-hostid-alias-2", "host-2-hostid-alias-3"},
 		})
 		assert.ElementsMatch(t, md.Tags.OTel, []string{"cloud_provider:azure", "env:staging"})
 		assert.Equal(t, md.Platform(), map[string]string{

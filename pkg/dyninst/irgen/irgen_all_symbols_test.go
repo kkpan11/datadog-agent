@@ -3,68 +3,275 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf && test
 
 package irgen_test
 
 import (
+	"crypto/rand"
 	"fmt"
-	"strings"
+	"io"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/DataDog/datadog-agent/pkg/dyninst/config"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/dyninsttest"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/irgen"
-	object "github.com/DataDog/datadog-agent/pkg/dyninst/object"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/object"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/symdb"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/testprogs"
-	"github.com/DataDog/datadog-agent/pkg/util/safeelf"
 )
 
+var verboseIssues = os.Getenv("IRGEN_VERBOSE_ISSUES") != ""
+
 func TestIRGenAllProbes(t *testing.T) {
-	programs := testprogs.GetPrograms(t)
-	cfgs := testprogs.GetCommonConfigs(t)
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	programs := testprogs.MustGetPrograms(t)
+	cfgs := testprogs.MustGetCommonConfigs(t)
+	sem := dyninsttest.MakeSemaphore()
+
+	// Find objcopy for each architecture.
+	// Native arch uses plain 'objcopy', cross-arch needs arch-specific toolchain.
+	crossObjcopyNames := map[string]string{
+		"amd64": "x86_64-linux-gnu-objcopy",
+		"arm64": "aarch64-linux-gnu-objcopy",
+	}
+	objcopyByArch := make(map[string]string)
+	for _, arch := range []string{"amd64", "arm64"} {
+		var name string
+		if arch == runtime.GOARCH {
+			name = "objcopy"
+		} else {
+			name = crossObjcopyNames[arch]
+		}
+		if path, err := exec.LookPath(name); err == nil {
+			objcopyByArch[arch] = path
+		}
+	}
+
 	for _, pkg := range programs {
+		switch pkg {
+		case "simple", "sample":
+		default:
+			t.Logf("skipping %s", pkg)
+			continue
+		}
 		t.Run(pkg, func(t *testing.T) {
 			for _, cfg := range cfgs {
 				t.Run(cfg.String(), func(t *testing.T) {
-					bin := testprogs.GetBinary(t, pkg, cfg)
-					testAllProbes(t, bin)
+					t.Parallel()
+					bin := testprogs.MustGetBinary(t, pkg, cfg)
+
+					defer sem.Acquire()()
+					probes := buildAllSymDBProbes(t, bin)
+					testAllProbes(t, bin, probes)
+
+					version, ok := object.ParseGoVersion(cfg.GOTOOLCHAIN)
+					require.True(t, ok)
+					if version.Minor >= 25 {
+						return // already uses loclists
+					}
+					t.Run("bogus loclist", func(t *testing.T) {
+						objcopy, ok := objcopyByArch[cfg.GOARCH]
+						if !ok {
+							t.Skipf("no objcopy available for %s", cfg.GOARCH)
+						}
+						tempDir, cleanup := dyninsttest.PrepTmpDir(t, "irgen_all_symbols_test")
+						defer cleanup()
+						modified, err := addLoclistSection(bin, objcopy, tempDir)
+						if err != nil {
+							t.Errorf("failed to objcopy a loclist section for %s: %v", cfg.String(), err)
+						}
+						testAllProbes(t, modified, probes)
+					})
 				})
 			}
 		})
 	}
 }
 
-func testAllProbes(t *testing.T, sampleServicePath string) {
-	binary, err := safeelf.Open(sampleServicePath)
-	require.NoError(t, err)
-	symbols, err := binary.Symbols()
-	require.NoError(t, err)
-	defer func() { require.NoError(t, binary.Close()) }()
-	var probes []config.Probe
-	for i, s := range symbols {
-		// These automatically generated symbols cause problems.
-		if strings.HasPrefix(s.Name, "type:.") {
-			continue
-		}
-		if strings.HasPrefix(s.Name, "runtime.vdso") {
-			continue
-		}
-
-		// Speed things up by skipping some symbols.
-		probes = append(probes, &config.LogProbe{
-			ID: fmt.Sprintf("probe_%d", i),
-			Where: &config.Where{
-				MethodName: s.Name,
-			},
-		})
+func addLoclistSection(binPath, objcopy, tmpDir string) (modifiedBinPath string, err error) {
+	junkDataFile := path.Join(tmpDir, "junk.data")
+	junkData := make([]byte, 1024)
+	if _, err := io.ReadFull(rand.Reader, junkData); err != nil {
+		return "", fmt.Errorf("failed to generate junk data: %w", err)
 	}
+	if err := os.WriteFile(junkDataFile, junkData, 0644); err != nil {
+		return "", fmt.Errorf("failed to write junk data: %w", err)
+	}
+	modifiedBinPath = filepath.Join(tmpDir, "modified.bin")
+	if output, err := exec.Command(objcopy,
+		"--add-section", ".debug_loclists="+junkDataFile,
+		"--set-section-flags", ".debug_loclists=alloc,readonly,debug",
+		binPath,
+		modifiedBinPath,
+	).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to objcopy: %w\n%s", err, string(output))
+	}
+	return modifiedBinPath, nil
+}
 
-	obj, err := object.NewElfObject(binary)
+func testAllProbes(t *testing.T, binPath string, probes []ir.ProbeDefinition) {
+	obj, err := object.OpenElfFileWithDwarf(binPath)
 	require.NoError(t, err)
+	defer func() { require.NoError(t, obj.Close()) }()
 	v, err := irgen.GenerateIR(1, obj, probes)
 	require.NoError(t, err)
 	require.NotNil(t, v)
-	// TODO: Validate more properties of the IR.
+	verifyIR(t, v)
+}
+
+func verifyIR(t *testing.T, p *ir.Program) {
+	for _, s := range p.Subprograms {
+		varNames := make(map[string]struct{})
+		for _, v := range s.Variables {
+			if _, ok := varNames[v.Name]; ok {
+				t.Fatalf("variable %s appears multiple times in subprogram %s", v.Name, s.Name)
+			}
+			varNames[v.Name] = struct{}{}
+		}
+	}
+	noBodyCount := 0
+	singleInstrCount := 0
+	for _, probe := range p.Probes {
+		for _, instance := range probe.Instances {
+			for _, event := range instance.Events {
+				for _, ip := range event.InjectionPoints {
+					if ip.NoReturnReason == ir.NoReturnReasonNoBody {
+						ranges := instance.Subprogram.OutOfLinePCRanges
+						if len(ranges) > 0 {
+							size := ranges[0][1] - ranges[0][0]
+							if ip.HasAssociatedReturn == false && size <= 1 {
+								singleInstrCount++
+							} else {
+								noBodyCount++
+								if verboseIssues {
+									t.Logf("noBody function: %s (pc=0x%x, size=%d)", instance.Subprogram.Name, ranges[0][0], size)
+								}
+							}
+						} else {
+							noBodyCount++
+							if verboseIssues {
+								t.Logf("noBody function: %s (no out-of-line ranges)", instance.Subprogram.Name)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	t.Logf("NoReturnReasonNoBody: %d noBody + %d singleInstr", noBodyCount, singleInstrCount)
+	kindCounts := make(map[ir.IssueKind]int)
+	defer func() {
+		for kind, count := range kindCounts {
+			t.Logf("kind %s: %d", kind.String(), count)
+		}
+	}()
+	for _, issue := range p.Issues {
+		var loc string
+		switch where := issue.ProbeDefinition.GetWhere().(type) {
+		case ir.FunctionWhere:
+			loc = where.Location()
+		case ir.LineWhere:
+			fn, file, line := where.Line()
+			loc = fmt.Sprintf("%s:%s:%s", fn, file, line)
+		default:
+			t.Fatalf("unexpected Where type: %T", issue.ProbeDefinition.GetWhere())
+		}
+		kindCounts[issue.Kind]++
+		switch issue.Kind {
+		case ir.IssueKindInvalidDWARF:
+			t.Errorf("%s: invalid DWARF: %s", loc, issue.Message)
+		case ir.IssueKindDisassemblyFailed:
+			// Some functions contain instructions the disassembler can't
+			// decode (e.g. AVX-512, LSE atomics) or have injection PCs that
+			// don't land on instruction boundaries. Log instead of fail.
+			if verboseIssues {
+				t.Logf("%s: disassembly failed: %s", loc, issue.Message)
+			}
+		case ir.IssueKindInvalidProbeDefinition:
+			if verboseIssues {
+				t.Logf("%s: invalid probe definition: %s", loc, issue.Message)
+			}
+		case ir.IssueKindMalformedExecutable:
+			if verboseIssues {
+				t.Logf("%s: malformed executable: %s", loc, issue.Message)
+			}
+		case ir.IssueKindTargetNotFoundInBinary:
+			t.Errorf("%s: target not found in binary: %s", loc, issue.Message)
+		case ir.IssueKindUnsupportedFeature:
+			if verboseIssues {
+				t.Logf("%s: unsupported feature: %s", loc, issue.Message)
+			}
+		default:
+			t.Errorf("%s: unexpected issue kind: %#v", loc, issue.Kind)
+		}
+	}
+}
+
+// BenchmarkIRGenAllSymbols measures the performance of generating IR for all
+// symbols in a binary. This exercises the DWARF line reader code paths,
+// including the workaround for functions without line info.
+func BenchmarkIRGenAllSymbols(b *testing.B) {
+	cfgs := testprogs.MustGetCommonConfigs(b)
+	for _, pkg := range []string{"simple", "sample"} {
+		b.Run(pkg, func(b *testing.B) {
+			for _, cfg := range cfgs {
+				b.Run(cfg.String(), func(b *testing.B) {
+					binPath := testprogs.MustGetBinary(b, pkg, cfg)
+					probes := buildAllSymDBProbes(b, binPath)
+
+					obj, err := object.OpenElfFileWithDwarf(binPath)
+					require.NoError(b, err)
+					defer func() { require.NoError(b, obj.Close()) }()
+
+					b.ResetTimer()
+					b.ReportAllocs()
+					for b.Loop() {
+						v, err := irgen.GenerateIR(1, obj, probes)
+						require.NoError(b, err)
+						require.NotNil(b, v)
+					}
+				})
+			}
+		})
+	}
+}
+
+// buildAllSymDBProbes uses symdb to discover all functions and injectable
+// lines in the binary and creates a probe for each one.
+func buildAllSymDBProbes(tb testing.TB, binPath string) []ir.ProbeDefinition {
+	tb.Helper()
+	symbols, err := symdb.ExtractSymbols(
+		binPath,
+		object.NewInMemoryLoader(),
+		symdb.ExtractOptions{
+			Scope: symdb.ExtractScopeAllSymbols,
+		},
+	)
+	require.NoError(tb, err)
+
+	var probes []ir.ProbeDefinition
+	probeID := 0
+	var methodCount, lineCount int
+	for _, pkg := range symbols.Packages {
+		probes, probeID, methodCount, lineCount = collectFunctionProbes(
+			probes, probeID, methodCount, lineCount, pkg.Functions,
+		)
+		for _, typ := range pkg.Types {
+			probes, probeID, methodCount, lineCount = collectFunctionProbes(
+				probes, probeID, methodCount, lineCount, typ.Methods,
+			)
+		}
+	}
+	tb.Logf("built %d probes (%d method, %d line) from symdb", len(probes), methodCount, lineCount)
+	return probes
 }

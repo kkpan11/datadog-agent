@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2024-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 // Package perf implements types related to eBPF and the perf subsystem, like perf buffers and ring buffers.
 package perf
@@ -22,6 +22,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 
 	ddebpf "github.com/DataDog/datadog-agent/pkg/ebpf"
+	"github.com/DataDog/datadog-agent/pkg/ebpf/modifiers"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/names"
 	ebpfTelemetry "github.com/DataDog/datadog-agent/pkg/ebpf/telemetry"
 	ddsync "github.com/DataDog/datadog-agent/pkg/util/sync"
@@ -259,7 +260,7 @@ func (e *EventHandler) removeRingBufferHelperCalls(mgr *manager.Manager, moduleN
 		return
 	}
 	// add helper call remover because ring buffers are not available
-	_ = ddebpf.NewHelperCallRemover(asm.FnRingbufOutput, asm.FnRingbufQuery, asm.FnRingbufReserve, asm.FnRingbufSubmit, asm.FnRingbufDiscard).BeforeInit(mgr, moduleName, mgrOpts)
+	_ = modifiers.NewHelperCallRemover(asm.FnRingbufOutput, asm.FnRingbufQuery, asm.FnRingbufReserve, asm.FnRingbufSubmit, asm.FnRingbufDiscard).BeforeInit(mgr, moduleName, mgrOpts)
 }
 
 func (e *EventHandler) setupEnabledConstant(mgrOpts *manager.Options) {
@@ -322,15 +323,21 @@ func (e *EventHandler) Flush() {
 	e.f.Flush()
 }
 
-// ResizeRingBuffer resizes the ring buffer by creating/updating a map spec editor
-func ResizeRingBuffer(mgrOpts *manager.Options, mapName string, bufferSize int) {
+func updateMapSpecEditor(mgrOpts *manager.Options, mapName string, editorFunc func(specEditor *manager.MapSpecEditor)) {
 	if mgrOpts.MapSpecEditors == nil {
 		mgrOpts.MapSpecEditors = make(map[string]manager.MapSpecEditor)
 	}
 	specEditor := mgrOpts.MapSpecEditors[mapName]
-	specEditor.MaxEntries = uint32(bufferSize)
-	specEditor.EditorFlag |= manager.EditMaxEntries
+	editorFunc(&specEditor)
 	mgrOpts.MapSpecEditors[mapName] = specEditor
+}
+
+// ResizeRingBuffer resizes the ring buffer by creating/updating a map spec editor
+func ResizeRingBuffer(mgrOpts *manager.Options, mapName string, bufferSize int) {
+	updateMapSpecEditor(mgrOpts, mapName, func(specEditor *manager.MapSpecEditor) {
+		specEditor.MaxEntries = uint32(bufferSize)
+		specEditor.EditorFlag |= manager.EditMaxEntries
+	})
 }
 
 func (e *EventHandler) perfLoop() {

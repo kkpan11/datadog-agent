@@ -8,11 +8,14 @@
 package cgroups
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
@@ -46,6 +49,11 @@ func (r *readerV2) parseCgroups() (map[string]Cgroup, error) {
 
 	err := filepath.WalkDir(r.cgroupRoot, func(fullPath string, de fs.DirEntry, err error) error {
 		if err != nil {
+			// if the error is a permission issue skip the directory
+			if errors.Is(err, fs.ErrPermission) {
+				log.Debugf("skipping %s due to permission error", fullPath)
+				return filepath.SkipDir
+			}
 			return err
 		}
 		if !de.IsDir() {
@@ -54,11 +62,15 @@ func (r *readerV2) parseCgroups() (map[string]Cgroup, error) {
 
 		id, err := r.filter(fullPath, de.Name())
 		if id != "" {
-			relPath, err := filepath.Rel(r.cgroupRoot, fullPath)
-			if err != nil {
-				return err
+			// If we already have a cgroup with this id, that means that we have a sub-cgroup.
+			// In that case, we keep the parent's stats path.
+			if _, exists := res[id]; !exists {
+				relPath, err := filepath.Rel(r.cgroupRoot, fullPath)
+				if err != nil {
+					return err
+				}
+				res[id] = newCgroupV2(id, r.cgroupRoot, relPath, r.cgroupControllers, r.pidMapper)
 			}
-			res[id] = newCgroupV2(id, r.cgroupRoot, relPath, r.cgroupControllers, r.pidMapper)
 		}
 
 		return err
@@ -69,8 +81,8 @@ func (r *readerV2) parseCgroups() (map[string]Cgroup, error) {
 func readCgroupControllers(cgroupRoot string) (map[string]struct{}, error) {
 	controllersMap := make(map[string]struct{})
 	err := parseFile(defaultFileReader, path.Join(cgroupRoot, controllersFile), func(s string) error {
-		controllers := strings.Fields(s)
-		for _, c := range controllers {
+		controllers := strings.FieldsSeq(s)
+		for c := range controllers {
 			controllersMap[c] = struct{}{}
 		}
 		return nil

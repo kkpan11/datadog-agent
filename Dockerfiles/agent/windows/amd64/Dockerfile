@@ -1,7 +1,11 @@
-ARG BASE_IMAGE=mcr.microsoft.com/powershell:lts-windowsservercore-1809
+ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:9.0-windowsservercore-ltsc2019
 FROM ${BASE_IMAGE}
-LABEL baseimage.os "windows server core"
+ARG BASE_IMAGE
+ARG BASE_IMAGE_OS="windows server core"
+LABEL baseimage.os "${BASE_IMAGE_OS}"
 LABEL baseimage.name "${BASE_IMAGE}"
+LABEL org.opencontainers.image.base.name "${BASE_IMAGE}"
+LABEL org.opencontainers.image.title="Datadog Agent"
 
 ARG WITH_JMX="false"
 ARG VARIANT="unknown"
@@ -11,6 +15,9 @@ ARG GENERAL_ARTIFACTS_CACHE_BUCKET_URL
 ARG WITH_FIPS
 
 LABEL maintainer "Datadog <package@datadoghq.com>"
+LABEL org.opencontainers.image.authors="Datadog <package@datadoghq.com>"
+LABEL org.opencontainers.image.source="https://github.com/DataDog/datadog-agent"
+LABEL org.opencontainers.image.vendor="Datadog, Inc."
 
 USER ContainerAdministrator
 
@@ -18,7 +25,7 @@ SHELL ["pwsh", "-Command", "$ErrorActionPreference = 'Stop';"]
 
 COPY ["Datadog Agent", "C:/Program Files/Datadog/Datadog Agent"]
 
-COPY install.ps1 ./
+COPY install.ps1 install-utils.ps1 ./
 RUN . ./install.ps1
 
 COPY bouncycastle-fips /fips-build

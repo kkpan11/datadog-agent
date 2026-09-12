@@ -1,0 +1,11 @@
+{
+  "type": "len",
+  "operation": "",
+  "left": {
+    "type": "ref",
+    "ref": "payload",
+    "operation": "",
+    "error": ""
+  },
+  "error": ""
+}

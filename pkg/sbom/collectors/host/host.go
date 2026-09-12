@@ -16,6 +16,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/datadog-agent/pkg/util/option"
 	"github.com/DataDog/datadog-agent/pkg/util/trivy"
+	"github.com/aquasecurity/trivy/pkg/types"
 )
 
 // Collector defines a host collector
@@ -54,14 +55,24 @@ func (c *Collector) Scan(ctx context.Context, request sbom.ScanRequest) sbom.Sca
 
 	report, err := c.DirectScan(ctx, path)
 	return sbom.ScanResult{
-		Error:  err,
-		Report: report,
+		Error:            err,
+		Report:           report,
+		GenerationMethod: "filesystem",
 	}
 }
 
 // DirectScan performs a scan on a specific path
 func (c *Collector) DirectScan(ctx context.Context, path string) (sbom.Report, error) {
 	return c.trivyCollector.ScanFilesystem(ctx, path, c.opts, true)
+}
+
+// DirectScanForTrivyReport performs a scan on a specific path
+func (c *Collector) DirectScanForTrivyReport(ctx context.Context, path string) (*types.Report, error) {
+	report, err := c.trivyCollector.ScanFSTrivyReport(ctx, path, c.opts, true)
+	if err != nil {
+		return nil, err
+	}
+	return report, nil
 }
 
 // NewCollectorForCWS creates a new host collector, specifically for CWS

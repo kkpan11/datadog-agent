@@ -54,7 +54,7 @@ package util
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"sync"
 	"time"
@@ -64,9 +64,10 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
-	"github.com/DataDog/datadog-agent/comp/metadata/runner/runnerimpl"
+	runnerdef "github.com/DataDog/datadog-agent/comp/metadata/runner/def"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/serializer/marshaler"
+	"github.com/DataDog/datadog-agent/pkg/util/scrubber"
 )
 
 var (
@@ -86,6 +87,15 @@ type PayloadGetter func() marshaler.JSONMarshaler
 //
 // Embedding type need to provide a PayloadGetter callback when calling Init. This callback will be called each time a
 // new payload need to be generated.
+//
+// # Scrubbing responsibility
+//
+// InventoryPayload owns flare scrubbing: FlareProvider applies ScrubJSON (structured JSON scrubbing
+// by key name) before writing the payload file. Callers do not need to scrub simple scalar fields.
+//
+// Exception: callers that store YAML content as JSON string values (e.g. check init_config or
+// instance_config) must pre-scrub those strings with scrubber.ScrubYamlString before storing them,
+// because ScrubJSON operates on JSON key names and cannot reach inside opaque string values.
 type InventoryPayload struct {
 	m sync.Mutex
 
@@ -133,16 +143,47 @@ func CreateInventoryPayload(conf config.Component, l log.Component, s serializer
 
 // FlareProvider returns a flare providers to add the current inventory payload to each flares.
 func (i *InventoryPayload) FlareProvider() flaretypes.Provider {
-	return flaretypes.NewProvider(i.fillFlare)
+	// We return a anonymous function here instead of a method from `InventoryPayload` so calling reflect on
+	// the pointer to function show the true caller instead of this generic helper. The flare provider uses reflect
+	// to detect the name of each provider to produce helpful logs. Using a method from InventoryPayload create the
+	// same name for all provider while a anonymous function is unique.
+	//
+	// for example the flare logs  this will show:
+	//   'comp/metadata/inventoryagent/impl.NewComponent.(*InventoryPayload).FlareProvider.func2'
+	// instead of:
+	//   'comp/metadata/internal/util.(*InventoryPayload).fillFlare-fm'
+	return flaretypes.NewProvider(
+		func(_ context.Context, fb flaretypes.FlareBuilder) error {
+			path := filepath.Join("metadata", "inventory", i.FlareFileName)
+			if !i.Enabled {
+				fb.AddFile(path, []byte("inventory metadata is disabled")) //nolint:errcheck
+				return nil
+			}
+
+			// InventoryPayload owns flare scrubbing. We use ScrubJSON (structured,
+			// key-name-based) rather than the builder's default ScrubBytes, which applies
+			// regex replacers to raw text and corrupts JSON when a key name contains a
+			// pattern substring (e.g. "pass" in "cache_bypass_limit").
+			data, err := i.GetAsJSON()
+			if err != nil {
+				return err
+			}
+			scrubbed, err := scrubber.ScrubJSON(data)
+			if err != nil {
+				return err
+			}
+			fb.AddFileWithoutScrubbing(path, scrubbed) //nolint:errcheck
+			return nil
+		})
 }
 
 // MetadataProvider returns a metadata 'runner.Provider' for the current inventory payload (taking into account if
 // invnetory is enabled or not).
-func (i *InventoryPayload) MetadataProvider() runnerimpl.Provider {
+func (i *InventoryPayload) MetadataProvider() runnerdef.Provider {
 	if i.Enabled {
-		return runnerimpl.NewProvider(i.collect)
+		return runnerdef.NewProvider(i.collect)
 	}
-	return runnerimpl.NewProvider(nil)
+	return runnerdef.NewProvider(nil)
 }
 
 // collect is the callback expected by the metadata runner.Provider. It will send a new payload and return the next
@@ -208,23 +249,11 @@ func (i *InventoryPayload) RefreshTriggered() bool {
 // GetAsJSON returns the payload as a JSON string. Useful to be displayed in the CLI or added to a flare.
 func (i *InventoryPayload) GetAsJSON() ([]byte, error) {
 	if !i.Enabled {
-		return nil, fmt.Errorf("inventory metadata is disabled")
+		return nil, errors.New("inventory metadata is disabled")
 	}
 
 	i.m.Lock()
 	defer i.m.Unlock()
 
-	return json.MarshalIndent(i.getPayload(), "", "    ")
-}
-
-// fillFlare add the inventory payload to flares.
-func (i *InventoryPayload) fillFlare(fb flaretypes.FlareBuilder) error {
-	path := filepath.Join("metadata", "inventory", i.FlareFileName)
-	if !i.Enabled {
-		fb.AddFile(path, []byte("inventory metadata is disabled")) //nolint:errcheck
-		return nil
-	}
-
-	fb.AddFileFromFunc(path, i.GetAsJSON) //nolint:errcheck
-	return nil
+	return json.MarshalIndent(i.getPayload(), "", "  ")
 }

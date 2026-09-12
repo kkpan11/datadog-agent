@@ -12,8 +12,10 @@ import (
 	"strconv"
 
 	"github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
+	"github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace/idx"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 	"github.com/DataDog/datadog-agent/pkg/trace/log"
+	"github.com/DataDog/datadog-agent/pkg/trace/semantics"
 )
 
 const (
@@ -86,9 +88,39 @@ func (ps *ProbabilisticSampler) Sample(root *trace.Span) bool {
 	return keep
 }
 
+// SampleV1 a trace given the chunk's root span, returns true if the trace should be kept
+func (ps *ProbabilisticSampler) SampleV1(traceID []byte, root *idx.InternalSpan) bool {
+	if !ps.enabled {
+		return false
+	}
+
+	tid := make([]byte, 16)
+	if !ps.fullTraceIDMode {
+		// The trace ID is a big-endian 128-bit value, so the low-order 64 bits (the
+		// legacy trace ID) live in traceID[8:]. Copy those into the first 8 bytes so
+		// the hash input matches the non-V1 Sample path ([low64 || zeros]) and rides
+		// on the bits that survive when legacy apps drop the top 64 bits.
+		copy(tid, traceID[8:])
+	} else {
+		copy(tid, traceID)
+	}
+
+	hasher := fnv.New32a()
+	_, _ = hasher.Write(ps.hashSeed)
+	_, _ = hasher.Write(tid)
+	hash := hasher.Sum32()
+	keep := hash&bitMaskHashBuckets < ps.scaledSamplingPercentage
+	if keep {
+		root.SetFloat64Attribute(probRateKey, ps.samplingPercentage)
+	}
+	return keep
+}
+
 func get128BitTraceID(span *trace.Span) ([]byte, error) {
-	// If it's an otel span the whole trace ID is in otel.trace
-	if tid, ok := span.Meta["otel.trace_id"]; ok {
+	reg := semantics.DefaultRegistry()
+	metaAccessor := semantics.NewStringMapAccessor(span.Meta)
+	// If it's an otel span the whole trace ID is in otel.trace_id
+	if tid := semantics.LookupString(reg, metaAccessor, semantics.ConceptOTelTraceID); tid != "" {
 		bs, err := hex.DecodeString(tid)
 		if err != nil {
 			return nil, err
@@ -99,7 +131,7 @@ func get128BitTraceID(span *trace.Span) ([]byte, error) {
 	binary.BigEndian.PutUint64(tid[8:], span.TraceID)
 	// Get hex encoded upper bits for datadog spans
 	// If no value is found we can use the default `0` value as that's what will have been propagated
-	if upper, ok := span.Meta["_dd.p.tid"]; ok {
+	if upper := semantics.LookupString(reg, metaAccessor, semantics.ConceptDDTraceIDHigh); upper != "" {
 		u, err := strconv.ParseUint(upper, 16, 64)
 		if err != nil {
 			return nil, err

@@ -17,7 +17,9 @@ import (
 	"path"
 	"path/filepath"
 
-	proto "github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/internal/retry"
 )
 
 func main() {
@@ -69,7 +71,7 @@ func dumpRetryFile(file string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	collection := HttpTransactionProtoCollection{}
+	collection := retry.HttpTransactionProtoCollection{}
 
 	if err := proto.Unmarshal(content, &collection); err != nil {
 		return nil, err
@@ -93,7 +95,7 @@ func dumpRetryFile(file string) ([]byte, error) {
 // JSONHTTPTransaction is a transaction object with a string-type Payload associated
 // with it
 type JSONHTTPTransaction struct {
-	*HttpTransactionProto
+	*retry.HttpTransactionProto
 	Payload string // Same as HttpTransactionProto.Payload but the type is string instead of []byte
 }
 

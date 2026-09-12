@@ -11,7 +11,9 @@ package remoteagentregistry
 
 // Component is the component type.
 type Component interface {
-	RegisterRemoteAgent(req *RegistrationData) (uint32, error)
-	GetRegisteredAgents() []*RegisteredAgent
-	GetRegisteredAgentStatuses() []*StatusData
+	RegisterRemoteAgent(req *RegistrationData) (sessionID string, recommendedRefreshIntervalSecs uint32, err error)
+	RefreshRemoteAgent(sessionID string) bool
+	ReportRemoteAgentEvent(sessionID string, events []RemoteAgentEvent) error
+	GetRegisteredAgents() []RegisteredAgent
+	GetRegisteredAgentStatuses() []StatusData
 }

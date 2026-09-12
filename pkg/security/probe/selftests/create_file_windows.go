@@ -15,7 +15,6 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/security/secl/compiler/eval"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/rules"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // WindowsCreateFileSelfTest defines a windows create file self test
@@ -27,7 +26,7 @@ type WindowsCreateFileSelfTest struct {
 
 // GetRuleDefinition returns the rule
 func (o *WindowsCreateFileSelfTest) GetRuleDefinition() *rules.RuleDefinition {
-	o.ruleID = fmt.Sprintf("%s_windows_create_file", ruleIDPrefix)
+	o.ruleID = ruleIDPrefix + "_windows_create_file"
 
 	basename := filepath.Base(o.filename)
 	devicePath := o.filename
@@ -58,8 +57,7 @@ func (o *WindowsCreateFileSelfTest) GenerateEvent(ctx context.Context) error {
 		"file",
 	)
 	if err := cmd.Run(); err != nil {
-		log.Debugf("error creating file: %v", err)
-		return err
+		return fmt.Errorf("error creating file: %w", err)
 	}
 
 	return os.Remove(o.filename)

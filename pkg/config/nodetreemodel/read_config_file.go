@@ -6,15 +6,16 @@
 package nodetreemodel
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
+	"github.com/DataDog/datadog-agent/pkg/config/basic"
 	"github.com/DataDog/datadog-agent/pkg/config/model"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
@@ -31,38 +32,56 @@ func (c *ntmConfig) findConfigFile() {
 	}
 }
 
-// ReadInConfig wraps Viper for concurrent access
+// ReadInConfig resets the file tree and reads the configuration from the file system.
 func (c *ntmConfig) ReadInConfig() error {
 	if !c.isReady() && !c.allowDynamicSchema.Load() {
 		return log.Errorf("attempt to ReadInConfig before config is constructed")
 	}
 
+	c.maybeRebuild()
+
 	c.Lock()
 	defer c.Unlock()
 
+	// Reset the file tree like Viper does, so previous config is cleared
+	c.file = newInnerNode(nil)
+
 	c.findConfigFile()
-	err := c.readInConfig(c.configFile)
-	if err != nil {
+	if err := c.readInConfig(c.configFile); err != nil {
+		// For compatibility with Viper, we wrap the error with ErrConfigFileNotFound. Note
+		// that this case can be reached even if the config file *is* found. For example,
+		// if the config file at the default location (/opt/datadog-agent/etc/datadog.yaml)
+		// contains unparseable data, this branch is reached. This specific return value is
+		// checked during the config.Component constructor here:
+		// https://github.com/DataDog/datadog-agent/blob/31d06e70d70081d166b628efcf6c444b8aef5fbc/comp/core/config/setup.go#L53
+		// Meaning parser errors *won't* prevent the config.Component from initializing.
+		if !errors.Is(err, model.ErrConfigFileNotFound) {
+			return model.NewConfigFileNotFoundError(err) // nolint: forbidigo // needed for compatibility
+		}
 		return err
 	}
 
 	for _, f := range c.extraConfigFilePaths {
-		err = c.readInConfig(f)
-		if err != nil {
+		if err := c.readInConfig(f); err != nil {
 			return err
 		}
 	}
 	return c.mergeAllLayers()
 }
 
-// ReadConfig wraps Viper for concurrent access
+// ReadConfig resets the file tree and reads the configuration from the provided reader.
 func (c *ntmConfig) ReadConfig(in io.Reader) error {
 	if !c.isReady() && !c.allowDynamicSchema.Load() {
 		return log.Errorf("attempt to ReadConfig before config is constructed")
 	}
 
+	c.maybeRebuild()
+
 	c.Lock()
 	defer c.Unlock()
+
+	// Reset the file tree like Viper does, so previous config is cleared
+	c.file = newInnerNode(nil)
 
 	content, err := io.ReadAll(in)
 	if err != nil {
@@ -77,12 +96,36 @@ func (c *ntmConfig) ReadConfig(in io.Reader) error {
 func (c *ntmConfig) readInConfig(filePath string) error {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return model.ConfigFileNotFoundError{Err: err}
+		return model.NewConfigFileNotFoundError(err) // nolint: forbidigo // constructing proper error
 	}
 	return c.readConfigurationContent(c.file, model.SourceFile, content)
 }
 
-func (c *ntmConfig) readConfigurationContent(target InnerNode, source model.Source, content []byte) error {
+func (c *ntmConfig) processDeprecation(tree *nodeImpl, deprecatedValues map[string]interface{}, source model.Source) {
+	for newName, deprecation := range c.deprecations {
+		alreadyFound := ""
+		for _, oldName := range deprecation.oldNames {
+			if val, ok := deprecatedValues[oldName]; ok {
+				// deprecated names are sorted by priority, we stop backporting the value after finding one
+				if alreadyFound == "" {
+					tree.setAt(newName, val, source, copyOnWrite) // nolint:errcheck
+					alreadyFound = oldName
+					c.warnings = append(c.warnings,
+						fmt.Sprintf("setting '%s' is deprecated, use '%s' instead", oldName, newName),
+					)
+				} else {
+					c.warnings = append(c.warnings,
+						fmt.Sprintf(
+							"setting '%s' is deprecated, use '%s' instead (value ignored in favor of '%s')",
+							oldName, newName, alreadyFound),
+					)
+				}
+			}
+		}
+	}
+}
+
+func (c *ntmConfig) readConfigurationContent(target *nodeImpl, source model.Source, content []byte) error {
 	var inData map[string]interface{}
 
 	if strictErr := yaml.UnmarshalStrict(content, &inData); strictErr != nil {
@@ -91,91 +134,131 @@ func (c *ntmConfig) readConfigurationContent(target InnerNode, source model.Sour
 			return err
 		}
 	}
-	c.warnings = append(c.warnings, loadYamlInto(target, source, inData, "", c.schema, c.allowDynamicSchema.Load())...)
+	deprecatedValues := map[string]interface{}{}
+	c.warnings = append(c.warnings, c.loadYamlInto(target, source, inData, "", c.defaults, deprecatedValues)...)
+	c.processDeprecation(target, deprecatedValues, source)
 	return nil
 }
 
-// toMapStringInterface convert any type of map into a map[string]interface{}
-func toMapStringInterface(data any, path string) (map[string]interface{}, error) {
-	if res, ok := data.(map[string]interface{}); ok {
-		return res, nil
+// buildNestedMap converts keys with dots into a nested structure
+// for example:
+//
+//	buildNestedMap(["a", "b", "c"], 123) => {"a": {"b": {"c": 123}}}
+func buildNestedMap(keyParts []string, bottomValue interface{}) map[string]interface{} {
+	res := map[string]interface{}{}
+	nextKey := keyParts[0]
+	if len(keyParts) == 1 {
+		res[nextKey] = bottomValue
+	} else {
+		res[nextKey] = buildNestedMap(keyParts[1:], bottomValue)
 	}
-
-	v := reflect.ValueOf(data)
-	switch v.Kind() {
-	case reflect.Map:
-		convert := map[string]interface{}{}
-		iter := v.MapRange()
-		for iter.Next() {
-			key := iter.Key()
-			switch k := key.Interface().(type) {
-			case string:
-				convert[k] = iter.Value().Interface()
-			default:
-				convert[fmt.Sprintf("%v", key.Interface())] = iter.Value().Interface()
-			}
-		}
-		return convert, nil
-	}
-	return nil, fmt.Errorf("invalid type from configuration for key '%s'", path)
+	return res
 }
+
+var valuelessLeaf = &nodeImpl{}
 
 // loadYamlInto traverses input data parsed from YAML, checking if each node is defined by the schema.
 // If found, the value from the YAML blob is imported into the 'dest' tree. Otherwise, a warning will be created.
-func loadYamlInto(dest InnerNode, source model.Source, inData map[string]interface{}, atPath string, schema InnerNode, allowDynamicSchema bool) []error {
-	warnings := []error{}
+func (c *ntmConfig) loadYamlInto(dest *nodeImpl, source model.Source, inData map[string]interface{}, atPath string, schema *nodeImpl, deprecatedValues map[string]interface{}) []string {
+	warnings := []string{}
 	for key, value := range inData {
 		key = strings.ToLower(key)
+
+		// If the key contains a dot, it represents a nested key
+		if strings.Contains(key, ".") {
+			parts := splitKeyFunc(key)
+			key = parts[0]
+			value = buildNestedMap(parts[1:], value)
+		}
 		currPath := joinKey(atPath, key)
+
+		if _, ok := c.deprecatedNames[currPath]; ok {
+			// deprecation are resolved after loading the entire YAML file. A setting can be deprecated
+			// multiple times. When a configuration contains multiple old name we use the older.
+			deprecatedValues[currPath] = value
+			continue
+		}
 
 		// check if the key is defined in the schema
 		schemaChild, err := schema.GetChild(key)
 		if err != nil {
-			warnings = append(warnings, fmt.Errorf("unknown key from YAML: %s", currPath))
-			if !allowDynamicSchema {
-				continue
-			} else if isScalar(value) || isSlice(value) {
-				schemaChild = newLeafNode(value, model.SourceSchema)
+			isLeaf, isKnown := c.knownKeys[currPath]
+			if isLeaf {
+				// Not found but known, the leaf setting must be valueless. This should never happen
+				schemaChild = valuelessLeaf
 			} else {
-				schemaChild = newInnerNode(make(map[string]Node))
+				// if the key is not defined in the schema, we can still add it to the destination
+				if value == nil || isScalar(value) || isSlice(value) {
+					if !isKnown {
+						warnings = append(warnings, "unknown key from YAML: "+currPath)
+					}
+
+					dest.InsertChildNode(key, newLeafNode(value, source))
+					c.unknownKeys.Store(currPath, struct{}{})
+					continue
+				}
+
+				// fallback to inner node if it's not a scalar or nil
+				schemaChild = newInnerNode(nil)
 			}
 		}
 
 		// if the node in the schema is a leaf, then we create a new leaf in dest
-		if _, isLeaf := schemaChild.(LeafNode); isLeaf {
+		if schemaChild.IsLeafNode() {
 			// check that dest doesn't have a inner leaf under that name
 			c, _ := dest.GetChild(key)
-			if _, ok := c.(InnerNode); ok {
+			if c != nil && c.IsInnerNode() {
 				// Both default and dest have a child but they conflict in type. This should never happen.
-				warnings = append(warnings, fmt.Errorf("invalid tree: default and dest tree don't have the same layout"))
+				warnings = append(warnings, "invalid tree: default and dest tree don't have the same layout")
 			} else {
-				dest.InsertChildNode(key, newLeafNode(value, source))
+				// If a setting is known and nil we mimic the behavior of viper and ignore the value
+				// to keep the default one. We still insert nil value for unknown settings to keep
+				// track of them and from inner node since this mechanism is used by OTEL to mark
+				// entire section as "existing".
+				//
+				// 'nil' value in YAML file can easily be create by setting a key with no value.
+				//
+				// Example:
+				//
+				//    setting_name_1:      # no value -> nil in Go
+				//    setting name_2: 1234
+				if value != nil {
+					if converted, err := basic.ConvertToDefaultType(value, schemaChild.Get(), false); err == nil {
+						value = converted
+					}
+					// normalize YAML v2 map[interface{}]interface{} to map[string]interface{}
+					if normalized, err := ToMapStringInterface(value, currPath); err == nil {
+						value = normalized
+					}
+					dest.InsertChildNode(key, newLeafNode(value, source))
+				}
 			}
 			continue
 		}
-		// by now we know schemaNode is an InnerNode
-		schemaInner, _ := schemaChild.(InnerNode)
 
-		childValue, err := toMapStringInterface(value, currPath)
+		childValue, err := ToMapStringInterface(value, currPath)
 		if err != nil {
-			warnings = append(warnings, err)
+			warnings = append(warnings, err.Error())
+			// Insert child node here as a leaf. It has the wrong type, but this maintains better
+			// compatibility with how viper works.
+			dest.InsertChildNode(key, newLeafNode(value, source))
+			continue
 		}
 
 		if !dest.HasChild(key) {
-			destChildInner := newInnerNode(nil)
-			warnings = append(warnings, loadYamlInto(destChildInner, source, childValue, currPath, schemaInner, allowDynamicSchema)...)
-			dest.InsertChildNode(key, destChildInner)
+			destChild := newInnerNode(nil)
+			warnings = append(warnings, c.loadYamlInto(destChild, source, childValue, currPath, schemaChild, deprecatedValues)...)
+			dest.InsertChildNode(key, destChild)
 			continue
 		}
 
 		destChild, _ := dest.GetChild(key)
-		destChildInner, ok := destChild.(InnerNode)
-		if !ok {
+		if destChild.IsLeafNode() {
 			// Both default and dest have a child but they conflict in type. This should never happen.
-			warnings = append(warnings, fmt.Errorf("invalid tree: default and dest tree don't have the same layout"))
+			warnings = append(warnings, "invalid tree: default and dest tree don't have the same layout")
 			continue
 		}
-		warnings = append(warnings, loadYamlInto(destChildInner, source, childValue, currPath, schemaInner, allowDynamicSchema)...)
+		warnings = append(warnings, c.loadYamlInto(destChild, source, childValue, currPath, schemaChild, deprecatedValues)...)
 	}
 	return warnings
 }

@@ -6,15 +6,14 @@
 package writer
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
-	"time"
 
 	compression "github.com/DataDog/datadog-agent/comp/trace/compression/def"
 	gzip "github.com/DataDog/datadog-agent/comp/trace/compression/impl-gzip"
@@ -50,6 +49,10 @@ func (s MockSampler) GetTargetTPS() float64 {
 var mockSampler = MockSampler{TargetTPS: 5, Enabled: true}
 
 func TestTraceWriter(t *testing.T) {
+	if os.Getenv("CI") == "true" && runtime.GOOS == "darwin" {
+		t.Skip("TestTraceWriter is known to fail on the macOS Gitlab runners.")
+	}
+
 	testCases := []struct {
 		compressor compression.Component
 	}{
@@ -57,7 +60,7 @@ func TestTraceWriter(t *testing.T) {
 		{zstd.NewComponent()},
 	}
 	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("encoding:%s", tc.compressor.Encoding()), func(t *testing.T) {
+		t.Run("encoding:"+tc.compressor.Encoding(), func(t *testing.T) {
 			srv := newTestServer()
 			defer srv.Close()
 			cfg := &config.AgentConfig{
@@ -162,21 +165,18 @@ func payloadsContain(t *testing.T, payloads []*payload, sampledSpans []*SampledC
 	t.Helper()
 	var all pb.AgentPayload
 	for _, p := range payloads {
-		assert := assert.New(t)
-		var slurp []byte
-
 		reader, err := compressor.NewReader(p.body)
-		assert.NoError(err)
-		defer reader.Close()
+		require.NoError(t, err, "payload body is not valid %s", compressor.Encoding())
 
-		slurp, err = io.ReadAll(reader)
+		slurp, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		require.NoError(t, readErr)
+		require.NoError(t, closeErr)
 
-		assert.NoError(err)
 		var payload pb.AgentPayload
-		err = proto.Unmarshal(slurp, &payload)
-		assert.NoError(err)
-		assert.Equal(payload.HostName, testHostname)
-		assert.Equal(payload.Env, testEnv)
+		require.NoError(t, proto.Unmarshal(slurp, &payload))
+		assert.Equal(t, testHostname, payload.HostName)
+		assert.Equal(t, testEnv, payload.Env)
 		all.TracerPayloads = append(all.TracerPayloads, payload.TracerPayloads...)
 	}
 	for _, ss := range sampledSpans {
@@ -382,6 +382,117 @@ func TestTraceWriterAgentPayload(t *testing.T) {
 	})
 }
 
+func TestTraceWriterAPMMode(t *testing.T) {
+	testCases := []struct {
+		name        string
+		configValue string
+		expected    string
+	}{
+		{
+			name:        "default-empty",
+			configValue: "",
+			expected:    "",
+		},
+		{
+			name:        "edge",
+			configValue: "edge",
+			expected:    "edge",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer()
+			defer srv.Close()
+			cfg := &config.AgentConfig{
+				Hostname:   testHostname,
+				DefaultEnv: testEnv,
+				Endpoints: []*config.Endpoint{{
+					APIKey: "123",
+					Host:   srv.URL,
+				}},
+				TraceWriter:         &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
+				SynchronousFlushing: true,
+				APMMode:             tc.configValue,
+			}
+			tw := NewTraceWriter(cfg, mockSampler, mockSampler, mockSampler, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}, gzip.NewComponent())
+			defer tw.Stop()
+
+			// Send a span and force flush
+			tw.WriteChunks(randomSampledSpans(20, 8))
+			err := tw.FlushSync()
+			assert.Nil(t, err)
+
+			// Verify the AgentPayload has the correct APMMode
+			require.Len(t, srv.payloads, 1)
+			ap, err := deserializePayload(*srv.payloads[0], tw.compressor)
+			assert.Nil(t, err)
+			v, ok := ap.Tags[tagAPMMode]
+			// If APMMode is not set, the tag should not be present
+			if tc.expected == "" {
+				assert.False(t, ok)
+				assert.Empty(t, v)
+			} else {
+				// If APMMode is set, the tag should be present and equal to the expected value
+				assert.True(t, ok)
+				assert.Equal(t, tc.expected, v)
+			}
+		})
+	}
+}
+
+func TestTraceWriterOTelGateway(t *testing.T) {
+	testCases := []struct {
+		name        string
+		otelGateway bool
+	}{
+		{
+			name:        "gateway-disabled",
+			otelGateway: false,
+		},
+		{
+			name:        "gateway-enabled",
+			otelGateway: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer()
+			defer srv.Close()
+			cfg := &config.AgentConfig{
+				Hostname:   testHostname,
+				DefaultEnv: testEnv,
+				Endpoints: []*config.Endpoint{{
+					APIKey: "123",
+					Host:   srv.URL,
+				}},
+				TraceWriter:         &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40},
+				SynchronousFlushing: true,
+				OTelGateway:         tc.otelGateway,
+			}
+			tw := NewTraceWriter(cfg, mockSampler, mockSampler, mockSampler, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}, gzip.NewComponent())
+			defer tw.Stop()
+
+			tw.WriteChunks(randomSampledSpans(20, 8))
+			err := tw.FlushSync()
+			assert.Nil(t, err)
+
+			require.Len(t, srv.payloads, 1)
+			ap, err := deserializePayload(*srv.payloads[0], tw.compressor)
+			assert.Nil(t, err)
+			v, ok := ap.Tags[tagOTelGateway]
+			if tc.otelGateway {
+				assert.True(t, ok)
+				assert.Equal(t, "true", v)
+			} else {
+				assert.False(t, ok)
+				assert.Empty(t, v)
+			}
+		})
+	}
+}
+
 func TestTraceWriterUpdateAPIKey(t *testing.T) {
 	assert := assert.New(t)
 	srv := newTestServer()
@@ -403,15 +514,15 @@ func TestTraceWriterUpdateAPIKey(t *testing.T) {
 	assert.NoError(err)
 
 	assert.Len(tw.senders, 1)
-	assert.Equal("123", tw.senders[0].cfg.apiKey)
+	assert.Equal("123", tw.senders[0].apiKeyManager.Get())
 	assert.Equal(url, tw.senders[0].cfg.url)
 
 	tw.UpdateAPIKey("invalid", "foo")
-	assert.Equal("123", tw.senders[0].cfg.apiKey)
+	assert.Equal("123", tw.senders[0].apiKeyManager.Get())
 	assert.Equal(url, tw.senders[0].cfg.url)
 
 	tw.UpdateAPIKey("123", "foo")
-	assert.Equal("foo", tw.senders[0].cfg.apiKey)
+	assert.Equal("foo", tw.senders[0].apiKeyManager.Get())
 	assert.Equal(url, tw.senders[0].cfg.url)
 }
 
@@ -440,14 +551,11 @@ func TestTraceWriterInfo(t *testing.T) {
 	defer useFlushThreshold(testSpans[0].Size + testSpans[1].Size + 10)()
 	tw := NewTraceWriter(cfg, mockSampler, mockSampler, mockSampler, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}, zstd.NewComponent())
 
-	time.Sleep(200 * time.Millisecond) // allow stats to be initialized
-
 	for _, ss := range testSpans {
 		tw.WriteChunks(ss)
 	}
 	err := tw.FlushSync()
 	assert.NoError(t, err)
-	time.Sleep(200 * time.Millisecond) // allow stats to be propagated in the reporter goroutine
 	// One payload flushes due to overflowing the threshold, and the second one
 	// because of the sync flush
 	assert.Equal(t, 2, srv.Accepted())
@@ -461,6 +569,55 @@ func TestTraceWriterInfo(t *testing.T) {
 	assert.NotEmpty(t, tw.statsLastMinute.BytesUncompressed.Load())
 	assert.Empty(t, tw.statsLastMinute.Errors.Load())
 	assert.Empty(t, tw.statsLastMinute.Retries.Load())
+
+	tw.Stop()
+}
+
+// passthroughCompressor is a no-op compressor that writes/reads data unchanged.
+// It is used in tests to obtain a compression ratio of 1, making bytes and
+// bytes_uncompressed directly comparable.
+type passthroughCompressor struct{}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+func (passthroughCompressor) NewWriter(w io.Writer) (io.WriteCloser, error) {
+	return nopWriteCloser{w}, nil
+}
+func (passthroughCompressor) NewReader(r io.Reader) (io.ReadCloser, error) {
+	return io.NopCloser(r), nil
+}
+func (passthroughCompressor) Encoding() string { return "identity" }
+
+// TestTraceWriterBytesMetricsMultipleSenders verifies that bytes_uncompressed is
+// counted once per sender (same scope as bytes), so the two metrics remain
+// consistent regardless of the number of configured endpoints.
+func TestTraceWriterBytesMetricsMultipleSenders(t *testing.T) {
+	srv := newTestServer()
+	defer srv.Close()
+	cfg := &config.AgentConfig{
+		Hostname:   testHostname,
+		DefaultEnv: testEnv,
+		Endpoints: []*config.Endpoint{
+			{APIKey: "123", Host: srv.URL},
+			{APIKey: "123", Host: srv.URL},
+		},
+		SynchronousFlushing: true,
+		TraceWriter:         &config.WriterConfig{ConnectionLimit: 200, QueueSize: 40, FlushPeriodSeconds: 100},
+	}
+	defer useFlushThreshold(1)()
+	tw := NewTraceWriter(cfg, mockSampler, mockSampler, mockSampler, telemetry.NewNoopCollector(), &statsd.NoOpClient{}, &timing.NoopReporter{}, passthroughCompressor{})
+
+	tw.WriteChunks(randomSampledSpans(20, 8))
+	require.NoError(t, tw.FlushSync())
+
+	bytes := tw.statsLastMinute.Bytes.Load()
+	bytesUncompressed := tw.statsLastMinute.BytesUncompressed.Load()
+	assert.Greater(t, bytes, int64(0))
+	// With a passthrough compressor, compressed == uncompressed per payload.
+	// Both metrics are counted once per sender, so they must be equal.
+	assert.Equal(t, bytes, bytesUncompressed)
 
 	tw.Stop()
 }
@@ -500,7 +657,7 @@ func BenchmarkMapDelete(b *testing.B) {
 	}
 	for n := 0; n < b.N; n++ {
 		m["_sampling_priority_v1"] = 1
-		//delete(m, "_sampling_priority_v1")
+		// delete(m, "_sampling_priority_v1")
 	}
 }
 
@@ -521,7 +678,7 @@ func BenchmarkSpanProto(b *testing.B) {
 		},
 	}
 	for n := 0; n < b.N; n++ {
-		//proto.Marshal(&s)
+		// proto.Marshal(&s)
 		s.MarshalVT()
 	}
 }

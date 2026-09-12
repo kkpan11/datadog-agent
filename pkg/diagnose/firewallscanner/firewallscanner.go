@@ -10,12 +10,13 @@ package firewallscanner
 import (
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	diagnose "github.com/DataDog/datadog-agent/comp/core/diagnose/def"
 	"github.com/DataDog/datadog-agent/comp/netflow/common"
-	netflowConfig "github.com/DataDog/datadog-agent/comp/netflow/config"
+	netflowConfig "github.com/DataDog/datadog-agent/comp/netflow/config/def"
 	"github.com/DataDog/datadog-agent/pkg/config/structure"
 )
 
@@ -115,7 +116,7 @@ func getNetflowRulesToCheck(config config.Component) []ruleToCheck {
 		rulesToCheck = append(rulesToCheck, ruleToCheck{
 			firewallRule: firewallRule{
 				protocol: "UDP",
-				destPort: fmt.Sprintf("%d", destPort),
+				destPort: strconv.FormatUint(uint64(destPort), 10),
 			},
 			source: fmt.Sprintf("netflow (%s)", flowTypeDetail.Name()),
 		})

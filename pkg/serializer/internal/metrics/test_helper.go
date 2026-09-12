@@ -10,23 +10,25 @@ package metrics
 import (
 	"fmt"
 
-	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
+	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/transaction"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 	"github.com/DataDog/datadog-agent/pkg/tagset"
-	"github.com/DataDog/opentelemetry-mapping-go/pkg/quantile"
+	"github.com/DataDog/datadog-agent/pkg/util/quantile"
 )
 
 // Makeseries creates a metrics.SketchSeries with i+5 Sketch Points
 func Makeseries(i int) *metrics.SketchSeries {
 	// Makeseries is deterministic so that we can test for mutation.
 	ss := &metrics.SketchSeries{
-		Name: fmt.Sprintf("name.%d", i),
-		Tags: tagset.CompositeTagsFromSlice([]string{
-			fmt.Sprintf("a:%d", i),
-			fmt.Sprintf("b:%d", i),
-		}),
-		Host:     fmt.Sprintf("host.%d", i),
-		Interval: int64(i),
+		DistributionMetadata: metrics.DistributionMetadata{
+			Name: fmt.Sprintf("name.%d", i),
+			Tags: tagset.CompositeTagsFromSlice([]string{
+				fmt.Sprintf("a:%d", i),
+				fmt.Sprintf("b:%d", i),
+			}),
+			Host:     fmt.Sprintf("host.%d", i),
+			Interval: int64(i),
+		},
 	}
 
 	// We create i+5 Sketch Points to insure all hosts have at least 5 Sketch Points for tests
@@ -36,9 +38,6 @@ func Makeseries(i int) *metrics.SketchSeries {
 			Sketch: makesketch(j),
 		})
 	}
-
-	gen := ckey.NewKeyGenerator()
-	ss.ContextKey = gen.Generate(ss.Name, ss.Host, tagset.NewHashingTagsAccumulatorWithTags(ss.Tags.UnsafeToReadOnlySliceString()))
 
 	return ss
 }
@@ -69,10 +68,21 @@ func (s *serieSourceMock) Count() uint64 {
 	return uint64(len(s.series))
 }
 
-//nolint:revive // TODO(AML) Fix revive linter
 func CreateSerieSource(series metrics.Series) metrics.SerieSource {
 	return &serieSourceMock{
 		series: series,
 		index:  -1,
 	}
+}
+
+// GetPayloads returns all payloads from a pipeline set, without regard for their intended destination.
+func (ps PipelineSet) GetPayloads() (payloads transaction.BytesPayloads) {
+	for _, ctx := range ps {
+		payloads = append(payloads, ctx.payloads...)
+	}
+	return
+}
+
+func testPipelines() PipelineSet {
+	return PipelineSet{{AllowAllFilter{}, false}: {}}
 }

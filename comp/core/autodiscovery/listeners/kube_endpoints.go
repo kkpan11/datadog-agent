@@ -16,7 +16,8 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/integration"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/providers/names"
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/telemetry"
-	"github.com/DataDog/datadog-agent/pkg/util/containers"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 
@@ -47,18 +48,20 @@ type KubeEndpointsListener struct {
 	delService         chan<- Service
 	targetAllEndpoints bool
 	m                  sync.RWMutex
-	containerFilters   *containerFilters
+	filterStore        workloadfilter.Component
 	telemetryStore     *telemetry.Store
 }
 
 // KubeEndpointService represents an endpoint in a Kubernetes Endpoints
 type KubeEndpointService struct {
 	entity          string
+	metadata        *workloadfilter.KubeEndpoint
 	tags            []string
 	hosts           map[string]string
-	ports           []ContainerPort
+	ports           []workloadmeta.ContainerPort
 	metricsExcluded bool
 	globalExcluded  bool
+	namespace       string
 }
 
 // Make sure KubeEndpointService implements the Service interface
@@ -82,8 +85,6 @@ func NewKubeEndpointsListener(options ServiceListernerDeps) (ServiceListener, er
 		return nil, fmt.Errorf("cannot get service informer: %s", err)
 	}
 
-	containerFilters := newContainerFilters()
-
 	return &KubeEndpointsListener{
 		endpoints:          make(map[k8stypes.UID][]*KubeEndpointService),
 		endpointsInformer:  endpointsInformer,
@@ -92,7 +93,7 @@ func NewKubeEndpointsListener(options ServiceListernerDeps) (ServiceListener, er
 		serviceLister:      serviceInformer.Lister(),
 		promInclAnnot:      getPrometheusIncludeAnnotations(),
 		targetAllEndpoints: options.Config.IsProviderEnabled(names.KubeEndpointsFileRegisterName),
-		containerFilters:   containerFilters,
+		filterStore:        options.Filter,
 		telemetryStore:     options.Telemetry,
 	}, nil
 }
@@ -213,6 +214,11 @@ func (l *KubeEndpointsListener) serviceUpdated(old, obj interface{}) {
 		l.createService(l.endpointsForService(castedObj), false)
 	}
 
+	// Detect if prometheus annotations changed
+	if l.promInclAnnot.AnnotationsDiffer(castedObj.GetAnnotations(), castedOld.GetAnnotations()) {
+		l.createService(l.endpointsForService(castedObj), false)
+	}
+
 	// Detect changes of AD labels for standard tags if the Service is annotated
 	if isServiceAnnotated(castedObj, kubeEndpointsID) && (standardTagsDigest(castedOld.GetLabels()) != standardTagsDigest(castedObj.GetLabels())) {
 		kep := l.endpointsForService(castedObj)
@@ -309,29 +315,7 @@ func (l *KubeEndpointsListener) createService(kep *v1.Endpoints, checkServiceAnn
 		tags = []string{}
 	}
 
-	eps := processEndpoints(kep, tags)
-
-	for i := 0; i < len(eps); i++ {
-		if l.containerFilters == nil {
-			eps[i].metricsExcluded = false
-			eps[i].globalExcluded = false
-			continue
-		}
-		eps[i].metricsExcluded = l.containerFilters.IsExcluded(
-			containers.MetricsFilter,
-			kep.GetAnnotations(),
-			kep.Name,
-			"",
-			kep.Namespace,
-		)
-		eps[i].globalExcluded = l.containerFilters.IsExcluded(
-			containers.GlobalFilter,
-			kep.GetAnnotations(),
-			kep.Name,
-			"",
-			kep.Namespace,
-		)
-	}
+	eps := processEndpoints(kep, tags, l.filterStore)
 
 	l.m.Lock()
 	l.endpoints[kep.UID] = eps
@@ -353,26 +337,35 @@ func (l *KubeEndpointsListener) createService(kep *v1.Endpoints, checkServiceAnn
 
 // processEndpoints parses a kubernetes Endpoints object
 // and returns a slice of KubeEndpointService per endpoint
-func processEndpoints(kep *v1.Endpoints, tags []string) []*KubeEndpointService {
+func processEndpoints(kep *v1.Endpoints, tags []string, filterStore workloadfilter.Component) []*KubeEndpointService {
 	var eps []*KubeEndpointService
+
+	filterableEndpoint := workloadfilter.CreateKubeEndpoint(kep.Name, kep.Namespace, kep.GetAnnotations())
+	metricsExcluded := filterStore.GetKubeEndpointAutodiscoveryFilters(workloadfilter.MetricsFilter).IsExcluded(filterableEndpoint)
+	globalExcluded := filterStore.GetKubeEndpointAutodiscoveryFilters(workloadfilter.GlobalFilter).IsExcluded(filterableEndpoint)
+
 	for i := range kep.Subsets {
-		ports := []ContainerPort{}
+		ports := []workloadmeta.ContainerPort{}
 		// Ports
 		for _, port := range kep.Subsets[i].Ports {
-			ports = append(ports, ContainerPort{int(port.Port), port.Name})
+			ports = append(ports, workloadmeta.ContainerPort{Port: int(port.Port), Name: port.Name})
 		}
 		// Hosts
 		for _, host := range kep.Subsets[i].Addresses {
 			// create a separate AD service per host
 			ep := &KubeEndpointService{
-				entity: apiserver.EntityForEndpoints(kep.Namespace, kep.Name, host.IP),
-				hosts:  map[string]string{"endpoint": host.IP},
-				ports:  ports,
+				entity:   apiserver.EntityForEndpoints(kep.Namespace, kep.Name, host.IP),
+				metadata: filterableEndpoint,
+				hosts:    map[string]string{"endpoint": host.IP},
+				ports:    ports,
 				tags: []string{
-					fmt.Sprintf("kube_service:%s", kep.Name),
-					fmt.Sprintf("kube_namespace:%s", kep.Namespace),
-					fmt.Sprintf("kube_endpoint_ip:%s", host.IP),
+					"kube_service:" + kep.Name,
+					"kube_namespace:" + kep.Namespace,
+					"kube_endpoint_ip:" + host.IP,
 				},
+				metricsExcluded: metricsExcluded,
+				globalExcluded:  globalExcluded,
+				namespace:       kep.Namespace,
 			}
 			ep.tags = append(ep.tags, tags...)
 			eps = append(eps, ep)
@@ -451,7 +444,7 @@ func (s *KubeEndpointService) GetServiceID() string {
 
 // GetADIdentifiers returns the service AD identifiers
 func (s *KubeEndpointService) GetADIdentifiers() []string {
-	return []string{s.entity}
+	return []string{s.entity, string(types.CelEndpointIdentifier)}
 }
 
 // GetHosts returns the pod hosts
@@ -468,9 +461,9 @@ func (s *KubeEndpointService) GetPid() (int, error) {
 }
 
 // GetPorts returns the endpoint's ports
-func (s *KubeEndpointService) GetPorts() ([]ContainerPort, error) {
+func (s *KubeEndpointService) GetPorts() ([]workloadmeta.ContainerPort, error) {
 	if s.ports == nil {
-		return []ContainerPort{}, nil
+		return []workloadmeta.ContainerPort{}, nil
 	}
 	return s.ports, nil
 }
@@ -500,11 +493,11 @@ func (s *KubeEndpointService) IsReady() bool {
 
 // HasFilter returns whether the kube endpoint should not collect certain metrics
 // due to filtering applied.
-func (s *KubeEndpointService) HasFilter(filter containers.FilterType) bool {
-	switch filter {
-	case containers.MetricsFilter:
+func (s *KubeEndpointService) HasFilter(fs workloadfilter.Scope) bool {
+	switch fs {
+	case workloadfilter.MetricsFilter:
 		return s.metricsExcluded
-	case containers.GlobalFilter:
+	case workloadfilter.GlobalFilter:
 		return s.globalExcluded
 	default:
 		return false
@@ -512,10 +505,49 @@ func (s *KubeEndpointService) HasFilter(filter containers.FilterType) bool {
 }
 
 // GetExtraConfig isn't supported
-func (s *KubeEndpointService) GetExtraConfig(_ string) (string, error) {
+func (s *KubeEndpointService) GetExtraConfig(key string) (string, error) {
+	switch key {
+	case "namespace":
+		return s.namespace, nil
+	}
 	return "", ErrNotSupported
 }
 
-// FilterTemplates does nothing.
-func (s *KubeEndpointService) FilterTemplates(map[string]integration.Config) {
+// FilterTemplates filters the given configs based on the service's CEL selector
+// and endpoint annotation precedence.
+func (s *KubeEndpointService) FilterTemplates(configs map[string]integration.Config) {
+	filterTemplatesMatched(s, configs)
+	s.filterTemplatesOverriddenChecks(configs)
+}
+
+// filterTemplatesOverriddenChecks drops DatadogInstrumentation endpoint
+// templates when an endpoint annotation configures the same integration.
+func (s *KubeEndpointService) filterTemplatesOverriddenChecks(configs map[string]integration.Config) {
+	annotationCheckNames := make(map[string]struct{})
+	for _, config := range configs {
+		if config.Provider == names.KubeEndpoints || config.Provider == names.KubeEndpointSlices {
+			annotationCheckNames[config.Name] = struct{}{}
+		}
+	}
+
+	for digest, config := range configs {
+		if config.Provider != names.KubeEndpointSlicesCR {
+			continue
+		}
+		if _, found := annotationCheckNames[config.Name]; found {
+			log.Debugf("Ignoring config from %s: endpoint annotation overrides check %s for service %s",
+				config.Source, config.Name, s.GetServiceID())
+			delete(configs, digest)
+		}
+	}
+}
+
+// GetFilterableEntity returns the filterable entity of the service
+func (s *KubeEndpointService) GetFilterableEntity() workloadfilter.Filterable {
+	return s.metadata
+}
+
+// GetImageName does nothing
+func (s *KubeEndpointService) GetImageName() string {
+	return ""
 }

@@ -6,27 +6,34 @@
 package api
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/DataDog/datadog-agent/pkg/obfuscate"
 	"github.com/DataDog/datadog-agent/pkg/trace/config"
 )
 
 // ensureKeys takes 2 maps, expect and result, and ensures that the set of keys in expect and
-// result match. For each key (k) in expect, if expect[k] is of type map[string]interface{}, then
+// result match. For each key (k) in expect, if expect[k] is of type map[string]any, then
 // ensureKeys recurses on expect[k], result[k], prefix + "." + k.
 //
 // This should ensure that whatever keys and maps are defined in expect are exactly mirrored in
 // result, but without checking for specific values in result.
-func ensureKeys(expect, result map[string]interface{}, prefix string) error {
+func ensureKeys(expect, result map[string]any, prefix string) error {
 	for k, ev := range expect {
 		rv, ok := result[k]
 		if !ok {
@@ -37,8 +44,8 @@ func ensureKeys(expect, result map[string]interface{}, prefix string) error {
 			return fmt.Errorf("expected key %s, but it is not present in the output", path)
 		}
 
-		if em, ok := ev.(map[string]interface{}); ok {
-			rm, ok := rv.(map[string]interface{})
+		if em, ok := ev.(map[string]any); ok {
+			rm, ok := rv.(map[string]any)
 			if !ok {
 				return fmt.Errorf("expected key %s to be a map, but it is '%#v'", k, rv)
 			}
@@ -67,38 +74,38 @@ func ensureKeys(expect, result map[string]interface{}, prefix string) error {
 
 func TestEnsureKeys(t *testing.T) {
 	for _, tt := range []struct {
-		expect map[string]interface{}
-		result map[string]interface{}
+		expect map[string]any
+		result map[string]any
 		err    bool
 	}{
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one": nil,
 				"two": nil,
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one": 1,
 				"two": "two",
 			},
 		},
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one":   nil,
 				"two":   nil,
 				"three": nil,
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one": 1,
 				"two": "two",
 			},
 			err: true,
 		},
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one": nil,
 				"two": nil,
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one":   1,
 				"two":   "two",
 				"three": 3,
@@ -106,61 +113,61 @@ func TestEnsureKeys(t *testing.T) {
 			err: true,
 		},
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one": nil,
 				"two": nil,
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone": nil,
 					"subtwo": nil,
 				},
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one": 1,
 				"two": "two",
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone": 1,
 					"subtwo": 2,
 				},
 			},
 		},
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one": nil,
 				"two": nil,
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone": nil,
 					"subtwo": nil,
 				},
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one": 1,
-				"two": map[string]interface{}{ // Map values not described in expect are NOT checked, so this is OK.
+				"two": map[string]any{ // Map values not described in expect are NOT checked, so this is OK.
 					"subone": 1,
 					"subtwo": 2,
 				},
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone": 1,
 					"subtwo": 2,
 				},
 			},
 		},
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one": nil,
 				"two": nil,
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone":   nil,
 					"subtwo":   nil,
 					"subthree": nil,
 				},
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one": 1,
-				"two": map[string]interface{}{ // Map values not described in expect are NOT checked, so this is OK.
+				"two": map[string]any{ // Map values not described in expect are NOT checked, so this is OK.
 					"subone": 1,
 					"subtwo": 2,
 				},
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone": 1,
 					"subtwo": 2,
 				},
@@ -168,21 +175,21 @@ func TestEnsureKeys(t *testing.T) {
 			err: true,
 		},
 		{
-			expect: map[string]interface{}{
+			expect: map[string]any{
 				"one": nil,
 				"two": nil,
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone": nil,
 					"subtwo": nil,
 				},
 			},
-			result: map[string]interface{}{
+			result: map[string]any{
 				"one": 1,
-				"two": map[string]interface{}{ // Map values not described in expect are NOT checked, so this is OK.
+				"two": map[string]any{ // Map values not described in expect are NOT checked, so this is OK.
 					"subone": 1,
 					"subtwo": 2,
 				},
-				"sub": map[string]interface{}{
+				"sub": map[string]any{
 					"subone":   1,
 					"subtwo":   2,
 					"subthree": 3,
@@ -221,6 +228,7 @@ func TestInfoHandler(t *testing.T) {
 	}
 	obfCfg := &config.ObfuscationConfig{
 		ES:                   jsonObfCfg,
+		OpenSearch:           jsonObfCfg,
 		Mongo:                jsonObfCfg,
 		SQLExecPlan:          jsonObfCfg,
 		SQLExecPlanNormalize: jsonObfCfg,
@@ -232,14 +240,27 @@ func TestInfoHandler(t *testing.T) {
 		Redis:             obfuscate.RedisConfig{Enabled: true},
 		Valkey:            obfuscate.ValkeyConfig{Enabled: true},
 		Memcached:         obfuscate.MemcachedConfig{Enabled: false},
+		CreditCards: obfuscate.CreditCardsConfig{
+			Enabled:    true,
+			Luhn:       true,
+			KeepValues: []string{"safe"},
+		},
 	}
 	conf := &config.AgentConfig{
-		Enabled:      true,
-		AgentVersion: "0.99.0",
-		GitCommit:    "fab047e10",
-		Hostname:     "test.host.name",
-		DefaultEnv:   "prod",
-		ConfigPath:   "/path/to/config",
+		ContainerTags: func(cid string) ([]string, error) {
+			if cid == "id1" {
+				return []string{"kube_cluster_name:clusterA", "kube_namespace:namespace1", "pod_name:pod1"}, nil
+			}
+			return nil, fmt.Errorf("container tags not found for %s", cid)
+		},
+		HasContainerFeatures:      true,                                     // so IDProvider reads Datadog-Container-ID header and container hash is computed
+		ContainerIDFromOriginInfo: config.NoopContainerIDFromOriginInfoFunc, // required when HasContainerFeatures for Linux
+		Enabled:                   true,
+		AgentVersion:              "0.99.0",
+		GitCommit:                 "fab047e10",
+		Hostname:                  "test.host.name",
+		DefaultEnv:                "prod",
+		ConfigPath:                "/path/to/config",
 		Endpoints: []*config.Endpoint{{
 			APIKey:  "123",
 			Host:    "https://target-intake.datadoghq.com",
@@ -274,7 +295,11 @@ func TestInfoHandler(t *testing.T) {
 		WatchdogInterval:            time.Minute,
 		ProxyURL:                    u,
 		SkipSSLValidation:           false,
-		Ignore:                      map[string][]string{"K": {"1", "2"}},
+		Ignore:                      map[string][]string{"resource": {"(GET|POST) /healthcheck", "GET /ping"}},
+		RejectTags:                  []*config.Tag{{K: "env", V: "test"}, {K: "debug", V: ""}},
+		RequireTags:                 []*config.Tag{{K: "env", V: "prod"}},
+		RejectTagsRegex:             []*config.TagRegex{{K: "version", V: regexp.MustCompile(`.*-beta`)}},
+		RequireTagsRegex:            []*config.TagRegex{{K: "version", V: regexp.MustCompile(`v1\\..*`)}},
 		ReplaceTags:                 []*config.ReplaceRule{{Name: "a", Pattern: "*", Repl: "b"}},
 		AnalyzedRateByServiceLegacy: map[string]float64{"X": 1.2},
 		AnalyzedSpansByService:      map[string]map[string]float64{"X": {"Y": 2.4}},
@@ -290,10 +315,16 @@ func TestInfoHandler(t *testing.T) {
 				},
 			},
 		},
-		Features: map[string]struct{}{"feature_flag": {}},
+		Features: map[string]struct{}{
+			"feature_flag":        {},
+			"quantize_sql_tables": {},
+			"keep_sql_alias":      {},
+			"dollar_quoted_func":  {},
+			"sqllexer":            {},
+		},
 	}
 
-	expectedKeys := map[string]interface{}{
+	expectedKeys := map[string]any{
 		"version":                   nil,
 		"git_commit":                nil,
 		"endpoints":                 nil,
@@ -306,7 +337,16 @@ func TestInfoHandler(t *testing.T) {
 		"peer_tags":                 nil,
 		"span_kinds_stats_computed": nil,
 		"obfuscation_version":       nil,
-		"config": map[string]interface{}{
+		"filter_tags": map[string]any{
+			"require": nil,
+			"reject":  nil,
+		},
+		"filter_tags_regex": map[string]any{
+			"require": nil,
+			"reject":  nil,
+		},
+		"ignore_resources": nil,
+		"config": map[string]any{
 			"default_env":               nil,
 			"target_tps":                nil,
 			"max_eps":                   nil,
@@ -319,12 +359,14 @@ func TestInfoHandler(t *testing.T) {
 			"max_memory":                nil,
 			"max_cpu":                   nil,
 			"analyzed_spans_by_service": nil,
-			"obfuscation": map[string]interface{}{
+			"obfuscation": map[string]any{
 				"elastic_search":          nil,
 				"mongo":                   nil,
 				"sql_exec_plan":           nil,
 				"sql_exec_plan_normalize": nil,
-				"http": map[string]interface{}{
+				"sql_obfuscation_mode":    nil,
+				"tag_replace_rules":       nil,
+				"http": map[string]any{
 					"remove_query_string": nil,
 					"remove_path_digits":  nil,
 				},
@@ -332,6 +374,37 @@ func TestInfoHandler(t *testing.T) {
 				"redis":               nil,
 				"valkey":              nil,
 				"memcached":           nil,
+				"credit_cards": map[string]any{
+					"enabled":     nil,
+					"luhn":        nil,
+					"keep_values": nil,
+				},
+				"sql": map[string]any{
+					"replace_digits":                   nil,
+					"keep_sql_alias":                   nil,
+					"dollar_quoted_func":               nil,
+					"keep_null":                        nil,
+					"keep_boolean":                     nil,
+					"keep_positional_parameter":        nil,
+					"keep_trailing_semicolon":          nil,
+					"keep_identifier_quotation":        nil,
+					"replace_bind_parameter":           nil,
+					"remove_space_between_parentheses": nil,
+					"keep_json_path":                   nil,
+					"obfuscation_mode":                 nil,
+				},
+				"elasticsearch": map[string]any{
+					"enabled":   nil,
+					"keep_keys": nil,
+				},
+				"opensearch": map[string]any{
+					"enabled":   nil,
+					"keep_keys": nil,
+				},
+				"mongodb": map[string]any{
+					"enabled":   nil,
+					"keep_keys": nil,
+				},
 			},
 		},
 	}
@@ -340,10 +413,317 @@ func TestInfoHandler(t *testing.T) {
 	_, h := rcv.makeInfoHandler()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/info", nil)
+	req.Header.Add("Datadog-Container-ID", "id1")
 	h.ServeHTTP(rec, req)
-	var m map[string]interface{}
-	if !assert.NoError(t, json.NewDecoder(rec.Body).Decode(&m)) {
-		return
-	}
+	var m map[string]any
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&m))
 	assert.NoError(t, ensureKeys(expectedKeys, m, ""))
+	obfuscation := m["config"].(map[string]any)["obfuscation"].(map[string]any)
+	assert.Equal(t, []any{map[string]any{"name": "a", "pattern": "*", "repl": "b"}}, obfuscation["tag_replace_rules"])
+	assert.Equal(t, map[string]any{
+		"remove_query_string": true,
+		"remove_path_digits":  true,
+	}, obfuscation["http"])
+	assert.Equal(t, map[string]any{"enabled": true, "luhn": true, "keep_values": []any{"safe"}}, obfuscation["credit_cards"])
+	assert.Equal(t, map[string]any{
+		"replace_digits":                   true,
+		"keep_sql_alias":                   true,
+		"dollar_quoted_func":               true,
+		"keep_null":                        false,
+		"keep_boolean":                     false,
+		"keep_positional_parameter":        false,
+		"keep_trailing_semicolon":          false,
+		"keep_identifier_quotation":        false,
+		"replace_bind_parameter":           false,
+		"remove_space_between_parentheses": false,
+		"keep_json_path":                   false,
+		"obfuscation_mode":                 "obfuscate_only",
+	}, obfuscation["sql"])
+	for _, key := range []string{"elasticsearch", "opensearch", "mongodb"} {
+		assert.Equal(t, map[string]any{"enabled": true, "keep_keys": []any{"a", "b", "c"}}, obfuscation[key])
+	}
+	expectedContainerHash := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join([]string{"kube_cluster_name:clusterA", "kube_namespace:namespace1"}, ","))))
+	assert.Equal(t, expectedContainerHash, rec.Header().Get(containerTagsHashHeader))
+}
+
+func TestInfoHandler_OPMAbsent(t *testing.T) {
+	conf := config.New()
+	conf.Endpoints = []*config.Endpoint{{Host: "http://localhost:8126", APIKey: "test"}}
+	rcv := newTestReceiverFromConfig(conf)
+
+	_, h := rcv.makeInfoHandler()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/info", nil)
+	h.ServeHTTP(rec, req)
+
+	var m map[string]any
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&m))
+	_, hasOPM := m["org_prop_marker"]
+	assert.False(t, hasOPM, "org_prop_marker must be absent from /info when OPM is not set")
+	obfuscation := m["config"].(map[string]any)["obfuscation"].(map[string]any)
+	assert.Nil(t, obfuscation["tag_replace_rules"])
+}
+
+func TestInfoHandler_OPMPresent(t *testing.T) {
+	conf := config.New()
+	conf.Endpoints = []*config.Endpoint{{Host: "http://localhost:8126", APIKey: "test"}}
+	rcv := newTestReceiverFromConfig(conf)
+
+	_, h := rcv.makeInfoHandler()
+	rcv.setOrgPropMarker("testOPM123")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/info", nil)
+	h.ServeHTTP(rec, req)
+
+	var m map[string]any
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&m))
+	opm, ok := m["org_prop_marker"]
+	assert.True(t, ok, "org_prop_marker should be present in /info when OPM is set")
+	assert.Equal(t, "testOPM123", opm)
+}
+
+func TestInfoHandler_AgentStateHashChanges(t *testing.T) {
+	conf := config.New()
+	conf.Endpoints = []*config.Endpoint{{Host: "http://localhost:8126", APIKey: "test"}}
+	rcv := newTestReceiverFromConfig(conf)
+
+	_, _ = rcv.makeInfoHandler()
+	hashBefore := rcv.agentState.Load()
+
+	rcv.setOrgPropMarker("newOPMValue")
+	hashAfter := rcv.agentState.Load()
+
+	assert.NotEmpty(t, hashBefore)
+	assert.NotEmpty(t, hashAfter)
+	assert.NotEqual(t, hashBefore, hashAfter, "Datadog-Agent-State hash must change when OPM is set")
+
+	// Verify the post-OPM hash is consistent with the combined compute function.
+	rcv.computeInfoAndHashMu.Lock()
+	fn := rcv.computeInfoAndHash
+	rcv.computeInfoAndHashMu.Unlock()
+	require.NotNil(t, fn)
+	_, expectedHash := fn("newOPMValue")
+	assert.Equal(t, expectedHash, hashAfter)
+}
+
+func TestInfoHandler_OPMConcurrent(t *testing.T) {
+	conf := config.New()
+	conf.Endpoints = []*config.Endpoint{{Host: "http://localhost:8126", APIKey: "test"}}
+	rcv := newTestReceiverFromConfig(conf)
+
+	_, h := rcv.makeInfoHandler()
+
+	done := make(chan struct{})
+	// Writer goroutine: repeatedly update the OPM
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			rcv.setOrgPropMarker("opm-concurrent")
+			time.Sleep(time.Microsecond)
+		}
+	}()
+
+	// 50 reader goroutines hit /info concurrently
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/info", nil)
+			h.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusOK, rec.Code)
+		}()
+	}
+	wg.Wait()
+	<-done
+}
+
+func TestInfoHandlerFilterTags(t *testing.T) {
+	conf := config.New()
+	conf.Endpoints = []*config.Endpoint{{Host: "http://localhost:8126", APIKey: "test"}}
+	conf.RequireTags = []*config.Tag{
+		{K: "env", V: "prod"},
+		{K: "team", V: "backend"},
+	}
+	conf.RejectTags = []*config.Tag{
+		{K: "env", V: "test"},
+		{K: "debug", V: ""},
+		{K: "internal", V: "true"},
+	}
+	conf.RequireTagsRegex = []*config.TagRegex{
+		{K: "service", V: regexp.MustCompile("^api-.*")},
+	}
+	conf.RejectTagsRegex = []*config.TagRegex{
+		{K: "version", V: regexp.MustCompile(".*-beta")},
+		{K: "experimental_.*", V: nil},
+	}
+	conf.Ignore = map[string][]string{
+		"resource": {"(GET|POST) /healthcheck", "GET /ping"},
+	}
+
+	rcv := newTestReceiverFromConfig(conf)
+	_, h := rcv.makeInfoHandler()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/info", nil)
+	h.ServeHTTP(rec, req)
+
+	var result map[string]any
+	assert.NoError(t, json.NewDecoder(rec.Body).Decode(&result))
+
+	// Check filter_tags
+	filterTags, ok := result["filter_tags"].(map[string]any)
+	assert.True(t, ok, "filter_tags should be present and should be a map")
+
+	requireTags, ok := filterTags["require"].([]any)
+	assert.True(t, ok, "filter_tags.require should be an array")
+	assert.Len(t, requireTags, 2)
+	assert.Contains(t, requireTags, "env:prod")
+	assert.Contains(t, requireTags, "team:backend")
+
+	rejectTags, ok := filterTags["reject"].([]any)
+	assert.True(t, ok, "filter_tags.reject should be an array")
+	assert.Len(t, rejectTags, 3)
+	assert.Contains(t, rejectTags, "env:test")
+	assert.Contains(t, rejectTags, "debug")
+	assert.Contains(t, rejectTags, "internal:true")
+
+	// Check filter_tags_regex
+	filterTagsRegex, ok := result["filter_tags_regex"].(map[string]any)
+	assert.True(t, ok, "filter_tags_regex should be present and should be a map")
+
+	requireTagsRegex, ok := filterTagsRegex["require"].([]any)
+	assert.True(t, ok, "filter_tags_regex.require should be an array")
+	assert.Len(t, requireTagsRegex, 1)
+	assert.Contains(t, requireTagsRegex, "service:^api-.*")
+
+	rejectTagsRegex, ok := filterTagsRegex["reject"].([]any)
+	assert.True(t, ok, "filter_tags_regex.reject should be an array")
+	assert.Len(t, rejectTagsRegex, 2)
+	assert.Contains(t, rejectTagsRegex, "version:.*-beta")
+	assert.Contains(t, rejectTagsRegex, "experimental_.*")
+
+	// Check ignore_resources
+	ignoreResources, ok := result["ignore_resources"].([]any)
+	assert.True(t, ok, "ignore_resources should be an array")
+	assert.Len(t, ignoreResources, 2)
+	assert.Contains(t, ignoreResources, "(GET|POST) /healthcheck")
+	assert.Contains(t, ignoreResources, "GET /ping")
+}
+
+// TestInfoHandler_CachedResponseBytes verifies that the pre-serialised response
+// cache is populated by makeInfoHandler and updated by setOrgPropMarker, and
+// that the /info handler serves exactly those bytes.
+func TestInfoHandler_CachedResponseBytes(t *testing.T) {
+	conf := config.New()
+	conf.Endpoints = []*config.Endpoint{{Host: "http://localhost:8126", APIKey: "test"}}
+	rcv := newTestReceiverFromConfig(conf)
+
+	_, h := rcv.makeInfoHandler()
+
+	// After makeInfoHandler, the cache should be populated with valid JSON.
+	initialBytes, ok := rcv.cachedInfoResponse.Load().([]byte)
+	require.True(t, ok, "cachedInfoResponse should be []byte after makeInfoHandler")
+	require.NotEmpty(t, initialBytes)
+
+	var initialPayload map[string]any
+	require.NoError(t, json.Unmarshal(initialBytes, &initialPayload))
+	_, hasOPM := initialPayload["org_prop_marker"]
+	assert.False(t, hasOPM, "org_prop_marker should be absent from cached bytes before OPM is set")
+
+	// Datadog-Agent-State must equal SHA-256 of the response body.
+	initialHash := rcv.agentState.Load()
+	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256(initialBytes)), initialHash,
+		"agentState must be SHA-256 of the cached response body")
+
+	// After setOrgPropMarker, the cache should be refreshed with the OPM included.
+	rcv.setOrgPropMarker("cached-opm-value")
+
+	updatedBytes, ok := rcv.cachedInfoResponse.Load().([]byte)
+	require.True(t, ok, "cachedInfoResponse should still be []byte after setOrgPropMarker")
+	require.NotEmpty(t, updatedBytes)
+	assert.NotEqual(t, initialBytes, updatedBytes, "cached bytes should change when OPM is set")
+
+	var updatedPayload map[string]any
+	require.NoError(t, json.Unmarshal(updatedBytes, &updatedPayload))
+	opm, hasOPM := updatedPayload["org_prop_marker"]
+	assert.True(t, hasOPM, "org_prop_marker should be present in cached bytes after OPM is set")
+	assert.Equal(t, "cached-opm-value", opm)
+
+	// After OPM update, agentState must still equal SHA-256 of the (now-updated) body.
+	updatedHash := rcv.agentState.Load()
+	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256(updatedBytes)), updatedHash,
+		"agentState must be SHA-256 of the updated response body after OPM is set")
+
+	// The handler should serve the same bytes as what is in the cache.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/info", nil)
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, string(updatedBytes), rec.Body.String(), "handler response body must match cached bytes")
+	assert.Equal(t, strconv.Itoa(len(updatedBytes)), rec.Header().Get("Content-Length"))
+}
+
+// TestInfoHandler_CustomObfuscationConfig ensures that when a custom obfuscation
+// config that affects the way stats are obfuscated is passed,
+// the obfuscation_version is set to 2 as a hacky way to force disable client-side stats obfuscation.
+//
+// see https://docs.google.com/document/d/1i-CQfkF-5B_8vLYepIJ6A16aRISH-Px7XIBSq0HKMaY/edit?tab=t.0 solution 2.
+func TestInfoHandler_CustomObfuscationConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name                   string
+		obfuscationConfig      *config.ObfuscationConfig
+		features               map[string]struct{}
+		sqlObfuscationMode     string
+		wantObfuscationVersion int
+	}{
+		{
+			name:                   "Default obfuscation config has obfuscation_version = 1 (current obfuscate.Version)",
+			obfuscationConfig:      nil,
+			wantObfuscationVersion: obfuscate.Version,
+		},
+		{
+			name:                   "Custom obfuscation config that changes the effective SQL obfuscation mode has obfuscation_version = 2",
+			sqlObfuscationMode:     string(obfuscate.ObfuscateOnly),
+			wantObfuscationVersion: 2,
+		},
+		{
+			name: "Custom obfuscation config that doesn't affect stats has obfuscation_version = 1 (current obfuscate.Version)",
+			obfuscationConfig: &config.ObfuscationConfig{
+				HTTP: obfuscate.HTTPConfig{
+					RemoveQueryString: true,
+					RemovePathDigits:  true,
+				},
+				RemoveStackTraces: true,
+				Memcached:         obfuscate.MemcachedConfig{Enabled: false},
+			},
+			wantObfuscationVersion: obfuscate.Version,
+		},
+		{
+			name:                   "Table name collection has obfuscation_version = 1 (current obfuscate.Version)",
+			features:               map[string]struct{}{"table_names": {}},
+			wantObfuscationVersion: obfuscate.Version,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := config.New()
+			conf.Obfuscation = tt.obfuscationConfig
+			if tt.features != nil {
+				conf.Features = tt.features
+			}
+			conf.SQLObfuscationMode = tt.sqlObfuscationMode
+			rcv := newTestReceiverFromConfig(conf)
+			_, h := rcv.makeInfoHandler()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/info", nil)
+			req.Header.Add("Datadog-Container-ID", "id1")
+			h.ServeHTTP(rec, req)
+			var m map[string]any
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&m))
+
+			actual := int(m["obfuscation_version"].(float64))
+			assert.Equal(t, tt.wantObfuscationVersion, actual, "Unexpected obfuscation version")
+		})
+	}
 }

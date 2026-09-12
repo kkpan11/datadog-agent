@@ -9,8 +9,10 @@ package kubernetesresourceparsers
 
 import (
 	"regexp"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/util/gpu"
@@ -23,7 +25,7 @@ type podParser struct {
 
 // NewPodParser creates and returns a pod parser based on annotations exclusion list
 func NewPodParser(annotationsExclude []string) (ObjectParser, error) {
-	filters, err := parseFilters(annotationsExclude)
+	filters, err := ParseFilters(annotationsExclude)
 	if err != nil {
 		return nil, err
 	}
@@ -31,15 +33,57 @@ func NewPodParser(annotationsExclude []string) (ObjectParser, error) {
 	return podParser{annotationsFilter: filters}, nil
 }
 
+// ResizePolicyFromContainerResizePolicy converts a container's resize policy rules to the
+// workloadmeta representation.
+func ResizePolicyFromContainerResizePolicy(rules []corev1.ContainerResizePolicy) workloadmeta.ContainerResizePolicy {
+	policy := workloadmeta.ContainerResizePolicy{}
+	for _, rule := range rules {
+		switch rule.ResourceName {
+		case corev1.ResourceCPU:
+			policy.CPURestartPolicy = string(rule.RestartPolicy)
+		case corev1.ResourceMemory:
+			policy.MemoryRestartPolicy = string(rule.RestartPolicy)
+		}
+	}
+	return policy
+}
+
 func (p podParser) Parse(obj interface{}) workloadmeta.Entity {
 	pod := obj.(*corev1.Pod)
 	owners := make([]workloadmeta.KubernetesPodOwner, 0, len(pod.OwnerReferences))
 	for _, o := range pod.OwnerReferences {
+		gv, _ := schema.ParseGroupVersion(o.APIVersion)
 		owners = append(owners, workloadmeta.KubernetesPodOwner{
-			Kind: o.Kind,
-			Name: o.Name,
-			ID:   string(o.UID),
+			Kind:  o.Kind,
+			Name:  o.Name,
+			ID:    string(o.UID),
+			Group: gv.Group,
 		})
+	}
+
+	var ready bool
+	var readyTimestamp *time.Time
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			if condition.Status == corev1.ConditionTrue {
+				ready = true
+				// Leave readyTimestamp nil when the transition time is unknown (omitted/zero),
+				// so the warmup gate treats the readiness time as unknown rather than year 1.
+				if !condition.LastTransitionTime.IsZero() {
+					t := condition.LastTransitionTime.Time
+					readyTimestamp = &t
+				}
+			}
+			break
+		}
+	}
+
+	// DeletionTimestamp is set once the pod is terminating; cluster-agent workload autoscaling
+	// uses it to exclude terminating pods from its replica calculation (matching the HPA).
+	var deletionTimestamp *time.Time
+	if pod.DeletionTimestamp != nil {
+		t := pod.DeletionTimestamp.Time
+		deletionTimestamp = &t
 	}
 
 	var pvcNames []string
@@ -79,6 +123,13 @@ func (p podParser) Parse(obj interface{}) workloadmeta.Entity {
 		if memoryReq, found := container.Resources.Requests[corev1.ResourceMemory]; found {
 			c.Resources.MemoryRequest = kubernetes.FormatMemoryRequests(memoryReq)
 		}
+		if cpuLimit, found := container.Resources.Limits[corev1.ResourceCPU]; found {
+			c.Resources.CPULimit = kubernetes.FormatCPURequests(cpuLimit)
+		}
+		if memoryLimit, found := container.Resources.Limits[corev1.ResourceMemory]; found {
+			c.Resources.MemoryLimit = kubernetes.FormatMemoryRequests(memoryLimit)
+		}
+		c.ResizePolicy = ResizePolicyFromContainerResizePolicy(container.ResizePolicy)
 		containersList = append(containersList, c)
 	}
 
@@ -90,33 +141,22 @@ func (p podParser) Parse(obj interface{}) workloadmeta.Entity {
 		EntityMeta: workloadmeta.EntityMeta{
 			Name:        pod.Name,
 			Namespace:   pod.Namespace,
-			Annotations: filterMapStringKey(pod.Annotations, p.annotationsFilter),
+			Annotations: FilterMapStringKey(pod.Annotations, p.annotationsFilter),
 			Labels:      pod.Labels,
 		},
 		Phase:                      string(pod.Status.Phase),
 		Owners:                     owners,
 		PersistentVolumeClaimNames: pvcNames,
-		Ready:                      isPodReady(pod),
+		Ready:                      ready,
 		IP:                         pod.Status.PodIP,
 		PriorityClass:              pod.Spec.PriorityClassName,
 		QOSClass:                   string(pod.Status.QOSClass),
 		RuntimeClass:               rtcName,
 		GPUVendorList:              gpuVendorList,
 		Containers:                 containersList,
+		CreationTimestamp:          pod.CreationTimestamp.Time,
+		ReadyTimestamp:             readyTimestamp,
+		DeletionTimestamp:          deletionTimestamp,
+		NodeName:                   pod.Spec.NodeName,
 	}
-}
-
-// Should be aligned with pkg/util/kubernetes/kubelet/kubelet.go
-// (Except the static pods that should go away as fixed long time ago)
-func isPodReady(pod *corev1.Pod) bool {
-	if pod.Status.Phase != corev1.PodRunning {
-		return false
-	}
-
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }

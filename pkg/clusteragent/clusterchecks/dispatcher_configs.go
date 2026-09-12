@@ -12,6 +12,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/clusteragent/clusterchecks/types"
 	checkid "github.com/DataDog/datadog-agent/pkg/collector/check/id"
 	le "github.com/DataDog/datadog-agent/pkg/util/kubernetes/apiserver/leaderelection/metrics"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // getAllConfigs returns all configurations known to the store, for reporting
@@ -22,20 +23,95 @@ func (d *dispatcher) getAllConfigs() ([]integration.Config, error) {
 	return makeConfigArray(d.store.digestToConfig), nil
 }
 
-func (d *dispatcher) getState() (types.StateResponse, error) {
+// nodeConfigsSnapshot holds a node's configs and precomputed instance IDs,
+// copied out of the store so scrubbing can happen without holding d.store's lock.
+type nodeConfigsSnapshot struct {
+	name        string
+	rawConfigs  []integration.Config
+	instanceIDs [][]string
+	stats       types.CLCRunnersStats
+}
+
+func (d *dispatcher) getState(scrub bool) (types.StateResponse, error) {
+	// Copy data out while holding the lock, then scrub after releasing it.
+	// Scrubbing is an O(instances) operation and would otherwise starve
+	// writers like expireNodes and updateLeaderIP.
 	d.store.RLock()
-	defer d.store.RUnlock()
+	danglingConf := makeConfigArrayFromDangling(d.store.danglingConfigs)
+	warmup := !d.store.active
+
+	nodeSnapshots := make([]nodeConfigsSnapshot, 0, len(d.store.nodes))
+	for _, node := range d.store.nodes {
+		rawConfigs := makeConfigArray(node.digestToConfig)
+
+		// Copy runner stats for this node. Stats are populated by the periodic
+		// rebalance cycle when advanced dispatching is enabled. Without advanced
+		// dispatching or when the runner is unreachable, stats will be empty.
+		// Take node read lock to avoid concurrent map read/write with updateRunnersStats.
+		var stats types.CLCRunnersStats
+		node.RLock()
+		if len(node.clcRunnerStats) > 0 {
+			stats = make(types.CLCRunnersStats, len(node.clcRunnerStats))
+			for k, v := range node.clcRunnerStats {
+				stats[k] = v
+			}
+		}
+		node.RUnlock()
+
+		nodeSnapshots = append(nodeSnapshots, nodeConfigsSnapshot{
+			name:       node.name,
+			rawConfigs: rawConfigs,
+			stats:      stats,
+		})
+	}
+	d.store.RUnlock()
+
+	// IDs must be computed before scrubbing, since scrubbing changes the
+	// digest. BuildID unmarshals YAML, so do this after releasing d.store.
+	for i, snap := range nodeSnapshots {
+		instanceIDs := make([][]string, len(snap.rawConfigs))
+		for j, config := range snap.rawConfigs {
+			digest := config.FastDigest()
+			ids := make([]string, 0, len(config.Instances))
+			for _, inst := range config.Instances {
+				ids = append(ids, string(checkid.BuildID(config.Name, digest, inst, config.InitConfig)))
+			}
+			instanceIDs[j] = ids
+		}
+		nodeSnapshots[i].instanceIDs = instanceIDs
+	}
+
+	if scrub {
+		scrubbedConf := make([]integration.Config, 0, len(danglingConf))
+		for _, config := range danglingConf {
+			scrubbedConf = append(scrubbedConf, integration.ScrubCheckConfig(config, log.NewWrapper(1)))
+		}
+		danglingConf = scrubbedConf
+	}
 
 	response := types.StateResponse{
-		Warmup:   !d.store.active,
-		Dangling: makeConfigArrayFromDangling(d.store.danglingConfigs),
+		Warmup:   warmup,
+		Dangling: danglingConf,
 	}
-	for _, node := range d.store.nodes {
-		n := types.StateNodeResponse{
-			Name:    node.name,
-			Configs: makeConfigArray(node.digestToConfig),
+
+	for _, snap := range nodeSnapshots {
+		configsWithIDs := make([]types.ConfigWithInstanceIDs, 0, len(snap.rawConfigs))
+		for i, config := range snap.rawConfigs {
+			if scrub {
+				config = integration.ScrubCheckConfig(config, log.NewWrapper(1))
+			}
+
+			configsWithIDs = append(configsWithIDs, types.ConfigWithInstanceIDs{
+				InstanceIDs: snap.instanceIDs[i],
+				Config:      config,
+			})
 		}
-		response.Nodes = append(response.Nodes, n)
+
+		response.Nodes = append(response.Nodes, types.StateNodeResponse{
+			Name:    snap.name,
+			Configs: configsWithIDs,
+			Stats:   snap.stats,
+		})
 	}
 
 	return response, nil
@@ -190,13 +266,4 @@ func (d *dispatcher) patchConfiguration(in integration.Config) (integration.Conf
 	}
 
 	return out, nil
-}
-
-// getConfigAndDigest returns config and digest of a check by checkID
-func (d *dispatcher) getConfigAndDigest(checkID string) (integration.Config, string) {
-	d.store.RLock()
-	defer d.store.RUnlock()
-
-	digest := d.store.idToDigest[checkid.ID(checkID)]
-	return d.store.digestToConfig[digest], digest
 }

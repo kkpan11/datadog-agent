@@ -9,7 +9,6 @@ package hostgpuimpl
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -17,12 +16,12 @@ import (
 	api "github.com/DataDog/datadog-agent/comp/api/api/def"
 	"github.com/DataDog/datadog-agent/comp/core/config"
 	flaretypes "github.com/DataDog/datadog-agent/comp/core/flare/types"
-	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface"
+	"github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	hostgpu "github.com/DataDog/datadog-agent/comp/metadata/hostgpu/def"
 	"github.com/DataDog/datadog-agent/comp/metadata/internal/util"
-	"github.com/DataDog/datadog-agent/comp/metadata/runner/runnerimpl"
+	runnerdef "github.com/DataDog/datadog-agent/comp/metadata/runner/def"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/serializer/marshaler"
 	httputils "github.com/DataDog/datadog-agent/pkg/util/http"
@@ -32,16 +31,18 @@ import (
 const flareFileName = "hostgpu.json"
 
 type gpuDeviceMetadata struct {
-	Index         int    `json:"gpu_index"`
-	Vendor        string `json:"gpu_vendor"`
-	Name          string `json:"gpu_device"`
-	DriverVersion string `json:"gpu_driver_version"`
-	UUID          string `json:"gpu_uuid"`
-	Architecture  string `json:"gpu_architecture"`
-
-	ComputeVersion string `json:"gpu_compute_version"` //e.g: in nvidia this refers to Compute Capability
-	TotalCores     int    `json:"gpu_total_cores"`
-
+	Index              int    `json:"gpu_index"`
+	Vendor             string `json:"gpu_vendor"`
+	Name               string `json:"gpu_device"`
+	DriverVersion      string `json:"gpu_driver_version"`
+	UUID               string `json:"gpu_uuid"`
+	Architecture       string `json:"gpu_architecture"`
+	GPUType            string `json:"gpu_type"`
+	SlicingMode        string `json:"gpu_slicing_mode"`
+	VirtualizationMode string `json:"gpu_virtualization_mode"`
+	ComputeVersion     string `json:"gpu_compute_version"` //e.g: in nvidia this refers to Compute Capability
+	TotalCores         int    `json:"gpu_total_cores"`
+	ParentGPUUUID      string `json:"gpu_parent_uuid"`
 	//Total device memory in bytes
 	TotalMemory        uint64 `json:"device_total_memory"`
 	MaxSMClockRate     uint32 `json:"device_max_sm_clock_rate"`
@@ -68,12 +69,6 @@ func (p *Payload) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*PayloadAlias)(p))
 }
 
-// SplitPayload implements marshaler.AbstractMarshaler#SplitPayload.
-// In this case, the payload can't be split any further.
-func (p *Payload) SplitPayload(_ int) ([]marshaler.AbstractMarshaler, error) {
-	return nil, fmt.Errorf("could not split inventories host gpu payload any more, payload is too big for intake")
-}
-
 type gpuHost struct {
 	util.InventoryPayload
 
@@ -96,13 +91,13 @@ type Requires struct {
 // Provides defines the output of the hostgpu component
 type Provides struct {
 	Comp          hostgpu.Component
-	Provider      runnerimpl.Provider
+	Provider      runnerdef.Provider
 	FlareProvider flaretypes.Provider
 	Endpoint      api.AgentEndpointProvider
 }
 
-// NewGPUHostProvider creates a new hostgpu component
-func NewGPUHostProvider(deps Requires) Provides {
+// NewComponent creates a new hostgpu component
+func NewComponent(deps Requires) Provides {
 	hname, _ := deps.Hostname.Get(context.Background())
 	gh := &gpuHost{
 		conf:     deps.Config,
@@ -143,6 +138,10 @@ func (gh *gpuHost) fillData() {
 			TotalCores:         gpu.TotalCores,
 			TotalMemory:        gpu.TotalMemory,
 			MemoryBusWidth:     gpu.MemoryBusWidth,
+			GPUType:            gpu.GPUType,
+			SlicingMode:        gpu.SlicingMode(),
+			VirtualizationMode: gpu.VirtualizationMode,
+			ParentGPUUUID:      gpu.ParentGPUUUID,
 			MaxSMClockRate:     gpu.MaxClockRates[workloadmeta.GPUSM],
 			MaxMemoryClockRate: gpu.MaxClockRates[workloadmeta.GPUMemory],
 		}

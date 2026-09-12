@@ -1,0 +1,39 @@
+{
+  "type": "index",
+  "operation": "",
+  "left": {
+    "type": "filter",
+    "operation": "",
+    "left": {
+      "type": "ref",
+      "ref": "collection",
+      "operation": "",
+      "error": ""
+    },
+    "right": {
+      "type": "gt",
+      "operation": "",
+      "left": {
+        "type": "ref",
+        "ref": "@it",
+        "operation": "",
+        "error": ""
+      },
+      "right": {
+        "type": "literal",
+        "operation": "",
+        "value": 2,
+        "error": ""
+      },
+      "error": ""
+    },
+    "error": ""
+  },
+  "right": {
+    "type": "literal",
+    "operation": "",
+    "value": 0,
+    "error": ""
+  },
+  "error": ""
+}

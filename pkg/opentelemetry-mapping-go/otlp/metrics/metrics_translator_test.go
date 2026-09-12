@@ -16,15 +16,11 @@ package metrics
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
-	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
-	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
-	"github.com/DataDog/datadog-agent/pkg/util/quantile"
-	"github.com/DataDog/datadog-agent/pkg/util/quantile/summary"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
@@ -32,6 +28,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
+	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
+	"github.com/DataDog/datadog-agent/pkg/util/quantile"
+	"github.com/DataDog/datadog-agent/pkg/util/quantile/summary"
 )
 
 func TestIsCumulativeMonotonic(t *testing.T) {
@@ -99,7 +101,7 @@ func (t testProvider) Source(context.Context) (source.Source, error) {
 	}, nil
 }
 
-func newTranslatorWithStatsChannel(t *testing.T, logger *zap.Logger, ch chan []byte) *Translator {
+func newTranslatorWithStatsChannel(t *testing.T, logger *zap.Logger, ch chan []byte) *defaultTranslator {
 	options := []TranslatorOption{
 		WithFallbackSourceProvider(testProvider(fallbackHostname)),
 		WithHistogramMode(HistogramModeDistributions),
@@ -113,17 +115,17 @@ func newTranslatorWithStatsChannel(t *testing.T, logger *zap.Logger, ch chan []b
 
 	attributesTranslator, err := attributes.NewTranslator(set)
 	require.NoError(t, err)
-	tr, err := NewTranslator(
+	tr, err := NewDefaultTranslator(
 		set,
 		attributesTranslator,
 		options...,
 	)
 
 	require.NoError(t, err)
-	return tr
+	return tr.(*defaultTranslator)
 }
 
-func newTranslator(t *testing.T, logger *zap.Logger) *Translator {
+func newTranslator(t *testing.T, logger *zap.Logger) *defaultTranslator {
 	return newTranslatorWithStatsChannel(t, logger, nil)
 }
 
@@ -131,6 +133,7 @@ type metric struct {
 	name      string
 	typ       DataType
 	timestamp uint64
+	interval  int64
 	value     float64
 	tags      []string
 	host      string
@@ -140,11 +143,12 @@ type sketch struct {
 	name      string
 	basic     summary.Summary
 	timestamp uint64
+	interval  int64
 	tags      []string
 	host      string
 }
 
-var _ TimeSeriesConsumer = (*mockTimeSeriesConsumer)(nil)
+var _ Consumer = (*mockTimeSeriesConsumer)(nil)
 
 type mockTimeSeriesConsumer struct {
 	metrics []metric
@@ -155,6 +159,7 @@ func (m *mockTimeSeriesConsumer) ConsumeTimeSeries(
 	dimensions *Dimensions,
 	typ DataType,
 	ts uint64,
+	interval int64,
 	val float64,
 ) {
 	m.metrics = append(m.metrics,
@@ -162,11 +167,39 @@ func (m *mockTimeSeriesConsumer) ConsumeTimeSeries(
 			name:      dimensions.Name(),
 			typ:       typ,
 			timestamp: ts,
+			interval:  interval,
 			value:     val,
 			tags:      dimensions.Tags(),
 			host:      dimensions.Host(),
 		},
 	)
+}
+
+func (m *mockTimeSeriesConsumer) ConsumeSketch(
+	_ context.Context,
+	_ *Dimensions,
+	_ uint64,
+	_ int64,
+	_ *quantile.Sketch,
+) {
+	panic("unexpected method call to `ConsumeSketch` on mock consumer")
+}
+
+func (m *mockTimeSeriesConsumer) ConsumeExplicitBoundHistogram(
+	_ context.Context,
+	_ *Dimensions,
+	_ pmetric.HistogramDataPointSlice,
+) {
+	panic("unexpected method call to `ConsumeExplicitBoundHistogram` on mock consumer")
+}
+
+func (m *mockTimeSeriesConsumer) ConsumeExponentialHistogram(
+	_ context.Context,
+	_ *Dimensions,
+	_ pmetric.ExponentialHistogramDataPointSlice,
+
+) {
+	panic("unexpected method call to `ConsumeExponentialHistogram` on mock consumer")
 }
 
 func newDims(name string) *Dimensions {
@@ -204,7 +237,7 @@ func TestMapIntMetrics(t *testing.T) {
 
 	consumer := &mockTimeSeriesConsumer{}
 	dims := newDims("int64.test")
-	tr.mapNumberMetrics(ctx, consumer, dims, Gauge, slice)
+	tr.getMapper().MapNumberMetrics(ctx, consumer, dims, Gauge, slice)
 	assert.ElementsMatch(t,
 		consumer.metrics,
 		[]metric{newGauge(dims, uint64(ts), 17)},
@@ -212,7 +245,7 @@ func TestMapIntMetrics(t *testing.T) {
 
 	consumer = &mockTimeSeriesConsumer{}
 	dims = newDims("int64.delta.test")
-	tr.mapNumberMetrics(ctx, consumer, dims, Count, slice)
+	tr.getMapper().MapNumberMetrics(ctx, consumer, dims, Count, slice)
 	assert.ElementsMatch(t,
 		consumer.metrics,
 		[]metric{newCount(dims, uint64(ts), 17)},
@@ -221,7 +254,7 @@ func TestMapIntMetrics(t *testing.T) {
 	// With attribute tags
 	consumer = &mockTimeSeriesConsumer{}
 	dims = &Dimensions{name: "int64.test", tags: []string{"attribute_tag:attribute_value"}}
-	tr.mapNumberMetrics(ctx, consumer, dims, Gauge, slice)
+	tr.getMapper().MapNumberMetrics(ctx, consumer, dims, Gauge, slice)
 	assert.ElementsMatch(t,
 		consumer.metrics,
 		[]metric{newGauge(dims, uint64(ts), 17)},
@@ -239,7 +272,7 @@ func TestMapDoubleMetrics(t *testing.T) {
 
 	consumer := &mockTimeSeriesConsumer{}
 	dims := newDims("float64.test")
-	tr.mapNumberMetrics(ctx, consumer, dims, Gauge, slice)
+	tr.getMapper().MapNumberMetrics(ctx, consumer, dims, Gauge, slice)
 	assert.ElementsMatch(t,
 		consumer.metrics,
 		[]metric{newGauge(dims, uint64(ts), math.Pi)},
@@ -247,7 +280,7 @@ func TestMapDoubleMetrics(t *testing.T) {
 
 	consumer = &mockTimeSeriesConsumer{}
 	dims = newDims("float64.delta.test")
-	tr.mapNumberMetrics(ctx, consumer, dims, Count, slice)
+	tr.getMapper().MapNumberMetrics(ctx, consumer, dims, Count, slice)
 	assert.ElementsMatch(t,
 		consumer.metrics,
 		[]metric{newCount(dims, uint64(ts), math.Pi)},
@@ -256,7 +289,7 @@ func TestMapDoubleMetrics(t *testing.T) {
 	// With attribute tags
 	consumer = &mockTimeSeriesConsumer{}
 	dims = &Dimensions{name: "float64.test", tags: []string{"attribute_tag:attribute_value"}}
-	tr.mapNumberMetrics(ctx, consumer, dims, Gauge, slice)
+	tr.getMapper().MapNumberMetrics(ctx, consumer, dims, Gauge, slice)
 	assert.ElementsMatch(t,
 		consumer.metrics,
 		[]metric{newGauge(dims, uint64(ts), math.Pi)},
@@ -967,6 +1000,66 @@ func TestMapIntMonotonicReportRateForFirstValue(t *testing.T) {
 	assert.Empty(t, rmt.Languages)
 }
 
+func secondsAfterStart(i int) pcommon.Timestamp {
+	return seconds(int(getProcessStartTime()) + 1 + i)
+}
+
+func buildIntPoints(startTs int, deltas []int64) pmetric.NumberDataPointSlice {
+	slice := pmetric.NewNumberDataPointSlice()
+	val := int64(0)
+	for i, delta := range deltas {
+		val += delta
+		point := slice.AppendEmpty()
+		point.SetStartTimestamp(secondsAfterStart(startTs))
+		point.SetTimestamp(secondsAfterStart(i + 1))
+		point.SetIntValue(val)
+	}
+	return slice
+}
+
+// Regression Test: Check initial point drop behavior based on the value of
+// InitialCumulMonoValueMode and whether the metric series started before or after the Agent.
+// Notably, we want to make sure that the "auto" value drops the initial point iff the series
+// started before the metrics translator.
+func TestInitialCumulMonoValueMode(t *testing.T) {
+	ctx := context.Background()
+
+	deltas := []int64{1, 2, 3}
+
+	agentRestartInput := buildIntPoints(-20, deltas)
+	appRestartInput := buildIntPoints(0, deltas)
+
+	var keepOutput []metric
+	for i, delta := range deltas {
+		keepOutput = append(keepOutput, newCount(exampleDims, uint64(secondsAfterStart(i+1)), float64(delta)))
+	}
+	dropOutput := keepOutput[1:]
+
+	type testCase struct {
+		name   string
+		mode   InitialCumulMonoValueMode
+		input  pmetric.NumberDataPointSlice
+		output []metric
+	}
+	testCases := []testCase{
+		{"auto/agent-restart", InitialCumulMonoValueModeAuto, agentRestartInput, dropOutput},
+		{"auto/app-restart", InitialCumulMonoValueModeAuto, appRestartInput, keepOutput},
+		{"drop/agent-restart", InitialCumulMonoValueModeDrop, agentRestartInput, dropOutput},
+		{"drop/app-restart", InitialCumulMonoValueModeDrop, appRestartInput, dropOutput},
+		{"keep/agent-restart", InitialCumulMonoValueModeKeep, agentRestartInput, keepOutput},
+		{"keep/app-restart", InitialCumulMonoValueModeKeep, appRestartInput, keepOutput},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTranslator(t, zap.NewNop())
+			tr.cfg.InitialCumulMonoValueMode = tc.mode
+			consumer := mockFullConsumer{}
+			tr.mapNumberMonotonicMetrics(ctx, &consumer, exampleDims, tc.input)
+			assert.Equal(t, tc.output, consumer.metrics)
+		})
+	}
+}
+
 func TestMapRuntimeMetricsHasMapping(t *testing.T) {
 	ctx := context.Background()
 	tr := newTranslator(t, zap.NewNop())
@@ -1323,6 +1416,78 @@ func TestMapRuntimeMetricsNoMapping(t *testing.T) {
 		},
 	)
 	assert.Empty(t, rmt.Languages)
+}
+
+func TestWithRuntimeMetricMappings(t *testing.T) {
+	tests := []struct {
+		name         string
+		mappedName   string
+		withMappings bool
+		expectedLang string
+	}{
+		{
+			name:         "process.runtime.go.goroutines",
+			withMappings: true,
+			mappedName:   "runtime.go.num_goroutine",
+			expectedLang: "go",
+		},
+		{
+			name: "process.runtime.go.goroutines",
+		},
+		{
+			name:         "process.runtime.dotnet.exceptions.count",
+			withMappings: true,
+			mappedName:   "runtime.dotnet.exceptions.count",
+			expectedLang: "dotnet",
+		},
+		{
+			name: "process.runtime.dotnet.exceptions.count",
+		},
+		{
+			name:         "jvm.thread.count",
+			withMappings: true,
+			mappedName:   "jvm.thread_count",
+			expectedLang: "jvm",
+		},
+		{
+			name: "jvm.thread.count",
+		},
+		{
+			name:         "process.runtime.jvm.threads.count",
+			withMappings: true,
+			mappedName:   "jvm.thread_count",
+			expectedLang: "jvm",
+		},
+		{
+			name: "process.runtime.jvm.threads.count",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s/%v", tt.name, tt.withMappings), func(t *testing.T) {
+			var opts []TranslatorOption
+			if !tt.withMappings {
+				opts = append(opts, WithoutRuntimeMetricMappings())
+			}
+			tr := NewTestTranslator(t, opts...)
+			consumer := &mockTimeSeriesConsumer{}
+			metric := createTestMetricWithAttributes(tt.name, pmetric.MetricTypeGauge, nil, 1)
+
+			rmt, err := tr.MapMetrics(t.Context(), metric, consumer, nil)
+			require.NoError(t, err)
+
+			if tt.withMappings {
+				require.Len(t, consumer.metrics, 2)
+				assert.Equal(t, tt.name, consumer.metrics[0].name)
+				assert.Equal(t, tt.mappedName, consumer.metrics[1].name)
+				assert.Equal(t, []string{tt.expectedLang}, rmt.Languages)
+			} else {
+				require.Len(t, consumer.metrics, 1)
+				assert.Equal(t, tt.name, consumer.metrics[0].name)
+				assert.Empty(t, rmt.Languages)
+			}
+		})
+	}
 }
 
 func TestMapSystemMetrics(t *testing.T) {
@@ -1909,7 +2074,23 @@ func TestMapAPMStatsWithBytes(t *testing.T) {
 	logger, err := zap.NewDevelopment()
 	require.NoError(t, err)
 	ch := make(chan []byte, 10)
-	tr := newTranslatorWithStatsChannel(t, logger, ch)
+
+	options := []TranslatorOption{
+		WithFallbackSourceProvider(testProvider(fallbackHostname)),
+		WithHistogramMode(HistogramModeDistributions),
+		WithNumberMode(NumberModeCumulativeToDelta),
+		WithHistogramAggregations(),
+		WithStatsOut(ch),
+	}
+
+	set := componenttest.NewNopTelemetrySettings()
+	set.Logger = logger
+
+	attributesTranslator, err := attributes.NewTranslator(set)
+	require.NoError(t, err)
+	tr, err := NewTranslator(set, attributesTranslator, options...)
+	require.NoError(t, err)
+
 	want := &pb.StatsPayload{
 		Stats: []*pb.ClientStatsPayload{statsPayloads[0], statsPayloads[1]},
 	}
@@ -1991,19 +2172,20 @@ func TestMapDoubleMonotonicOutOfOrder(t *testing.T) {
 	)
 }
 
-var _ SketchConsumer = (*mockFullConsumer)(nil)
+var _ Consumer = (*mockFullConsumer)(nil)
 
 type mockFullConsumer struct {
 	mockTimeSeriesConsumer
 	sketches []sketch
 }
 
-func (c *mockFullConsumer) ConsumeSketch(_ context.Context, dimensions *Dimensions, ts uint64, sk *quantile.Sketch) {
+func (c *mockFullConsumer) ConsumeSketch(_ context.Context, dimensions *Dimensions, ts uint64, interval int64, sk *quantile.Sketch) {
 	c.sketches = append(c.sketches,
 		sketch{
 			name:      dimensions.Name(),
 			basic:     sk.Basic,
 			timestamp: ts,
+			interval:  interval,
 			tags:      dimensions.Tags(),
 			host:      dimensions.Host(),
 		},
@@ -2023,7 +2205,8 @@ func TestLegacyBucketsTags(t *testing.T) {
 	pointOne.SetTimestamp(seconds(0))
 	consumer := &mockTimeSeriesConsumer{}
 	dims := &Dimensions{name: "test.histogram.one", tags: tags}
-	tr.getLegacyBuckets(ctx, consumer, dims, pointOne, true)
+	mapper := tr.getMapper().(*defaultMapper)
+	mapper.getLegacyBuckets(ctx, consumer, dims, pointOne, true)
 	seriesOne := consumer.metrics
 
 	pointTwo := pmetric.NewHistogramDataPoint()
@@ -2032,11 +2215,204 @@ func TestLegacyBucketsTags(t *testing.T) {
 	pointTwo.SetTimestamp(seconds(0))
 	consumer = &mockTimeSeriesConsumer{}
 	dims = &Dimensions{name: "test.histogram.two", tags: tags}
-	tr.getLegacyBuckets(ctx, consumer, dims, pointTwo, true)
+	mapper.getLegacyBuckets(ctx, consumer, dims, pointTwo, true)
 	seriesTwo := consumer.metrics
 
 	assert.ElementsMatch(t, seriesOne[0].tags, []string{"lower_bound:-inf", "upper_bound:0"})
 	assert.ElementsMatch(t, seriesTwo[0].tags, []string{"lower_bound:-inf", "upper_bound:1.0"})
+}
+
+// TestMalformedHistogramNoPanic verifies that histograms violating the OTel
+// invariant (counts == bounds+1) are rejected without panicking, covering both
+// the counts > bounds+1 case (which would panic in getBounds) and the
+// counts < bounds+1 case.
+func TestMalformedHistogramNoPanic(t *testing.T) {
+	ctx := context.Background()
+	tr := newTranslator(t, zap.NewNop())
+	mapper := tr.getMapper().(*defaultMapper)
+	dims := &Dimensions{name: "test.malformed"}
+
+	tests := []struct {
+		name         string
+		bucketCounts []uint64
+		bounds       []float64
+	}{
+		{
+			name:         "counts > bounds+1",
+			bucketCounts: []uint64{1, 2},
+			bounds:       []float64{},
+		},
+		{
+			name:         "counts < bounds+1",
+			bucketCounts: []uint64{1},
+			bounds:       []float64{0.5, 1.0},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := pmetric.NewHistogramDataPoint()
+			p.BucketCounts().FromRaw(tc.bucketCounts)
+			p.ExplicitBounds().FromRaw(tc.bounds)
+			p.SetTimestamp(seconds(0))
+
+			consumer := &mockTimeSeriesConsumer{}
+			var legacyErr error
+			assert.NotPanics(t, func() {
+				legacyErr = mapper.getLegacyBuckets(ctx, consumer, dims, p, true)
+			})
+			assert.Error(t, legacyErr)
+			assert.Empty(t, consumer.metrics)
+
+			fullConsumer := &mockFullConsumer{}
+			var sketchErr error
+			assert.NotPanics(t, func() {
+				sketchErr = mapper.getSketchBuckets(ctx, fullConsumer, dims, p, histogramInfo{ok: false}, true)
+			})
+			assert.Error(t, sketchErr)
+			assert.Empty(t, fullConsumer.sketches)
+		})
+	}
+}
+
+// rawSketchConsumer captures the full *quantile.Sketch (not just Basic stats)
+// so tests can assert on bin keys and counts.
+type rawSketchConsumer struct {
+	mockTimeSeriesConsumer
+	sketches []*quantile.Sketch
+}
+
+func (c *rawSketchConsumer) ConsumeSketch(_ context.Context, _ *Dimensions, _ uint64, _ int64, sk *quantile.Sketch) {
+	c.sketches = append(c.sketches, sk)
+}
+
+// keyCount returns the count at the given sketch key, or 0 if the key is absent.
+func keyCount(sk *quantile.Sketch, key int32) uint32 {
+	keys, counts := sk.Cols()
+	for i, k := range keys {
+		if k == key {
+			return counts[i]
+		}
+	}
+	return 0
+}
+
+// TestSketchBucketsZeroLowerBoundDoesNotLeakIntoZeroBin is a regression test
+// for OTAGENT-1067. InsertInterpolate anchors its first deposit at the lower
+// bound, so an explicit-bucket histogram whose first non-empty bucket is
+// (0, B] used to park count in the sketch's zero bin (key 0, value 0). The
+// OTel explicit-bucket spec defines intervals as (lowerBound, upperBound], so
+// observations in this bucket are strictly positive and must not land at 0.
+// With high-cardinality tags and short delta intervals, per-bucket counts of
+// 1 or 2 made the leak dominate, collapsing all percentiles to 0 once the
+// backend merged the sketches.
+func TestSketchBucketsZeroLowerBoundDoesNotLeakIntoZeroBin(t *testing.T) {
+	ctx := context.Background()
+	tr := newTranslator(t, zap.NewNop())
+	mapper := tr.getMapper().(*defaultMapper)
+	dims := &Dimensions{name: "test.histogram"}
+
+	tests := []struct {
+		name         string
+		bucketCounts []uint64
+		bounds       []float64
+	}{
+		{
+			// Catastrophic case before the fix: a single observation in (0, 5]
+			// deposited the full count at value 0.
+			name:         "single observation in (0, 5]",
+			bucketCounts: []uint64{0, 1, 0},
+			bounds:       []float64{0, 5},
+		},
+		{
+			// Worst-case for the customer's reported MockLab scenario: many
+			// observations all in (0, 5ms]. Before the fix, a non-trivial
+			// fraction landed at value 0.
+			name:         "100 observations across (0, 5]",
+			bucketCounts: []uint64{0, 100, 0},
+			bounds:       []float64{0, 5},
+		},
+		{
+			// Default OTel boundary set, mass concentrated in the first
+			// positive bucket — the realistic shape for sub-5ms latencies.
+			name:         "default OTel bounds, small counts in (0, 5]",
+			bucketCounts: []uint64{0, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+			bounds:       []float64{0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := pmetric.NewHistogramDataPoint()
+			p.BucketCounts().FromRaw(tc.bucketCounts)
+			p.ExplicitBounds().FromRaw(tc.bounds)
+			p.SetTimestamp(seconds(0))
+
+			consumer := &rawSketchConsumer{}
+			err := mapper.getSketchBuckets(ctx, consumer, dims, p, histogramInfo{ok: false}, true)
+			require.NoError(t, err)
+			require.Len(t, consumer.sketches, 1)
+
+			sk := consumer.sketches[0]
+			assert.EqualValuesf(t, 0, keyCount(sk, 0),
+				"no count should land in the sketch's zero bin (key 0)")
+
+			var totalIn uint64
+			for _, c := range tc.bucketCounts {
+				totalIn += c
+			}
+			assert.EqualValues(t, totalIn, sk.Basic.Cnt)
+		})
+	}
+}
+
+// TestSketchBucketsNegativeBucketAtZeroSpreads asserts the (A, 0] case is not
+// clamped: the OTel interval is closed at 0, so observations can legitimately
+// equal 0, and InsertInterpolate's first-deposit-at-lower-bound seeds at A
+// (not at the zero bin). Counts should spread across (A, 0] as usual.
+func TestSketchBucketsNegativeBucketAtZeroSpreads(t *testing.T) {
+	ctx := context.Background()
+	tr := newTranslator(t, zap.NewNop())
+	mapper := tr.getMapper().(*defaultMapper)
+	dims := &Dimensions{name: "test.histogram.neg"}
+
+	p := pmetric.NewHistogramDataPoint()
+	p.BucketCounts().FromRaw([]uint64{0, 10, 0})
+	p.ExplicitBounds().FromRaw([]float64{-5, 0})
+	p.SetTimestamp(seconds(0))
+
+	consumer := &rawSketchConsumer{}
+	err := mapper.getSketchBuckets(ctx, consumer, dims, p, histogramInfo{ok: false}, true)
+	require.NoError(t, err)
+	require.Len(t, consumer.sketches, 1)
+
+	sk := consumer.sketches[0]
+	// Spread should produce multiple distinct keys across (-5, 0]; verify the
+	// count was not collapsed to a single point.
+	keys, _ := sk.Cols()
+	assert.Greaterf(t, len(keys), 1, "(-5, 0] bucket should produce multiple keys, got %v", keys)
+	assert.EqualValuesf(t, 10, sk.Basic.Cnt, "all 10 observations should be preserved")
+}
+
+// TestSketchBucketsInfiniteBoundsStillWork guards the existing ±Inf workaround
+// from regressing alongside the zero-bound fix: a histogram with implicit
+// (-Inf, 10] and (100, +Inf) buckets must still produce a sketch.
+func TestSketchBucketsInfiniteBoundsStillWork(t *testing.T) {
+	ctx := context.Background()
+	tr := newTranslator(t, zap.NewNop())
+	mapper := tr.getMapper().(*defaultMapper)
+	dims := &Dimensions{name: "test.histogram.inf"}
+
+	p := pmetric.NewHistogramDataPoint()
+	p.BucketCounts().FromRaw([]uint64{1, 0, 1})
+	p.ExplicitBounds().FromRaw([]float64{10, 100})
+	p.SetTimestamp(seconds(0))
+
+	consumer := &rawSketchConsumer{}
+	err := mapper.getSketchBuckets(ctx, consumer, dims, p, histogramInfo{ok: false}, true)
+	require.NoError(t, err)
+	require.Len(t, consumer.sketches, 1)
+	assert.EqualValues(t, 2, consumer.sketches[0].Basic.Cnt)
 }
 
 func TestFormatFloat(t *testing.T) {
@@ -2279,4 +2655,56 @@ var statsPayloads = []*pb.ClientStatsPayload{
 			},
 		},
 	},
+}
+
+func TestInferInterval(t *testing.T) {
+	tests := []struct {
+		name        string
+		startTs, ts uint64
+		expected    int64
+	}{
+		{
+			name:     "exact difference",
+			startTs:  1e9,
+			ts:       11e9,
+			expected: 10,
+		},
+		{
+			name:     "under within tolerance",
+			startTs:  1e9,
+			ts:       11e9 - 30e6,
+			expected: 10,
+		},
+		{
+			name:     "over within tolerance",
+			startTs:  1e9,
+			ts:       11e9 + 30e6,
+			expected: 10,
+		},
+		{
+			name:     "outside tolerance",
+			startTs:  1e9,
+			ts:       11e9 + 50e7,
+			expected: 0,
+		},
+		{
+			name:     "no starttimestamp",
+			startTs:  0,
+			ts:       11e9,
+			expected: 0,
+		},
+		{
+			name:     "malformed data",
+			startTs:  710000000,
+			ts:       0,
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferDeltaInterval(tt.startTs, tt.ts)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
 }

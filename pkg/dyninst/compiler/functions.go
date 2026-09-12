@@ -1,0 +1,136 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-present Datadog, Inc.
+
+//go:build linux && bpf
+
+package compiler
+
+import (
+	"fmt"
+
+	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
+)
+
+// ThrottleMode controls when throttling is applied relative to condition evaluation.
+// Must be kept in sync with throttle_mode_t in ebpf/types.h.
+type ThrottleMode int8
+
+const (
+	// ThrottleAtStart throttles before probe_run (default for unconditional non-return probes).
+	ThrottleAtStart ThrottleMode = 0
+	// ThrottleAfterCondCheck throttles after condition evaluates to true.
+	ThrottleAfterCondCheck ThrottleMode = 1
+	// ThrottleNone never throttles (unconditional returns, entries with conditional returns).
+	ThrottleNone ThrottleMode = 2
+)
+
+// FunctionID is the identifier of a logical function.
+// Implementations must be usable as a hash map key.
+type FunctionID interface {
+	logicalFuncID() // marker
+
+	String() string
+}
+
+// Implements interface marker.
+type baseFunctionID struct{}
+
+func (baseFunctionID) logicalFuncID() {}
+
+// Global, unique functions.
+
+// ChasePointers is a function for pointer chasing.
+type ChasePointers struct {
+	baseFunctionID
+}
+
+// String returns a human-readable identifier for the function.
+func (ChasePointers) String() string {
+	return "ChasePointers"
+}
+
+// ProcessEvent is a function for processing user function event (call, line, etc..),
+// at given injection PC.
+type ProcessEvent struct {
+	baseFunctionID
+	ProbeID             uint32
+	InjectionPC         uint64
+	ThrottlerIdx        int
+	PointerChasingLimit uint32
+	CollectionSizeLimit uint32
+	StringSizeLimit     uint32
+	Frameless           bool
+	HasAssociatedReturn bool
+	NoReturnReason      ir.NoReturnReason
+	EventKind           ir.EventKind
+	TopPCOffset         int8
+	ThrottleMode        ThrottleMode
+	EventRootType       *ir.EventRootType
+}
+
+// String returns a human-readable identifier for the function.
+func (e ProcessEvent) String() string {
+	return fmt.Sprintf("ProcessEvent[%s@%x]", e.EventRootType.GetName(), e.InjectionPC)
+}
+
+// ProcessExpression is a function that runs expression evaluation from a context
+// of event function frame, at given injection PC.
+type ProcessExpression struct {
+	baseFunctionID
+	EventRootType *ir.EventRootType
+	// The index of the expression in the event root type.
+	ExprIdx     uint32
+	InjectionPC uint64
+}
+
+// String returns a human-readable identifier for the function.
+func (e ProcessExpression) String() string {
+	return fmt.Sprintf("ProcessExpression[%s@0x%x.expr[%d]]", e.EventRootType.GetName(), e.InjectionPC, e.ExprIdx)
+}
+
+// ProcessCondition is a function that evaluates a condition expression and
+// sets the condition_failed flag if the condition is not met.
+type ProcessCondition struct {
+	baseFunctionID
+	EventRootType *ir.EventRootType
+	InjectionPC   uint64
+}
+
+// String returns a human-readable identifier for the function.
+func (e ProcessCondition) String() string {
+	return fmt.Sprintf("ProcessCondition[%s@0x%x]", e.EventRootType.GetName(), e.InjectionPC)
+}
+
+// ProcessConditionLeaf is a function that evaluates a single entry-side
+// leaf of a split-event-kind condition. Compiling each leaf to its own
+// SM sub-function isolates leaf-internal aborts (nil deref / OOB) to the
+// leaf boundary: the existing abort path's sm_return lands in the
+// entry-side driver, which captures the leaf's outcome via
+// SM_OP_CONDITION_LEAF_RECORD and proceeds to the next leaf.
+type ProcessConditionLeaf struct {
+	baseFunctionID
+	EventRootType *ir.EventRootType
+	InjectionPC   uint64
+	LeafIdx       uint8
+}
+
+// String returns a human-readable identifier for the function.
+func (e ProcessConditionLeaf) String() string {
+	return fmt.Sprintf("ProcessConditionLeaf[%s@0x%x.leaf[%d]]",
+		e.EventRootType.GetName(), e.InjectionPC, e.LeafIdx)
+}
+
+// ProcessType is a function that processes user data of a specific type, chasing
+// pointers, resolving interfaces, etc (after the data was already read into ringbuf).
+// The generated function expects output offset to be set to the beginning of the data.
+type ProcessType struct {
+	baseFunctionID
+	Type ir.Type
+}
+
+// String returns a human-readable identifier for the function.
+func (e ProcessType) String() string {
+	return fmt.Sprintf("ProcessType[%s]", e.Type.GetName())
+}

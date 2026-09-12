@@ -7,11 +7,18 @@
 package installer
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+	"testing"
 
-	e2eos "github.com/DataDog/test-infra-definitions/components/os"
+	e2eos "github.com/DataDog/datadog-agent/test/e2e-framework/components/os"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner"
+	"github.com/DataDog/datadog-agent/test/e2e-framework/testing/runner/parameters"
+	"github.com/google/go-containerregistry/pkg/crane"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/stretchr/testify/require"
 )
 
 // TestPackageConfig is a struct that regroups the fields necessary to install a package from an OCI Registry
@@ -67,7 +74,9 @@ func WithAlias(alias string) PackageOption {
 var PackagesConfig = []TestPackageConfig{
 	{Name: "datadog-installer", Version: fmt.Sprintf("pipeline-%v", os.Getenv("E2E_PIPELINE_ID")), Registry: "installtesting.datad0g.com.internal.dda-testing.com"},
 	{Name: "datadog-agent", Alias: "agent-package", Version: fmt.Sprintf("pipeline-%v", os.Getenv("E2E_PIPELINE_ID")), Registry: "installtesting.datad0g.com.internal.dda-testing.com"},
-	{Name: "datadog-apm-inject", Version: "latest"},
+	{Name: "datadog-ddot", Alias: "ddot-package", Version: fmt.Sprintf("pipeline-%v", os.Getenv("E2E_PIPELINE_ID")), Registry: "installtesting.datad0g.com.internal.dda-testing.com"},
+	{Name: "datadog-apm-inject", Version: pinnedApmInjectVersion()},
+	{Name: "apm-inject-package", Version: pinnedApmInjectVersion()},
 	{Name: "datadog-apm-library-java", Version: "latest"},
 	{Name: "datadog-apm-library-ruby", Version: "latest"},
 	{Name: "datadog-apm-library-js", Version: "latest"},
@@ -75,20 +84,44 @@ var PackagesConfig = []TestPackageConfig{
 	{Name: "datadog-apm-library-python", Version: "latest"},
 }
 
-func installScriptPackageManagerEnv(env map[string]string, arch e2eos.Architecture) {
-	apiKey := os.Getenv("DD_API_KEY")
-	if apiKey == "" {
-		apiKey = "deadbeefdeadbeefdeadbeefdeadbeef"
+func pinnedApmInjectVersion() string {
+	if version, ok := os.LookupEnv("E2E_APM_INJECT_PACKAGE_VERSION"); ok && version != "" {
+		return version
 	}
-	env["DD_API_KEY"] = apiKey
+	return "0.71.0-1"
+}
+
+func previousApmInjectVersion() string {
+	if version, ok := os.LookupEnv("E2E_APM_INJECT_PREVIOUS_PACKAGE_VERSION"); ok && version != "" {
+		return version
+	}
+	return "0.58.0-1"
+}
+
+func pinnedApmLibraryPythonVersion() string {
+	if version, ok := os.LookupEnv("E2E_APM_LIBRARY_PYTHON_PACKAGE_VERSION"); ok && version != "" {
+		return version
+	}
+	return "4.14.0"
+}
+
+func previousApmLibraryPythonVersion() string {
+	if version, ok := os.LookupEnv("E2E_APM_LIBRARY_PYTHON_PREVIOUS_PACKAGE_VERSION"); ok && version != "" {
+		return version
+	}
+	return "2.8.5"
+}
+
+func installScriptPackageManagerEnv(env map[string]string, arch e2eos.Architecture) {
+	env["DD_API_KEY"] = GetAPIKey()
 	env["DD_SITE"] = "datadoghq.com"
 	// Install Script env variables
-	env["DD_INSTALLER"] = "true"
-	env["TESTING_KEYS_URL"] = "keys.datadoghq.com"
-	env["TESTING_APT_URL"] = "s3.amazonaws.com/apttesting.datad0g.com"
-	env["TESTING_APT_REPO_VERSION"] = fmt.Sprintf("pipeline-%s-a7-%s 7", os.Getenv("E2E_PIPELINE_ID"), arch)
+	env["TESTING_KEYS_URL"] = "apttesting.datad0g.com/test-keys"
+	env["TESTING_APT_URL"] = fmt.Sprintf("s3.amazonaws.com/apttesting.datad0g.com/datadog-agent/pipeline-%s-a7", os.Getenv("E2E_PIPELINE_ID"))
+	env["TESTING_APT_REPO_VERSION"] = fmt.Sprintf("stable-%s 7", arch)
 	env["TESTING_YUM_URL"] = "s3.amazonaws.com/yumtesting.datad0g.com"
 	env["TESTING_YUM_VERSION_PATH"] = fmt.Sprintf("testing/pipeline-%s-a7/7", os.Getenv("E2E_PIPELINE_ID"))
+	env["DD_APM_INSTRUMENTATION_PIPELINE_ID"] = os.Getenv("E2E_PIPELINE_ID")
 }
 
 func installScriptInstallerEnv(env map[string]string, packagesConfig []TestPackageConfig) {
@@ -96,15 +129,30 @@ func installScriptInstallerEnv(env map[string]string, packagesConfig []TestPacka
 		name := strings.ToUpper(strings.ReplaceAll(pkg.Name, "-", "_"))
 		image := strings.TrimPrefix(name, "DATADOG_") + "_PACKAGE"
 		if pkg.Registry != "" {
-			env[fmt.Sprintf("DD_INSTALLER_REGISTRY_URL_%s", image)] = pkg.Registry
+			env["DD_INSTALLER_REGISTRY_URL_"+image] = pkg.Registry
 		}
 		if pkg.Auth != "" {
-			env[fmt.Sprintf("DD_INSTALLER_REGISTRY_AUTH_%s", image)] = pkg.Auth
+			env["DD_INSTALLER_REGISTRY_AUTH_"+image] = pkg.Auth
 		}
 		if pkg.Version != "" && pkg.Version != "latest" {
-			env[fmt.Sprintf("DD_INSTALLER_DEFAULT_PKG_VERSION_%s", name)] = pkg.Version
+			env["DD_INSTALLER_DEFAULT_PKG_VERSION_"+name] = pkg.Version
 		}
 	}
+}
+
+// InstallerScriptBaseURL returns the host+path prefix (no scheme, no trailing suffix) where
+// pipeline-specific install scripts are hosted. Pipeline builds write scripts to
+// s3://installtesting.datad0g.com/pipeline-{CI_PIPELINE_ID}/scripts/, commit builds to
+// s3://installtesting.datad0g.com/{CI_COMMIT_SHA}/scripts/. Falls back to production when
+// neither variable is set.
+func InstallerScriptBaseURL() string {
+	if pipelineID, ok := os.LookupEnv("E2E_PIPELINE_ID"); ok {
+		return "s3.amazonaws.com/installtesting.datad0g.com/pipeline-" + pipelineID
+	}
+	if commitHash, ok := os.LookupEnv("CI_COMMIT_SHA"); ok {
+		return "s3.amazonaws.com/installtesting.datad0g.com/" + commitHash
+	}
+	return "install.datadoghq.com"
 }
 
 // InstallScriptEnv returns the environment variables for the install script
@@ -123,12 +171,41 @@ func InstallScriptEnvWithPackages(arch e2eos.Architecture, packagesConfig []Test
 // InstallInstallerScriptEnvWithPackages returns the environment variables for the installer script for the given packages
 func InstallInstallerScriptEnvWithPackages() map[string]string {
 	env := map[string]string{}
-	apiKey := os.Getenv("DD_API_KEY")
-	if apiKey == "" {
-		apiKey = "deadbeefdeadbeefdeadbeefdeadbeef"
-	}
-	env["DD_API_KEY"] = apiKey
+	env["DD_API_KEY"] = GetAPIKey()
 	env["DD_SITE"] = "datadoghq.com"
 	installScriptInstallerEnv(env, PackagesConfig)
 	return env
+}
+
+// GetAPIKey returns the API key from the runner config, or a default value if not set
+//
+// Set the key in ~/.test_infra_config.yaml or use the E2E_API_KEY env var
+//
+// Do not use the DD_API_KEY env var, the CI uses it to report results to org2, the tests
+// should use a different key.
+func GetAPIKey() string {
+	apiKey, err := runner.GetProfile().SecretStore().Get(parameters.APIKey)
+	if apiKey == "" || err != nil {
+		apiKey = "deadbeefdeadbeefdeadbeefdeadbeef"
+	}
+	return apiKey
+}
+
+// PipelineAgentVersion returns the version of the pipeline agent
+func PipelineAgentVersion(t *testing.T) string {
+	ref := "installtesting.datad0g.com/agent-package:pipeline-" + os.Getenv("E2E_PIPELINE_ID")
+	p := v1.Platform{
+		OS:           "linux",
+		Architecture: "amd64",
+	}
+	raw, err := crane.Manifest(ref, crane.WithPlatform(&p))
+	require.NoError(t, err)
+
+	var m v1.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		require.NoError(t, err)
+	}
+	version, ok := m.Annotations["com.datadoghq.package.version"]
+	require.True(t, ok, "com.datadoghq.package.version annotation not found in manifest")
+	return version
 }

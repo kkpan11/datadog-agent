@@ -4,9 +4,11 @@
 #include "constants/syscall_macro.h"
 #include "helpers/approvers.h"
 #include "helpers/filesystem.h"
+#include "helpers/span_fill.h"
 #include "helpers/syscalls.h"
+#include "helpers/discarders.h"
 
-int __attribute__((always_inline)) trace__sys_rename(u8 async, const char *oldpath, const char *newpath) {
+int __attribute__((always_inline)) trace__sys_rename(void *ctx, u8 async, const char *oldpath, const char *newpath) {
     struct syscall_cache_t syscall = {
         .policy = fetch_policy(EVENT_RENAME),
         .async = async,
@@ -16,28 +18,36 @@ int __attribute__((always_inline)) trace__sys_rename(u8 async, const char *oldpa
     if (!async) {
         collect_syscall_ctx(&syscall, SYSCALL_CTX_ARG_STR(0) | SYSCALL_CTX_ARG_STR(1), (void *)oldpath, (void *)newpath, NULL);
     }
-    cache_syscall(&syscall);
-
+    cache_syscall_update_cgroup(ctx, &syscall);
     return 0;
 }
 
 HOOK_SYSCALL_ENTRY2(rename, const char *, oldpath, const char *, newpath) {
-    return trace__sys_rename(SYNC_SYSCALL, oldpath, newpath);
+    return trace__sys_rename(ctx, SYNC_SYSCALL, oldpath, newpath);
 }
 
 HOOK_SYSCALL_ENTRY4(renameat, int, olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
-    return trace__sys_rename(SYNC_SYSCALL, oldpath, newpath);
+    return trace__sys_rename(ctx, SYNC_SYSCALL, oldpath, newpath);
 }
 
 HOOK_SYSCALL_ENTRY4(renameat2, int , olddirfd, const char *, oldpath, int, newdirfd, const char *, newpath) {
-    return trace__sys_rename(SYNC_SYSCALL, oldpath, newpath);
+    return trace__sys_rename(ctx, SYNC_SYSCALL, oldpath, newpath);
 }
 
 HOOK_ENTRY("do_renameat2")
 int hook_do_renameat2(ctx_t *ctx) {
     struct syscall_cache_t *syscall = peek_syscall(EVENT_RENAME);
     if (!syscall) {
-        return trace__sys_rename(ASYNC_SYSCALL, NULL, NULL);
+        return trace__sys_rename(ctx, ASYNC_SYSCALL, NULL, NULL);
+    }
+    return 0;
+}
+
+HOOK_ENTRY("filename_renameat2")
+int hook_filename_renameat2(ctx_t *ctx) {
+    struct syscall_cache_t *syscall = peek_syscall(EVENT_RENAME);
+    if (!syscall) {
+        return trace__sys_rename(ctx, ASYNC_SYSCALL, NULL, NULL);
     }
     return 0;
 }
@@ -76,29 +86,33 @@ int hook_vfs_rename(ctx_t *ctx) {
         syscall->rename.target_file.flags |= UPPER_LAYER;
     }
 
+    // invalidate global path id for dir rename as the rename could invalidate children
+    enum PATH_ID_INVALIDATE_TYPE invalidate_type = S_ISDIR(syscall->rename.target_file.metadata.mode) ? PATH_ID_INVALIDATE_TYPE_GLOBAL : PATH_ID_INVALIDATE_TYPE_LOCAL;
+
     // use src_dentry as target inode is currently empty and the target file will
     // have the src inode anyway
-    set_file_inode(src_dentry, &syscall->rename.target_file, 1);
+    set_file_inode(src_dentry, &syscall->rename.target_file, invalidate_type);
 
     // we generate a fake source key as the inode is (can be ?) reused
     syscall->rename.src_file.path_key.ino = FAKE_INODE_MSW << 32 | bpf_get_prandom_u32();
 
-    // if destination already exists invalidate
+    // if destination already exists invalidate the discarder and
+    // force an invalidate of the target path_id as the file will be replaced by the src file.
     u64 inode = get_dentry_ino(target_dentry);
     if (inode) {
         expire_inode_discarders(syscall->rename.target_file.path_key.mount_id, inode);
+
+        // force an invalidate of the target as the file will be replaced by the src file.
+        get_path_id(inode, syscall->rename.target_file.path_key.mount_id, 0, invalidate_type);
     }
 
-    // always return after any invalidate_inode call
-    if (approve_syscall(syscall, rename_approvers) == DISCARDED) {
-        // do not pop, we want to invalidate the inode even if the syscall is discarded
-        return 0;
-    }
+    approve_syscall(syscall, rename_approvers);
 
     // the mount id of path_key is resolved by kprobe/mnt_want_write. It is already set by the time we reach this probe.
     syscall->resolver.dentry = syscall->rename.src_dentry;
     syscall->resolver.key = syscall->rename.src_file.path_key;
-    syscall->resolver.discarder_event_type = 0;
+    syscall->resolver.event_type = syscall->type;
+    syscall->resolver.flags = get_resolver_flags(syscall, 1);
     syscall->resolver.callback = DR_NO_CALLBACK;
     syscall->resolver.iteration = 0;
     syscall->resolver.ret = 0;
@@ -129,7 +143,7 @@ int __attribute__((always_inline)) sys_rename_ret(void *ctx, int retval, enum TA
         expire_inode_discarders(syscall->rename.target_file.path_key.mount_id, inode);
     }
 
-    // invalid discarder + path_id
+    // remove the discarder for the target file
     if (retval >= 0) {
         expire_inode_discarders(syscall->rename.target_file.path_key.mount_id, syscall->rename.target_file.path_key.ino);
 
@@ -138,6 +152,11 @@ int __attribute__((always_inline)) sys_rename_ret(void *ctx, int retval, enum TA
             // folder rename. For the inode the discarder is invalidated in the ret.
             bump_mount_discarder_revision(syscall->rename.target_file.path_key.mount_id);
         }
+    }
+
+    if (syscall->state != DISCARDED && is_auid_discarder(EVENT_RENAME)) {
+        syscall->state = DISCARDED;
+        monitor_discarded(EVENT_RENAME);
     }
 
     if (syscall->state != DISCARDED && is_event_enabled(EVENT_RENAME)) {
@@ -150,7 +169,8 @@ int __attribute__((always_inline)) sys_rename_ret(void *ctx, int retval, enum TA
             syscall->resolver.dentry = syscall->rename.target_dentry;
         }
         syscall->resolver.key = syscall->rename.target_file.path_key;
-        syscall->resolver.discarder_event_type = 0;
+        syscall->resolver.event_type = syscall->type;
+        syscall->resolver.flags = get_resolver_flags(syscall, 1);
         syscall->resolver.callback = select_dr_key(prog_type, DR_RENAME_CALLBACK_KPROBE_KEY, DR_RENAME_CALLBACK_TRACEPOINT_KEY);
         syscall->resolver.iteration = 0;
         syscall->resolver.ret = 0;
@@ -165,6 +185,12 @@ int __attribute__((always_inline)) sys_rename_ret(void *ctx, int retval, enum TA
 
 HOOK_EXIT("do_renameat2")
 int rethook_do_renameat2(ctx_t *ctx) {
+    int retval = CTX_PARMRET(ctx);
+    return sys_rename_ret(ctx, retval, KPROBE_OR_FENTRY_TYPE);
+}
+
+HOOK_EXIT("filename_renameat2")
+int rethook_filename_renameat2(ctx_t *ctx) {
     int retval = CTX_PARMRET(ctx);
     return sys_rename_ret(ctx, retval, KPROBE_OR_FENTRY_TYPE);
 }
@@ -188,7 +214,7 @@ TAIL_CALL_TRACEPOINT_FNC(handle_sys_rename_exit, struct tracepoint_raw_syscalls_
     return sys_rename_ret(args, args->ret, TRACEPOINT_TYPE);
 }
 
-int __attribute__((always_inline)) dr_rename_callback(void *ctx) {
+int __attribute__((always_inline)) dr_rename_callback(void *ctx, enum TAIL_CALL_PROG_TYPE prog_type) {
     struct syscall_cache_t *syscall = pop_syscall(EVENT_RENAME);
     if (!syscall) {
         return 0;
@@ -200,29 +226,30 @@ int __attribute__((always_inline)) dr_rename_callback(void *ctx) {
         return 0;
     }
 
-    struct rename_event_t event = {
-        .syscall.retval = retval,
-        .syscall_ctx.id = syscall->ctx_id,
-        .event.flags = syscall->async ? EVENT_FLAGS_ASYNC : 0,
-        .old = syscall->rename.src_file,
-        .new = syscall->rename.target_file,
-    };
+    struct rename_event_t *event = SPAN_FILL_EVENT(struct rename_event_t, EVENT_RENAME);
+    if (!event) {
+        return 0;
+    }
+    event->syscall.retval = retval;
+    event->syscall_ctx.id = syscall->ctx_id;
+    event->event.flags = syscall->async ? EVENT_FLAGS_ASYNC : 0;
+    event->old = syscall->rename.src_file;
+    event->new = syscall->rename.target_file;
 
-    struct proc_cache_t *entry = fill_process_context(&event.process);
-    fill_container_context(entry, &event.container);
-    fill_span_context(&event.span);
+    struct proc_cache_t *entry = fill_process_context(&event->process);
+    fill_cgroup_context(entry, &event->cgroup);
 
-    send_event(ctx, EVENT_RENAME, event);
+    span_fill_tail_call(ctx, prog_type);
 
     return 0;
 }
 
 TAIL_CALL_FNC(dr_rename_callback, ctx_t *ctx) {
-    return dr_rename_callback(ctx);
+    return dr_rename_callback(ctx, KPROBE_OR_FENTRY_TYPE);
 }
 
 TAIL_CALL_TRACEPOINT_FNC(dr_rename_callback, struct tracepoint_syscalls_sys_exit_t *args) {
-    return dr_rename_callback(args);
+    return dr_rename_callback(args, TRACEPOINT_TYPE);
 }
 
 #endif

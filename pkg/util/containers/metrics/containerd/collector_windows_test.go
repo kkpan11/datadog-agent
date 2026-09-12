@@ -26,7 +26,7 @@ import (
 
 	wstats "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
 	"github.com/containerd/containerd/api/types"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/typeurl/v2"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
@@ -108,7 +108,7 @@ func TestGetContainerStats_Containerd(t *testing.T) {
 			// namespace.
 			workloadmetaStore := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
 				fx.Provide(func() log.Component { return logmock.New(t) }),
-				config.MockModule(),
+				fx.Provide(func() config.Component { return config.NewMock(t) }),
 				workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 			))
 
@@ -173,7 +173,7 @@ func TestGetContainerNetworkStats_Containerd(t *testing.T) {
 			// namespace.
 			workloadmetaStore := fxutil.Test[workloadmetamock.Mock](t, fx.Options(
 				fx.Provide(func() log.Component { return logmock.New(t) }),
-				config.MockModule(),
+				fx.Provide(func() config.Component { return config.NewMock(t) }),
 				workloadmetafxmock.MockModule(workloadmeta.NewParams()),
 			))
 

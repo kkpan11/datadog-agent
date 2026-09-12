@@ -12,12 +12,15 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 
 	logmock "github.com/DataDog/datadog-agent/comp/core/log/mock"
-	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
 	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/endpoints"
+	defaultforwarderimpl "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/impl"
+	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/transaction"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
+	"github.com/DataDog/datadog-agent/pkg/version"
 )
 
 var (
@@ -49,7 +52,7 @@ func TestSendHTTPRequestToEndpoint(t *testing.T) {
 	defer ts1.Close()
 
 	log := logmock.New(t)
-	client := defaultforwarder.NewHTTPClient(mockConfig, 1, log)
+	client := defaultforwarderimpl.NewHTTPClient(mockConfig, 1, log)
 
 	// With the correct API Key, it should be a 200
 	statusCodeWithKey, responseBodyWithKey, _, errWithKey := sendHTTPRequestToEndpoint(context.Background(), client, ts1.URL, endpointInfoTest, apiKey1)
@@ -82,7 +85,7 @@ func TestAcceptRedirection(t *testing.T) {
 
 	ddURL := ts.URL
 
-	client := clientWithOneRedirects(mockConfig, 1, mockLog)
+	client := getClient(mockConfig, 1, mockLog, withOneRedirect())
 
 	url := ddURL + "/support/flare"
 	statusCode, err := sendHTTPHEADRequestToEndpoint(url, client)
@@ -99,12 +102,81 @@ func TestAcceptRedirection(t *testing.T) {
 func TestGetLogsUseTCP(t *testing.T) {
 	mockConfig := configmock.New(t)
 
-	mockConfig.SetWithoutSource("logs_enabled", true)
+	mockConfig.SetInTest("logs_enabled", true)
 	assert.False(t, getLogsUseTCP())
 
-	mockConfig.SetWithoutSource("logs_config.force_use_tcp", true)
+	mockConfig.SetInTest("logs_config.force_use_tcp", true)
 	assert.True(t, getLogsUseTCP())
 
-	mockConfig.SetWithoutSource("logs_config.force_use_http", true)
+	mockConfig.SetInTest("logs_config.force_use_http", true)
 	assert.False(t, getLogsUseTCP())
+}
+
+func TestSendHTTPRequestToEndpoint_ProtoPayload(t *testing.T) {
+	mockConfig := configmock.New(t)
+	log := logmock.New(t)
+
+	// Create a fake server that checks for protobuf content type and unmarshals the payload
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "application/x-protobuf", r.Header.Get("Content-Type"))
+		assert.Equal(t, "api_key1", r.Header.Get("DD-API-KEY"))
+
+		_, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		defer r.Body.Close()
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Received Protobuf"))
+	}))
+	defer ts.Close()
+
+	client := defaultforwarderimpl.NewHTTPClient(mockConfig, 1, log)
+
+	endpointInfo := endpointInfo{
+		Endpoint:    transaction.Endpoint{Route: "/", Name: "sketch"},
+		Method:      "POST",
+		Payload:     mustMarshalProto(buildSketchPayload(), t),
+		ContentType: "application/x-protobuf",
+	}
+
+	statusCode, responseBody, _, err := sendHTTPRequestToEndpoint(context.Background(), client, ts.URL, endpointInfo, "api_key1")
+	assert.NoError(t, err)
+	assert.Equal(t, 200, statusCode)
+	assert.Equal(t, "Received Protobuf", string(responseBody))
+}
+
+func mustMarshalProto(msg proto.Message, t *testing.T) []byte {
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Failed to marshal proto: %v", err)
+	}
+	return data
+}
+
+func TestSendHTTPRequestHeaders(t *testing.T) {
+	mockConfig := configmock.New(t)
+	log := logmock.New(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "api_key1", r.Header.Get("DD-API-KEY"))
+		assert.Equal(t, "application/x-protobuf", r.Header.Get("Content-Type"))
+		assert.Equal(t, version.AgentVersion, r.Header.Get("DD-Agent-Version"))
+		assert.Equal(t, "datadog-agent/"+version.AgentVersion, r.Header.Get("User-Agent"))
+		assert.Equal(t, requestWithHeader, r.Header.Get("X-Requested-With"))
+		w.Write([]byte("Received Protobuf"))
+	}))
+	defer ts.Close()
+
+	client := defaultforwarderimpl.NewHTTPClient(mockConfig, 1, log)
+
+	endpointInfo := endpointInfo{
+		Endpoint:    transaction.Endpoint{Route: "/", Name: "sketch"},
+		Method:      "POST",
+		Payload:     mustMarshalProto(buildSketchPayload(), t),
+		ContentType: "application/x-protobuf",
+	}
+
+	statusCode, _, _, err := sendHTTPRequestToEndpoint(context.Background(), client, ts.URL, endpointInfo, "api_key1")
+	assert.NoError(t, err)
+	assert.Equal(t, 200, statusCode)
 }

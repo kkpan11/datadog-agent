@@ -8,7 +8,7 @@
 package corechecks
 
 import (
-	"fmt"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,8 +35,8 @@ func (m *mockLongRunningCheck) Stop() {
 	m.Called()
 }
 
-func (m *mockLongRunningCheck) Configure(senderManger sender.SenderManager, integrationConfigDigest uint64, config, initConfig integration.Data, source string) error {
-	args := m.Called(senderManger, integrationConfigDigest, config, initConfig, source)
+func (m *mockLongRunningCheck) Configure(senderManger sender.SenderManager, integrationConfigDigest uint64, config, initConfig integration.Data, source string, provider string) error {
+	args := m.Called(senderManger, integrationConfigDigest, config, initConfig, source, provider)
 	return args.Error(0)
 }
 
@@ -66,6 +66,11 @@ func (m *mockLongRunningCheck) Version() string {
 }
 
 func (m *mockLongRunningCheck) ConfigSource() string {
+	args := m.Called()
+	return args.String(0)
+}
+
+func (m *mockLongRunningCheck) ConfigProvider() string {
 	args := m.Called()
 	return args.String(0)
 }
@@ -152,7 +157,7 @@ func TestLongRunningCheckWrapperRun(t *testing.T) {
 	})
 
 	t.Run("Committing the sender if the check is already running", func(t *testing.T) {
-		mockSender := mocksender.NewMockSender("ok")
+		mockSender := mocksender.NewMockSender(t, "ok")
 		mockSender.On("Commit").Return()
 
 		mockCheck := newMockLongRunningCheck()
@@ -170,7 +175,7 @@ func TestLongRunningCheckWrapperRun(t *testing.T) {
 
 	t.Run("Returning an error if GetSender fails while already running", func(t *testing.T) {
 		mockCheck := newMockLongRunningCheck()
-		expectedErr := fmt.Errorf("failed to get sender")
+		expectedErr := errors.New("failed to get sender")
 		mockCheck.On("GetSender").Return(nil, expectedErr)
 
 		wrapper := NewLongRunningCheckWrapper(mockCheck)

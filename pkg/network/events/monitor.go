@@ -18,6 +18,7 @@ import (
 	"go.uber.org/atomic"
 	"go4.org/intern"
 
+	tracermetadata "github.com/DataDog/datadog-agent/pkg/discovery/tracermetadata/model"
 	sprobe "github.com/DataDog/datadog-agent/pkg/security/probe"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -132,7 +133,7 @@ func (h *eventConsumerWrapper) Copy(ev *model.Event) any {
 	// keep the map of tagsFound, so that entries found at lower levels
 	// don't supercede those at higher.  However, we must actually parse
 	// all of the inputs to ensure that we don't miss any tags that are
-	tagsFound := make(map[string]struct{})
+	tagsFound := make(map[string]string)
 
 	envs := model.FilterEnvs(ev.GetProcessEnvp(), envFilter)
 	if len(envs) > 0 {
@@ -142,7 +143,7 @@ func (h *eventConsumerWrapper) Copy(ev *model.Event) any {
 			if len(v) > 0 {
 				if t := envTagNames[k]; t != "" {
 					p.Tags = append(p.Tags, intern.GetByString(t+":"+v))
-					tagsFound[k] = struct{}{}
+					tagsFound[k] = v
 				}
 			}
 		}
@@ -155,7 +156,19 @@ func (h *eventConsumerWrapper) Copy(ev *model.Event) any {
 		}
 	}
 
-	if cid := ev.GetContainerId(); cid != "" {
+	if tmeta := ev.GetProcessTracerMetadata(); !tmeta.IsZero() {
+		for key, value := range tmeta.Tags() {
+			if tracermetadata.ShouldSkipServiceTagKV(key, value,
+				tagsFound["DD_SERVICE"],
+				tagsFound["DD_ENV"],
+				tagsFound["DD_VERSION"]) {
+				continue
+			}
+			p.Tags = append(p.Tags, intern.GetByString(key+":"+value))
+		}
+	}
+
+	if cid := ev.GetContainerID(); cid != "" {
 		p.ContainerID = intern.GetByString(cid)
 	}
 
@@ -167,6 +180,7 @@ func (h *eventConsumerWrapper) EventTypes() []model.EventType {
 	return []model.EventType{
 		model.ForkEventType,
 		model.ExecEventType,
+		model.TracerMemfdSealEventType,
 	}
 }
 

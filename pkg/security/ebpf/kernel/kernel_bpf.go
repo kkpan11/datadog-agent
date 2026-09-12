@@ -3,24 +3,55 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux && linux_bpf
+//go:build linux && bpf
 
 // Package kernel holds kernel related files
 package kernel
 
 import (
 	"runtime"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
-	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
+
+	ddbtf "github.com/DataDog/datadog-agent/pkg/ebpf/btf"
 )
 
 // HaveMmapableMaps returns whether the kernel supports mmapable maps.
 func (k *Version) HaveMmapableMaps() bool {
 	return features.HaveMapFlag(features.BPF_F_MMAPABLE) == nil
+}
+
+// ioUringParams mirrors the kernel's struct io_uring_params. Only its size matters here: the kernel
+// writes the submission/completion ring offsets into it during io_uring_setup.
+type ioUringParams struct {
+	sqEntries    uint32
+	cqEntries    uint32
+	flags        uint32
+	sqThreadCPU  uint32
+	sqThreadIdle uint32
+	features     uint32
+	wqFd         uint32
+	resv         [3]uint32
+	sqOff        [10]uint32 // struct io_sqring_offsets
+	cqOff        [10]uint32 // struct io_cqring_offsets
+}
+
+// HaveIOURing returns whether the kernel supports io-uring.
+func (k *Version) HaveIOURing() bool {
+	// probe support by issuing an io_uring_setup(2) syscall directly, avoiding a dedicated io-uring
+	// library dependency in the agent binary
+	var params ioUringParams
+	fd, _, errno := unix.Syscall(unix.SYS_IO_URING_SETUP, 1, uintptr(unsafe.Pointer(&params)), 0)
+	if errno != 0 {
+		return false
+	}
+	_ = unix.Close(int(fd))
+	return true
 }
 
 // HaveRingBuffers returns whether the kernel supports ring buffer.
@@ -97,6 +128,10 @@ func (k *Version) HasSKStorageInTracingPrograms() bool {
 // HasBPFForEachMapElemHelper returns true if the kernel support the bpf_for_each_map_elem helper
 // See https://github.com/torvalds/linux/commit/69c087ba6225b574afb6e505b72cb75242a3d844
 func (k *Version) HasBPFForEachMapElemHelper() bool {
+	if !k.HasJITBlindingSubprogsFix() {
+		return false
+	}
+
 	// because of https://lore.kernel.org/bpf/20211231151018.3781550-1-houtao1@huawei.com/
 	// we need a kernel 5.17 or higher on arm64 to use the bpf_for_each_map_elem helper
 	if runtime.GOARCH == "arm64" && k.Code < Kernel5_17 {
@@ -167,6 +202,109 @@ func (k *Version) HaveFentryNoDuplicatedWeakSymbols() bool {
 
 // SupportCORE returns is CORE is supported
 func (k *Version) SupportCORE() bool {
-	_, err := btf.LoadKernelSpec()
+	_, err := ddbtf.GetKernelSpec()
 	return err == nil
+}
+
+// HasBpfGetCurrentPidTgidForSchedCLS returns true if the kernel supports bpf_get_current_pid_tgid for Sched CLS program type
+// https://github.com/torvalds/linux/commit/eb166e522c77699fc19bfa705652327a1e51a117
+func (k *Version) HasBpfGetCurrentPidTgidForSchedCLS() bool {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnGetCurrentPidTgid) == nil
+}
+
+// HasBpfGetCurrentCgroupIDForSchedCLS returns if the kernel supports bpf_get_current_cgroup_id for Sched CLS program type
+// https://github.com/torvalds/linux/commit/c501bf55c88b834adefda870c7c092ec9052a437
+func (k *Version) HasBpfGetCurrentCgroupIDForSchedCLS() bool {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnGetCurrentCgroupId) == nil
+}
+
+// HasSkLookupForSchedCLS returns true if the kernel supports bpf_sk_lookup_tcp/udp for the Sched CLS program type
+// https://github.com/torvalds/linux/commit/6acc9b432e6714d72d7d77ec7c27f6f8358d0c71
+func (k *Version) HasSkLookupForSchedCLS() bool {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkLookupTcp) == nil
+}
+
+// HasSKStorageInSchedCLS returns true if the kernel supports bpf_sk_storage_get in Sched CLS programs
+func (k *Version) HasSKStorageInSchedCLS() bool {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkStorageGet) == nil
+}
+
+// HasSKStorageInCgroupSock returns true if the kernel supports bpf_sk_storage_get in cgroup/sock programs
+func (k *Version) HasSKStorageInCgroupSock() bool {
+	return features.HaveProgramHelper(ebpf.CGroupSock, asm.FnSkStorageGet) == nil
+}
+
+// HasBpfGetCurrentCgroupID returns if the kernel supports bpf_get_current_cgroup_id for Sched CLS program type
+// Kernel version >= 4.18
+func (k *Version) HasBpfGetCurrentCgroupID() bool {
+	return features.HaveProgramHelper(ebpf.Kprobe, asm.FnGetCurrentCgroupId) == nil
+}
+
+// HasBpfGetSocketCookieForCgroupSocket returns if the kernel supports bpf_get_socket_cookie for Cgroup Socket program type
+// https://github.com/torvalds/linux/commit/c5dbb89fc2ac013afe67b9e4fcb3743c02b567cd
+func (k *Version) HasBpfGetSocketCookieForCgroupSocket() bool {
+	return features.HaveProgramHelper(ebpf.CGroupSock, asm.FnGetSocketCookie) == nil
+}
+
+// HasJITBlindingSubprogsFix returns true if the kernel has the following fix
+// https://github.com/torvalds/linux/commit/4b6313cf99b0d51b49aeaea98ec76ca8161ecb80
+// which was merged in mainline starting with 5.19-rc1 and backported to 5.17.13 and 5.18.2
+// This fixes kernel segfaults when running eBPF programs that call subprogs
+// (using the bpf_for_each_map_elem helper for instance).
+func (k *Version) HasJITBlindingSubprogsFix() bool {
+	if k.Code.Major() < 5 {
+		return false
+	}
+	if k.Code.Major() >= 6 {
+		return true
+	}
+
+	// https://github.com/torvalds/linux/commit/4b6313cf99b0d51b49aeaea98ec76ca8161ecb80
+	if k.Code.Minor() >= 19 {
+		return true
+	}
+
+	// https://github.com/torvalds/linux/commit/d106a3e96fca30e44081eae9c27aab28fc132a46
+	if k.Code.Minor() == 18 {
+		return k.Code.Patch() >= 2
+	}
+
+	// https://github.com/torvalds/linux/commit/a029b02b47dd5bb87a21550d9d9a80cb4dd3f714
+	if k.Code.Minor() == 17 {
+		return k.Code.Patch() >= 13
+	}
+
+	return false
+}
+
+// HasTaskStorage returns true if the kernel supports BPF_MAP_TYPE_TASK_STORAGE maps
+// See https://github.com/torvalds/linux/commit/4cf1bc1f10452065a29d576fc5693fc4fab5b919
+func (k *Version) HasTaskStorage() bool {
+	if features.HaveMapType(ebpf.TaskStorage) == nil {
+		return true
+	}
+
+	return k.Code != 0 && k.Code >= Kernel5_11
+}
+
+// hasTaskStorageForProgramType returns true if the kernel supports using task local storage for the given program type
+// See https://github.com/torvalds/linux/commit/a10787e6d58c24b51e91c19c6d16c5da89fcaa4b
+func (k *Version) hasTaskStorageForProgramType(progType ebpf.ProgramType) bool {
+	return features.HaveProgramHelper(progType, asm.FnTaskStorageGet) == nil &&
+		features.HaveProgramHelper(progType, asm.FnGetCurrentTaskBtf) == nil
+}
+
+// HasTaskStorageInKprobePrograms returns true if the kernel supports using task local storage in kprobe programs
+func (k *Version) HasTaskStorageInKprobePrograms() bool {
+	return k.hasTaskStorageForProgramType(ebpf.Kprobe)
+}
+
+// HasTaskStorageInTracingPrograms returns true if the kernel supports using task local storage in tracing (fentry) programs
+func (k *Version) HasTaskStorageInTracingPrograms() bool {
+	return k.hasTaskStorageForProgramType(ebpf.Tracing)
+}
+
+// HasTaskStorageInTracePointPrograms returns true if the kernel supports using task local storage in tracepoint programs
+func (k *Version) HasTaskStorageInTracePointPrograms() bool {
+	return k.hasTaskStorageForProgramType(ebpf.TracePoint)
 }

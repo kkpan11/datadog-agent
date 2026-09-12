@@ -7,7 +7,6 @@ package setup
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
+	"github.com/DataDog/datadog-agent/pkg/util/defaultpaths"
 )
 
 // TestProcessDefaults tests to ensure that the config has set process settings correctly
@@ -28,11 +29,11 @@ func TestProcessDefaultConfig(t *testing.T) {
 	}{
 		{
 			key:          "process_config.dd_agent_bin",
-			defaultValue: DefaultDDAgentBin,
+			defaultValue: defaultpaths.GetDefaultDDAgentBin(),
 		},
 		{
 			key:          "process_config.log_file",
-			defaultValue: DefaultProcessAgentLogFile,
+			defaultValue: defaultpaths.GetDefaultProcessAgentLogFile(),
 		},
 		{
 			key:          "process_config.grpc_connection_timeout_secs",
@@ -59,10 +60,6 @@ func TestProcessDefaultConfig(t *testing.T) {
 			defaultValue: true,
 		},
 		{
-			key:          "process_config.run_in_core_agent.enabled",
-			defaultValue: runtime.GOOS == "linux",
-		},
-		{
 			key:          "process_config.queue_size",
 			defaultValue: DefaultProcessQueueSize,
 		},
@@ -83,10 +80,6 @@ func TestProcessDefaultConfig(t *testing.T) {
 			defaultValue: make(map[string][]string),
 		},
 		{
-			key:          "process_config.events_additional_endpoints",
-			defaultValue: make(map[string][]string),
-		},
-		{
 			key:          "process_config.internal_profiling.enabled",
 			defaultValue: false,
 		},
@@ -104,31 +97,7 @@ func TestProcessDefaultConfig(t *testing.T) {
 		},
 		{
 			key:          "process_config.cmd_port",
-			defaultValue: DefaultProcessCmdPort,
-		},
-		{
-			key:          "process_config.event_collection.store.max_items",
-			defaultValue: DefaultProcessEventStoreMaxItems,
-		},
-		{
-			key:          "process_config.event_collection.store.max_pending_pushes",
-			defaultValue: DefaultProcessEventStoreMaxPendingPushes,
-		},
-		{
-			key:          "process_config.event_collection.store.max_pending_pulls",
-			defaultValue: DefaultProcessEventStoreMaxPendingPulls,
-		},
-		{
-			key:          "process_config.event_collection.store.stats_interval",
-			defaultValue: DefaultProcessEventStoreStatsInterval,
-		},
-		{
-			key:          "process_config.event_collection.enabled",
-			defaultValue: false,
-		},
-		{
-			key:          "process_config.event_collection.interval",
-			defaultValue: DefaultProcessEventsCheckInterval,
+			defaultValue: constants.DefaultProcessCmdPort,
 		},
 		{
 			key:          "process_config.language_detection.grpc_port",
@@ -136,7 +105,7 @@ func TestProcessDefaultConfig(t *testing.T) {
 		},
 		{
 			key:          "process_config.intervals.connections",
-			defaultValue: nil,
+			defaultValue: 30,
 		},
 	} {
 		t.Run(tc.key+" default", func(t *testing.T) {
@@ -190,11 +159,6 @@ func TestProcessConfigPrefixes(t *testing.T) {
 }
 
 func TestEnvVarOverride(t *testing.T) {
-	processRunInAgent := true
-	if runtime.GOOS != "linux" {
-		processRunInAgent = false
-	}
-
 	for _, tc := range []struct {
 		key, env, value string
 		expType         string
@@ -267,12 +231,6 @@ func TestEnvVarOverride(t *testing.T) {
 			expected: true,
 		},
 		{
-			key:      "process_config.run_in_core_agent.enabled",
-			env:      "DD_PROCESS_CONFIG_RUN_IN_CORE_AGENT_ENABLED",
-			value:    "true",
-			expected: processRunInAgent,
-		},
-		{
 			key:      "process_config.enabled",
 			env:      "DD_PROCESS_CONFIG_ENABLED",
 			value:    "false",
@@ -305,12 +263,6 @@ func TestEnvVarOverride(t *testing.T) {
 		{
 			key:      "process_config.process_dd_url",
 			env:      "DD_PROCESS_AGENT_URL",
-			value:    "datacat.com",
-			expected: "datacat.com",
-		},
-		{
-			key:      "process_config.events_dd_url",
-			env:      "DD_PROCESS_CONFIG_EVENTS_DD_URL",
 			value:    "datacat.com",
 			expected: "datacat.com",
 		},
@@ -382,7 +334,7 @@ func TestEnvVarOverride(t *testing.T) {
 			key:      "process_config.strip_proc_arguments",
 			env:      "DD_STRIP_PROCESS_ARGS",
 			value:    "false",
-			expType:  "boolean", // process_config.strip_proc_arguments has no default value so Get returns a string
+			expType:  "boolean",
 			expected: false,
 		},
 		{
@@ -407,42 +359,6 @@ func TestEnvVarOverride(t *testing.T) {
 			expected: true,
 		},
 		{
-			key:      "process_config.event_collection.store.max_items",
-			env:      "DD_PROCESS_CONFIG_EVENT_COLLECTION_STORE_MAX_ITEMS",
-			value:    "400",
-			expected: 400,
-		},
-		{
-			key:      "process_config.event_collection.store.max_pending_pushes",
-			env:      "DD_PROCESS_CONFIG_EVENT_COLLECTION_STORE_MAX_PENDING_PUSHES",
-			value:    "100",
-			expected: 100,
-		},
-		{
-			key:      "process_config.event_collection.store.max_pending_pulls",
-			env:      "DD_PROCESS_CONFIG_EVENT_COLLECTION_STORE_MAX_PENDING_PULLS",
-			value:    "50",
-			expected: 50,
-		},
-		{
-			key:      "process_config.event_collection.store.stats_interval",
-			env:      "DD_PROCESS_CONFIG_EVENT_COLLECTION_STORE_STATS_INTERVAL",
-			value:    "60",
-			expected: 60,
-		},
-		{
-			key:      "process_config.event_collection.enabled",
-			env:      "DD_PROCESS_CONFIG_EVENT_COLLECTION_ENABLED",
-			value:    "true",
-			expected: true,
-		},
-		{
-			key:      "process_config.event_collection.interval",
-			env:      "DD_PROCESS_CONFIG_EVENT_COLLECTION_INTERVAL",
-			value:    "20s",
-			expected: 20 * time.Second,
-		},
-		{
 			key:      "process_config.language_detection.grpc_port",
 			env:      "DD_PROCESS_CONFIG_LANGUAGE_DETECTION_GRPC_PORT",
 			value:    "5431",
@@ -452,7 +368,7 @@ func TestEnvVarOverride(t *testing.T) {
 			key:      "process_config.intervals.connections",
 			env:      "DD_PROCESS_CONFIG_INTERVALS_CONNECTIONS",
 			value:    "10",
-			expected: "10",
+			expected: 10,
 		},
 	} {
 		t.Run(tc.env, func(t *testing.T) {
@@ -486,15 +402,6 @@ func TestEnvVarOverride(t *testing.T) {
 				"fakeAPIKey",
 			},
 		}, cfg.GetStringMapStringSlice("process_config.additional_endpoints"))
-	})
-
-	t.Run("DD_PROCESS_CONFIG_EVENTS_ADDITIONAL_ENDPOINTS", func(t *testing.T) {
-		t.Setenv("DD_PROCESS_CONFIG_EVENTS_ADDITIONAL_ENDPOINTS", `{"https://process-events.datadoghq.io": ["fakeAPIKey"]}`)
-		assert.Equal(t, map[string][]string{
-			"https://process-events.datadoghq.io": {
-				"fakeAPIKey",
-			},
-		}, cfg.GetStringMapStringSlice("process_config.events_additional_endpoints"))
 	})
 }
 
@@ -541,49 +448,6 @@ func TestEnvVarCustomSensitiveWords(t *testing.T) {
 	}
 }
 
-func TestProcBindEnvAndSetDefault(t *testing.T) {
-	cfg := newTestConf(t)
-	procBindEnvAndSetDefault(cfg, "process_config.foo.bar", "asdf")
-
-	envs := map[string]struct{}{}
-	for _, env := range cfg.GetEnvVars() {
-		envs[env] = struct{}{}
-	}
-
-	_, ok := envs["DD_PROCESS_CONFIG_FOO_BAR"]
-	assert.True(t, ok)
-
-	_, ok = envs["DD_PROCESS_AGENT_FOO_BAR"]
-	assert.True(t, ok)
-
-	// Make sure the default is set properly
-	assert.Equal(t, "asdf", cfg.GetString("process_config.foo.bar"))
-}
-
-func TestProcBindEnv(t *testing.T) {
-	cfg := newTestConf(t)
-	procBindEnv(cfg, "process_config.foo.bar")
-
-	envs := map[string]struct{}{}
-	for _, env := range cfg.GetEnvVars() {
-		envs[env] = struct{}{}
-	}
-
-	_, ok := envs["DD_PROCESS_CONFIG_FOO_BAR"]
-	assert.True(t, ok)
-
-	_, ok = envs["DD_PROCESS_AGENT_FOO_BAR"]
-	assert.True(t, ok)
-
-	// Make sure that DD_PROCESS_CONFIG_FOO_BAR shows up as unset by default
-	assert.False(t, cfg.IsSet("process_config.foo.bar"))
-
-	// Try and set DD_PROCESS_CONFIG_FOO_BAR and make sure it shows up in the config
-	t.Setenv("DD_PROCESS_CONFIG_FOO_BAR", "baz")
-	assert.True(t, cfg.IsSet("process_config.foo.bar"))
-	assert.Equal(t, "baz", cfg.GetString("process_config.foo.bar"))
-}
-
 func TestProcConfigEnabledTransform(t *testing.T) {
 	for _, tc := range []struct {
 		procConfigEnabled                                      string
@@ -607,11 +471,126 @@ func TestProcConfigEnabledTransform(t *testing.T) {
 	} {
 		t.Run("process_config.enabled="+tc.procConfigEnabled, func(t *testing.T) {
 			cfg := newTestConf(t)
-			cfg.SetWithoutSource("process_config.enabled", tc.procConfigEnabled)
+			cfg.SetInTest("process_config.enabled", tc.procConfigEnabled)
 			loadProcessTransforms(cfg)
 
 			assert.Equal(t, tc.expectedContainerCollection, cfg.GetBool("process_config.container_collection.enabled"))
 			assert.Equal(t, tc.expectedProcessCollection, cfg.GetBool("process_config.process_collection.enabled"))
 		})
+	}
+}
+
+// TestProcConfigEnabledTransformPrecedence ensures the deprecated process_config.enabled only fills in
+// the settings that replaced it, and never overrides them when the user configured them explicitly. The
+// expected sources pin down which value won: environment-variable for the user's, agent-runtime for the
+// one derived from the deprecated setting.
+func TestProcConfigEnabledTransformPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                   string
+		env                                                    map[string]string
+		expectedContainerCollection, expectedProcessCollection bool
+		expectedContainerSource, expectedProcessSource         pkgconfigmodel.Source
+	}{
+		{
+			name: "explicit container collection wins over process_config.enabled",
+			env: map[string]string{
+				"DD_PROCESS_CONFIG_ENABLED":                      "false",
+				"DD_PROCESS_CONFIG_CONTAINER_COLLECTION_ENABLED": "false",
+			},
+			expectedContainerCollection: false,
+			expectedContainerSource:     pkgconfigmodel.SourceEnvVar,
+			expectedProcessCollection:   false,
+			expectedProcessSource:       pkgconfigmodel.SourceAgentRuntime,
+		},
+		{
+			name: "explicit process collection wins over process_config.enabled",
+			env: map[string]string{
+				"DD_PROCESS_CONFIG_ENABLED":                    "true",
+				"DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED": "false",
+			},
+			expectedContainerCollection: false,
+			expectedContainerSource:     pkgconfigmodel.SourceAgentRuntime,
+			expectedProcessCollection:   false,
+			expectedProcessSource:       pkgconfigmodel.SourceEnvVar,
+		},
+		{
+			name: "explicit collection settings win over process_config.enabled=disabled",
+			env: map[string]string{
+				"DD_PROCESS_CONFIG_ENABLED":                      "disabled",
+				"DD_PROCESS_CONFIG_CONTAINER_COLLECTION_ENABLED": "true",
+				"DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED":   "true",
+			},
+			expectedContainerCollection: true,
+			expectedContainerSource:     pkgconfigmodel.SourceEnvVar,
+			expectedProcessCollection:   true,
+			expectedProcessSource:       pkgconfigmodel.SourceEnvVar,
+		},
+		{
+			name: "process_config.enabled still applies to the settings left unset",
+			env: map[string]string{
+				"DD_PROCESS_CONFIG_ENABLED":                    "false",
+				"DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED": "true",
+			},
+			expectedContainerCollection: true,
+			expectedContainerSource:     pkgconfigmodel.SourceAgentRuntime,
+			expectedProcessCollection:   true,
+			expectedProcessSource:       pkgconfigmodel.SourceEnvVar,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for env, value := range tc.env {
+				t.Setenv(env, value)
+			}
+
+			cfg := newTestConfWithoutOverrides(t)
+			loadProcessTransforms(cfg)
+
+			assert.Equal(t, tc.expectedContainerCollection, cfg.GetBool("process_config.container_collection.enabled"))
+			assert.Equal(t, tc.expectedContainerSource, cfg.GetSource("process_config.container_collection.enabled"))
+			assert.Equal(t, tc.expectedProcessCollection, cfg.GetBool("process_config.process_collection.enabled"))
+			assert.Equal(t, tc.expectedProcessSource, cfg.GetSource("process_config.process_collection.enabled"))
+		})
+	}
+}
+
+// TestProcConfigEnabledTransformNormalizesDeprecatedKey ensures the deprecated setting is not left enabled
+// once the settings that replaced it are off. Consumers OR the three keys together, so a stale "true"
+// would keep process checks running after the user disabled them.
+func TestProcConfigEnabledTransformNormalizesDeprecatedKey(t *testing.T) {
+	t.Setenv("DD_PROCESS_CONFIG_ENABLED", "true")
+	t.Setenv("DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED", "false")
+
+	cfg := newTestConfWithoutOverrides(t)
+	loadProcessTransforms(cfg)
+
+	assert.False(t, cfg.GetBool("process_config.process_collection.enabled"))
+	assert.False(t, cfg.GetBool("process_config.container_collection.enabled"))
+	assert.False(t, cfg.GetBool("process_config.enabled"))
+}
+
+// TestProcConfigEnabledTransformOverridesInfraMode ensures infra-mode values, which rank below user
+// configuration, do not shadow the deprecated process_config.enabled.
+func TestProcConfigEnabledTransformOverridesInfraMode(t *testing.T) {
+	cfg := newTestConfWithoutOverrides(t)
+	cfg.Set("process_config.process_collection.enabled", true, pkgconfigmodel.SourceInfraMode)
+	cfg.SetInTest("process_config.enabled", "disabled")
+	loadProcessTransforms(cfg)
+
+	assert.False(t, cfg.GetBool("process_config.process_collection.enabled"))
+	assert.False(t, cfg.GetBool("process_config.container_collection.enabled"))
+}
+
+// TestProcConfigEnabledTransformIsIdempotent ensures re-running the transform keeps the values computed by
+// the first pass. It is registered as an override func, and override funcs can run more than once.
+func TestProcConfigEnabledTransformIsIdempotent(t *testing.T) {
+	t.Setenv("DD_PROCESS_CONFIG_ENABLED", "false")
+	t.Setenv("DD_PROCESS_CONFIG_CONTAINER_COLLECTION_ENABLED", "false")
+
+	cfg := newTestConfWithoutOverrides(t)
+	for i := range 3 {
+		loadProcessTransforms(cfg)
+
+		assert.Falsef(t, cfg.GetBool("process_config.container_collection.enabled"), "run %d overrode the user value", i+1)
+		assert.Falsef(t, cfg.GetBool("process_config.process_collection.enabled"), "run %d changed the derived value", i+1)
 	}
 }

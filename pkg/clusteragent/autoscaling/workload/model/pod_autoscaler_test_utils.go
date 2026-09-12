@@ -8,6 +8,7 @@
 package model
 
 import (
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -15,8 +16,8 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	datadoghqcommon "github.com/DataDog/datadog-operator/api/datadoghq/common"
@@ -24,54 +25,128 @@ import (
 )
 
 // FakePodAutoscalerInternal is a fake PodAutoscalerInternal object.
+// Spec is a convenience shortcut: if UpstreamCR is nil and Spec is non-nil, Build() creates a
+// minimal upstream CR shell carrying the provided Spec.  When UpstreamCR is set it takes
+// precedence and Spec is ignored.
 type FakePodAutoscalerInternal struct {
-	Namespace                      string
-	Name                           string
-	Generation                     int64
-	Spec                           *datadoghq.DatadogPodAutoscalerSpec
-	SettingsTimestamp              time.Time
-	CreationTimestamp              time.Time
-	ScalingValues                  ScalingValues
-	MainScalingValues              ScalingValues
-	FallbackScalingValues          ScalingValues
-	HorizontalLastActions          []datadoghqcommon.DatadogPodAutoscalerHorizontalAction
-	HorizontalLastLimitReason      string
-	HorizontalLastActionError      error
-	HorizontalEventsRetention      time.Duration
-	VerticalLastAction             *datadoghqcommon.DatadogPodAutoscalerVerticalAction
-	VerticalLastActionError        error
-	CurrentReplicas                *int32
-	ScaledReplicas                 *int32
-	Error                          error
-	Deleted                        bool
-	TargetGVK                      schema.GroupVersionKind
-	CustomRecommenderConfiguration *RecommenderConfiguration
+	Namespace                          string
+	Name                               string
+	Generation                         int64
+	Spec                               *datadoghq.DatadogPodAutoscalerSpec
+	UpstreamCR                         *datadoghq.DatadogPodAutoscaler
+	SettingsTimestamp                  time.Time
+	CreationTimestamp                  time.Time
+	ScalingValues                      ScalingValues
+	MainScalingValues                  ScalingValues
+	MainScalingValuesVersion           uint64
+	FallbackScalingValues              ScalingValues
+	HorizontalLastActions              []datadoghqcommon.DatadogPodAutoscalerHorizontalAction
+	HorizontalLastRecommendations      []datadoghqcommon.DatadogPodAutoscalerHorizontalRecommendation
+	HorizontalLastLimitReason          string
+	HorizontalLastActionError          error
+	HorizontalActionErrorCount         uint
+	HorizontalActionSuccessCount       uint
+	HorizontalEventsRetention          time.Duration
+	HorizontalRecommendationsRetention time.Duration
+	VerticalLastAction                 *datadoghqcommon.DatadogPodAutoscalerVerticalAction
+	VerticalLastActionError            error
+	VerticalLastLimitReason            error
+	VerticalActionErrorCount           uint
+	VerticalActionSuccessCount         uint
+	InPlacePatchSuccessCount           uint
+	InPlacePatchErrorCount             uint
+	InPlaceEvictionSuccessCount        uint
+	InPlaceEvictionErrorCount          uint
+	InPlaceRolloutFallbackCount        uint
+	InPlacePDBBlockedCount             uint
+	InPlaceDisruptionThrottledCount    uint
+	InPlaceResizeCompletedCount        uint
+	CurrentReplicas                    *int32
+	ScaledReplicas                     *int32
+	EvictedReplicas                    *int32
+	Error                              error
+	Deleted                            bool
+	ProfileName                        string
+	PreviewAnnotationKey               string
+	DesiredProfileTemplateHash         string
+	AppliedProfileHash                 string
+	TargetGVK                          schema.GroupVersionKind
+	CustomRecommenderConfiguration     *RecommenderConfiguration
 }
 
 // Build creates a PodAutoscalerInternal object from the FakePodAutoscalerInternal.
 func (f FakePodAutoscalerInternal) Build() PodAutoscalerInternal {
+	upstreamCR := f.UpstreamCR
+	if upstreamCR == nil && f.Spec != nil {
+		upstreamCR = &datadoghq.DatadogPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace,
+				Name:      f.Name,
+			},
+			Spec: *f.Spec,
+		}
+	}
+
+	// Mirror what setPreviewAnnotation does in production: keep upstreamCR.Annotations in sync
+	// with PreviewAnnotationKey so that PreviewAnnotation() returns the expected value.
+	if f.PreviewAnnotationKey != "" {
+		if upstreamCR == nil {
+			upstreamCR = &datadoghq.DatadogPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: f.Namespace,
+					Name:      f.Name,
+				},
+			}
+		}
+		if upstreamCR.Annotations == nil {
+			upstreamCR.Annotations = make(map[string]string)
+		}
+		upstreamCR.Annotations[PreviewAnnotationKey] = f.PreviewAnnotationKey
+	}
+
 	return PodAutoscalerInternal{
-		namespace:                      f.Namespace,
-		name:                           f.Name,
-		generation:                     f.Generation,
-		spec:                           f.Spec,
-		settingsTimestamp:              f.SettingsTimestamp,
-		creationTimestamp:              f.CreationTimestamp,
-		scalingValues:                  f.ScalingValues,
-		mainScalingValues:              f.MainScalingValues,
-		fallbackScalingValues:          f.FallbackScalingValues,
-		horizontalLastActions:          f.HorizontalLastActions,
-		horizontalLastLimitReason:      f.HorizontalLastLimitReason,
-		horizontalLastActionError:      f.HorizontalLastActionError,
-		horizontalEventsRetention:      f.HorizontalEventsRetention,
-		verticalLastAction:             f.VerticalLastAction,
-		verticalLastActionError:        f.VerticalLastActionError,
-		currentReplicas:                f.CurrentReplicas,
-		scaledReplicas:                 f.ScaledReplicas,
-		error:                          f.Error,
-		deleted:                        f.Deleted,
-		targetGVK:                      f.TargetGVK,
-		customRecommenderConfiguration: f.CustomRecommenderConfiguration,
+		namespace:                          f.Namespace,
+		name:                               f.Name,
+		generation:                         f.Generation,
+		upstreamCR:                         upstreamCR,
+		settingsTimestamp:                  f.SettingsTimestamp,
+		creationTimestamp:                  f.CreationTimestamp,
+		scalingValues:                      f.ScalingValues,
+		mainScalingValues:                  f.MainScalingValues,
+		mainScalingValuesVersion:           f.MainScalingValuesVersion,
+		fallbackScalingValues:              f.FallbackScalingValues,
+		horizontalLastActions:              f.HorizontalLastActions,
+		horizontalLastRecommendations:      f.HorizontalLastRecommendations,
+		horizontalLastLimitReason:          f.HorizontalLastLimitReason,
+		horizontalLastActionError:          f.HorizontalLastActionError,
+		horizontalActionErrorCount:         f.HorizontalActionErrorCount,
+		horizontalActionSuccessCount:       f.HorizontalActionSuccessCount,
+		horizontalEventsRetention:          f.HorizontalEventsRetention,
+		horizontalRecommendationsRetention: f.HorizontalRecommendationsRetention,
+		verticalLastAction:                 f.VerticalLastAction,
+		verticalLastActionError:            f.VerticalLastActionError,
+		verticalLastLimitReason:            f.VerticalLastLimitReason,
+		verticalActionErrorCount:           f.VerticalActionErrorCount,
+		verticalActionSuccessCount:         f.VerticalActionSuccessCount,
+		inPlacePatchSuccessCount:           f.InPlacePatchSuccessCount,
+		inPlacePatchErrorCount:             f.InPlacePatchErrorCount,
+		inPlaceEvictionSuccessCount:        f.InPlaceEvictionSuccessCount,
+		inPlaceEvictionErrorCount:          f.InPlaceEvictionErrorCount,
+		inPlaceRolloutFallbackCount:        f.InPlaceRolloutFallbackCount,
+		inPlacePDBBlockedCount:             f.InPlacePDBBlockedCount,
+		inPlaceDisruptionThrottledCount:    f.InPlaceDisruptionThrottledCount,
+		inPlaceResizeCompletedCount:        f.InPlaceResizeCompletedCount,
+		currentReplicas:                    f.CurrentReplicas,
+		scaledReplicas:                     f.ScaledReplicas,
+		evictedReplicas:                    f.EvictedReplicas,
+		error:                              f.Error,
+		deleted:                            f.Deleted,
+		profileName:                        f.ProfileName,
+		previewOptions:                     parsePreviewAnnotationString(f.PreviewAnnotationKey),
+		desiredProfileTemplateHash:         f.DesiredProfileTemplateHash,
+		appliedProfileHash:                 f.AppliedProfileHash,
+		targetGVK:                          f.TargetGVK,
+		customRecommenderConfiguration:     f.CustomRecommenderConfiguration,
 	}
 }
 
@@ -95,13 +170,22 @@ func NewFakePodAutoscalerInternal(ns, name string, fake *FakePodAutoscalerIntern
 func ComparePodAutoscalers(expected any, actual any) string {
 	return cmp.Diff(
 		expected, actual,
-		cmpopts.EquateErrors(),
 		cmp.Exporter(func(t reflect.Type) bool {
 			return t == reflect.TypeOf(PodAutoscalerInternal{})
 		}),
+		cmp.FilterValues(func(x, y any) bool {
+			_, ok1 := x.(error)
+			_, ok2 := y.(error)
+			return ok1 && ok2
+		}, cmp.Comparer(func(x, y any) bool {
+			xe := x.(error)
+			ye := y.(error)
+
+			return errors.Is(xe, ye) || errors.Is(ye, xe) || xe.Error() == ye.Error()
+		})),
 		cmp.FilterValues(
-			func(x, y interface{}) bool {
-				for _, v := range []interface{}{x, y} {
+			func(x, y any) bool {
+				for _, v := range []any{x, y} {
 					switch v.(type) {
 					case FakePodAutoscalerInternal:
 					case PodAutoscalerInternal:
@@ -121,8 +205,8 @@ func ComparePodAutoscalers(expected any, actual any) string {
 			}),
 		),
 		cmp.FilterValues(
-			func(x, y interface{}) bool {
-				for _, v := range []interface{}{x, y} {
+			func(x, y any) bool {
+				for _, v := range []any{x, y} {
 					switch v.(type) {
 					case []FakePodAutoscalerInternal:
 					case []PodAutoscalerInternal:

@@ -3,17 +3,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2022-present Datadog, Inc.
 
-//go:build linux_bpf || (windows && npm)
+//go:build (linux && bpf) || (windows && npm)
 
 package http
-
-import (
-	"time"
-)
 
 // IncompleteBuffer is responsible for buffering incomplete transactions
 // (eg. httpTX objects that have either only the request or response information)
 type IncompleteBuffer interface {
 	Add(tx Transaction)
-	Flush(now time.Time) []Transaction
+	Flush() []Transaction
 }

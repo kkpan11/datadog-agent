@@ -3,18 +3,19 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build (windows && npm) || linux_bpf
+//go:build (windows && npm) || (linux && bpf) || darwin
 
 package dns
 
 import (
 	"bytes"
+	"errors"
+	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/pkg/errors"
 
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/process/util"
@@ -26,12 +27,6 @@ const maxIPBufferSize = 200
 var (
 	errTruncated      = errors.New("the packet is truncated")
 	errSkippedPayload = errors.New("the packet does not contain relevant DNS response")
-
-	// recordedRecordTypes defines a map of DNS types that we'll capture by default.
-	// add additional types here to change the default.
-	defaultRecordedQueryTypes = map[layers.DNSType]struct{}{
-		layers.DNSTypeA: {},
-	}
 
 	// map for translating config strings back to the typed value
 	queryTypeStrings = map[string]layers.DNSType{
@@ -63,7 +58,7 @@ type dnsParser struct {
 	layers             []gopacket.LayerType
 	ipv4Payload        *layers.IPv4
 	ipv6Payload        *layers.IPv6
-	udpPayload         *layers.UDP
+	udpPayload         *udpWithDNSSupport
 	tcpPayload         *tcpWithDNSSupport
 	dnsPayload         *layers.DNS
 	collectDNSStats    bool
@@ -74,13 +69,19 @@ type dnsParser struct {
 func newDNSParser(layerType gopacket.LayerType, cfg *config.Config) *dnsParser {
 	ipv4Payload := &layers.IPv4{}
 	ipv6Payload := &layers.IPv6{}
-	udpPayload := &layers.UDP{}
+	udpPayload := &udpWithDNSSupport{}
 	tcpPayload := &tcpWithDNSSupport{}
 	dnsPayload := &layers.DNS{}
 	queryTypes := getRecordedQueryTypes(cfg)
 
+	var linkLayer gopacket.DecodingLayer
+	if layerType == layers.LayerTypeLoopback {
+		linkLayer = &layers.Loopback{}
+	} else {
+		linkLayer = &layers.Ethernet{}
+	}
 	stack := []gopacket.DecodingLayer{
-		&layers.Ethernet{},
+		linkLayer,
 		ipv4Payload,
 		ipv6Payload,
 		udpPayload,
@@ -251,7 +252,7 @@ func (p *dnsParser) isWantedQueryType(checktype layers.DNSType) bool {
 
 func getRecordedQueryTypes(cfg *config.Config) map[layers.DNSType]struct{} {
 	if len(cfg.RecordedQueryTypes) <= 0 {
-		return defaultRecordedQueryTypes
+		return getDefaultRecordedQueryTypes()
 	}
 	queryTypes := make(map[layers.DNSType]struct{})
 	//
@@ -269,9 +270,23 @@ func getRecordedQueryTypes(cfg *config.Config) map[layers.DNSType]struct{} {
 	}
 	if len(queryTypes) <= 0 {
 		log.Warnf("No known query types provided in config, reverting to default")
-		return defaultRecordedQueryTypes
+		return getDefaultRecordedQueryTypes()
 	}
 	return queryTypes
+}
+
+func getDefaultRecordedQueryTypes() map[layers.DNSType]struct{} {
+	// recordedRecordTypes defines a map of DNS types that we'll capture by default.
+	// add additional types here to change the default.
+	defaultRecordedQueryTypes := map[layers.DNSType]struct{}{
+		layers.DNSTypeA: {},
+	}
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		// ipv6 DNS is currently not supported on Windows
+		// TODO: Add layers.DNSTypeAAAA for windows once supported
+		defaultRecordedQueryTypes[layers.DNSTypeAAAA] = struct{}{}
+	}
+	return defaultRecordedQueryTypes
 }
 
 // inplaceASCIILower is an optimized, replace inplace version of bytes.ToLower

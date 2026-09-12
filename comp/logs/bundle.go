@@ -3,12 +3,14 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-package logs //nolint:revive // TODO(AML) Fix revive linter
+// Package logs provides the logs component bundle
+package logs
 
 import (
-	"github.com/DataDog/datadog-agent/comp/logs/agent/agentimpl"
+	kubehealthfx "github.com/DataDog/datadog-agent/comp/logs-library/kubehealth/fx"
+	agentfx "github.com/DataDog/datadog-agent/comp/logs/agent/fx"
 	auditorfx "github.com/DataDog/datadog-agent/comp/logs/auditor/fx"
-	healthfx "github.com/DataDog/datadog-agent/comp/logs/health/fx"
+	severityproviderfx "github.com/DataDog/datadog-agent/comp/logs/severityprovider/fx"
 	streamlogs "github.com/DataDog/datadog-agent/comp/logs/streamlogs/fx"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 )
@@ -18,8 +20,9 @@ import (
 // Bundle defines the fx options for this bundle.
 func Bundle() fxutil.BundleOptions {
 	return fxutil.Bundle(
-		healthfx.Module(),
-		agentimpl.Module(),
+		kubehealthfx.Module(),
+		agentfx.Module(),
+		severityproviderfx.Module(),
 		streamlogs.Module(),
 		auditorfx.Module(),
 	)

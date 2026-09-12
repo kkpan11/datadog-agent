@@ -22,11 +22,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
+	"github.com/DataDog/datadog-agent/pkg/fleet/installer/config"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/db"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/env"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/fixtures"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/oci"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/packages"
+	extensionsPkg "github.com/DataDog/datadog-agent/pkg/fleet/installer/packages/extensions"
 	"github.com/DataDog/datadog-agent/pkg/fleet/installer/repository"
 )
 
@@ -41,19 +43,27 @@ type testPackageManager struct {
 }
 
 func newTestPackageManager(t *testing.T, s *fixtures.Server, rootPath string) *testPackageManager {
+	extensionsPkg.ExtensionsDBDir = filepath.Join(rootPath, "run")
+	os.MkdirAll(extensionsPkg.ExtensionsDBDir, 0755)
 	packages := repository.NewRepositories(rootPath, nil)
-	configs := repository.NewRepositories(t.TempDir(), nil)
-	db, err := db.New(filepath.Join(rootPath, "packages.db"))
+	err := os.MkdirAll(filepath.Join(rootPath, "run"), 0755)
+	assert.NoError(t, err)
+	db, err := db.New(context.Background(), filepath.Join(rootPath, "packages.db"))
 	assert.NoError(t, err)
 	hooks := &testHooks{}
+	userConfigsDir := t.TempDir()
+	config := &config.Directories{
+		StablePath:     userConfigsDir,
+		ExperimentPath: t.TempDir(),
+	}
 	return &testPackageManager{
 		installerImpl: installerImpl{
 			env:            &env.Env{},
 			db:             db,
 			downloader:     oci.NewDownloader(&env.Env{}, s.Client()),
 			packages:       packages,
-			configs:        configs,
-			userConfigsDir: t.TempDir(),
+			userConfigsDir: userConfigsDir,
+			config:         config,
 			packagesDir:    rootPath,
 			hooks:          hooks,
 		},
@@ -162,8 +172,32 @@ func (h *testHooks) PostPromoteConfigExperiment(ctx context.Context, pkg string)
 	return nil
 }
 
-func (i *testPackageManager) ConfigFS(f fixtures.Fixture) fs.FS {
-	return os.DirFS(filepath.Join(i.userConfigsDir, f.Package))
+func (h *testHooks) PreInstallExtension(ctx context.Context, pkg string, extension string) error {
+	if h.noop {
+		return nil
+	}
+	h.Called(ctx, pkg, extension)
+	return nil
+}
+
+func (h *testHooks) PreRemoveExtension(ctx context.Context, pkg string, extension string) error {
+	if h.noop {
+		return nil
+	}
+	h.Called(ctx, pkg, extension)
+	return nil
+}
+
+func (h *testHooks) PostInstallExtension(ctx context.Context, pkg string, extension string, _ bool) error {
+	if h.noop {
+		return nil
+	}
+	h.Called(ctx, pkg, extension)
+	return nil
+}
+
+func (i *testPackageManager) ConfigFS(_ fixtures.Fixture) fs.FS {
+	return os.DirFS(filepath.Join(i.userConfigsDir, "datadog-agent"))
 }
 
 func TestInstallStable(t *testing.T) {
@@ -233,7 +267,6 @@ func TestInstallExperiment(t *testing.T) {
 		assert.Equal(t, fixtures.FixtureSimpleV2.Version, state.Experiment)
 		fixtures.AssertEqualFS(t, s.PackageFS(fixtures.FixtureSimpleV1), r.StableFS())
 		fixtures.AssertEqualFS(t, s.PackageFS(fixtures.FixtureSimpleV2), r.ExperimentFS())
-		fixtures.AssertEqualFS(t, s.ConfigFS(fixtures.FixtureSimpleV2), installer.ConfigFS(fixtures.FixtureSimpleV2))
 	})
 }
 
@@ -261,7 +294,6 @@ func TestInstallPromoteExperiment(t *testing.T) {
 		assert.Equal(t, fixtures.FixtureSimpleV2.Version, state.Stable)
 		assert.False(t, state.HasExperiment())
 		fixtures.AssertEqualFS(t, s.PackageFS(fixtures.FixtureSimpleV2), r.StableFS())
-		fixtures.AssertEqualFS(t, s.ConfigFS(fixtures.FixtureSimpleV2), installer.ConfigFS(fixtures.FixtureSimpleV2))
 	})
 }
 
@@ -289,8 +321,6 @@ func TestUninstallExperiment(t *testing.T) {
 		assert.Equal(t, fixtures.FixtureSimpleV1.Version, state.Stable)
 		assert.False(t, state.HasExperiment())
 		fixtures.AssertEqualFS(t, s.PackageFS(fixtures.FixtureSimpleV1), r.StableFS())
-		// we do not rollback configuration examples to their previous versions currently
-		fixtures.AssertEqualFS(t, s.ConfigFS(fixtures.FixtureSimpleV2), installer.ConfigFS(fixtures.FixtureSimpleV2))
 	})
 }
 
@@ -404,7 +434,28 @@ func TestPurge(t *testing.T) {
 		installer := newTestPackageManager(t, s, rootPath)
 		installer.testHooks.noop = true
 
-		err := instFactory(installer)(testCtx, s.PackageURL(fixtures.FixtureSimpleV1), nil)
+		// Create a tmppath and set it as the root tmp directory
+		tmpPath := filepath.Join(rootPath, "tmp")
+		err := os.MkdirAll(tmpPath, 0755)
+		assert.NoError(t, err)
+
+		oldPurgeTmpDirectory := purgeTmpDirectory
+		purgeTmpDirectory = func(_ string) error {
+			err := os.RemoveAll(tmpPath)
+			if err != nil {
+				t.Fatalf("could not delete tmp directory: %v", err)
+			}
+			return nil
+		}
+		defer func() {
+			purgeTmpDirectory = oldPurgeTmpDirectory
+		}()
+
+		// Create a file in the tmp directory
+		err = os.WriteFile(filepath.Join(tmpPath, "test.txt"), []byte("test"), 0644)
+		assert.NoError(t, err)
+
+		err = instFactory(installer)(testCtx, s.PackageURL(fixtures.FixtureSimpleV1), nil)
 		assert.NoError(t, err)
 		r := installer.packages.Get(fixtures.FixtureSimpleV1.Package)
 
@@ -416,6 +467,7 @@ func TestPurge(t *testing.T) {
 		assert.NoFileExists(t, filepath.Join(rootPath, "packages.db"), "purge should remove the packages database")
 		assert.NoDirExists(t, rootPath, "purge should remove the packages directory")
 		assert.Nil(t, installer.db, "purge should close the packages database")
+		assert.NoDirExists(t, tmpPath, "purge should remove the tmp directory")
 	})
 }
 
@@ -447,17 +499,19 @@ func TestNoOutsideImport(t *testing.T) {
 		"pkg/version",      // TODO: cleanup & remove
 		"pkg/util/log",     // TODO: cleanup & remove
 		"pkg/util/winutil", // Needed for Windows
+		"pkg/config/setup", // Needed for extensions
 		"pkg/template",
+		"pkg/fips", // Needed to detect FIPS-compiled binaries at runtime
 	}
 
 	// Walk the directory tree
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
 		// Only check .go files
-		if !info.IsDir() && strings.HasSuffix(info.Name(), ".go") {
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".go") {
 			// Create a file set and parse the file
 			fs := token.NewFileSet()
 			node, err := parser.ParseFile(fs, path, nil, parser.ImportsOnly)
@@ -490,32 +544,31 @@ func TestNoOutsideImport(t *testing.T) {
 	}
 }
 
-func TestWriteConfigSymlinks(t *testing.T) {
-	fleetDir := t.TempDir()
-	userDir := t.TempDir()
-	err := os.WriteFile(filepath.Join(userDir, "datadog.yaml"), []byte("user config"), 0644)
-	assert.NoError(t, err)
-	err = os.WriteFile(filepath.Join(fleetDir, "datadog.yaml"), []byte("fleet config"), 0644)
-	assert.NoError(t, err)
-	err = os.MkdirAll(filepath.Join(fleetDir, "conf.d"), 0755)
+// Test that only files older than 24 hours are deleted
+func TestTmpDirectoryCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+
+	oldFile := filepath.Join(tempDir, "old.txt")
+	newFile := filepath.Join(tempDir, "new.txt")
+
+	err := os.WriteFile(oldFile, []byte("old"), 0644)
 	assert.NoError(t, err)
 
-	err = writeConfigSymlinks(userDir, fleetDir)
+	err = os.WriteFile(newFile, []byte("new"), 0644)
 	assert.NoError(t, err)
-	assert.FileExists(t, filepath.Join(userDir, "datadog.yaml"))
-	assert.FileExists(t, filepath.Join(userDir, "datadog.yaml.override"))
-	assert.FileExists(t, filepath.Join(userDir, "conf.d.override"))
-	configContent, err := os.ReadFile(filepath.Join(userDir, "datadog.yaml"))
-	assert.NoError(t, err)
-	overrideConfigConent, err := os.ReadFile(filepath.Join(userDir, "datadog.yaml.override"))
-	assert.NoError(t, err)
-	assert.Equal(t, "user config", string(configContent))
-	assert.Equal(t, "fleet config", string(overrideConfigConent))
 
-	fleetDir = t.TempDir()
-	err = writeConfigSymlinks(userDir, fleetDir)
+	oldTime := time.Now().Add(-25 * time.Hour)
+	newTime := time.Now().Add(-1 * time.Hour)
+
+	err = os.Chtimes(oldFile, oldTime, oldTime)
 	assert.NoError(t, err)
-	assert.FileExists(t, filepath.Join(userDir, "datadog.yaml"))
-	assert.NoFileExists(t, filepath.Join(userDir, "datadog.yaml.override"))
-	assert.NoFileExists(t, filepath.Join(userDir, "conf.d.override"))
+
+	err = os.Chtimes(newFile, newTime, newTime)
+	assert.NoError(t, err)
+
+	err = cleanupTmpDirectory(tempDir)
+	assert.NoError(t, err)
+
+	assert.NoFileExists(t, oldFile, "old file should be deleted")
+	assert.FileExists(t, newFile, "new file should be kept")
 }

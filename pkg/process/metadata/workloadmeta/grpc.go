@@ -7,6 +7,7 @@ package workloadmeta
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -15,24 +16,27 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	pbgo "github.com/DataDog/datadog-agent/pkg/proto/pbgo/process"
-	"github.com/DataDog/datadog-agent/pkg/telemetry"
 	grpcutil "github.com/DataDog/datadog-agent/pkg/util/grpc"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
-// DuplicateConnectionErr is an error that explains the connection was closed because another client tried to connect
+// ErrDuplicateConnection is an error that explains the connection was closed because another client tried to connect
 //
 //nolint:revive // TODO(PROC) Fix revive linter
-var DuplicateConnectionErr = errors.New("the stream was closed because another client called StreamEntities")
+var ErrDuplicateConnection = errors.New("the stream was closed because another client called StreamEntities")
 
 // GRPCServer implements a gRPC server to expose Process Entities collected with a WorkloadMetaExtractor
 type GRPCServer struct {
+	pbgo.UnimplementedProcessEntityStreamServer
+
 	config    pkgconfigmodel.Reader
 	extractor *WorkloadMetaExtractor
 	server    *grpc.Server
@@ -49,21 +53,26 @@ const keepaliveInterval = 10 * time.Second
 const streamSendTimeout = 1 * time.Minute
 
 var (
-	invalidVersionError = telemetry.NewSimpleCounter(subsystem, "invalid_version_errors", "The number of times the grpc server receives an entity diff that has an invalid version.")
-	streamServerError   = telemetry.NewSimpleCounter(subsystem, "stream_send_errors", "The number of times the grpc server has failed to send an entity diff to the core agent.")
+	invalidVersionError = telemetryimpl.GetCompatComponent().NewSimpleCounter(subsystem, "invalid_version_errors", "The number of times the grpc server receives an entity diff that has an invalid version.")
+	streamServerError   = telemetryimpl.GetCompatComponent().NewSimpleCounter(subsystem, "stream_send_errors", "The number of times the grpc server has failed to send an entity diff to the core agent.")
 )
 
 // NewGRPCServer creates a new instance of a GRPCServer
-func NewGRPCServer(config pkgconfigmodel.Reader, extractor *WorkloadMetaExtractor) *GRPCServer {
+func NewGRPCServer(config pkgconfigmodel.Reader, extractor *WorkloadMetaExtractor, tlsConfig *tls.Config) *GRPCServer {
+	opts := []grpc.ServerOption{
+		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time: keepaliveInterval,
+		}),
+	}
+
+	// Add gRPC metrics interceptors
+	opts = grpcutil.ServerOptionsWithMetrics(opts...)
+
 	l := &GRPCServer{
-		config:    config,
-		extractor: extractor,
-		server: grpc.NewServer(
-			grpc.Creds(insecure.NewCredentials()),
-			grpc.KeepaliveParams(keepalive.ServerParameters{
-				Time: keepaliveInterval,
-			}),
-		),
+		config:      config,
+		extractor:   extractor,
+		server:      grpc.NewServer(opts...),
 		streamMutex: &sync.Mutex{},
 	}
 
@@ -157,7 +166,7 @@ func (l *GRPCServer) StreamEntities(_ *pbgo.ProcessStreamEntitiesRequest, out pb
 			// Ensure that if streamCtx.Done() is closed, we always choose that path.
 			select {
 			case <-streamCtx.Done():
-				return DuplicateConnectionErr
+				return ErrDuplicateConnection
 			default:
 			}
 
@@ -168,7 +177,7 @@ func (l *GRPCServer) StreamEntities(_ *pbgo.ProcessStreamEntitiesRequest, out pb
 
 			// The diff received from the channel should be 1 + the previous version. Otherwise, we have lost data,
 			// and we should signal the client to resync by closing the stream.
-			log.Trace("[WorkloadMeta GRPCServer] expected diff version %d, actual %d", expectedVersion, diff.cacheVersion)
+			log.Tracef("[WorkloadMeta GRPCServer] expected diff version %d, actual %d", expectedVersion, diff.cacheVersion)
 			if diff.cacheVersion != expectedVersion {
 				invalidVersionError.Inc()
 				log.Debug("[WorkloadMeta GRPCServer] missing cache diff - dropping stream")
@@ -196,14 +205,14 @@ func (l *GRPCServer) StreamEntities(_ *pbgo.ProcessStreamEntitiesRequest, out pb
 			}
 			return nil
 		case <-streamCtx.Done():
-			return DuplicateConnectionErr
+			return ErrDuplicateConnection
 		}
 	}
 }
 
 // getListener returns a listening connection
 func getListener(cfg pkgconfigmodel.Reader) (net.Listener, error) {
-	host, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+	host, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return nil, err
 	}

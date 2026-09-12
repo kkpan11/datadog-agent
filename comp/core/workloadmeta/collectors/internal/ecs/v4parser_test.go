@@ -9,7 +9,6 @@ package ecs
 
 import (
 	"context"
-	"fmt"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -23,35 +22,43 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/ecs/metadata/v3or4"
 )
 
-// TestPullWithTaskCollectionEnabledWithV4Parser tests the Pull method with taskCollectionEnabled enabled
-// and taskCollectionParser set to parseTasksFromV4Endpoint to parse the tasks from the v4 metadata endpoint
-func TestPullWithTaskCollectionEnabledWithV4Parser(t *testing.T) {
+// setupV4ParserTest creates a common setup for v4 parser tests
+func setupV4ParserTest(t *testing.T, collectResourceTags bool) (*httptest.Server, *fakeWorkloadmetaStore, *collector, func()) {
 	// Start a dummy Http server to simulate ECS metadata endpoints
 	// /v1/tasks: return the list of tasks containing datadog-agent task and nginx task
 	ts, err := getDummyECS()
 	require.NoError(t, err)
-	defer ts.Close()
 
 	// Add container handler to return the v4 endpoints for different containers
 	store := getFakeWorkloadmetaStore(ts.URL)
 
 	// create an ECS collector with v4TaskEnabled enabled
-	collector := collector{
+	collector := &collector{
 		store:                 store,
 		taskCollectionEnabled: true,
+		resourceTags:          make(map[string]resourceTags),
 		metaV1:                v1.NewClient(ts.URL),
 		metaV3or4: func(metaURI, metaVersion string) v3or4.Client {
 			return v3or4.NewClient(metaURI, metaVersion)
 		},
-		taskCache:     cache.New(3*time.Minute, 30*time.Second),
-		taskRateRPS:   35,
-		taskRateBurst: 60,
+		taskCache:           cache.New(3*time.Minute, 30*time.Second),
+		taskRateRPS:         35,
+		taskRateBurst:       60,
+		hasResourceTags:     true,
+		collectResourceTags: collectResourceTags,
 	}
 
 	collector.taskCollectionParser = collector.parseTasksFromV4Endpoint
 
-	err = collector.Pull(context.Background())
-	require.NoError(t, err)
+	cleanup := func() {
+		ts.Close()
+	}
+
+	return ts, store, collector, cleanup
+}
+
+// verifyV4ParserResults verifies the common results expected from v4 parser tests
+func verifyV4ParserResults(t *testing.T, store *fakeWorkloadmetaStore, checkTags bool) {
 	// two ECS task events and two container events should be notified
 	require.Len(t, store.notifiedEvents, 4)
 
@@ -77,8 +84,13 @@ func TestPullWithTaskCollectionEnabledWithV4Parser(t *testing.T) {
 			} else {
 				t.Errorf("unexpected entity family: %s", entity.Family)
 			}
+			if checkTags {
+				require.Equal(t, "task-test-value", entity.Tags["tag-test"])
+				require.Equal(t, "tag_value", entity.ContainerInstanceTags["tag_key"])
+			}
 		case *workloadmeta.Container:
 			require.Equal(t, "RUNNING", entity.KnownStatus)
+			require.Equal(t, workloadmeta.ContainerStatusRunning, entity.State.Status)
 			require.Equal(t, "HEALTHY", entity.Health.Status)
 			if entity.Image.Name == "datadog/datadog-agent" {
 				require.Equal(t, "7.50.0", entity.Image.Tag)
@@ -97,6 +109,18 @@ func TestPullWithTaskCollectionEnabledWithV4Parser(t *testing.T) {
 		}
 	}
 	require.Equal(t, 4, count)
+}
+
+// TestPullWithTaskCollectionEnabledWithV4Parser tests the Pull method with taskCollectionEnabled enabled
+// and taskCollectionParser set to parseTasksFromV4Endpoint to parse the tasks from the v4 metadata endpoint
+func TestPullWithTaskCollectionEnabledWithV4Parser(t *testing.T) {
+	_, store, collector, cleanup := setupV4ParserTest(t, true)
+	defer cleanup()
+
+	err := collector.Pull(context.Background())
+	require.NoError(t, err)
+
+	verifyV4ParserResults(t, store, true)
 
 	// second pull should not notify any events as they are in cache
 	store.notifiedEvents = store.notifiedEvents[:0]
@@ -104,12 +128,152 @@ func TestPullWithTaskCollectionEnabledWithV4Parser(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, store.notifiedEvents, 0)
 
+	// Manually check task cache
+	rt := collector.resourceTags["arn:aws:ecs:us-east-1:123457279990:task/ecs-cluster/7d2dae60ad844c608fb2d44215a46f6f"]
+	require.Equal(t, "task-test-value", rt.tags["tag-test"])
+	require.Equal(t, "tag_value", rt.containerInstanceTags["tag_key"])
+
+}
+
+// TestPullWithTaskCollectionEnabledWithV4ParserNoResourceTags tests the Pull method with taskCollectionEnabled enabled
+// and taskCollectionParser set to parseTasksFromV4Endpoint to parse the tasks from the v4 metadata endpoint
+// but with collectResourceTags set to false
+func TestPullWithTaskCollectionEnabledWithV4ParserNoResourceTags(t *testing.T) {
+	_, store, collector, cleanup := setupV4ParserTest(t, false)
+	defer cleanup()
+
+	err := collector.Pull(context.Background())
+	require.NoError(t, err)
+
+	verifyV4ParserResults(t, store, false)
+
+	// second pull should not notify any events as they are in cache
+	store.notifiedEvents = store.notifiedEvents[:0]
+	err = collector.Pull(context.Background())
+	require.NoError(t, err)
+	require.Len(t, store.notifiedEvents, 0)
+}
+
+// TestPullWithTaskCollectionEnabledWithV4ParserCacheClearing tests the Pull method with taskCollectionEnabled enabled
+// and taskCollectionParser set to parseTasksFromV4Endpoint to parse the tasks from the v4 metadata endpoint
+// This test runs collect twice with cache clearing in between to test tag caching behavior
+func TestPullWithTaskCollectionEnabledWithV4ParserCacheClearing(t *testing.T) {
+	_, store, collector, cleanup := setupV4ParserTest(t, true)
+	defer cleanup()
+
+	// First pull - should fetch tags from API
+	err := collector.Pull(context.Background())
+	require.NoError(t, err)
+
+	verifyV4ParserResults(t, store, true)
+
+	// Verify tags are cached
+	rt := collector.resourceTags["arn:aws:ecs:us-east-1:123457279990:task/ecs-cluster/7d2dae60ad844c608fb2d44215a46f6f"]
+	require.Equal(t, "task-test-value", rt.tags["tag-test"])
+	require.Equal(t, "tag_value", rt.containerInstanceTags["tag_key"])
+
+	// Clear the task cache to force re-fetching
+	collector.taskCache.Flush()
+
+	// Reset store notifications to track new events
+	store.notifiedEvents = store.notifiedEvents[:0]
+
+	// Second pull - should fetch from API again since cache was cleared
+	err = collector.Pull(context.Background())
+	require.NoError(t, err)
+
+	// Should notify events again since cache was cleared
+	verifyV4ParserResults(t, store, true)
+
+	// Verify tags are still cached (should use existing tags from resourceTags cache)
+	rt = collector.resourceTags["arn:aws:ecs:us-east-1:123457279990:task/ecs-cluster/7d2dae60ad844c608fb2d44215a46f6f"]
+	require.Equal(t, "task-test-value", rt.tags["tag-test"])
+	require.Equal(t, "tag_value", rt.containerInstanceTags["tag_key"])
+}
+
+// TestParseTasksFromV4TasksEndpoint tests that parseTasksFromV4TasksEndpoint correctly parses
+// all tasks returned by the v4 /tasks endpoint, deriving DaemonName from the "daemon:" Group
+// prefix for daemon-scheduled tasks.
+func TestParseTasksFromV4TasksEndpoint(t *testing.T) {
+	// Serve the /tasks endpoint from the daemon agent's own v4 URI
+	dummyECS, err := testutil.NewDummyECS(
+		testutil.FileHandlerOption("/v4/daemon/tasks", "./testdata/tasks_v4.json"),
+	)
+	require.NoError(t, err)
+	ts := dummyECS.Start()
+	defer ts.Close()
+
+	c := &collector{
+		metaV4:       v3or4.NewClient(ts.URL+"/v4/daemon", "v4"),
+		resourceTags: make(map[string]resourceTags),
+		seen:         make(map[workloadmeta.EntityID]struct{}),
+	}
+	c.taskCollectionParser = c.parseTasksFromV4TasksEndpoint
+
+	events, err := c.parseTasksFromV4TasksEndpoint(context.Background())
+	require.NoError(t, err)
+
+	// expect 2 task events + 2 container events
+	require.Len(t, events, 4)
+
+	var serviceTask, daemonTask *workloadmeta.ECSTask
+	for _, event := range events {
+		require.Equal(t, workloadmeta.EventTypeSet, event.Type)
+		if task, ok := event.Entity.(*workloadmeta.ECSTask); ok {
+			if task.Family == "my-service" {
+				serviceTask = task
+			} else if task.Family == "my-daemon" {
+				daemonTask = task
+			}
+		}
+	}
+
+	require.NotNil(t, serviceTask, "service task should be parsed")
+	require.Equal(t, "my-service", serviceTask.ServiceName)
+	require.Empty(t, serviceTask.DaemonName)
+
+	require.NotNil(t, daemonTask, "daemon task should be parsed")
+	require.Equal(t, "my-daemon", daemonTask.DaemonName)
+	require.Empty(t, daemonTask.ServiceName)
+}
+
+// TestParseTasksFromV4TasksEndpointUnsetsStaleTasks verifies that tasks present in a
+// previous pull but absent from the current /tasks response are emitted as unset events.
+func TestParseTasksFromV4TasksEndpointUnsetsStaleTasks(t *testing.T) {
+	dummyECS, err := testutil.NewDummyECS(
+		testutil.FileHandlerOption("/v4/daemon/tasks", "./testdata/tasks_v4.json"),
+	)
+	require.NoError(t, err)
+	ts := dummyECS.Start()
+	defer ts.Close()
+
+	staleID := workloadmeta.EntityID{Kind: workloadmeta.KindECSTask, ID: "arn:aws:ecs:us-east-1:123457279990:task/ecs-cluster/stale000"}
+
+	c := &collector{
+		metaV4:       v3or4.NewClient(ts.URL+"/v4/daemon", "v4"),
+		resourceTags: make(map[string]resourceTags),
+		seen:         map[workloadmeta.EntityID]struct{}{staleID: {}},
+	}
+
+	events, err := c.parseTasksFromV4TasksEndpoint(context.Background())
+	require.NoError(t, err)
+
+	var unsetEvents []workloadmeta.CollectorEvent
+	for _, e := range events {
+		if e.Type == workloadmeta.EventTypeUnset {
+			unsetEvents = append(unsetEvents, e)
+		}
+	}
+	require.Len(t, unsetEvents, 1)
+	require.Equal(t, staleID, unsetEvents[0].Entity.GetID())
 }
 
 func getDummyECS() (*httptest.Server, error) {
 	dummyECS, err := testutil.NewDummyECS(
 		testutil.FileHandlerOption("/v4/1234-1/taskWithTags", "./testdata/datadog-agent.json"),
 		testutil.FileHandlerOption("/v4/1234-2/taskWithTags", "./testdata/nginx.json"),
+		testutil.FileHandlerOption("/v4/1234-1/task", "./testdata/datadog-agent-no-tags.json"),
+		testutil.FileHandlerOption("/v4/1234-2/task", "./testdata/nginx-no-tags.json"),
 		testutil.FileHandlerOption("/v1/tasks", "./testdata/tasks.json"),
 	)
 	if err != nil {
@@ -128,7 +292,7 @@ func getFakeWorkloadmetaStore(ecsAgentURL string) *fakeWorkloadmetaStore {
 				// add delay to trigger timeout
 				return &workloadmeta.Container{
 					EnvVars: map[string]string{
-						v3or4.DefaultMetadataURIv4EnvVariable: fmt.Sprintf("%s/v4/1234-2", ecsAgentURL),
+						v3or4.DefaultMetadataURIv4EnvVariable: ecsAgentURL + "/v4/1234-2",
 					},
 				}, nil
 			}
@@ -137,15 +301,142 @@ func getFakeWorkloadmetaStore(ecsAgentURL string) *fakeWorkloadmetaStore {
 				// add delay to trigger timeout
 				return &workloadmeta.Container{
 					EnvVars: map[string]string{
-						v3or4.DefaultMetadataURIv4EnvVariable: fmt.Sprintf("%s/v4/1234-1", ecsAgentURL),
+						v3or4.DefaultMetadataURIv4EnvVariable: ecsAgentURL + "/v4/1234-1",
 					},
 				}, nil
 			}
 			return &workloadmeta.Container{
 				EnvVars: map[string]string{
-					v3or4.DefaultMetadataURIv4EnvVariable: fmt.Sprintf("%s/v4/undefined", ecsAgentURL),
+					v3or4.DefaultMetadataURIv4EnvVariable: ecsAgentURL + "/v4/undefined",
 				},
 			}, nil
 		},
 	}
+}
+
+// TestParseV4TaskForSidecarFargate tests parsing a V4 task in sidecar mode with Fargate launch type
+func TestParseV4TaskForSidecarFargate(t *testing.T) {
+	task := &v3or4.Task{
+		TaskARN:       "arn:aws:ecs:us-east-1:123456:task/test-task",
+		Family:        "test-family",
+		Version:       "1",
+		KnownStatus:   "RUNNING",
+		DesiredStatus: "RUNNING",
+		Containers: []v3or4.Container{
+			{
+				DockerID:   "test-container-id",
+				Name:       "test-container",
+				DockerName: "ecs-test-container",
+			},
+		},
+	}
+
+	collector := &collector{
+		actualLaunchType: workloadmeta.ECSLaunchTypeFargate,
+		deploymentMode:   deploymentModeSidecar,
+	}
+
+	events := collector.parseV4TaskForSidecar(task)
+	require.NotEmpty(t, events)
+
+	// Verify Fargate-specific attributes
+	for _, event := range events {
+		require.Equal(t, workloadmeta.SourceRuntime, event.Source, "Sidecar mode should use SourceRuntime")
+
+		if ecsTask, ok := event.Entity.(*workloadmeta.ECSTask); ok {
+			require.Equal(t, workloadmeta.ECSLaunchTypeFargate, ecsTask.LaunchType, "Launch type should be Fargate")
+		}
+
+		if container, ok := event.Entity.(*workloadmeta.Container); ok {
+			require.Equal(t, workloadmeta.ContainerRuntimeECSFargate, container.Runtime, "Fargate containers should have ECSFargate runtime")
+		}
+	}
+}
+
+// TestParseV4TaskForSidecarEC2 tests parsing a V4 task in sidecar mode with EC2 launch type
+func TestParseV4TaskForSidecarEC2(t *testing.T) {
+	task := &v3or4.Task{
+		TaskARN:       "arn:aws:ecs:us-east-1:123456:task/test-task",
+		Family:        "test-family",
+		Version:       "1",
+		KnownStatus:   "RUNNING",
+		DesiredStatus: "RUNNING",
+		Containers: []v3or4.Container{
+			{
+				DockerID:   "test-container-id",
+				Name:       "test-container",
+				DockerName: "ecs-test-container",
+			},
+		},
+	}
+
+	collector := &collector{
+		actualLaunchType: workloadmeta.ECSLaunchTypeEC2,
+		deploymentMode:   deploymentModeSidecar,
+	}
+
+	events := collector.parseV4TaskForSidecar(task)
+	require.NotEmpty(t, events)
+
+	// Verify EC2-specific attributes
+	for _, event := range events {
+		require.Equal(t, workloadmeta.SourceRuntime, event.Source, "Sidecar mode should use SourceRuntime")
+
+		if ecsTask, ok := event.Entity.(*workloadmeta.ECSTask); ok {
+			require.Equal(t, workloadmeta.ECSLaunchTypeEC2, ecsTask.LaunchType, "Launch type should be EC2")
+		}
+
+		if container, ok := event.Entity.(*workloadmeta.Container); ok {
+			require.Empty(t, container.Runtime, "EC2 sidecar containers should have empty runtime")
+		}
+	}
+}
+
+// TestParseV4TaskForSidecarDaemonMode tests parsing a V4 task with daemon deployment mode
+func TestParseV4TaskForSidecarDaemonMode(t *testing.T) {
+	task := &v3or4.Task{
+		TaskARN:       "arn:aws:ecs:us-east-1:123456:task/test-task",
+		Family:        "test-family",
+		Version:       "1",
+		KnownStatus:   "RUNNING",
+		DesiredStatus: "RUNNING",
+		Containers: []v3or4.Container{
+			{
+				DockerID:   "test-container-id",
+				Name:       "test-container",
+				DockerName: "ecs-test-container",
+			},
+		},
+	}
+
+	collector := &collector{
+		actualLaunchType: workloadmeta.ECSLaunchTypeEC2,
+		deploymentMode:   deploymentModeDaemon,
+	}
+
+	events := collector.parseV4TaskForSidecar(task)
+	require.NotEmpty(t, events)
+
+	// Verify daemon mode uses SourceNodeOrchestrator
+	for _, event := range events {
+		require.Equal(t, workloadmeta.SourceNodeOrchestrator, event.Source, "Daemon mode should use SourceNodeOrchestrator")
+	}
+}
+
+// TestParseV4TaskForSidecarStoppedTask tests that stopped tasks are filtered out
+func TestParseV4TaskForSidecarStoppedTask(t *testing.T) {
+	task := &v3or4.Task{
+		TaskARN:       "arn:aws:ecs:us-east-1:123456:task/test-task",
+		Family:        "test-family",
+		KnownStatus:   workloadmeta.ECSTaskKnownStatusStopped,
+		DesiredStatus: "STOPPED",
+	}
+
+	collector := &collector{
+		actualLaunchType: workloadmeta.ECSLaunchTypeFargate,
+		deploymentMode:   deploymentModeSidecar,
+	}
+
+	events := collector.parseV4TaskForSidecar(task)
+	require.Empty(t, events, "Stopped tasks should not generate events")
 }

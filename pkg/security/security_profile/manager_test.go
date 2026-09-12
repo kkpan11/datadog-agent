@@ -10,13 +10,14 @@ package securityprofile
 
 import (
 	"errors"
-	"fmt"
 	"math/rand"
+	"strconv"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/atomic"
 
@@ -479,7 +480,7 @@ func TestActivityDumpManager_getExpiredDumps(t *testing.T) {
 
 			adm := &Manager{
 				activeDumps:        tt.fields.activeDumps,
-				ignoreFromSnapshot: make(map[model.PathKey]bool),
+				ignoreFromSnapshot: make(map[uint64]bool),
 			}
 
 			expiredDumps := adm.getExpiredDumps()
@@ -959,18 +960,128 @@ func TestActivityDumpManager_getOverweightDumps(t *testing.T) {
 				config: &config.Config{
 					RuntimeSecurity: &config.RuntimeSecurityConfig{
 						ActivityDumpMaxDumpSize: func() int {
-							return 2048
+							// Threshold is two process nodes' worth of the shallow
+							// ApproximateSize estimate, so the ProcessNodes:2 fixtures are
+							// exactly overweight regardless of the ProcessNode struct size.
+							return 2 * int(unsafe.Sizeof(activity_tree.ProcessNode{}))
 						},
 					},
 				},
 				statsdClient:       &statsd.NoOpClient{},
-				ignoreFromSnapshot: make(map[model.PathKey]bool),
+				ignoreFromSnapshot: make(map[uint64]bool),
 			}
 
 			compareListOfDumps(t, adm.getOverweightDumps(), tt.overweightDumps)
 			compareListOfDumps(t, adm.activeDumps, tt.activeDumps)
 		})
 	}
+}
+
+// ManagerV2 unit tests
+
+func newTestManagerV2() (*ManagerV2, *lru.Cache[uint32, sampleCookieEntry]) {
+	cookieMap, _ := lru.New[uint32, sampleCookieEntry](128)
+	m := &ManagerV2{
+		sampleCookieMap:       cookieMap,
+		sampleRefreshReceived: atomic.NewUint64(0),
+		sampleRefreshHits:     atomic.NewUint64(0),
+		sampleRefreshMisses:   atomic.NewUint64(0),
+	}
+	return m, cookieMap
+}
+
+func TestManagerV2_HandleSampleRefresh(t *testing.T) {
+	t.Run("unknown_cookie", func(t *testing.T) {
+		m, _ := newTestManagerV2()
+		m.HandleSampleRefresh(42)
+		assert.Equal(t, uint64(1), m.sampleRefreshMisses.Load())
+	})
+
+	t.Run("valid_cookie_updates_process_and_event_node", func(t *testing.T) {
+		m, cookieMap := newTestManagerV2()
+		prof := profile.New()
+		imageTagID := prof.ActivityTree.GetOrInsertImageTag("v1")
+
+		processNode := &activity_tree.ProcessNode{}
+		processNode.NodeBase = activity_tree.NewNodeBase()
+		eventNodeBase := activity_tree.NewNodeBase()
+
+		initialTime := time.Now().Add(-time.Hour)
+		processNode.AppendImageTagID(imageTagID, initialTime)
+		eventNodeBase.AppendImageTagID(imageTagID, initialTime)
+
+		cookieMap.Add(uint32(1), sampleCookieEntry{
+			profile:       prof,
+			processNode:   processNode,
+			eventNodeBase: &eventNodeBase,
+			imageTag:      "v1",
+		})
+
+		m.HandleSampleRefresh(1)
+
+		procTimes, ok := processNode.GetSeenTimes(imageTagID)
+		assert.True(t, ok)
+		assert.True(t, procTimes.LastSeen.After(initialTime))
+
+		evtTimes, ok := eventNodeBase.GetSeenTimes(imageTagID)
+		assert.True(t, ok)
+		assert.True(t, evtTimes.LastSeen.After(initialTime))
+	})
+
+	t.Run("valid_cookie_nil_event_node_updates_process_only", func(t *testing.T) {
+		m, cookieMap := newTestManagerV2()
+		prof := profile.New()
+		imageTagID := prof.ActivityTree.GetOrInsertImageTag("v1")
+
+		processNode := &activity_tree.ProcessNode{}
+		processNode.NodeBase = activity_tree.NewNodeBase()
+
+		initialTime := time.Now().Add(-time.Hour)
+		processNode.AppendImageTagID(imageTagID, initialTime)
+
+		cookieMap.Add(uint32(1), sampleCookieEntry{
+			profile:       prof,
+			processNode:   processNode,
+			eventNodeBase: nil,
+			imageTag:      "v1",
+		})
+
+		m.HandleSampleRefresh(1)
+
+		procTimes, ok := processNode.GetSeenTimes(imageTagID)
+		assert.True(t, ok)
+		assert.True(t, procTimes.LastSeen.After(initialTime))
+	})
+
+	t.Run("nil_process_node_removes_cookie", func(t *testing.T) {
+		m, cookieMap := newTestManagerV2()
+		prof := profile.New()
+
+		cookieMap.Add(uint32(2), sampleCookieEntry{
+			profile:     prof,
+			processNode: nil,
+			imageTag:    "v1",
+		})
+
+		m.HandleSampleRefresh(2)
+		assert.False(t, cookieMap.Contains(uint32(2)))
+	})
+
+	t.Run("empty_seen_map_removes_cookie", func(t *testing.T) {
+		m, cookieMap := newTestManagerV2()
+		prof := profile.New()
+		processNode := &activity_tree.ProcessNode{}
+		processNode.NodeBase = activity_tree.NewNodeBase()
+
+		cookieMap.Add(uint32(3), sampleCookieEntry{
+			profile:     prof,
+			processNode: processNode,
+			imageTag:    "v1",
+		})
+
+		m.HandleSampleRefresh(3)
+		assert.False(t, cookieMap.Contains(uint32(3)))
+	})
 }
 
 // Old security profile manager unit tests
@@ -992,17 +1103,17 @@ type testIteration struct {
 func craftFakeEvent(t0 time.Time, ti *testIteration, defaultContainerID string) *model.Event {
 	event := model.NewFakeEvent()
 	event.Type = uint32(ti.eventType)
-	event.ContainerContext.CreatedAt = uint64(t0.Add(ti.containerCreatedAt).UnixNano())
 	event.TimestampRaw = uint64(t0.Add(ti.eventTimestampRaw).UnixNano())
 	event.Timestamp = t0.Add(ti.eventTimestampRaw)
 
 	// setting process
 	event.ProcessCacheEntry = model.NewPlaceholderProcessCacheEntry(42, 42, false)
-	event.ProcessCacheEntry.ContainerID = containerutils.ContainerID(defaultContainerID)
+	event.ProcessCacheEntry.ContainerContext.ContainerID = containerutils.ContainerID(defaultContainerID)
 	event.ProcessCacheEntry.FileEvent.PathnameStr = ti.eventProcessPath
 	event.ProcessCacheEntry.FileEvent.Inode = 42
 	event.ProcessCacheEntry.Args = "foo"
 	event.ProcessContext = &event.ProcessCacheEntry.ProcessContext
+	event.ProcessContext.Process.ContainerContext.CreatedAt = uint64(t0.Add(ti.containerCreatedAt).UnixNano())
 	switch ti.eventType {
 	case model.ExecEventType:
 		event.Exec.Process = &event.ProcessCacheEntry.ProcessContext.Process
@@ -1052,6 +1163,7 @@ func TestSecurityProfileManager_tryAutolearn(t *testing.T) {
 			eventType:           model.ExecEventType,
 			eventProcessPath:    "/bin/foo0",
 		},
+
 		// and for dns:
 		{
 			name:                "warmup-dns/insert-dns-process",
@@ -1793,15 +1905,10 @@ func TestSecurityProfileManager_tryAutolearn(t *testing.T) {
 					profile.WithEventTypes([]model.EventType{model.ExecEventType, model.DNSEventType}),
 				)
 				secprof.ActivityTree = activity_tree.NewActivityTree(secprof, nil, "security_profile")
+				cgce := cgroupModel.NewCacheEntry(model.ContainerContext{ContainerID: containerutils.ContainerID(defaultContainerID)}, model.CGroupContext{CGroupID: containerutils.CGroupID(defaultContainerID)}, 0)
 				secprof.Instances = append(secprof.Instances, &tags.Workload{
-					CacheEntry: &cgroupModel.CacheEntry{ContainerContext: model.ContainerContext{
-						ContainerID: containerutils.ContainerID(defaultContainerID),
-					},
-						CGroupContext: model.CGroupContext{
-							CGroupID: containerutils.CGroupID(defaultContainerID),
-						},
-					},
-					Selector: cgroupModel.WorkloadSelector{Image: "image", Tag: "tag"},
+					GCroupCacheEntry: cgce,
+					Selector:         cgroupModel.WorkloadSelector{Image: "image", Tag: "tag"},
 				})
 				secprof.LoadedNano.Store(uint64(t0.UnixNano()))
 			}
@@ -1818,9 +1925,9 @@ func TestSecurityProfileManager_tryAutolearn(t *testing.T) {
 				baseDNSReq := ti.eventDNSReq
 				for currentIncrement < ti.loopUntil {
 					if ti.eventType == model.ExecEventType {
-						ti.eventProcessPath = basePath + fmt.Sprintf("%d", rand.Int())
+						ti.eventProcessPath = basePath + strconv.Itoa(rand.Int())
 					} else if ti.eventType == model.DNSEventType {
-						ti.eventDNSReq = fmt.Sprintf("%d", rand.Int()) + baseDNSReq
+						ti.eventDNSReq = strconv.Itoa(rand.Int()) + baseDNSReq
 					}
 					ti.eventTimestampRaw = currentIncrement
 					event := craftFakeEvent(t0, &ti, defaultContainerID)

@@ -15,11 +15,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	datadogconfig "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog/config"
+	datadogconfig "github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/datadogconfig"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/confmaptest"
-	"go.opentelemetry.io/collector/confmap/xconfmap"
 )
 
 func TestUnmarshalDefaultConfig(t *testing.T) {
@@ -37,13 +37,15 @@ func TestUnmarshalConfig(t *testing.T) {
 	factory := newFactory()
 	got := factory.CreateDefaultConfig()
 	require.NoError(t, sub.Unmarshal(&got))
-	assert.NoError(t, xconfmap.Validate(got))
+	assert.NoError(t, confmap.Validate(got))
 
 	want := factory.CreateDefaultConfig().(*ExporterConfig)
 	want.TimeoutConfig.Timeout = 10 * time.Second
-	want.QueueBatchConfig.QueueSize = 100
+	want.HTTPConfig.Timeout = 10 * time.Second
+	queueConfig := *want.QueueBatchConfig.Get()
+	queueConfig.QueueSize = 100
+	want.QueueBatchConfig = configoptional.Some(queueConfig)
 	want.Metrics.APMStatsReceiverAddr = "localhost:1234"
-	want.Metrics.TagCardinality = "high"
 	want.Metrics.Tags = "tag"
 	want.Metrics.Metrics.DeltaTTL = 200
 	want.Metrics.Metrics.Endpoint = "localhost:5678"

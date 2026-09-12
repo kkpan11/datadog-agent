@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-//go:build linux_bpf
+//go:build linux && bpf
 
 package usm
 
@@ -17,6 +17,7 @@ import (
 
 	manager "github.com/DataDog/ebpf-manager"
 
+	telemetryimpl "github.com/DataDog/datadog-agent/comp/core/telemetry/impl"
 	"github.com/DataDog/datadog-agent/pkg/ebpf/uprobes"
 	"github.com/DataDog/datadog-agent/pkg/network/config"
 	"github.com/DataDog/datadog-agent/pkg/network/protocols"
@@ -150,7 +151,7 @@ type istioMonitor struct {
 var _ protocols.Protocol = (*istioMonitor)(nil)
 
 func newIstioMonitor(mgr *manager.Manager, c *config.Config) (protocols.Protocol, error) {
-	if !c.EnableIstioMonitoring || !usmconfig.TLSSupported(c) {
+	if !c.EnableIstioMonitoring || !usmconfig.TLSSupported(c) || !usmconfig.UretprobeSupported() {
 		return nil, nil
 	}
 
@@ -172,7 +173,11 @@ func newIstioMonitor(mgr *manager.Manager, c *config.Config) (protocols.Protocol
 		ExcludeTargets:                 uprobes.ExcludeSelf | uprobes.ExcludeInternal | uprobes.ExcludeBuildkit | uprobes.ExcludeContainerdTmp,
 		EnablePeriodicScanNewProcesses: true,
 	}
-	attacher, err := uprobes.NewUprobeAttacher(consts.USMModuleName, istioAttacherName, attachCfg, mgr, nil, &uprobes.NativeBinaryInspector{}, m.processMonitor)
+	attacher, err := uprobes.NewUprobeAttacher(consts.USMModuleName, istioAttacherName, attachCfg, mgr, nil, uprobes.AttacherDependencies{
+		Inspector:      &uprobes.NativeBinaryInspector{},
+		ProcessMonitor: m.processMonitor,
+		Telemetry:      telemetryimpl.GetCompatComponent(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("Cannot create uprobe attacher: %w", err)
 	}

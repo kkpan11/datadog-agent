@@ -8,6 +8,7 @@
 package safenvml
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -32,7 +33,19 @@ func init() {
 
 // WithMockNVML calls the WithPartialMockNVML with all symbols available
 func WithMockNVML(tb testing.TB, lib nvml.Interface) {
-	WithPartialMockNVML(tb, lib, allSymbols)
+	capabilities := maps.Clone(allSymbols)
+	// The generated NVML mock cannot construct GpuFabricInfoHandler, which is
+	// required to invoke the versioned fabric API.
+	delete(capabilities, toNativeName("GetGpuFabricInfoV"))
+	WithPartialMockNVML(tb, lib, capabilities)
+}
+
+func resetSingleton() {
+	singleton.mu.Lock()
+	defer singleton.mu.Unlock()
+
+	singleton.lib = nil
+	singleton.capabilities = nil
 }
 
 // WithPartialMockNVML sets the singleton SafeNVML library for testing purposes.
@@ -45,11 +58,17 @@ func WithPartialMockNVML(tb testing.TB, lib nvml.Interface, capabilities map[str
 	singleton.lib = lib
 	singleton.capabilities = capabilities
 
-	tb.Cleanup(func() {
-		singleton.mu.Lock()
-		defer singleton.mu.Unlock()
+	tb.Cleanup(resetSingleton)
+}
 
-		singleton.lib = nil
-		singleton.capabilities = nil
+// WithMockNvmlNewFunc overrides the function to create a new NVML library instance.
+// It can be used to test the NVML library without having to initialize it
+// manually. It automatically restores the original function on test cleanup
+func WithMockNvmlNewFunc(tb testing.TB, f func(opts ...nvml.LibraryOption) nvml.Interface) {
+	oldNvmlNewFunc := nvmlNewFunc
+	nvmlNewFunc = f
+	tb.Cleanup(func() {
+		nvmlNewFunc = oldNvmlNewFunc
+		resetSingleton()
 	})
 }

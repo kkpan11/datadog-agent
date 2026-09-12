@@ -1,0 +1,276 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2024-present Datadog, Inc.
+
+//go:build linux && nvml
+
+package nvidia
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	"golang.org/x/exp/constraints"
+
+	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
+	taggertypes "github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	ddnvml "github.com/DataDog/datadog-agent/pkg/gpu/safenvml"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
+)
+
+var logLimiter = log.NewLogLimit(20, 10*time.Minute)
+
+var eccErrorTypeToName = map[nvml.MemoryErrorType]string{
+	nvml.MEMORY_ERROR_TYPE_CORRECTED:   "corrected",
+	nvml.MEMORY_ERROR_TYPE_UNCORRECTED: "uncorrected",
+}
+
+var memoryLocationToName = map[nvml.MemoryLocation]string{
+	nvml.MEMORY_LOCATION_L1_CACHE:       "l1_cache",
+	nvml.MEMORY_LOCATION_L2_CACHE:       "l2_cache",
+	nvml.MEMORY_LOCATION_DEVICE_MEMORY:  "device_memory",
+	nvml.MEMORY_LOCATION_REGISTER_FILE:  "register_file",
+	nvml.MEMORY_LOCATION_TEXTURE_MEMORY: "texture_memory",
+	nvml.MEMORY_LOCATION_TEXTURE_SHM:    "texture_shm",
+	nvml.MEMORY_LOCATION_CBU:            "cbu",
+	nvml.MEMORY_LOCATION_SRAM:           "sram",
+}
+
+var eccCounterTypeToName = map[nvml.EccCounterType]string{
+	nvml.AGGREGATE_ECC: "total",
+	nvml.VOLATILE_ECC:  "volatile",
+}
+
+// boolToFloat converts a boolean value to float64 (1.0 for true, 0.0 for false)
+func boolToFloat(val bool) float64 {
+	if val {
+		return 1
+	}
+	return 0
+}
+
+// number interface for numeric type constraints
+type number interface {
+	constraints.Integer | constraints.Float
+}
+
+// readNumberFromBuffer reads a number from a binary reader and converts it to the target type
+func readNumberFromBuffer[T number, V number](reader io.Reader) (V, error) {
+	var value T
+	err := binary.Read(reader, binary.LittleEndian, &value)
+	return V(value), err
+}
+
+// fieldValueToNumber converts an NVML field value to a numeric type based on its value type
+func fieldValueToNumber[V number](valueType nvml.ValueType, value [8]byte) (V, error) {
+	reader := bytes.NewReader(value[:])
+
+	switch valueType {
+	case nvml.VALUE_TYPE_DOUBLE:
+		return readNumberFromBuffer[float64, V](reader)
+	case nvml.VALUE_TYPE_UNSIGNED_INT:
+		return readNumberFromBuffer[uint32, V](reader)
+	case nvml.VALUE_TYPE_UNSIGNED_LONG, nvml.VALUE_TYPE_UNSIGNED_LONG_LONG:
+		return readNumberFromBuffer[uint64, V](reader)
+	case nvml.VALUE_TYPE_SIGNED_LONG_LONG: // No typo, there's no SIGNED_LONG in the NVML API
+		return readNumberFromBuffer[int64, V](reader)
+	case nvml.VALUE_TYPE_SIGNED_INT:
+		return readNumberFromBuffer[int32, V](reader)
+
+	default:
+		return 0, fmt.Errorf("unsupported value type %d", valueType)
+	}
+}
+
+// filterSupportedAPIs tests each API call against the device and returns only the supported ones
+func filterSupportedAPIs(device ddnvml.Device, apiCalls []apiCallInfo) []apiCallInfo {
+	var supportedAPIs []apiCallInfo
+	for _, apiCall := range apiCalls {
+		// Test API support by calling the handler with timestamp=0 and ignoring results
+		_, _, err := apiCall.Handler(device, 0)
+		if err != nil && (ddnvml.IsAPIUnsupportedOnDevice(err, device) || errors.Is(err, errUnsupportedDevice)) {
+			continue
+		}
+		supportedAPIs = append(supportedAPIs, apiCall)
+	}
+
+	return supportedAPIs
+}
+
+// GetDeviceTagsMapping returns the mapping of tags per GPU device.
+func GetDeviceTagsMapping(deviceCache ddnvml.DeviceCache, tagger tagger.Component) map[string][]string {
+	devCount, err := deviceCache.Count()
+	if err != nil {
+		if logLimiter.ShouldLog() {
+			log.Warnf("Error getting device count: %s", err)
+		}
+		return nil
+	}
+	if devCount == 0 {
+		return nil
+	}
+
+	tagsMapping := make(map[string][]string, devCount)
+
+	allDevices, err := deviceCache.All()
+	if err != nil {
+		if logLimiter.ShouldLog() {
+			log.Warnf("Error getting all physical devices: %s", err)
+		}
+		return nil
+	}
+	for _, dev := range allDevices {
+		uuid := dev.GetDeviceInfo().UUID
+		entityID := taggertypes.NewEntityID(taggertypes.GPU, uuid)
+		tags, err := tagger.Tag(entityID, taggertypes.ChecksConfigCardinality)
+		if err != nil {
+			log.Warnf("Error collecting GPU tags for GPU UUID %s: %s", uuid, err)
+		}
+
+		if len(tags) == 0 {
+			// If we get no tags (either WMS hasn't collected GPUs yet, or we are running the check standalone with 'agent check')
+			// add at least the UUID as a tag to distinguish the values.
+			tags = []string{"gpu_uuid:" + uuid}
+		}
+
+		tagsMapping[uuid] = tags
+	}
+
+	return tagsMapping
+}
+
+// RemoveDuplicateSamples filters samples by priority across collectors while preserving all samples within each collector.
+// For each sample key, it finds the collector with the highest priority sample for that key, then includes
+// ALL samples with that key from the winning collector. This preserves multiple metrics with the same name
+// but different tags (e.g., multiple memory.usage metrics with different PIDs) from the same collector,
+// while still allowing cross-collector deduplication based on priority.
+//
+// Input: map from collector ID to samples from that collector
+// Output: flat slice of samples with duplicates removed according to the priority rules
+//
+// Example:
+//
+//	CollectorA: [
+//	  {Name: "process.memory.usage", Priority: 10, Tags: ["pid:1001"]},
+//	  {Name: "process.memory.usage", Priority: 10, Tags: ["pid:1002"]},
+//	  {Name: "core.temp", Priority: 0}
+//	]
+//	CollectorB: [
+//	  {Name: "process.memory.usage", Priority: 5, Tags: ["pid:1003"]},
+//	  {Name: "fan.speed", Priority: 0}
+//	]
+//
+// Result: [
+//
+//	{Name: "process.memory.usage", Priority: 10, Tags: ["pid:1001"]},  // From CollectorA (winner)
+//	{Name: "process.memory.usage", Priority: 10, Tags: ["pid:1002"]},  // From CollectorA (winner)
+//	{Name: "core.temp", Priority: 0},                          // From CollectorA (unique)
+//	{Name: "fan.speed", Priority: 0}                           // From CollectorB (unique)
+//
+// ]
+func RemoveDuplicateSamples(allSamples map[CollectorName][]Sample) []Sample {
+	// Map sample key -> collector ID -> priority -> samples.
+	keyToCollectorSamples := make(map[string]map[CollectorName]map[MetricPriority][]Sample)
+
+	for collectorID, samples := range allSamples {
+		for _, sample := range samples {
+			key := sample.Key()
+			if _, ok := keyToCollectorSamples[key]; !ok {
+				keyToCollectorSamples[key] = make(map[CollectorName]map[MetricPriority][]Sample)
+			}
+			if _, ok := keyToCollectorSamples[key][collectorID]; !ok {
+				keyToCollectorSamples[key][collectorID] = make(map[MetricPriority][]Sample)
+			}
+			priority := sample.Priority()
+			keyToCollectorSamples[key][collectorID][priority] = append(keyToCollectorSamples[key][collectorID][priority], sample)
+		}
+	}
+
+	var result []Sample
+
+	// For each sample key, pick all matching samples from the collector with the highest-priority sample.
+	for _, collectorSamples := range keyToCollectorSamples {
+		maxPriority := Low
+		var winningSamples []Sample
+		for _, prioritySamples := range collectorSamples {
+			for priority, samples := range prioritySamples {
+				if priority >= maxPriority {
+					maxPriority = priority
+					winningSamples = samples
+				}
+			}
+		}
+		result = append(result, winningSamples...)
+	}
+
+	return result
+}
+
+func fieldValueForField(device ddnvml.Device, fieldID uint32, fieldName string) (int, error) {
+	fields := []nvml.FieldValue{{
+		FieldId: fieldID,
+		ScopeId: 0,
+	}}
+
+	if err := device.GetFieldValues(fields); err != nil {
+		return 0, fmt.Errorf("get %s: %w", fieldName, err)
+	}
+	if ret := nvml.Return(fields[0].NvmlReturn); ret != nvml.SUCCESS {
+		return 0, ddnvml.NewNvmlAPIErrorOrNil(fmt.Sprintf("GetFieldValues(%s)", fieldName), ret)
+	}
+
+	value, err := fieldValueToNumber[int](nvml.ValueType(fields[0].ValueType), fields[0].Value)
+	if err != nil {
+		return 0, fmt.Errorf("convert %s: %w", fieldName, err)
+	}
+	return value, nil
+}
+
+// GetC2CLinkCount returns the number of C2C links on the device.
+func GetC2CLinkCount(device ddnvml.Device) (int, error) {
+	return fieldValueForField(device, nvml.FI_DEV_C2C_LINK_COUNT, "FI_DEV_C2C_LINK_COUNT")
+}
+
+func nvlinkPortTag(port int) string {
+	return fmt.Sprintf("nvlink_port:%d", port)
+}
+
+// portIsAlwaysSupported is a placeholder that can be used in getSupportedNvlinkPorts to indicate that a port is always supported.
+func portIsAlwaysSupported(_ int) ([]Sample, error) {
+	return []Sample{&Metric{Name: "always_supported"}}, nil
+}
+
+func getSupportedNvlinkPorts(device ddnvml.Device, sampleCollector func(int) ([]Sample, error)) ([]int, error) {
+	totalPorts := device.GetDeviceInfo().NVLinkLinkCount
+	if totalPorts <= 0 {
+		return nil, fmt.Errorf("%w: no NVLink ports found", errUnsupportedDevice)
+	}
+
+	var ports []int
+	var portErrors []error
+	for port := 1; port <= totalPorts; port++ {
+		_, err := sampleCollector(port)
+		if err != nil {
+			portErrors = append(portErrors, fmt.Errorf("collect samples for port %d: %w", port, err))
+
+			if ddnvml.IsAPIUnsupportedOnDevice(err, device) || errors.Is(err, errUnsupportedDevice) {
+				// only ignore ports if the error is because the API is unsupported
+				continue
+			}
+		}
+
+		ports = append(ports, port)
+	}
+
+	if len(ports) == 0 {
+		return nil, fmt.Errorf("%w: no supported NVLink ports found", errUnsupportedDevice)
+	}
+
+	return ports, errors.Join(portErrors...)
+}

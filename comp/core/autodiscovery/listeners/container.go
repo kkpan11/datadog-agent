@@ -9,7 +9,6 @@ package listeners
 
 import (
 	"errors"
-	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +16,8 @@ import (
 	"github.com/DataDog/datadog-agent/comp/core/autodiscovery/common/utils"
 	tagger "github.com/DataDog/datadog-agent/comp/core/tagger/def"
 	"github.com/DataDog/datadog-agent/comp/core/tagger/types"
+	workloadfilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/def"
+	workloadmetafilter "github.com/DataDog/datadog-agent/comp/core/workloadfilter/util/workloadmeta"
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/util/containers"
@@ -26,22 +27,31 @@ import (
 )
 
 const (
-	newIdentifierLabel        = "com.datadoghq.ad.check.id"
-	legacyIdentifierLabel     = "com.datadoghq.sd.check.id"
-	tolerateUnreadyAnnotation = "ad.datadoghq.com/tolerate-unready"
+	newIdentifierLabel    = "com.datadoghq.ad.check.id"
+	legacyIdentifierLabel = "com.datadoghq.sd.check.id"
 )
 
 // ContainerListener listens to container creation through a subscription to the
 // workloadmeta store.
 type ContainerListener struct {
 	workloadmetaListener
-	tagger tagger.Component
+	globalFilter      workloadfilter.FilterBundle
+	metricsFilter     workloadfilter.FilterBundle
+	logsFilter        workloadfilter.FilterBundle
+	tagger            tagger.Component
+	staticConfigIndex *StaticConfigIndex
 }
 
 // NewContainerListener returns a new ContainerListener.
 func NewContainerListener(options ServiceListernerDeps) (ServiceListener, error) {
 	const name = "ad-containerlistener"
-	l := &ContainerListener{}
+	l := &ContainerListener{
+		globalFilter:      options.Filter.GetContainerAutodiscoveryFilters(workloadfilter.GlobalFilter),
+		metricsFilter:     options.Filter.GetContainerAutodiscoveryFilters(workloadfilter.MetricsFilter),
+		logsFilter:        options.Filter.GetContainerAutodiscoveryFilters(workloadfilter.LogsFilter),
+		tagger:            options.Tagger,
+		staticConfigIndex: options.StaticConfigIndex,
+	}
 	filter := workloadmeta.NewFilterBuilder().
 		SetSource(workloadmeta.SourceAll).
 		AddKind(workloadmeta.KindContainer).Build()
@@ -51,36 +61,38 @@ func NewContainerListener(options ServiceListernerDeps) (ServiceListener, error)
 		return nil, errors.New("workloadmeta store is not initialized")
 	}
 	var err error
-	l.workloadmetaListener, err = newWorkloadmetaListener(name, filter, l.createContainerService, wmetaInstance, options.Telemetry)
+
+	l.workloadmetaListener, err = newWorkloadmetaListenerWithTagWait(
+		name,
+		filter,
+		l.createContainerService,
+		wmetaInstance,
+		options.Telemetry,
+		l.areTagsComplete,
+		time.Duration(pkgconfigsetup.Datadog().GetInt("ad_tag_completeness_max_wait"))*time.Second,
+	)
 	if err != nil {
 		return nil, err
 	}
-	l.tagger = options.Tagger
 
 	return l, nil
 }
 
 func (l *ContainerListener) createContainerService(entity workloadmeta.Entity) {
 	container := entity.(*workloadmeta.Container)
-	var annotations map[string]string
 	var pod *workloadmeta.KubernetesPod
 	if findKubernetesInLabels(container.Labels) {
 		kubePod, err := l.Store().GetKubernetesPodForContainer(container.ID)
 		if err == nil {
 			pod = kubePod
-			annotations = pod.Annotations
 		} else {
 			log.Debugf("container %q belongs to a pod but was not found: %s", container.ID, err)
 		}
 	}
 	containerImg := container.Image
-	if l.IsExcluded(
-		containers.GlobalFilter,
-		annotations,
-		container.Name,
-		containerImg.RawName,
-		"",
-	) {
+	filterableContainer := workloadmetafilter.CreateContainer(container, workloadmetafilter.CreatePod(pod))
+
+	if l.globalFilter.IsExcluded(filterableContainer) {
 		log.Debugf("container %s filtered out: name %q image %q", container.ID, container.Name, containerImg.RawName)
 		return
 	}
@@ -98,13 +110,13 @@ func (l *ContainerListener) createContainerService(entity workloadmeta.Entity) {
 		}
 	}
 
-	if !container.State.Running && container.Runtime == workloadmeta.ContainerRuntimeECSFargate {
+	if !container.State.Running && (container.Runtime == workloadmeta.ContainerRuntimeECSFargate || container.Runtime == "") {
 		return
 	}
 
-	ports := make([]ContainerPort, 0, len(container.Ports))
+	ports := make([]workloadmeta.ContainerPort, 0, len(container.Ports))
 	for _, port := range container.Ports {
-		ports = append(ports, ContainerPort{
+		ports = append(ports, workloadmeta.ContainerPort{
 			Port: port.Port,
 			Name: port.Name,
 		})
@@ -114,7 +126,7 @@ func (l *ContainerListener) createContainerService(entity workloadmeta.Entity) {
 		return ports[i].Port < ports[j].Port
 	})
 
-	svc := &service{
+	svc := &WorkloadService{
 		entity:   container,
 		tagsHash: l.tagger.GetEntityHash(types.NewEntityID(types.ContainerID, container.ID), types.ChecksConfigCardinality),
 		adIdentifiers: computeContainerServiceIDs(
@@ -122,67 +134,40 @@ func (l *ContainerListener) createContainerService(entity workloadmeta.Entity) {
 			containerImg.RawName,
 			container.Labels,
 		),
-		ports:    ports,
-		pid:      container.PID,
-		hostname: container.Hostname,
-		tagger:   l.tagger,
+		ports:             ports,
+		pid:               container.PID,
+		hostname:          container.Hostname,
+		metricsExcluded:   l.metricsFilter.IsExcluded(filterableContainer),
+		logsExcluded:      l.logsFilter.IsExcluded(filterableContainer),
+		tagger:            l.tagger,
+		wmeta:             l.Store(),
+		staticConfigIndex: l.staticConfigIndex,
 	}
 
 	if pod != nil {
 		svc.hosts = map[string]string{"pod": pod.IP}
 		svc.ready = pod.Ready || shouldSkipPodReadiness(pod)
 
-		svc.metricsExcluded = l.IsExcluded(
-			containers.MetricsFilter,
-			pod.Annotations,
-			container.Name,
-			containerImg.RawName,
-			"",
-		)
-		svc.logsExcluded = l.IsExcluded(
-			containers.LogsFilter,
-			pod.Annotations,
-			container.Name,
-			containerImg.RawName,
-			"",
-		)
+		adIdentifier := container.Name
+		if customADID, found := utils.ExtractCheckIDFromPodAnnotations(pod.Annotations, container.Name); found {
+			adIdentifier = customADID
+			svc.adIdentifiers = append(svc.adIdentifiers, customADID)
+		}
+
+		checkNames, err := utils.ExtractCheckNamesFromPodAnnotations(pod.Annotations, adIdentifier)
+		if err != nil {
+			log.Errorf("error extracting check names from pod annotations: %s", err)
+		}
+		svc.checkNames = checkNames
 	} else {
 		checkNames, err := utils.ExtractCheckNamesFromContainerLabels(container.Labels)
 		if err != nil {
 			log.Errorf("error getting check names from labels on container %s: %v", container.ID, err)
 		}
 
-		hosts := make(map[string]string)
-		maps.Copy(hosts, container.NetworkIPs)
-
-		if rancherIP, ok := docker.FindRancherIPInLabels(container.Labels); ok {
-			hosts["rancher"] = rancherIP
-		}
-
-		// Some CNI solutions (including ECS awsvpc) do not assign an
-		// IP through docker, but set a valid reachable hostname. Use
-		// it if no IP is discovered.
-		if len(hosts) == 0 && len(container.Hostname) > 0 {
-			hosts["hostname"] = container.Hostname
-		}
-
 		svc.ready = true
-		svc.hosts = hosts
+		svc.hosts = docker.ContainerHosts(container.NetworkIPs, container.Labels, container.Hostname)
 		svc.checkNames = checkNames
-		svc.metricsExcluded = l.IsExcluded(
-			containers.MetricsFilter,
-			nil,
-			container.Name,
-			containerImg.RawName,
-			"",
-		)
-		svc.logsExcluded = l.IsExcluded(
-			containers.LogsFilter,
-			nil,
-			container.Name,
-			containerImg.RawName,
-			"",
-		)
 	}
 
 	svcID := buildSvcID(container.GetID())
@@ -230,10 +215,19 @@ func computeContainerServiceIDs(entity string, image string, labels map[string]s
 	return ids
 }
 
-func shouldSkipPodReadiness(pod *workloadmeta.KubernetesPod) bool {
-	tolerate, ok := pod.Annotations[tolerateUnreadyAnnotation]
+func (l *ContainerListener) areTagsComplete(entity workloadmeta.Entity) bool {
+	container, ok := entity.(*workloadmeta.Container)
 	if !ok {
+		log.Errorf("expected Container entity, got %T", entity)
+		return true
+	}
+
+	containerTaggerID := types.NewEntityID(types.ContainerID, container.ID)
+	_, complete, err := l.tagger.TagWithCompleteness(containerTaggerID, types.ChecksConfigCardinality)
+	if err != nil {
+		log.Debugf("error checking tag completeness for container %s: %s", container.ID, err)
 		return false
 	}
-	return tolerate == "true"
+
+	return complete
 }

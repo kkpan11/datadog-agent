@@ -8,9 +8,11 @@ package model
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"math/bits"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -60,7 +62,7 @@ var (
 		"EHOSTDOWN":       -int(syscall.EHOSTDOWN),
 		"EHOSTUNREACH":    -int(syscall.EHOSTUNREACH),
 		"EIDRM":           -int(syscall.EIDRM),
-		"EILSEQ":          -int(syscall.EIDRM),
+		"EILSEQ":          -int(syscall.EILSEQ),
 		"EINPROGRESS":     -int(syscall.EINPROGRESS),
 		"EINTR":           -int(syscall.EINTR),
 		"EINVAL":          -int(syscall.EINVAL),
@@ -183,7 +185,9 @@ var (
 		"O_NOCTTY":   syscall.O_NOCTTY,
 		"O_NOFOLLOW": syscall.O_NOFOLLOW,
 		"O_NONBLOCK": syscall.O_NONBLOCK,
+		"O_PATH":     unix.O_PATH,
 		"O_RSYNC":    syscall.O_RSYNC,
+		"O_TMPFILE":  unix.O_TMPFILE,
 	}
 
 	// fileModeConstants contains the constants describing file permissions as well as the set-user-ID, set-group-ID, and sticky bits.
@@ -300,21 +304,27 @@ var (
 		"PTRACE_DETACH":     unix.PTRACE_DETACH,
 		"PTRACE_SYSCALL":    unix.PTRACE_SYSCALL,
 
-		"PTRACE_SETOPTIONS":           unix.PTRACE_SETOPTIONS,
-		"PTRACE_GETEVENTMSG":          unix.PTRACE_GETEVENTMSG,
-		"PTRACE_GETSIGINFO":           unix.PTRACE_GETSIGINFO,
-		"PTRACE_SETSIGINFO":           unix.PTRACE_SETSIGINFO,
-		"PTRACE_GETREGSET":            unix.PTRACE_GETREGSET,
-		"PTRACE_SETREGSET":            unix.PTRACE_SETREGSET,
-		"PTRACE_SEIZE":                unix.PTRACE_SEIZE,
-		"PTRACE_INTERRUPT":            unix.PTRACE_INTERRUPT,
-		"PTRACE_LISTEN":               unix.PTRACE_LISTEN,
-		"PTRACE_PEEKSIGINFO":          unix.PTRACE_PEEKSIGINFO,
-		"PTRACE_GETSIGMASK":           unix.PTRACE_GETSIGMASK,
-		"PTRACE_SETSIGMASK":           unix.PTRACE_SETSIGMASK,
-		"PTRACE_SECCOMP_GET_FILTER":   unix.PTRACE_SECCOMP_GET_FILTER,
-		"PTRACE_SECCOMP_GET_METADATA": unix.PTRACE_SECCOMP_GET_METADATA,
-		"PTRACE_GET_SYSCALL_INFO":     unix.PTRACE_GET_SYSCALL_INFO,
+		"PTRACE_GETREGS":                          unix.PTRACE_GETREGS,
+		"PTRACE_SETREGS":                          unix.PTRACE_SETREGS,
+		"PTRACE_SETOPTIONS":                       unix.PTRACE_SETOPTIONS,
+		"PTRACE_GETEVENTMSG":                      unix.PTRACE_GETEVENTMSG,
+		"PTRACE_GETSIGINFO":                       unix.PTRACE_GETSIGINFO,
+		"PTRACE_SETSIGINFO":                       unix.PTRACE_SETSIGINFO,
+		"PTRACE_GETREGSET":                        unix.PTRACE_GETREGSET,
+		"PTRACE_SETREGSET":                        unix.PTRACE_SETREGSET,
+		"PTRACE_SEIZE":                            unix.PTRACE_SEIZE,
+		"PTRACE_INTERRUPT":                        unix.PTRACE_INTERRUPT,
+		"PTRACE_LISTEN":                           unix.PTRACE_LISTEN,
+		"PTRACE_PEEKSIGINFO":                      unix.PTRACE_PEEKSIGINFO,
+		"PTRACE_GETSIGMASK":                       unix.PTRACE_GETSIGMASK,
+		"PTRACE_SETSIGMASK":                       unix.PTRACE_SETSIGMASK,
+		"PTRACE_SECCOMP_GET_FILTER":               unix.PTRACE_SECCOMP_GET_FILTER,
+		"PTRACE_SECCOMP_GET_METADATA":             unix.PTRACE_SECCOMP_GET_METADATA,
+		"PTRACE_GET_SYSCALL_INFO":                 unix.PTRACE_GET_SYSCALL_INFO,
+		"PTRACE_SET_SYSCALL_INFO":                 unix.PTRACE_SET_SYSCALL_INFO,
+		"PTRACE_GET_RSEQ_CONFIGURATION":           unix.PTRACE_GET_RSEQ_CONFIGURATION,
+		"PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG": unix.PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG,
+		"PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG": unix.PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG,
 	}
 
 	// protConstants are the supported protections for the mmap syscall
@@ -337,7 +347,9 @@ var (
 		"MAP_ANON":            unix.MAP_ANON,
 		"MAP_ANONYMOUS":       unix.MAP_ANONYMOUS,       /* don't use a file */
 		"MAP_DENYWRITE":       unix.MAP_DENYWRITE,       /* ETXTBSY */
+		"MAP_DROPPABLE":       unix.MAP_DROPPABLE,       /* pages can be dropped under memory pressure */
 		"MAP_EXECUTABLE":      unix.MAP_EXECUTABLE,      /* mark it as an executable */
+		"MAP_FILE":            unix.MAP_FILE,            /* compatibility flag, mapped to 0 */
 		"MAP_FIXED":           unix.MAP_FIXED,           /* Interpret addr exactly */
 		"MAP_FIXED_NOREPLACE": unix.MAP_FIXED_NOREPLACE, /* MAP_FIXED which doesn't unmap underlying mapping */
 		"MAP_GROWSDOWN":       unix.MAP_GROWSDOWN,       /* stack-like segment */
@@ -459,6 +471,7 @@ var (
 		"AF_QIPCRTR":    unix.AF_QIPCRTR,
 		"AF_SMC":        unix.AF_SMC,
 		"AF_XDP":        unix.AF_XDP,
+		"AF_MCTP":       unix.AF_MCTP,
 		"AF_MAX":        unix.AF_MAX,
 	}
 
@@ -845,6 +858,412 @@ var (
 		"SYSCTL_READ":  SysCtlReadAction,
 		"SYSCTL_WRITE": SysCtlWriteAction,
 	}
+
+	// CloneFlagsConstants are the clone flags accepted by the unshare syscall
+	// generate_constants:Clone flags,Clone flags are the supported namespace flags for the unshare syscall.
+	CloneFlagsConstants = map[string]uint64{
+		"CLONE_NEWNS":     unix.CLONE_NEWNS,
+		"CLONE_NEWCGROUP": unix.CLONE_NEWCGROUP,
+		"CLONE_NEWUTS":    unix.CLONE_NEWUTS,
+		"CLONE_NEWIPC":    unix.CLONE_NEWIPC,
+		"CLONE_NEWUSER":   unix.CLONE_NEWUSER,
+		"CLONE_NEWPID":    unix.CLONE_NEWPID,
+		"CLONE_NEWNET":    unix.CLONE_NEWNET,
+		"CLONE_NEWTIME":   unix.CLONE_NEWTIME,
+		"CLONE_FILES":     unix.CLONE_FILES,
+		"CLONE_FS":        unix.CLONE_FS,
+		"CLONE_SYSVSEM":   unix.CLONE_SYSVSEM,
+		"CLONE_THREAD":    unix.CLONE_THREAD,
+		"CLONE_SIGHAND":   unix.CLONE_SIGHAND,
+		"CLONE_VM":        unix.CLONE_VM,
+	}
+
+	// RlimitConstants are the supported resource limit types for setrlimit
+	// generate_constants:Resource limit types,Resource limit types are the supported resource types for setrlimit syscall.
+	RlimitConstants = map[string]int{
+		"RLIMIT_CPU":        unix.RLIMIT_CPU,
+		"RLIMIT_FSIZE":      unix.RLIMIT_FSIZE,
+		"RLIMIT_DATA":       unix.RLIMIT_DATA,
+		"RLIMIT_STACK":      unix.RLIMIT_STACK,
+		"RLIMIT_CORE":       unix.RLIMIT_CORE,
+		"RLIMIT_RSS":        unix.RLIMIT_RSS,
+		"RLIMIT_NPROC":      unix.RLIMIT_NPROC,
+		"RLIMIT_NOFILE":     unix.RLIMIT_NOFILE,
+		"RLIMIT_MEMLOCK":    unix.RLIMIT_MEMLOCK,
+		"RLIMIT_AS":         unix.RLIMIT_AS,
+		"RLIMIT_LOCKS":      unix.RLIMIT_LOCKS,
+		"RLIMIT_SIGPENDING": unix.RLIMIT_SIGPENDING,
+		"RLIMIT_MSGQUEUE":   unix.RLIMIT_MSGQUEUE,
+		"RLIMIT_NICE":       unix.RLIMIT_NICE,
+		"RLIMIT_RTPRIO":     unix.RLIMIT_RTPRIO,
+		"RLIMIT_RTTIME":     unix.RLIMIT_RTTIME,
+	}
+
+	// SocketDomainConstants is the list of socket domains
+	// generate_constants:Socket domains,Socket domains are the supported socket domains.
+	SocketDomainConstants = map[string]int{
+		"AF_UNSPEC": syscall.AF_UNSPEC,
+		"AF_INET":   syscall.AF_INET,
+		"AF_INET6":  syscall.AF_INET6,
+		"AF_UNIX":   syscall.AF_UNIX,
+	}
+
+	// SocketTypeConstants is the list of socket types
+	// generate_constants:Socket types,Socket types are the supported socket types.
+	SocketTypeConstants = map[string]int{
+		"SOCK_STREAM":    syscall.SOCK_STREAM,
+		"SOCK_DGRAM":     syscall.SOCK_DGRAM,
+		"SOCK_RAW":       syscall.SOCK_RAW,
+		"SOCK_RDM":       syscall.SOCK_RDM,
+		"SOCK_SEQPACKET": syscall.SOCK_SEQPACKET,
+		"SOCK_DCCP":      syscall.SOCK_DCCP,
+		"SOCK_PACKET":    syscall.SOCK_PACKET,
+	}
+
+	// SocketProtocolConstants is the list of socket protocols
+	// generate_constants:Socket protocols,Socket protocols are the supported socket protocols.
+	SocketProtocolConstants = map[string]int{
+		"IPPROTO_IP":     syscall.IPPROTO_IP,
+		"IPPROTO_TCP":    syscall.IPPROTO_TCP,
+		"IPPROTO_UDP":    syscall.IPPROTO_UDP,
+		"IPPROTO_ICMP":   syscall.IPPROTO_ICMP,
+		"IPPROTO_IPV6":   syscall.IPPROTO_IPV6,
+		"IPPROTO_ICMPV6": syscall.IPPROTO_ICMPV6,
+	}
+
+	// SetSockoptLevelConstants is the list of available levels for setsockopt events
+	// generate_constants:SetSockopt Levels,SetSockopt Levels are the supported levels for the setsockopt event.
+	SetSockoptLevelConstants = map[string]int{
+		"IPPROTO_IP":     syscall.IPPROTO_IP,
+		"SOL_SOCKET":     syscall.SOL_SOCKET,
+		"IPPROTO_TCP":    syscall.IPPROTO_TCP,
+		"IPPROTO_UDP":    syscall.IPPROTO_UDP,
+		"IPPROTO_IPV6":   syscall.IPPROTO_IPV6,
+		"IPPROTO_ICMPV6": syscall.IPPROTO_ICMPV6,
+	}
+
+	// SetSockOptOptNameConstantsIP is the list of available options for setsockopt events when the level is IPPROTO_IP
+	// generate_constants:SetSockopt Options,SetSockopt Options are the supported options for the setsockopt event when the level is IPPROTO_IP.
+	SetSockOptOptNameConstantsIP = map[string]int{
+		// All the values were added according to the Linux kernel headers:
+		// https://elixir.bootlin.com/linux/v5.15.86/source/include/uapi/linux/in.h
+
+		// IPPROTO_IP options
+		"IP_TOS":                    syscall.IP_TOS,
+		"IP_TTL":                    syscall.IP_TTL,
+		"IP_HDRINCL":                syscall.IP_HDRINCL,
+		"IP_OPTIONS":                syscall.IP_OPTIONS,
+		"IP_ROUTER_ALERT":           syscall.IP_ROUTER_ALERT,
+		"IP_RECVOPTS":               syscall.IP_RECVOPTS,
+		"IP_RETOPTS":                syscall.IP_RETOPTS,
+		"IP_PKTINFO":                syscall.IP_PKTINFO,
+		"IP_PKTOPTIONS":             unix.IP_PKTOPTIONS,
+		"IP_MTU_DISCOVER":           syscall.IP_MTU_DISCOVER,
+		"IP_RECVERR":                syscall.IP_RECVERR,
+		"IP_RECVTTL":                syscall.IP_RECVTTL,
+		"IP_RECVTOS":                syscall.IP_RECVTOS,
+		"IP_MTU":                    unix.IP_MTU,
+		"IP_FREEBIND":               syscall.IP_FREEBIND,
+		"IP_IPSEC_POLICY":           unix.IP_IPSEC_POLICY,
+		"IP_XFRM_POLICY":            unix.IP_XFRM_POLICY,
+		"IP_PASSSEC":                syscall.IP_PASSSEC,
+		"IP_TRANSPARENT":            syscall.IP_TRANSPARENT,
+		"IP_ORIGDSTADDR":            syscall.IP_ORIGDSTADDR,
+		"IP_MINTTL":                 syscall.IP_MINTTL,
+		"IP_NODEFRAG":               unix.IP_NODEFRAG,
+		"IP_CHECKSUM":               unix.IP_CHECKSUM,
+		"IP_BIND_ADDRESS_NO_PORT":   unix.IP_BIND_ADDRESS_NO_PORT,
+		"IP_RECVFRAGSIZE":           unix.IP_RECVFRAGSIZE,
+		"IP_RECVERR_RFC4884":        unix.IP_RECVERR_RFC4884,
+		"IP_MULTICAST_IF":           unix.IP_MULTICAST_IF,
+		"IP_MULTICAST_TTL":          syscall.IP_MULTICAST_TTL,
+		"IP_MULTICAST_LOOP":         syscall.IP_MULTICAST_LOOP,
+		"IP_ADD_MEMBERSHIP":         unix.IP_ADD_MEMBERSHIP,
+		"IP_DROP_MEMBERSHIP":        unix.IP_DROP_MEMBERSHIP,
+		"IP_UNBLOCK_SOURCE":         unix.IP_UNBLOCK_SOURCE,
+		"IP_BLOCK_SOURCE":           unix.IP_BLOCK_SOURCE,
+		"IP_ADD_SOURCE_MEMBERSHIP":  unix.IP_ADD_SOURCE_MEMBERSHIP,
+		"IP_DROP_SOURCE_MEMBERSHIP": unix.IP_DROP_SOURCE_MEMBERSHIP,
+		"IP_MSFILTER":               unix.IP_MSFILTER,
+		"MCAST_JOIN_GROUP":          unix.MCAST_JOIN_GROUP,
+		"MCAST_BLOCK_SOURCE":        unix.MCAST_BLOCK_SOURCE,
+		"MCAST_UNBLOCK_SOURCE":      unix.MCAST_UNBLOCK_SOURCE,
+		"MCAST_LEAVE_GROUP":         unix.MCAST_LEAVE_GROUP,
+		"MCAST_JOIN_SOURCE_GROUP":   unix.MCAST_JOIN_SOURCE_GROUP,
+		"MCAST_LEAVE_SOURCE_GROUP":  unix.MCAST_LEAVE_SOURCE_GROUP,
+		"MCAST_MSFILTER":            unix.MCAST_MSFILTER,
+		"IP_MULTICAST_ALL":          unix.IP_MULTICAST_ALL,
+		"IP_UNICAST_IF":             unix.IP_UNICAST_IF}
+	// SetSockOptOptNameConstantsSolSocket is the list of available options for setsockopt events when the level is SOL_SOCKET
+	// generate_constants:SetSockopt Options,SetSockopt Options are the supported options for the setsockopt event when the level is SOL_SOCKET.
+	SetSockOptOptNameConstantsSolSocket = map[string]int{
+		// https://elixir.bootlin.com/linux/v6.15/source/include/uapi/linux/socket.h
+		// SOL_SOCKET options
+		"SO_DEBUG":                         syscall.SO_DEBUG,
+		"SO_REUSEADDR":                     syscall.SO_REUSEADDR,
+		"SO_TYPE":                          syscall.SO_TYPE,
+		"SO_ERROR":                         syscall.SO_ERROR,
+		"SO_DONTROUTE":                     syscall.SO_DONTROUTE,
+		"SO_BROADCAST":                     syscall.SO_BROADCAST,
+		"SO_SNDBUF":                        syscall.SO_SNDBUF,
+		"SO_RCVBUF":                        syscall.SO_RCVBUF,
+		"SO_KEEPALIVE":                     syscall.SO_KEEPALIVE,
+		"SO_OOBINLINE":                     syscall.SO_OOBINLINE,
+		"SO_NO_CHECK":                      syscall.SO_NO_CHECK,
+		"SO_PRIORITY":                      syscall.SO_PRIORITY,
+		"SO_LINGER":                        syscall.SO_LINGER,
+		"SO_BSDCOMPAT":                     syscall.SO_BSDCOMPAT,
+		"SO_REUSEPORT":                     unix.SO_REUSEPORT,
+		"SO_PASSCRED":                      syscall.SO_PASSCRED,
+		"SO_PEERCRED":                      syscall.SO_PEERCRED,
+		"SO_RCVLOWAT":                      syscall.SO_RCVLOWAT,
+		"SO_SNDLOWAT":                      syscall.SO_SNDLOWAT,
+		"SO_RCVTIMEO_OLD":                  unix.SO_RCVTIMEO_OLD,
+		"SO_SNDTIMEO_OLD":                  unix.SO_SNDTIMEO_OLD,
+		"SO_SECURITY_AUTHENTICATION":       syscall.SO_SECURITY_AUTHENTICATION,
+		"SO_SECURITY_ENCRYPTION_TRANSPORT": syscall.SO_SECURITY_ENCRYPTION_TRANSPORT,
+		"SO_SECURITY_ENCRYPTION_NETWORK":   syscall.SO_SECURITY_ENCRYPTION_NETWORK,
+		"SO_BINDTODEVICE":                  syscall.SO_BINDTODEVICE,
+		"SO_ATTACH_FILTER":                 syscall.SO_ATTACH_FILTER,
+		"SO_DETACH_FILTER":                 syscall.SO_DETACH_FILTER,
+		"SO_PEERNAME":                      syscall.SO_PEERNAME,
+		"SO_TIMESTAMP_OLD":                 unix.SO_TIMESTAMP_OLD,
+		"SO_ACCEPTCONN":                    syscall.SO_ACCEPTCONN,
+		"SO_PEERSEC":                       syscall.SO_PEERSEC,
+		"SO_SNDBUFFORCE":                   syscall.SO_SNDBUFFORCE,
+		"SO_RCVBUFFORCE":                   syscall.SO_RCVBUFFORCE,
+		"SO_PASSSEC":                       syscall.SO_PASSSEC,
+		"SO_TIMESTAMPNS_OLD":               unix.SO_TIMESTAMPNS_OLD,
+		"SO_MARK":                          syscall.SO_MARK,
+		"SO_TIMESTAMPING_OLD":              unix.SO_TIMESTAMPING_OLD,
+		"SO_PROTOCOL":                      syscall.SO_PROTOCOL,
+		"SO_DOMAIN":                        syscall.SO_DOMAIN,
+		"SO_RXQ_OVFL":                      syscall.SO_RXQ_OVFL,
+		"SO_WIFI_STATUS":                   unix.SO_WIFI_STATUS,
+		"SO_PEEK_OFF":                      unix.SO_PEEK_OFF,
+		"SO_NOFCS":                         unix.SO_NOFCS,
+		"SO_LOCK_FILTER":                   unix.SO_LOCK_FILTER,
+		"SO_SELECT_ERR_QUEUE":              unix.SO_SELECT_ERR_QUEUE,
+		"SO_BUSY_POLL":                     unix.SO_BUSY_POLL,
+		"SO_MAX_PACING_RATE":               unix.SO_MAX_PACING_RATE,
+		"SO_BPF_EXTENSIONS":                unix.SO_BPF_EXTENSIONS,
+		"SO_INCOMING_CPU":                  unix.SO_INCOMING_CPU,
+		"SO_ATTACH_BPF":                    unix.SO_ATTACH_BPF,
+		"SO_ATTACH_REUSEPORT_CBPF":         unix.SO_ATTACH_REUSEPORT_CBPF,
+		"SO_ATTACH_REUSEPORT_EBPF":         unix.SO_ATTACH_REUSEPORT_EBPF,
+		"SO_CNX_ADVICE":                    unix.SO_CNX_ADVICE,
+		"SCM_TIMESTAMPING_OPT_STATS":       unix.SCM_TIMESTAMPING_OPT_STATS,
+		"SO_MEMINFO":                       unix.SO_MEMINFO,
+		"SO_INCOMING_NAPI_ID":              unix.SO_INCOMING_NAPI_ID,
+		"SO_COOKIE":                        unix.SO_COOKIE,
+		"SCM_TIMESTAMPING_PKTINFO":         unix.SCM_TIMESTAMPING_PKTINFO,
+		"SO_PEERGROUPS":                    unix.SO_PEERGROUPS,
+		"SO_ZEROCOPY":                      unix.SO_ZEROCOPY,
+		"SO_TXTIME":                        unix.SO_TXTIME,
+		"SO_BINDTOIFINDEX":                 unix.SO_BINDTOIFINDEX,
+		"SO_TIMESTAMP_NEW":                 unix.SO_TIMESTAMP_NEW,
+		"SO_TIMESTAMPNS_NEW":               unix.SO_TIMESTAMPNS_NEW,
+		"SO_TIMESTAMPING_NEW":              unix.SO_TIMESTAMPING_NEW,
+		"SO_RCVTIMEO_NEW":                  unix.SO_RCVTIMEO_NEW,
+		"SO_SNDTIMEO_NEW":                  unix.SO_SNDTIMEO_NEW,
+		"SO_DETACH_REUSEPORT_BPF":          unix.SO_DETACH_REUSEPORT_BPF,
+		"SO_PREFER_BUSY_POLL":              unix.SO_PREFER_BUSY_POLL,
+		"SO_BUSY_POLL_BUDGET":              unix.SO_BUSY_POLL_BUDGET,
+		"SO_NETNS_COOKIE":                  unix.SO_NETNS_COOKIE,
+		"SO_BUF_LOCK":                      unix.SO_BUF_LOCK,
+		"SO_RESERVE_MEM":                   unix.SO_RESERVE_MEM,
+		"SO_TXREHASH":                      unix.SO_TXREHASH,
+		"SO_RCVMARK":                       unix.SO_RCVMARK,
+		"SO_PASSPIDFD":                     unix.SO_PASSPIDFD,
+		"SO_PEERPIDFD":                     unix.SO_PEERPIDFD,
+		"SO_DEVMEM_LINEAR":                 unix.SO_DEVMEM_LINEAR,
+		"SO_DEVMEM_DMABUF":                 unix.SO_DEVMEM_DMABUF,
+		"SO_DEVMEM_DONTNEED":               unix.SO_DEVMEM_DONTNEED,
+		"SCM_TS_OPT_ID":                    unix.SCM_TS_OPT_ID,
+		"SO_RCVPRIORITY":                   82}
+
+	// SetSockOptOptNameConstantsTCP is the list of available options for setsockopt events when the level is IPPROTO_TCP
+	// generate_constants:SetSockopt Options,SetSockopt Options are the supported options for the setsockopt event when the level is IPPROTO_TCP.
+	SetSockOptOptNameConstantsTCP = map[string]int{
+		// https://elixir.bootlin.com/linux/v6.15/source/include/uapi/linux/tcp.h
+		// IPPROTO_TCP options
+		"TCP_NODELAY":              syscall.TCP_NODELAY,
+		"TCP_MAXSEG":               syscall.TCP_MAXSEG,
+		"TCP_CORK":                 syscall.TCP_CORK,
+		"TCP_KEEPIDLE":             syscall.TCP_KEEPIDLE,
+		"TCP_KEEPINTVL":            syscall.TCP_KEEPINTVL,
+		"TCP_KEEPCNT":              syscall.TCP_KEEPCNT,
+		"TCP_SYNCNT":               syscall.TCP_SYNCNT,
+		"TCP_LINGER2":              syscall.TCP_LINGER2,
+		"TCP_DEFER_ACCEPT":         syscall.TCP_DEFER_ACCEPT,
+		"TCP_WINDOW_CLAMP":         syscall.TCP_WINDOW_CLAMP,
+		"TCP_INFO":                 syscall.TCP_INFO,
+		"TCP_QUICKACK":             syscall.TCP_QUICKACK,
+		"TCP_CONGESTION":           syscall.TCP_CONGESTION,
+		"TCP_MD5SIG":               syscall.TCP_MD5SIG,
+		"TCP_THIN_LINEAR_TIMEOUTS": unix.TCP_THIN_LINEAR_TIMEOUTS,
+		"TCP_THIN_DUPACK":          unix.TCP_THIN_DUPACK,
+		"TCP_USER_TIMEOUT":         unix.TCP_USER_TIMEOUT,
+		"TCP_REPAIR":               unix.TCP_REPAIR,
+		"TCP_REPAIR_QUEUE":         unix.TCP_REPAIR_QUEUE,
+		"TCP_QUEUE_SEQ":            unix.TCP_QUEUE_SEQ,
+		"TCP_REPAIR_OPTIONS":       unix.TCP_REPAIR_OPTIONS,
+		"TCP_FASTOPEN":             unix.TCP_FASTOPEN,
+		"TCP_TIMESTAMP":            unix.TCP_TIMESTAMP,
+		"TCP_NOTSENT_LOWAT":        unix.TCP_NOTSENT_LOWAT,
+		"TCP_CC_INFO":              unix.TCP_CC_INFO,
+		"TCP_SAVE_SYN":             unix.TCP_SAVE_SYN,
+		"TCP_SAVED_SYN":            unix.TCP_SAVED_SYN,
+		"TCP_REPAIR_WINDOW":        unix.TCP_REPAIR_WINDOW,
+		"TCP_FASTOPEN_CONNECT":     unix.TCP_FASTOPEN_CONNECT,
+		"TCP_ULP":                  unix.TCP_ULP,
+		"TCP_MD5SIG_EXT":           unix.TCP_MD5SIG_EXT,
+		"TCP_FASTOPEN_KEY":         unix.TCP_FASTOPEN_KEY,
+		"TCP_FASTOPEN_NO_COOKIE":   unix.TCP_FASTOPEN_NO_COOKIE,
+		"TCP_ZEROCOPY_RECEIVE":     unix.TCP_ZEROCOPY_RECEIVE,
+		"TCP_INQ":                  unix.TCP_INQ,
+		"TCP_TX_DELAY":             unix.TCP_TX_DELAY}
+
+	// SetSockOptOptNameConstantsIPv6 is the list of available options for setsockopt events when the level is IPPROTO_IPV6.
+	// generate_constants:SetSockopt Options,SetSockopt Options are the supported options for the setsockopt event when the level is IPPROTO_IPV6.
+	SetSockOptOptNameConstantsIPv6 = map[string]int{
+		// https://elixir.bootlin.com/linux/v6.15/source/include/uapi/linux/in6.h
+		// IPPROTO_IPV6 options
+		"IPV6_ADDRFORM":             syscall.IPV6_ADDRFORM,
+		"IPV6_2292PKTINFO":          syscall.IPV6_2292PKTINFO,
+		"IPV6_2292HOPOPTS":          syscall.IPV6_2292HOPOPTS,
+		"IPV6_2292DSTOPTS":          syscall.IPV6_2292DSTOPTS,
+		"IPV6_2292RTHDR":            syscall.IPV6_2292RTHDR,
+		"IPV6_2292PKTOPTIONS":       syscall.IPV6_2292PKTOPTIONS,
+		"IPV6_2292HOPLIMIT":         syscall.IPV6_2292HOPLIMIT,
+		"IPV6_FLOWINFO":             11,
+		"IPV6_UNICAST_HOPS":         syscall.IPV6_UNICAST_HOPS,
+		"IPV6_MULTICAST_IF":         syscall.IPV6_MULTICAST_IF,
+		"IPV6_MULTICAST_HOPS":       syscall.IPV6_MULTICAST_HOPS,
+		"IPV6_MULTICAST_LOOP":       syscall.IPV6_MULTICAST_LOOP,
+		"IPV6_ADD_MEMBERSHIP":       syscall.IPV6_ADD_MEMBERSHIP,
+		"IPV6_DROP_MEMBERSHIP":      syscall.IPV6_DROP_MEMBERSHIP,
+		"IPV6_ROUTER_ALERT":         syscall.IPV6_ROUTER_ALERT,
+		"IPV6_MTU_DISCOVER":         syscall.IPV6_MTU_DISCOVER,
+		"IPV6_MTU":                  syscall.IPV6_MTU,
+		"IPV6_RECVERR":              syscall.IPV6_RECVERR,
+		"IPV6_V6ONLY":               syscall.IPV6_V6ONLY,
+		"IPV6_JOIN_ANYCAST":         syscall.IPV6_JOIN_ANYCAST,
+		"IPV6_LEAVE_ANYCAST":        syscall.IPV6_LEAVE_ANYCAST,
+		"IPV6_MULTICAST_ALL":        unix.IPV6_MULTICAST_ALL,
+		"IPV6_ROUTER_ALERT_ISOLATE": unix.IPV6_ROUTER_ALERT_ISOLATE,
+		"IPV6_RECVERR_RFC4884":      unix.IPV6_RECVERR_RFC4884,
+		"IPV6_FLOWLABEL_MGR":        32,
+		"IPV6_FLOWINFO_SEND":        33,
+		"IPV6_IPSEC_POLICY":         syscall.IPV6_IPSEC_POLICY,
+		"IPV6_XFRM_POLICY":          syscall.IPV6_XFRM_POLICY,
+		"IPV6_HDRINCL":              unix.IPV6_HDRINCL,
+		"IPV6_RECVPKTINFO":          syscall.IPV6_RECVPKTINFO,
+		"IPV6_PKTINFO":              syscall.IPV6_PKTINFO,
+		"IPV6_RECVHOPLIMIT":         syscall.IPV6_RECVHOPLIMIT,
+		"IPV6_HOPLIMIT":             syscall.IPV6_HOPLIMIT,
+		"IPV6_RECVHOPOPTS":          syscall.IPV6_RECVHOPOPTS,
+		"IPV6_HOPOPTS":              syscall.IPV6_HOPOPTS,
+		"IPV6_RTHDRDSTOPTS":         syscall.IPV6_RTHDRDSTOPTS,
+		"IPV6_RECVRTHDR":            syscall.IPV6_RECVRTHDR,
+		"IPV6_RTHDR":                syscall.IPV6_RTHDR,
+		"IPV6_RECVDSTOPTS":          syscall.IPV6_RECVDSTOPTS,
+		"IPV6_DSTOPTS":              syscall.IPV6_DSTOPTS,
+		"IPV6_RECVPATHMTU":          unix.IPV6_RECVPATHMTU,
+		"IPV6_PATHMTU":              unix.IPV6_PATHMTU,
+		"IPV6_DONTFRAG":             unix.IPV6_DONTFRAG,
+		"IPV6_RECVTCLASS":           syscall.IPV6_RECVTCLASS,
+		"IPV6_TCLASS":               syscall.IPV6_TCLASS,
+		"IPV6_AUTOFLOWLABEL":        unix.IPV6_AUTOFLOWLABEL,
+		"IPV6_ADDR_PREFERENCES":     unix.IPV6_ADDR_PREFERENCES,
+		"IPV6_MINHOPCOUNT":          unix.IPV6_MINHOPCOUNT,
+		"IPV6_ORIGDSTADDR":          unix.IPV6_ORIGDSTADDR,
+		"IPV6_TRANSPARENT":          unix.IPV6_TRANSPARENT,
+		"IPV6_UNICAST_IF":           unix.IPV6_UNICAST_IF,
+		"IPV6_RECVFRAGSIZE":         unix.IPV6_RECVFRAGSIZE,
+		"IPV6_FREEBIND":             unix.IPV6_FREEBIND,
+	}
+	// PrCtlOptionConstants is the list of available options for prctl events
+	// generate_constants:PrCtl Options,PrCtl Options are the supported options for the prctl event
+	PrCtlOptionConstants = map[string]int{
+		"PR_CAP_AMBIENT":                unix.PR_CAP_AMBIENT,
+		"PR_CAPBSET_READ":               unix.PR_CAPBSET_READ,
+		"PR_CAPBSET_DROP":               unix.PR_CAPBSET_DROP,
+		"PR_SET_CHILD_SUBREAPER":        unix.PR_SET_CHILD_SUBREAPER,
+		"PR_GET_CHILD_SUBREAPER":        unix.PR_GET_CHILD_SUBREAPER,
+		"PR_SET_DUMPABLE":               unix.PR_SET_DUMPABLE,
+		"PR_GET_DUMPABLE":               unix.PR_GET_DUMPABLE,
+		"PR_SET_ENDIAN":                 unix.PR_SET_ENDIAN,
+		"PR_GET_ENDIAN":                 unix.PR_GET_ENDIAN,
+		"PR_SET_FP_MODE":                unix.PR_SET_FP_MODE,
+		"PR_GET_FP_MODE":                unix.PR_GET_FP_MODE,
+		"PR_SET_FPEMU":                  unix.PR_SET_FPEMU,
+		"PR_GET_FPEMU":                  unix.PR_GET_FPEMU,
+		"PR_SET_FPEXC":                  unix.PR_SET_FPEXC,
+		"PR_GET_FPEXC":                  unix.PR_GET_FPEXC,
+		"PR_SET_IO_FLUSHER":             unix.PR_SET_IO_FLUSHER,
+		"PR_GET_IO_FLUSHER":             unix.PR_GET_IO_FLUSHER,
+		"PR_SET_KEEPCAPS":               unix.PR_SET_KEEPCAPS,
+		"PR_GET_KEEPCAPS":               unix.PR_GET_KEEPCAPS,
+		"PR_MCE_KILL":                   unix.PR_MCE_KILL,
+		"PR_MCE_KILL_GET":               unix.PR_MCE_KILL_GET,
+		"PR_SET_MM":                     unix.PR_SET_MM,
+		"PR_SET_VMA":                    unix.PR_SET_VMA,
+		"PR_MPX_ENABLE_MANAGEMENT":      unix.PR_MPX_ENABLE_MANAGEMENT,
+		"PR_MPX_DISABLE_MANAGEMENT":     unix.PR_MPX_DISABLE_MANAGEMENT,
+		"PR_SET_NAME":                   unix.PR_SET_NAME,
+		"PR_GET_NAME":                   unix.PR_GET_NAME,
+		"PR_SET_NO_NEW_PRIVS":           unix.PR_SET_NO_NEW_PRIVS,
+		"PR_GET_NO_NEW_PRIVS":           unix.PR_GET_NO_NEW_PRIVS,
+		"PR_PAC_RESET_KEYS":             unix.PR_PAC_RESET_KEYS,
+		"PR_PAC_GET_ENABLED_KEYS":       unix.PR_PAC_GET_ENABLED_KEYS,
+		"PR_PAC_SET_ENABLED_KEYS":       unix.PR_PAC_SET_ENABLED_KEYS,
+		"PR_SET_PDEATHSIG":              unix.PR_SET_PDEATHSIG,
+		"PR_GET_PDEATHSIG":              unix.PR_GET_PDEATHSIG,
+		"PR_SET_PTRACER":                unix.PR_SET_PTRACER,
+		"PR_SET_SECCOMP":                unix.PR_SET_SECCOMP,
+		"PR_GET_SECCOMP":                unix.PR_GET_SECCOMP,
+		"PR_SET_SECUREBITS":             unix.PR_SET_SECUREBITS,
+		"PR_GET_SECUREBITS":             unix.PR_GET_SECUREBITS,
+		"PR_SCHED_CORE":                 unix.PR_SCHED_CORE,
+		"PR_GET_SPECULATION_CTRL":       unix.PR_GET_SPECULATION_CTRL,
+		"PR_SET_SPECULATION_CTRL":       unix.PR_SET_SPECULATION_CTRL,
+		"PR_SVE_SET_VL":                 unix.PR_SVE_SET_VL,
+		"PR_SVE_GET_VL":                 unix.PR_SVE_GET_VL,
+		"PR_SME_SET_VL":                 unix.PR_SME_SET_VL,
+		"PR_SME_GET_VL":                 unix.PR_SME_GET_VL,
+		"PR_SET_SYSCALL_USER_DISPATCH":  unix.PR_SET_SYSCALL_USER_DISPATCH,
+		"PR_SET_TAGGED_ADDR_CTRL":       unix.PR_SET_TAGGED_ADDR_CTRL,
+		"PR_GET_TAGGED_ADDR_CTRL":       unix.PR_GET_TAGGED_ADDR_CTRL,
+		"PR_TASK_PERF_EVENTS_DISABLE":   unix.PR_TASK_PERF_EVENTS_DISABLE,
+		"PR_TASK_PERF_EVENTS_ENABLE":    unix.PR_TASK_PERF_EVENTS_ENABLE,
+		"PR_SET_THP_DISABLE":            unix.PR_SET_THP_DISABLE,
+		"PR_GET_THP_DISABLE":            unix.PR_GET_THP_DISABLE,
+		"PR_GET_TID_ADDRESS":            unix.PR_GET_TID_ADDRESS,
+		"PR_SET_TIMERSLACK":             unix.PR_SET_TIMERSLACK,
+		"PR_GET_TIMERSLACK":             unix.PR_GET_TIMERSLACK,
+		"PR_SET_TIMING":                 unix.PR_SET_TIMING,
+		"PR_GET_TIMING":                 unix.PR_GET_TIMING,
+		"PR_TIMER_CREATE_RESTORE_IDS":   unix.PR_TIMER_CREATE_RESTORE_IDS,
+		"PR_SET_TSC":                    unix.PR_SET_TSC,
+		"PR_GET_TSC":                    unix.PR_GET_TSC,
+		"PR_SET_UNALIGN":                unix.PR_SET_UNALIGN,
+		"PR_GET_UNALIGN":                unix.PR_GET_UNALIGN,
+		"PR_GET_AUXV":                   unix.PR_GET_AUXV,
+		"PR_SET_MDWE":                   unix.PR_SET_MDWE,
+		"PR_GET_MDWE":                   unix.PR_GET_MDWE,
+		"PR_SET_MEMORY_MERGE":           unix.PR_SET_MEMORY_MERGE,
+		"PR_GET_MEMORY_MERGE":           unix.PR_GET_MEMORY_MERGE,
+		"PR_SET_SHADOW_STACK_STATUS":    unix.PR_SET_SHADOW_STACK_STATUS,
+		"PR_GET_SHADOW_STACK_STATUS":    unix.PR_GET_SHADOW_STACK_STATUS,
+		"PR_LOCK_SHADOW_STACK_STATUS":   unix.PR_LOCK_SHADOW_STACK_STATUS,
+		"PR_FUTEX_HASH":                 unix.PR_FUTEX_HASH,
+		"PR_PPC_GET_DEXCR":              unix.PR_PPC_GET_DEXCR,
+		"PR_PPC_SET_DEXCR":              unix.PR_PPC_SET_DEXCR,
+		"PR_RISCV_V_GET_CONTROL":        unix.PR_RISCV_V_GET_CONTROL,
+		"PR_RISCV_V_SET_CONTROL":        unix.PR_RISCV_V_SET_CONTROL,
+		"PR_RISCV_SET_ICACHE_FLUSH_CTX": unix.PR_RISCV_SET_ICACHE_FLUSH_CTX,
+	}
 )
 
 func initVMConstants() {
@@ -940,9 +1359,7 @@ func initKernelCapabilityConstants() {
 }
 
 func initPtraceConstants() {
-	for k, v := range ptraceArchConstants {
-		ptraceConstants[k] = v
-	}
+	maps.Copy(ptraceConstants, ptraceArchConstants)
 
 	for k, v := range ptraceConstants {
 		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
@@ -964,9 +1381,7 @@ func initProtConstansts() {
 }
 
 func initMMapFlagsConstants() {
-	for k, v := range mmapFlagArchConstants {
-		mmapFlagConstants[k] = v
-	}
+	maps.Copy(mmapFlagConstants, mmapFlagArchConstants)
 
 	for k, v := range mmapFlagConstants {
 		seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
@@ -993,6 +1408,64 @@ func initSysCtlActionConstants() {
 		sysctlActionStrings[uint32(v)] = k
 	}
 }
+func initSetSockOptLevelConstants() {
+	for k, v := range SetSockoptLevelConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		setsockoptLevelStrings[v] = k
+	}
+}
+func initSetSockOptOptNameConstantsSolSocket() {
+	for k, v := range SetSockOptOptNameConstantsSolSocket {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		setsockoptOptNameStringsSolSocket[v] = k
+	}
+}
+func initSetSockOptOptNameConstantsIP() {
+	for k, v := range SetSockOptOptNameConstantsIP {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		setsockoptOptNameStringsIP[v] = k
+	}
+}
+
+func initSetSockOptOptNameConstantsTCP() {
+	for k, v := range SetSockOptOptNameConstantsTCP {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		setsockoptOptNameStringsTCP[v] = k
+	}
+}
+
+func initSetSockOptOptNameConstantsIPv6() {
+	for k, v := range SetSockOptOptNameConstantsIPv6 {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		setsockoptOptNameStringsIPv6[v] = k
+	}
+}
+func initSocketDomainConstants() {
+	for k, v := range SocketDomainConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		socketDomainStrings[v] = k
+	}
+}
+
+func initSocketTypeConstants() {
+	for k, v := range SocketTypeConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		socketTypeStrings[v] = k
+	}
+}
+
+func initSocketFamilyConstants() {
+	for k, v := range addressFamilyConstants {
+		socketFamilyStrings[v] = k
+	}
+}
+
+func initSocketProtocolConstants() {
+	for k, v := range SocketProtocolConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		socketProtocolStrings[v] = k
+	}
+}
 
 func initBPFMapNamesConstants() {
 	seclConstants["CWS_MAP_NAMES"] = &eval.StringArrayEvaluator{Values: bpfMapNames}
@@ -1002,6 +1475,28 @@ func initAUIDConstants() {
 	seclConstants["AUDIT_AUID_UNSET"] = &eval.IntEvaluator{Value: sharedconsts.AuditUIDUnset}
 }
 
+func initRlimitConstants() {
+	for k, v := range RlimitConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		rlimitStrings[v] = k
+	}
+}
+
+func initCloneFlagsConstants() {
+	for k, v := range CloneFlagsConstants {
+		if bits.UintSize == 64 || v < math.MaxInt32 {
+			seclConstants[k] = &eval.IntEvaluator{Value: int(v)}
+		}
+		cloneFlagsStrings[v] = k
+	}
+}
+
+func initPrCtlOptionConstants() {
+	for k, v := range PrCtlOptionConstants {
+		seclConstants[k] = &eval.IntEvaluator{Value: v}
+		prctlOptionStrings[v] = k
+	}
+}
 func bitmaskToStringArray(bitmask int, intToStrMap map[int]string) []string {
 	var strs []string
 	var result int
@@ -1018,7 +1513,7 @@ func bitmaskToStringArray(bitmask int, intToStrMap map[int]string) []string {
 	}
 
 	if result != bitmask {
-		strs = append(strs, fmt.Sprintf("%d", bitmask&^result))
+		strs = append(strs, strconv.Itoa(bitmask&^result))
 	}
 
 	sort.Strings(strs)
@@ -1045,7 +1540,7 @@ func bitmaskU64ToStringArray(bitmask uint64, intToStrMap map[uint64]string) []st
 	}
 
 	if result != bitmask {
-		strs = append(strs, fmt.Sprintf("%d", bitmask&^result))
+		strs = append(strs, strconv.FormatUint(bitmask&^result, 10))
 	}
 
 	sort.Strings(strs)
@@ -1131,6 +1626,18 @@ func (kc KernelCapability) StringArray() []string {
 	computed := bitmaskU64ToStringArray(uint64(kc), kernelCapabilitiesStrings)
 	capsStringArrayCache.Add(kc, computed)
 	return computed
+}
+
+// CloneFlags represents a clone flags bitmask value, as passed to unshare
+type CloneFlags uint64
+
+func (cf CloneFlags) String() string {
+	return bitmaskU64ToString(uint64(cf), cloneFlagsStrings)
+}
+
+// StringArray returns the clone flags as an array of strings
+func (cf CloneFlags) StringArray() []string {
+	return bitmaskU64ToStringArray(uint64(cf), cloneFlagsStrings)
 }
 
 // BPFCmd represents a BPF command
@@ -1867,23 +2374,36 @@ func (sig Signal) String() string {
 }
 
 var (
-	openFlagsStrings          = map[int]string{}
-	fileModeStrings           = map[int]string{}
-	inodeModeStrings          = map[int]string{}
-	unlinkFlagsStrings        = map[int]string{}
-	kernelCapabilitiesStrings = map[uint64]string{}
-	bpfCmdStrings             = map[uint32]string{}
-	bpfHelperFuncStrings      = map[uint32]string{}
-	bpfMapTypeStrings         = map[uint32]string{}
-	bpfProgramTypeStrings     = map[uint32]string{}
-	bpfAttachTypeStrings      = map[uint32]string{}
-	ptraceFlagsStrings        = map[uint32]string{}
-	vmStrings                 = map[uint64]string{}
-	protStrings               = map[uint64]string{}
-	mmapFlagStrings           = map[uint64]string{}
-	signalStrings             = map[int]string{}
-	pipeBufFlagStrings        = map[int]string{}
-	sysctlActionStrings       = map[uint32]string{}
+	openFlagsStrings                  = map[int]string{}
+	fileModeStrings                   = map[int]string{}
+	inodeModeStrings                  = map[int]string{}
+	unlinkFlagsStrings                = map[int]string{}
+	kernelCapabilitiesStrings         = map[uint64]string{}
+	bpfCmdStrings                     = map[uint32]string{}
+	bpfHelperFuncStrings              = map[uint32]string{}
+	bpfMapTypeStrings                 = map[uint32]string{}
+	bpfProgramTypeStrings             = map[uint32]string{}
+	bpfAttachTypeStrings              = map[uint32]string{}
+	ptraceFlagsStrings                = map[uint32]string{}
+	vmStrings                         = map[uint64]string{}
+	protStrings                       = map[uint64]string{}
+	mmapFlagStrings                   = map[uint64]string{}
+	signalStrings                     = map[int]string{}
+	pipeBufFlagStrings                = map[int]string{}
+	sysctlActionStrings               = map[uint32]string{}
+	rlimitStrings                     = map[int]string{}
+	cloneFlagsStrings                 = map[uint64]string{}
+	setsockoptOptNameStringsIP        = map[int]string{}
+	setsockoptOptNameStringsSolSocket = map[int]string{}
+	setsockoptOptNameStringsTCP       = map[int]string{}
+	setsockoptOptNameStringsIPv6      = map[int]string{}
+
+	setsockoptLevelStrings = map[int]string{}
+	socketDomainStrings    = map[int]string{}
+	socketTypeStrings      = map[int]string{}
+	socketFamilyStrings    = map[uint16]string{}
+	socketProtocolStrings  = map[int]string{}
+	prctlOptionStrings     = map[int]string{}
 )
 
 // SysCtlAction is used to define the action of a sysctl event
@@ -1901,3 +2421,80 @@ const (
 	// SysCtlWriteAction sysctl action type
 	SysCtlWriteAction
 )
+
+// SetSockOptOptNameIP is used to define the optname for setsockopt when the level is IP
+type SetSockOptOptNameIP int
+
+func (s SetSockOptOptNameIP) String() string {
+	return setsockoptOptNameStringsIP[int(s)]
+}
+
+// SetSockOptOptNameTCP is used to define the optname for setsockopt when the level is TCP
+type SetSockOptOptNameTCP int
+
+func (s SetSockOptOptNameTCP) String() string {
+	return setsockoptOptNameStringsTCP[int(s)]
+}
+
+// SetSockOptOptNameSolSocket is used to define the optname for setsockopt when the level is SOL_SOCKET
+type SetSockOptOptNameSolSocket int
+
+func (s SetSockOptOptNameSolSocket) String() string {
+	return setsockoptOptNameStringsSolSocket[int(s)]
+}
+
+// SetSockOptOptNameIPv6 is used to define the optname for setsockopt when the level is IPV6
+type SetSockOptOptNameIPv6 int
+
+func (s SetSockOptOptNameIPv6) String() string {
+	return setsockoptOptNameStringsIPv6[int(s)]
+}
+
+// SetSockOptLevel is used to define the level of a socket in setsockopt
+type SetSockOptLevel int
+
+func (s SetSockOptLevel) String() string {
+	return setsockoptLevelStrings[int(s)]
+}
+
+// SocketDomain is used to define the domain of a socket
+type SocketDomain int
+
+func (s SocketDomain) String() string {
+	return socketDomainStrings[int(s)]
+}
+
+// SocketType is used to define the type of a socket in setsockopt
+type SocketType int
+
+func (s SocketType) String() string {
+	return socketTypeStrings[int(s)]
+}
+
+// SocketFamily is used to define the family of a socket in setsockopt
+type SocketFamily int
+
+func (s SocketFamily) String() string {
+	return socketFamilyStrings[uint16(s)]
+}
+
+// SocketProtocol is used to define the protocol of a socket in setsockopt
+type SocketProtocol int
+
+func (s SocketProtocol) String() string {
+	return socketProtocolStrings[int(s)]
+}
+
+// PrCtlOption is used to define the option of a process control in prctl
+type PrCtlOption int
+
+func (p PrCtlOption) String() string {
+	return prctlOptionStrings[int(p)]
+}
+
+// RlimitResource is used to define the resource type in rlimit calls
+type RlimitResource int
+
+func (r RlimitResource) String() string {
+	return rlimitStrings[int(r)]
+}

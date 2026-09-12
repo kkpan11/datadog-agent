@@ -13,15 +13,17 @@ import (
 )
 
 func TestCreateConfig(t *testing.T) {
-	config := CreateConfig("fake-origin")
-	assert.Equal(t, 5*time.Second, config.FlushTimeout)
-	assert.Equal(t, "fake-origin", config.source)
+	const wantTimeout = 5 * time.Second
+	config := CreateConfig("fake-logs-source", wantTimeout)
+	assert.Equal(t, wantTimeout, config.FlushTimeout)
+	assert.Equal(t, "fake-logs-source", config.source)
 }
 
 func TestCreateConfigWithSource(t *testing.T) {
 	t.Setenv("DD_SOURCE", "python")
-	config := CreateConfig("cloudrun")
-	assert.Equal(t, 5*time.Second, config.FlushTimeout)
+	const wantTimeout = 2 * time.Second
+	config := CreateConfig("cloudrun", wantTimeout)
+	assert.Equal(t, wantTimeout, config.FlushTimeout)
 	assert.Equal(t, "python", config.source)
 }
 
@@ -48,4 +50,26 @@ func TestIsInstanceTailingEnabled(t *testing.T) {
 	assert.True(t, isInstanceTailingEnabled())
 	t.Setenv("DD_AAS_INSTANCE_LOGGING_ENABLED", "")
 	assert.False(t, isInstanceTailingEnabled())
+}
+
+func TestSetAasInstanceTailingPath(t *testing.T) {
+	t.Setenv("COMPUTERNAME", "testInstance")
+	// Default path
+	t.Setenv("DD_AAS_INSTANCE_LOGGING_ENABLED", "true")
+	t.Setenv("DD_AAS_INSTANCE_LOG_FILE_DESCRIPTOR", "")
+	assert.Equal(t, "/home/LogFiles/*testInstance*.log", setAasInstanceTailingPath())
+
+	// Custom path
+	t.Setenv("DD_AAS_INSTANCE_LOG_FILE_DESCRIPTOR", "_custominfix")
+	assert.Equal(t, "/home/LogFiles/*testInstance*_custominfix.log", setAasInstanceTailingPath())
+}
+
+func TestCreateFileTailingSourceUsesEndMode(t *testing.T) {
+	t.Setenv("DD_SERVERLESS_LOG_PATH", "/tmp/test.log")
+
+	src := createFileTailingSource("test-source", []string{"tag1"}, "appservice")
+
+	assert.NotNil(t, src)
+	assert.Equal(t, "end", src.Config.TailingMode)
+	assert.Equal(t, "/tmp/test.log", src.Config.Path)
 }

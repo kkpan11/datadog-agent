@@ -1,0 +1,18 @@
+[Unit]
+Description=Datadog APM Inject - Manages libinject in ld.so.preload
+Documentation=https://docs.datadoghq.com/
+After=network.target
+# In a stale state, we should cleanup before Docker start.
+Before=shutdown.target docker.service
+
+[Service]
+Type=oneshot
+Environment=DD_LOG_LEVEL=info
+ExecStart={{INSTALLER_PATH}} apm instrument-start host
+ExecStopPost={{INSTALLER_PATH}} apm instrument-stop host
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 using Datadog.CustomActions.Extensions;
 using Datadog.CustomActions.Interfaces;
-using Microsoft.Deployment.WindowsInstaller;
+using WixToolset.Dtf.WindowsInstaller;
 using System;
 using System.IO;
 using System.Reflection;
@@ -11,6 +11,12 @@ namespace Datadog.CustomActions
     {
         private static ActionResult WriteInstallInfo(ISession session)
         {
+            var skipInstallInfo = session.Property("SKIP_INSTALL_INFO");
+            if (skipInstallInfo == "1")
+            {
+                session.Log("SKIP_INSTALL_INFO flag is set, skipping install_info file creation");
+                return ActionResult.Success;
+            }
             var configFolder = session.Property("APPLICATIONDATADIRECTORY");
             var installMethod = session.Property("OVERRIDE_INSTALLATION_METHOD");
             var installInfo = Path.Combine(configFolder, "install_info");

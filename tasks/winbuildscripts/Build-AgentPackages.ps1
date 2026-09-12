@@ -45,6 +45,11 @@ param(
 
 . "$PSScriptRoot\common.ps1"
 
+trap {
+    Write-Host "trap: $($_.InvocationInfo.Line.Trim()) - $_" -ForegroundColor Yellow
+    continue
+}
+
 Invoke-BuildScript `
     -BuildOutOfSource $BuildOutOfSource `
     -InstallDeps $InstallDeps `
@@ -78,7 +83,7 @@ Invoke-BuildScript `
 
     if ($BuildOutOfSource) {
         # Copy the resulting package to the mnt directory
-        mkdir C:\mnt\omnibus\pkg -Force -ErrorAction Stop | Out-Null
-        Copy-Item -Path ".\omnibus\pkg\*" -Destination "C:\mnt\omnibus\pkg" -Force -ErrorAction Stop
+        mkdir C:\mnt\omnibus\pkg\pipeline-$env:CI_PIPELINE_ID -Force -ErrorAction Stop | Out-Null
+        Copy-Item -Path ".\omnibus\pkg\*" -Destination "C:\mnt\omnibus\pkg\pipeline-$env:CI_PIPELINE_ID" -Recurse -Force -ErrorAction Stop
     }
 }

@@ -7,8 +7,10 @@ package tagset
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/twmb/murmur3"
 )
 
 func TestNewHashingTagsAccumulator(t *testing.T) {
@@ -104,4 +106,101 @@ func TestRemoveSorted(t *testing.T) {
 	r.SortUniq()
 	r.removeSorted(l)
 	assert.ElementsMatch(t, []string{"A", "e"}, r.Get())
+}
+
+func TestRemoveSortedHashCollision(t *testing.T) {
+	const collisionHash = uint64(0xdeadbeef)
+
+	// h's tag is alphabetically before the colliding tag in o — no match, tag must be kept.
+	h := NewHashingTagsAccumulator()
+	h.data = []string{"tag:keep"}
+	h.hash = []uint64{collisionHash}
+
+	o := NewHashingTagsAccumulator()
+	o.data = []string{"tag:other"} // same hash, different string; "tag:other" > "tag:keep"
+	o.hash = []uint64{collisionHash}
+
+	done := make(chan struct{})
+	go func() {
+		h.removeSorted(o)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		assert.ElementsMatch(t, []string{"tag:keep"}, h.Get())
+	case <-time.After(3 * time.Second):
+		t.Fatal("removeSorted hung: infinite loop on hash collision")
+	}
+}
+
+func TestRemoveSortedHashCollisionWithMatch(t *testing.T) {
+	const collisionHash = uint64(0xdeadbeef)
+
+	// h's tag is alphabetically AFTER the colliding tag in o, but o also contains h's tag — it must be removed.
+	// o sorted by (hash, string): ["tag:aaa"@collisionHash, "tag:zoo"@collisionHash]
+	h := NewHashingTagsAccumulator()
+	h.data = []string{"tag:zoo"}
+	h.hash = []uint64{collisionHash}
+
+	o := NewHashingTagsAccumulator()
+	o.data = []string{"tag:aaa", "tag:zoo"} // "tag:aaa" collides with same hash, comes before "tag:zoo"
+	o.hash = []uint64{collisionHash, collisionHash}
+
+	h.removeSorted(o)
+	assert.Empty(t, h.Get(), "tag:zoo must be removed since o contains it, despite hash collision with tag:aaa")
+}
+
+func testTagsMatchHash(t *testing.T, acc *HashingTagsAccumulator) {
+	assert.Equal(t, len(acc.data), len(acc.hash))
+	for idx, tag := range acc.data {
+		assert.Equal(t, murmur3.StringSum64(tag), acc.hash[idx])
+	}
+}
+
+func TestFilterTags(t *testing.T) {
+	tests := []struct {
+		name         string
+		inputTags    []string
+		keepFunc     func(string) bool
+		expectedTags []string
+	}{
+		{
+			name:         "filter all tags",
+			inputTags:    []string{"env:prod", "host:server1", "version:1.0"},
+			keepFunc:     func(_ string) bool { return false },
+			expectedTags: []string{},
+		},
+		{
+			name:         "keep all tags",
+			inputTags:    []string{"env:prod", "host:server1", "version:1.0"},
+			keepFunc:     func(_ string) bool { return true },
+			expectedTags: []string{"env:prod", "host:server1", "version:1.0"},
+		},
+		{
+			name:      "filter some tags",
+			inputTags: []string{"env:prod", "host:server1", "version:1.0", "region:us-east"},
+			keepFunc: func(tag string) bool {
+				return tag == "env:prod" || tag == "version:1.0"
+			},
+			expectedTags: []string{"env:prod", "version:1.0"},
+		},
+		{
+			name:         "no tags to filter",
+			inputTags:    []string{},
+			keepFunc:     func(_ string) bool { return true },
+			expectedTags: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			acc := NewHashingTagsAccumulatorWithTags(tt.inputTags)
+			removed := acc.RetainFunc(tt.keepFunc)
+
+			assert.Equal(t, tt.expectedTags, acc.Get())
+			assert.Equal(t, len(tt.inputTags)-len(tt.expectedTags), removed)
+			testTagsMatchHash(t, acc)
+		})
+	}
 }

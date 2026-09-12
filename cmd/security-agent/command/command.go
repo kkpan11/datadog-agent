@@ -7,7 +7,7 @@
 package command
 
 import (
-	"fmt"
+	"errors"
 	"path"
 
 	"github.com/fatih/color"
@@ -32,16 +32,23 @@ type GlobalParams struct {
 // SubcommandFactory returns a sub-command factory
 type SubcommandFactory func(globalParams *GlobalParams) []*cobra.Command
 
+// SubcommandFactoryFromOne converts a single-command factory into a multi-command factory
+func SubcommandFactoryFromOne(f func(globalParams *GlobalParams) *cobra.Command) SubcommandFactory {
+	return func(globalParams *GlobalParams) []*cobra.Command {
+		return []*cobra.Command{f(globalParams)}
+	}
+}
+
 // LoggerName defines the logger name
 const LoggerName = "SECURITY"
 
 var (
 	defaultSecurityAgentConfigFilePaths = []string{
-		path.Join(defaultpaths.ConfPath, "datadog.yaml"),
-		path.Join(defaultpaths.ConfPath, "security-agent.yaml"),
+		path.Join(defaultpaths.GetDefaultConfPath(), "datadog.yaml"),
+		path.Join(defaultpaths.GetDefaultConfPath(), "security-agent.yaml"),
 	}
 
-	defaultSysProbeConfPath = path.Join(defaultpaths.ConfPath, "system-probe.yaml")
+	defaultSysProbeConfPath = path.Join(defaultpaths.GetDefaultConfPath(), "system-probe.yaml")
 )
 
 // MakeCommand makes the top-level Cobra command for this command.
@@ -60,7 +67,7 @@ Datadog Security Agent takes care of running compliance and security checks.`,
 			}
 
 			if len(globalParams.ConfigFilePaths) == 1 && globalParams.ConfigFilePaths[0] == "" {
-				return fmt.Errorf("no Security Agent config files to load, exiting")
+				return errors.New("no Security Agent config files to load, exiting")
 			}
 			return nil
 		},

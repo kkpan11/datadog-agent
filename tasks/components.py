@@ -4,14 +4,16 @@ Invoke entrypoint, import here all the tasks we want to make available
 
 import os
 import pathlib
-from collections import namedtuple
+import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from string import Template
 
 from invoke import task
 from invoke.exceptions import Exit
 
 from tasks.libs.types.copyright import COPYRIGHT_HEADER
+
 
 # Component represents a directory defining a component
 #  version=1 is the classic style using:
@@ -21,10 +23,32 @@ from tasks.libs.types.copyright import COPYRIGHT_HEADER
 #    comp/<name>/def/component.go
 #    comp/<name>/fx/fx.go
 #    comp/<name>/impl/*
-Component = namedtuple('Component', ['name', 'def_file', 'path', 'doc', 'team', 'version'])
+@dataclass
+class Component:
+    name: str
+    def_file: str
+    path: str
+    doc: str
+    team: str | None
+    version: int
+
+    def __post_init__(self):
+        self.def_file = to_posix_path(self.def_file)
+        self.path = to_posix_path(self.path)
+
+
 # Bundle represents a bundle of components, defined using:
 #    comp/<group>/bundle.go
-Bundle = namedtuple('Bundle', ['path', 'doc', 'team', 'content', 'components'])
+@dataclass
+class Bundle:
+    path: str
+    doc: str
+    team: str | None
+    content: list
+    components: list
+
+    def __post_init__(self):
+        self.path = to_posix_path(self.path)
 
 
 def find_team(content: Iterable[str]) -> str | None:
@@ -62,99 +86,22 @@ def has_type_component(content) -> bool:
 # The migration of these components is in progresss.
 # Please do not add a new component to this list.
 components_to_migrate = [
-    "comp/aggregator/demultiplexer/component.go",
     "comp/core/config/component.go",
     "comp/core/flare/component.go",
-    "comp/dogstatsd/server/component.go",
     "comp/forwarder/defaultforwarder/component.go",
-    "comp/metadata/inventoryagent/component.go",
-    "comp/netflow/config/component.go",
-    "comp/netflow/server/component.go",
-    "comp/remote-config/rcclient/component.go",
-    "comp/trace/config/component.go",
-    "comp/process/apiserver/component.go",
 ]
 
 
 # List of components that use the classic style, where `comp/<component>/<component>impl` exists
 # New components should use the new style of `def`, `impl`, `fx` folders
 components_classic_style = [
-    'comp/agent/autoexit/autoexitimpl',
-    'comp/agent/cloudfoundrycontainer/cloudfoundrycontainerimpl',
-    'comp/agent/expvarserver/expvarserverimpl',
-    'comp/agent/jmxlogger/jmxloggerimpl',
-    'comp/aggregator/diagnosesendermanager/diagnosesendermanagerimpl',
     'comp/api/api/apiimpl',
     'comp/api/api/def',
-    'comp/api/authtoken/fetchonlyimpl',
-    'comp/api/authtoken/createandfetchimpl',
-    'comp/checks/agentcrashdetect/agentcrashdetectimpl',
-    'comp/checks/windowseventlog/windowseventlogimpl',
     "comp/checks/winregistry/impl",
-    'comp/collector/collector/collectorimpl',
-    'comp/core/autodiscovery/autodiscoveryimpl',
-    'comp/core/configsync/configsyncimpl',
-    'comp/core/gui/guiimpl',
     'comp/core/hostname/hostnameimpl',
-    'comp/core/pid/pidimpl',
-    'comp/core/secrets/secretsimpl',
-    'comp/core/settings/settingsimpl',
     'comp/core/status/statusimpl',
-    'comp/core/sysprobeconfig/sysprobeconfigimpl',
-    'comp/core/telemetry/telemetryimpl',
-    'comp/core/telemetry/noopsimpl',
-    'comp/dogstatsd/pidmap/pidmapimpl',
-    'comp/dogstatsd/serverDebug/serverdebugimpl',
-    'comp/dogstatsd/status/statusimpl',
     'comp/etw/impl',
-    'comp/forwarder/eventplatform/eventplatformimpl',
-    'comp/forwarder/eventplatformreceiver/eventplatformreceiverimpl',
-    'comp/forwarder/orchestrator/orchestratorimpl',
-    'comp/languagedetection/client/clientimpl',
-    'comp/logs/adscheduler/adschedulerimpl',
-    'comp/logs/agent/agentimpl',
-    'comp/metadata/host/hostimpl',
-    'comp/metadata/inventorychecks/inventorychecksimpl',
-    'comp/metadata/inventoryhost/inventoryhostimpl',
-    'comp/metadata/inventoryotel/inventoryotelimpl',
-    'comp/metadata/packagesigning/packagesigningimpl',
-    'comp/metadata/resources/resourcesimpl',
-    'comp/metadata/runner/runnerimpl',
-    'comp/ndmtmp/forwarder/forwarderimpl',
-    'comp/networkpath/npcollector/npcollectorimpl',
     'comp/otelcol/logsagentpipeline/logsagentpipelineimpl',
-    'comp/process/agent/agentimpl',
-    'comp/process/connectionscheck/connectionscheckimpl',
-    'comp/process/containercheck/containercheckimpl',
-    'comp/process/expvars/expvarsimpl',
-    'comp/process/forwarders/forwardersimpl',
-    'comp/process/hostinfo/hostinfoimpl',
-    'comp/process/processcheck/processcheckimpl',
-    'comp/process/processdiscoverycheck/processdiscoverycheckimpl',
-    'comp/process/processeventscheck/processeventscheckimpl',
-    'comp/process/profiler/profilerimpl',
-    'comp/process/rtcontainercheck/rtcontainercheckimpl',
-    'comp/process/runner/runnerimpl',
-    'comp/process/status/statusimpl',
-    'comp/process/submitter/submitterimpl',
-    'comp/remote-config/rcservice/rcserviceimpl',
-    'comp/remote-config/rcservicemrf/rcservicemrfimpl',
-    'comp/remote-config/rcstatus/rcstatusimpl',
-    'comp/remote-config/rctelemetryreporter/rctelemetryreporterimpl',
-    'comp/snmptraps/config/configimpl',
-    'comp/snmptraps/formatter/formatterimpl',
-    'comp/snmptraps/forwarder/forwarderimpl',
-    'comp/snmptraps/listener/listenerimpl',
-    'comp/snmptraps/oidresolver/oidresolverimpl',
-    'comp/snmptraps/server/serverimpl',
-    'comp/snmptraps/status/statusimpl',
-    'comp/systray/systray/systrayimpl',
-    'comp/trace/etwtracer/etwtracerimpl',
-    'comp/trace/status/statusimpl',
-    'comp/updater/localapi/localapiimpl',
-    'comp/updater/localapiclient/localapiclientimpl',
-    'comp/updater/telemetry/telemetryimpl',
-    'comp/updater/updater/updaterimpl',
 ]
 
 
@@ -168,14 +115,30 @@ components_missing_implementation_folder = [
 ]
 
 ignore_fx_import = [
+    "comp/aggregator/demultiplexer",
+    "comp/forwarder/eventplatform",
+    "comp/collector/collector",
+    "comp/forwarder/eventplatformreceiver",
+    "comp/forwarder/orchestrator",
+    "comp/logs/agent",
+    "comp/otelcol/logsagentpipeline",
     "comp/core/workloadmeta",
     "comp/rdnsquerier",
     "comp/trace/agent",
+    "comp/snmptraps/server",
 ]
 
 ignore_provide_component_constructor_missing = [
+    "comp/aggregator/demultiplexer",
+    "comp/forwarder/eventplatform",
+    "comp/collector/collector",
+    "comp/forwarder/eventplatformreceiver",
+    "comp/forwarder/orchestrator",
+    "comp/logs/agent",
+    "comp/otelcol/logsagentpipeline",
     "comp/core/workloadmeta",
     "comp/trace/agent",
+    "comp/core/configsync",
 ]
 
 mock_definitions = [
@@ -199,12 +162,18 @@ def check_component_contents_and_file_hiearchy(comp):
         return f"** {comp.def_file} does not define a Component interface"
 
     # Skip components that need to migrate
-    if str(comp.def_file) in components_to_migrate:
+    if comp.def_file in components_to_migrate:
         return
 
     # Special case for api
     if comp.def_file == 'comp/api/api/def/component.go':
         return
+
+    # Definition file must be named 'component.go' for v2 components. This is found by content
+    # (its 'type Component' definition) rather than by name, so a wrongly-named file is reported
+    # here instead of silently failing to be recognized as the component's definition.
+    if comp.version == 2 and pathlib.Path(comp.def_file).name != 'component.go':
+        return f"** {comp.def_file} should be renamed to 'component.go'. See https://datadoghq.dev/datadog-agent/components/creating-components/"
 
     # Definition file `component.go` (v1) or `def/component.go` (v2) must use `package <compname>`
     pkgname = parse_package_name(comp.def_file)
@@ -234,7 +203,7 @@ def check_component_contents_and_file_hiearchy(comp):
             for part in src_file.parts:
                 if "impl-" in part:
                     parts = part.split("-")
-                    expectname = parts[1] + 'impl'
+                    expectname = ''.join(parts[1:]) + 'impl'
 
             if pkgname != expectname:
                 return f"** {src_file} has wrong package name '{pkgname}', must be '{expectname}'"
@@ -247,15 +216,25 @@ def check_component_contents_and_file_hiearchy(comp):
                 return f"** {src_file} should not import 'fxutil' because it a component implementation"
         # FX files should use correct filename and package name, and call ProvideComponentConstructor
         for src_file in locate_fx_source_files(root_path):
-            if src_file.name != 'fx.go':
-                return f"** {src_file} should be named 'fx.go'"
+            # Skip test files
+            if src_file.name.endswith('_test.go'):
+                continue
+            # Allow fx.go or fx_<suffix>.go (e.g., fx_unsupported.go)
+            if src_file.name != 'fx.go' and not src_file.name.startswith('fx_'):
+                return f"** {src_file} should be named 'fx.go' or 'fx_<suffix>.go'"
             pkgname = parse_package_name(src_file)
             expectname = comp.name + 'fx'
             if pkgname != 'fx' and pkgname != expectname:
                 return f"** {src_file} has wrong package name '{pkgname}', must be 'fx' or '{expectname}'"
+            # All fx files must define a Module function (with optional prefix/suffix) returning fxutil.Module
+            src_content = read_file_content(src_file)
+            if not re.search(r'func \w*Module\w*\([^)]*\) fxutil\.Module', src_content):
+                return f"** {src_file} must define a function matching 'func <Prefix>Module<Suffix>(...) fxutil.Module'"
+            # Only check ProvideComponentConstructor for the main fx.go file
+            if src_file.name != 'fx.go':
+                continue
             if comp.path in ignore_provide_component_constructor_missing:
                 continue
-            src_content = read_file_content(src_file)
             if 'ProvideComponentConstructor' not in src_content:
                 return f"** {src_file} should call ProvideComponentConstructor to convert regular constructor into fx-aware"
 
@@ -285,8 +264,8 @@ def locate_implementation_folders(comp):
         if entry.is_file():
             continue
 
-        if str(entry) in components_missing_implementation_folder:
-            return 'skip'
+        if to_posix_path(entry) in components_missing_implementation_folder:
+            continue
 
         if comp.version == 2:
             # Check for component implementation using the new-style folder structure: comp/<component>/impl[-suffix]
@@ -295,7 +274,7 @@ def locate_implementation_folders(comp):
 
         if comp.version == 1:
             # Check for component implementation using the classic style: comp/<component>/<component>impl
-            if str(entry) in components_classic_style:
+            if to_posix_path(entry) in components_classic_style:
                 folders.append(entry)
 
     return folders
@@ -310,7 +289,7 @@ def locate_nontest_source_files(folder_list):
         for entry in folder.iterdir():
             if not entry.is_file():
                 continue
-            filename = str(entry)
+            filename = to_posix_path(entry)
             if filename.endswith('.go') and not filename.endswith('_test.go'):
                 results.append(entry)
     return results
@@ -373,7 +352,7 @@ def get_components_and_bundles():
             if direntry.is_file() and direntry.name == "bundle.go":
                 # Found bundle definition
                 content = read_file_content(direntry).split('\n')
-                path = str(direntry)[: -len('/bundle.go')]
+                path = to_posix_path(direntry).removesuffix('/bundle.go')
                 team = find_team(content)
                 doc = find_doc(content)
                 bundles.append(Bundle(path, doc, team, content, []))
@@ -391,9 +370,28 @@ def get_components_and_bundles():
         for c in components:
             if c.path.startswith(b.path):
                 bundle_components.append(c)
-        sorted_bundles.append(Bundle(b.path, b.doc, b.team, b.content, sorted(bundle_components)))
+        sorted_bundles.append(Bundle(b.path, b.doc, b.team, b.content, sorted(bundle_components, key=lambda c: c.name)))
 
-    return sorted(components, key=lambda c: c.path), sorted(sorted_bundles)
+    return sorted(components, key=lambda c: c.path), sorted(sorted_bundles, key=lambda b: b.path)
+
+
+def find_component_def_file(def_dir):
+    """
+    Return the Go file in def_dir that defines the Component interface, if any.
+
+    Components are expected to name this file 'component.go' (checked separately in
+    check_component_contents_and_file_hiearchy), but we locate it here by content so that a
+    misnamed file still gets picked up as a component - and reported with an actionable error -
+    instead of silently vanishing from component/codeowners generation.
+    """
+    for entry in sorted(def_dir.iterdir()):
+        if not entry.is_file() or not entry.name.endswith('.go') or entry.name.endswith('_test.go'):
+            continue
+        content = read_file_content(entry).split('\n')
+        if any(line.startswith('type Component interface') or line.startswith('type Component = ') for line in content):
+            return entry
+
+    return None
 
 
 def locate_component_def(dir):
@@ -402,12 +400,18 @@ def locate_component_def(dir):
     """
     component_name = dir.name.replace('-', '').lower()
 
-    # v2 component: this folder is a component root if it contains 'def/component.go'
+    # v2 component: this folder is a component root if it contains 'def/component.go', or, failing
+    # that, another Go file in 'def' that defines the Component interface (see find_component_def_file)
     def_file = dir / 'def/component.go'
-    if def_file.is_file():
+    if not def_file.is_file():
+        def_subdir = dir / 'def'
+        if def_subdir.is_dir():
+            def_file = find_component_def_file(def_subdir)
+
+    if def_file is not None and def_file.is_file():
         # comp/api/api/def/component.go is a special case, it's not a component using version 2
         # PLEASE DO NOT ADD MORE EXCEPTIONS
-        if str(def_file) == "comp/api/api/def/component.go":
+        if to_posix_path(def_file) == "comp/api/api/def/component.go":
             return construct_component(component_name, def_file, dir, 1)
         else:
             return construct_component(component_name, def_file, dir, 2)
@@ -415,15 +419,15 @@ def locate_component_def(dir):
     # v1 component: this folder is a component root if it contains '/component.go' but the path is not '/def/component.go'
     # in particular, the directory named 'def' should not be treated as a component root
     def_file = dir / 'component.go'
-    if def_file.is_file() and '/def/component.go' not in str(def_file):
+    if def_file.is_file() and '/def/component.go' not in to_posix_path(def_file):
         return construct_component(component_name, def_file, dir, 1)
 
 
 def construct_component(compname, def_file, path, version):
-    def_content = read_file_content(str(def_file)).split('\n')
+    def_content = read_file_content(def_file).split('\n')
     team = find_team(def_content)
     doc = find_doc(def_content)
-    return Component(compname, str(def_file), str(path), doc, team, version)
+    return Component(compname, def_file, path, doc, team, version)
 
 
 def make_components_md(bundles, components_without_bundle):
@@ -711,7 +715,7 @@ def lint_fxutil_oneshot_test(_):
         folder_path = pathlib.Path(folder)
         for file in folder_path.rglob("*.go"):
             # Don't lint test files
-            if str(file).endswith("_test.go"):
+            if to_posix_path(file).endswith("_test.go"):
                 continue
 
             one_shot_count = file.read_text().count("fxutil.OneShot(")
@@ -744,3 +748,8 @@ def lint_fxutil_oneshot_test(_):
     if len(errors) > 0:
         msg = '\n'.join(errors)
         raise Exit(f"Missings tests: {msg}")
+
+
+def to_posix_path(path):
+    """Convert a path (string or Path object) to posix-style string with forward slashes."""
+    return pathlib.Path(path).as_posix()

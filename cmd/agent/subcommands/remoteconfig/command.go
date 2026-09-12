@@ -23,8 +23,10 @@ import (
 	ipc "github.com/DataDog/datadog-agent/comp/core/ipc/def"
 	ipcfx "github.com/DataDog/datadog-agent/comp/core/ipc/fx"
 	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	rcservice "github.com/DataDog/datadog-agent/comp/remote-config/rcservice/def"
+	pkgconfighelper "github.com/DataDog/datadog-agent/pkg/config/helper"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
-	"github.com/DataDog/datadog-agent/pkg/flare"
+	configUtils "github.com/DataDog/datadog-agent/pkg/config/utils"
 	pbgo "github.com/DataDog/datadog-agent/pkg/proto/pbgo/core"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
 	agentgrpc "github.com/DataDog/datadog-agent/pkg/util/grpc"
@@ -58,31 +60,80 @@ func Commands(globalParams *command.GlobalParams) []*cobra.Command {
 		Hidden: true,
 	}
 
+	remoteConfigCmd.AddCommand(
+		&cobra.Command{
+			Use:   "reset",
+			Short: "Reset the remote configuration state",
+			Long:  ``,
+			RunE: func(_ *cobra.Command, _ []string) error {
+				return fxutil.OneShot(reset,
+					fx.Supply(cliParams),
+					fx.Supply(core.BundleParams{
+						ConfigParams: config.NewAgentParams(globalParams.ConfFilePath, config.WithExtraConfFiles(globalParams.ExtraConfFilePath), config.WithFleetPoliciesDirPath(globalParams.FleetPoliciesDirPath)),
+						LogParams:    log.ForOneShot(command.LoggerName, "OFF", false),
+					}),
+					core.Bundle(),
+					ipcfx.ModuleReadOnly(),
+				)
+			},
+			Hidden: true,
+		},
+	)
+
 	return []*cobra.Command{remoteConfigCmd}
 }
 
+func reset(_ *cliParams, config config.Component, ipc ipc.Component) error {
+	if !configUtils.IsRemoteConfigEnabled(config) {
+		return errors.New("remote configuration is not enabled")
+	}
+	fmt.Println("Resetting the remote configuration state...")
+
+	ctx, closeFn := context.WithCancel(context.Background())
+	defer closeFn()
+	md := metadata.MD{
+		"authorization": []string{"Bearer " + ipc.GetAuthToken()},
+	}
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
+	if err != nil {
+		return err
+	}
+
+	cli, err := agentgrpc.GetDDAgentSecureClient(ctx, ipcAddress, pkgconfighelper.GetIPCPort(pkgconfigsetup.Datadog()), ipc.GetTLSClientConfig())
+	if err != nil {
+		return err
+	}
+	in := new(emptypb.Empty)
+
+	_, err = cli.ResetConfigState(ctx, in)
+	if err != nil {
+		return fmt.Errorf("couldn't get the repositories state: %w", err)
+	}
+	return nil
+}
+
 func state(_ *cliParams, config config.Component, ipc ipc.Component) error {
-	if !pkgconfigsetup.IsRemoteConfigEnabled(config) {
+	if !configUtils.IsRemoteConfigEnabled(config) {
 		return errors.New("remote configuration is not enabled")
 	}
 	fmt.Println("Fetching the configuration and director repos state..")
 	// Call GRPC endpoint returning state tree
 
-	token := ipc.GetAuthToken()
-
 	ctx, closeFn := context.WithCancel(context.Background())
 	defer closeFn()
 	md := metadata.MD{
-		"authorization": []string{fmt.Sprintf("Bearer %s", token)},
+		"authorization": []string{"Bearer " + ipc.GetAuthToken()}, // TODO IPC: use GRPC client
 	}
 	ctx = metadata.NewOutgoingContext(ctx, md)
 
-	ipcAddress, err := pkgconfigsetup.GetIPCAddress(pkgconfigsetup.Datadog())
+	ipcAddress, err := pkgconfighelper.GetIPCAddress(pkgconfigsetup.Datadog())
 	if err != nil {
 		return err
 	}
 
-	cli, err := agentgrpc.GetDDAgentSecureClient(ctx, ipcAddress, pkgconfigsetup.GetIPCPort(), ipc.GetTLSClientConfig)
+	cli, err := agentgrpc.GetDDAgentSecureClient(ctx, ipcAddress, pkgconfighelper.GetIPCPort(pkgconfigsetup.Datadog()), ipc.GetTLSClientConfig())
 	if err != nil {
 		return err
 	}
@@ -101,7 +152,7 @@ func state(_ *cliParams, config config.Component, ipc ipc.Component) error {
 		}
 	}
 
-	flare.PrintRemoteConfigStates(os.Stdout, s, stateHA)
+	rcservice.PrintRemoteConfigStates(os.Stdout, s, stateHA)
 
 	return nil
 }

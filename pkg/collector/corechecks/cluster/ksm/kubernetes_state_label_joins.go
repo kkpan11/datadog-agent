@@ -9,6 +9,7 @@ package ksm
 
 import (
 	"slices"
+	"strings"
 
 	ksmstore "github.com/DataDog/datadog-agent/pkg/kubestatemetrics/store"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -57,14 +58,18 @@ import (
 */
 
 type joinsConfig struct {
-	labelsToMatch []string
-	labelsToGet   map[string]string
-	getAllLabels  bool
+	labelsToMatch    []string
+	labelsToGet      map[string]string
+	getAllLabels     bool
+	wildcardTemplate string
 }
 
 type labelJoiner struct {
 	metricsToJoin map[string]metricToJoin
 }
+
+// argoRolloutLabelName is the KSM-normalized name of the rollouts-pod-template-hash label.
+const argoRolloutLabelName = "label_rollouts_pod_template_hash"
 
 type metricToJoin struct {
 	config *joinsConfig
@@ -123,6 +128,25 @@ func newLeafNode() *node {
 	}
 }
 
+// resolveTag resolves the tag key for a given label name and config.
+// It substitutes the %%label%% or %%annotation%% placeholder with the label name.
+// If the label isn't a "matching label", it will be prefixed by either "label_" or "annotation_",
+// if the label is NOT a "matching label", so we can use that to determine which substitution to do.
+func resolveTag(labelName string, config *joinsConfig) string {
+	if label, ok := strings.CutPrefix(labelName, "label_"); ok {
+		return strings.ReplaceAll(
+			config.wildcardTemplate,
+			"%%label%%",
+			label,
+		)
+	}
+	return strings.ReplaceAll(
+		config.wildcardTemplate,
+		"%%annotation%%",
+		strings.TrimPrefix(labelName, "annotation_"),
+	)
+}
+
 func (lj *labelJoiner) insertMetric(metric ksmstore.DDMetric, config *joinsConfig, tree *node) {
 	current := tree
 
@@ -152,13 +176,20 @@ func (lj *labelJoiner) insertMetric(metric ksmstore.DDMetric, config *joinsConfi
 	// Fill the `labelsToAdd` on the leaf node.
 	if config.getAllLabels {
 		if current.labelsToAdd == nil {
-			current.labelsToAdd = make([]label, 0, len(metric.Labels)-len(config.labelsToMatch))
+			current.labelsToAdd = make([]label, 0, max(0, len(metric.Labels)-len(config.labelsToMatch)))
 		}
 
 		for labelName, labelValue := range metric.Labels {
 			isALabelToMatch := slices.Contains(config.labelsToMatch, labelName)
 			if !isALabelToMatch {
-				current.labelsToAdd = append(current.labelsToAdd, label{labelName, labelValue})
+				if ddTagKey, found := config.labelsToGet[labelName]; found {
+					current.labelsToAdd = append(current.labelsToAdd, label{ddTagKey, labelValue})
+				} else if config.wildcardTemplate != "" {
+					resolvedTagKey := resolveTag(labelName, config)
+					current.labelsToAdd = append(current.labelsToAdd, label{resolvedTagKey, labelValue})
+				} else {
+					current.labelsToAdd = append(current.labelsToAdd, label{labelName, labelValue})
+				}
 			}
 		}
 	} else {

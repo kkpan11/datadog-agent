@@ -6,20 +6,23 @@
 package nodetreemodel
 
 import (
-	"encoding/json"
-	"errors"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/DataDog/datadog-agent/pkg/config/model"
+	"github.com/spf13/cast"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/DataDog/datadog-agent/pkg/config/model"
 )
 
 // Test that a setting with a map value is seen as a leaf by the nodetreemodel config
@@ -31,10 +34,10 @@ func TestLeafNodeCanHaveComplexMapValue(t *testing.T) {
 	nodeTreeConfig, ok := cfg.(NodeTreeConfig)
 	require.Equal(t, ok, true)
 	// Assert that the key is a leaf node, since it was directly added by BindEnvAndSetDefault
-	n, err := nodeTreeConfig.GetNode("kubernetes_node_annotations_as_tags")
+	node, err := nodeTreeConfig.GetNode("kubernetes_node_annotations_as_tags")
 	require.NoError(t, err)
-	_, ok = n.(LeafNode)
-	require.Equal(t, ok, true)
+	require.True(t, node.IsLeafNode())
+	require.Equal(t, map[string]string{"cluster.k8s.io/machine": "kube_machine"}, node.Get())
 }
 
 // Test that default, file, and env layers can build, get merged, and retrieve settings
@@ -44,8 +47,8 @@ func TestBuildDefaultFileAndEnv(t *testing.T) {
     workers: 6
 secret_backend_command: ./my_secret_fetcher.sh
 `
-	os.Setenv("TEST_SECRET_BACKEND_TIMEOUT", "60")
-	os.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
+	t.Setenv("TEST_SECRET_BACKEND_TIMEOUT", "60")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
 
 	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
 	cfg.BindEnvAndSetDefault("network_path.collector.input_chan_size", 100000)
@@ -134,8 +137,6 @@ func TestNewConfig(t *testing.T) {
 	assert.NotNil(t, c.remoteConfig)
 	assert.NotNil(t, c.fleetPolicies)
 	assert.NotNil(t, c.cli)
-
-	// TODO: test SetTypeByDefaultValue and SetEnvKeyReplacer once implemented
 }
 
 // TODO: expand testing coverage once we have environment and Set() implemented
@@ -150,12 +151,14 @@ func TestBasicUsage(t *testing.T) {
 }
 
 func TestSet(t *testing.T) {
+	t.Setenv("TEST_ENV", "3")
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
 
 	cfg.SetDefault("default", 0)
 	cfg.SetDefault("unknown", 0)
 	cfg.SetDefault("file", 0)
 	cfg.SetDefault("env", 0)
+	cfg.BindEnvAndSetDefault("env", 0)
 	cfg.SetDefault("runtime", 0)
 	cfg.SetDefault("localConfigProcess", 0)
 	cfg.SetDefault("rc", 0)
@@ -167,7 +170,7 @@ func TestSet(t *testing.T) {
 	assert.Equal(t, 0, cfg.Get("default"))
 	assert.Equal(t, 0, cfg.Get("unknown"))
 	assert.Equal(t, 0, cfg.Get("file"))
-	assert.Equal(t, 0, cfg.Get("env"))
+	assert.Equal(t, 3, cfg.Get("env"))
 	assert.Equal(t, 0, cfg.Get("runtime"))
 	assert.Equal(t, 0, cfg.Get("localConfigProcess"))
 	assert.Equal(t, 0, cfg.Get("rc"))
@@ -184,7 +187,6 @@ file: 2
 	assert.Equal(t, 2, cfg.Get("file"))
 
 	cfg.Set("unknown", 1, model.SourceUnknown)
-	cfg.Set("env", 3, model.SourceEnvVar)
 	cfg.Set("runtime", 4, model.SourceAgentRuntime)
 	cfg.Set("localConfigProcess", 5, model.SourceLocalConfigProcess)
 	cfg.Set("rc", 6, model.SourceRC)
@@ -240,6 +242,23 @@ func TestSetLowerSource(t *testing.T) {
 
 	assert.Equal(t, 1, cfg.Get("setting"))
 	assert.Equal(t, model.SourceAgentRuntime, cfg.GetSource("setting"))
+
+	// Validate that the file layer was modified by Set, but it gets
+	// shadowed by the higher priority value from agent-runtime in the root
+	txt := cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=root
+> setting
+    leaf(#ptr<000001>), val:1, source:agent-runtime
+tree(#ptr<000002>) source=default
+> setting
+    leaf(#ptr<000003>), val:0, source:default
+tree(#ptr<000004>) source=file
+> setting
+    leaf(#ptr<000005>), val:2, source:file
+tree(#ptr<000006>) source=agent-runtime
+> setting
+    leaf(#ptr<000001>), val:1, source:agent-runtime`
+	assert.Equal(t, expect, txt)
 }
 
 func TestSetUnkownKey(t *testing.T) {
@@ -254,20 +273,29 @@ func TestSetUnkownKey(t *testing.T) {
 
 func TestAllSettings(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
-	cfg.SetDefault("a", 0)
-	cfg.SetDefault("b.c", 0)
-	cfg.SetDefault("b.d", 0)
-	cfg.SetKnown("b.e")
+	cfg.SetDefault("a", 0)                         // "a"   @ file
+	cfg.SetDefault("b.c", 0)                       // "b.c" @ agent-runtime
+	cfg.SetDefault("b.d", 0)                       // "b.d" @ default
+	cfg.BindEnvAndSetDefault("b.e", 0)             // "b.e" @ default
+	cfg.BindEnvAndSetDefault("f.g", 0, "TEST_F_G") // "f.g" @ env-var (defined)
+	cfg.BindEnvAndSetDefault("f.h", 0, "TEST_F_H") // "f.h" @ env-var (undefined, falls back to default)
+	t.Setenv("TEST_F_G", "456")
 	cfg.BuildSchema()
 
 	cfg.ReadConfig(strings.NewReader("a: 987"))
 	cfg.Set("b.c", 123, model.SourceAgentRuntime)
 
+	// AllSettings does not include 'known' keys
 	expected := map[string]interface{}{
-		"a": 987,
+		"a": 987, // file
 		"b": map[string]interface{}{
-			"c": 123,
-			"d": 0,
+			"c": 123, // agent-runtime
+			"d": 0,   // default
+			"e": 0,   // default
+		},
+		"f": map[string]interface{}{
+			"g": 456, // env-var defined
+			"h": 0,   // default (env-var undefined)
 		},
 	}
 	assert.Equal(t, expected, cfg.AllSettings())
@@ -275,9 +303,10 @@ func TestAllSettings(t *testing.T) {
 
 func TestAllSettingsWithoutDefault(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
-	cfg.SetDefault("a", 0)
-	cfg.SetDefault("b.c", 0)
-	cfg.SetDefault("b.d", 0)
+	cfg.SetDefault("a", 0)             // "a"   @ file
+	cfg.SetDefault("b.c", 0)           // "b.c" @ agent-runtime
+	cfg.SetDefault("b.d", 0)           // "b.d" @ default
+	cfg.BindEnvAndSetDefault("b.e", 0) // "b.e" @ default
 	cfg.BuildSchema()
 
 	cfg.ReadConfig(strings.NewReader("a: 987"))
@@ -297,6 +326,7 @@ func TestAllSettingsBySource(t *testing.T) {
 	cfg.SetDefault("a", 0)
 	cfg.SetDefault("b.c", 0)
 	cfg.SetDefault("b.d", 0)
+	cfg.SetDefault("x", 123)
 	cfg.BuildSchema()
 
 	cfg.ReadConfig(strings.NewReader("a: 987"))
@@ -309,52 +339,81 @@ func TestAllSettingsBySource(t *testing.T) {
 				"c": 0,
 				"d": 0,
 			},
+			"x": 123,
 		},
-		model.SourceUnknown: map[string]interface{}{},
+		model.SourceUnknown:   map[string]interface{}{},
+		model.SourceInfraMode: map[string]interface{}{},
 		model.SourceFile: map[string]interface{}{
 			"a": 987,
 		},
-		model.SourceEnvVar:        map[string]interface{}{},
-		model.SourceFleetPolicies: map[string]interface{}{},
+		model.SourceEnvVar:             map[string]interface{}{},
+		model.SourceFleetPolicies:      map[string]interface{}{},
+		model.SourceConfigPostInit:     map[string]interface{}{},
+		model.SourceLocalConfigProcess: map[string]interface{}{},
 		model.SourceAgentRuntime: map[string]interface{}{
 			"b": map[string]interface{}{
 				"c": 123,
 			},
 		},
-		model.SourceLocalConfigProcess: map[string]interface{}{},
-		model.SourceRC:                 map[string]interface{}{},
-		model.SourceCLI:                map[string]interface{}{},
+		model.SourceRC:  map[string]interface{}{},
+		model.SourceCLI: map[string]interface{}{},
+		model.SourceProvided: map[string]interface{}{
+			"a": 987,
+			"b": map[string]interface{}{
+				"c": 123,
+			},
+		},
 	}
 	assert.Equal(t, expected, cfg.AllSettingsBySource())
 }
 
-func TestIsSet(t *testing.T) {
+func TestAllSettingsWithoutSecrets(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
 	cfg.SetDefault("a", 0)
 	cfg.SetDefault("b", 0)
-	cfg.SetKnown("c")
 	cfg.BuildSchema()
 
-	cfg.Set("b", 123, model.SourceAgentRuntime)
+	cfg.Set("a", "file_value", model.SourceFile)
+	cfg.Set("a", "secret_value", model.SourceSecret)
+	cfg.Set("b", 42, model.SourceAgentRuntime)
 
-	assert.True(t, cfg.IsSet("a"))
-	assert.True(t, cfg.IsSet("b"))
-	assert.False(t, cfg.IsSet("c"))
+	// includes secrets
+	all := cfg.AllSettings()
+	assert.Equal(t, "secret_value", all["a"])
+	assert.Equal(t, 42, all["b"])
 
-	assert.True(t, cfg.IsKnown("a"))
-	assert.True(t, cfg.IsKnown("b"))
-	assert.True(t, cfg.IsKnown("c"))
+	// excludes secrets layer, "a" falls back to file layer value
+	withoutSecrets := cfg.AllSettingsWithoutSecrets()
+	assert.Equal(t, "file_value", withoutSecrets["a"])
+	assert.Equal(t, 42, withoutSecrets["b"])
+}
 
-	assert.False(t, cfg.IsSet("unknown"))
-	assert.False(t, cfg.IsKnown("unknown"))
+func TestAllSettingsWithoutDefaultOrSecrets(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("a", 0)
+	cfg.SetDefault("b", 0)
+	cfg.SetDefault("c", 0)
+	cfg.BuildSchema()
+
+	cfg.Set("a", "file_value", model.SourceFile)
+	cfg.Set("a", "secret_value", model.SourceSecret)
+	cfg.Set("b", 42, model.SourceAgentRuntime)
+
+	result := cfg.AllSettingsWithoutDefaultOrSecrets()
+	// "a" has a fallback file value
+	assert.Equal(t, "file_value", result["a"])
+	assert.Equal(t, 42, result["b"])
+	// "c" is only a default, excluded
+	_, found := result["c"]
+	assert.False(t, found)
 }
 
 func TestIsConfigured(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
 	cfg.SetDefault("a", 0)
 	cfg.SetDefault("b", 0)
-	cfg.SetKnown("c")
-	cfg.BindEnv("d")
+	cfg.BindEnvAndSetDefault("c", 0)
+	cfg.BindEnvAndSetDefault("d", 0)
 
 	t.Setenv("TEST_D", "123")
 
@@ -372,11 +431,9 @@ func TestIsConfigured(t *testing.T) {
 
 func TestEnvVarMultipleSettings(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
-	cfg.SetDefault("a", 0)
-	cfg.SetDefault("b", 0)
 	cfg.SetDefault("c", 0)
-	cfg.BindEnv("a", "TEST_MY_ENVVAR")
-	cfg.BindEnv("b", "TEST_MY_ENVVAR")
+	cfg.BindEnvAndSetDefault("a", 0, "TEST_MY_ENVVAR")
+	cfg.BindEnvAndSetDefault("b", 0, "TEST_MY_ENVVAR")
 
 	t.Setenv("TEST_MY_ENVVAR", "123")
 
@@ -389,8 +446,7 @@ func TestEnvVarMultipleSettings(t *testing.T) {
 
 func TestEmptyEnvVarSettings(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
-	cfg.SetDefault("a", -1)
-	cfg.BindEnv("a")
+	cfg.BindEnvAndSetDefault("a", -1)
 
 	// This empty string is ignored, so the default value of -1 will be returned by GetInt
 	t.Setenv("TEST_A", "")
@@ -404,15 +460,91 @@ func TestEmptyEnvVarSettings(t *testing.T) {
 
 func TestAllKeysLowercased(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
-	cfg.SetDefault("a", 0)
-	cfg.SetDefault("b", 0)
+	cfg.SetDefault("a", 0)                         // "a"   @ file
+	cfg.SetDefault("b.c", 0)                       // "b.c" @ agent-runtime
+	cfg.SetDefault("b.d", 0)                       // "b.d" @ default
+	cfg.BindEnvAndSetDefault("b.e", 0)             // "b.e" @ default
+	cfg.BindEnvAndSetDefault("f.g", 0, "TEST_F_G") // "f.g" @ env-var
+	cfg.BindEnvAndSetDefault("f.h", 0, "TEST_F_H") // "f.h" @ env-var
+	t.Setenv("TEST_F_G", "456")
 	cfg.BuildSchema()
 
-	cfg.Set("b", 123, model.SourceAgentRuntime)
+	cfg.ReadConfig(strings.NewReader("a: 987"))
+	cfg.Set("b.c", 123, model.SourceAgentRuntime)
 
 	keys := cfg.AllKeysLowercased()
 	sort.Strings(keys)
-	assert.Equal(t, []string{"a", "b"}, keys)
+	assert.Equal(t, []string{"a", "b.c", "b.d", "b.e", "f.g", "f.h"}, keys)
+}
+
+func TestIsConfiguredHasSection(t *testing.T) {
+	configData := `network_path:
+  collector:
+    workers: 6
+secret_backend_command: ./my_secret_fetcher.sh
+logs_config:
+`
+	t.Setenv("TEST_SECRET_BACKEND_TIMEOUT", "60")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
+	t.Setenv("TEST_RUNTIME_SECURITY_CONFIG_ENDPOINTS_DD_URL", "http://example.com")
+
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	cfg.SetConfigType("yaml")
+	cfg.BindEnvAndSetDefault("network_path.collector.input_chan_size", 100000)
+	cfg.BindEnvAndSetDefault("network_path.collector.processing_chan_size", 100000)
+	cfg.BindEnvAndSetDefault("network_path.collector.workers", 4)
+	cfg.BindEnvAndSetDefault("runtime_security_config.endpoints.dd_url", "TEST_RUNTIME_SECURITY_CONFIG_ENDPOINTS_DD_URL")
+	cfg.BindEnvAndSetDefault("secret_backend_command", "")
+	cfg.BindEnvAndSetDefault("secret_backend_config", map[string]interface{}{})
+	cfg.BindEnvAndSetDefault("secret_backend_timeout", 0)
+	cfg.BindEnvAndSetDefault("server_timeout", 30)
+
+	cfg.BuildSchema()
+	err := cfg.ReadConfig(strings.NewReader(configData))
+	require.NoError(t, err)
+
+	assert.True(t, cfg.IsConfigured("network_path"))
+	assert.True(t, cfg.IsConfigured("network_path.collector"))
+	assert.True(t, cfg.IsConfigured("network_path.collector.workers"))
+	assert.False(t, cfg.IsConfigured("network_path.collector.processing_chan_size"))
+	assert.True(t, cfg.IsConfigured("secret_backend_command"))
+	assert.False(t, cfg.IsConfigured("secret_backend_config"))
+	assert.True(t, cfg.IsConfigured("secret_backend_timeout"))
+	assert.False(t, cfg.IsConfigured("server_timeout"))
+	assert.False(t, cfg.IsConfigured("logs_config"))
+	assert.False(t, cfg.IsConfigured("apm_config"))
+	assert.True(t, cfg.IsConfigured("runtime_security_config"))
+
+	assert.True(t, cfg.HasSection("network_path"))
+	assert.True(t, cfg.HasSection("network_path.collector"))
+	assert.False(t, cfg.HasSection("network_path.collector.workers"))
+	assert.False(t, cfg.HasSection("network_path.collector.processing_chan_size"))
+	assert.False(t, cfg.HasSection("secret_backend_command"))
+	assert.False(t, cfg.HasSection("secret_backend_config"))
+	assert.False(t, cfg.HasSection("secret_backend_timeout"))
+	assert.False(t, cfg.HasSection("server_timeout"))
+	assert.True(t, cfg.HasSection("logs_config"))
+	assert.False(t, cfg.HasSection("apm_config"))
+	assert.True(t, cfg.HasSection("runtime_security_config"))
+}
+
+func TestMapGetChildNotFound(t *testing.T) {
+	m := map[string]interface{}{"a": "apple", "b": "banana"}
+	n, err := newNodeTree(m, model.SourceDefault)
+	assert.NoError(t, err)
+
+	val, err := n.GetChild("a")
+	assert.NoError(t, err)
+	str, err := cast.ToStringE(val.Get())
+	assert.NoError(t, err)
+	assert.Equal(t, str, "apple")
+
+	_, err = n.GetChild("c")
+	require.Error(t, err)
+	assert.Equal(t, err.Error(), "not found")
+
+	assert.True(t, n.IsInnerNode())
+	assert.Equal(t, n.ChildrenKeys(), []string{"a", "b"})
 }
 
 func TestStringifyLayers(t *testing.T) {
@@ -421,8 +553,8 @@ func TestStringifyLayers(t *testing.T) {
     workers: 6
 secret_backend_command: ./my_secret_fetcher.sh
 `
-	os.Setenv("TEST_SECRET_BACKEND_TIMEOUT", "60")
-	os.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
+	t.Setenv("TEST_SECRET_BACKEND_TIMEOUT", "60")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
 
 	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
 	cfg.BindEnvAndSetDefault("network_path.collector.input_chan_size", 100000)
@@ -479,9 +611,9 @@ secret_backend_command: ./my_secret_fetcher.sh
   > collector
     inner(#ptr<000016>)
     > input_chan_size
-        leaf(#ptr<000017>), val:"23456", source:environment-variable
+        leaf(#ptr<000017>), val:23456, source:environment-variable
 > secret_backend_timeout
-    leaf(#ptr<000018>), val:"60", source:environment-variable`
+    leaf(#ptr<000018>), val:60, source:environment-variable`
 	assert.Equal(t, expect, txt)
 
 	txt = cfg.(*ntmConfig).Stringify("root", model.OmitPointerAddr)
@@ -491,17 +623,17 @@ secret_backend_command: ./my_secret_fetcher.sh
   > collector
     inner(#ptr<000021>)
     > input_chan_size
-        leaf(#ptr<000022>), val:"23456", source:environment-variable
+        leaf(#ptr<000017>), val:23456, source:environment-variable
     > processing_chan_size
-        leaf(#ptr<000023>), val:100000, source:default
+        leaf(#ptr<000004>), val:100000, source:default
     > workers
-        leaf(#ptr<000024>), val:6, source:file
+        leaf(#ptr<000012>), val:6, source:file
 > secret_backend_command
-    leaf(#ptr<000025>), val:"./my_secret_fetcher.sh", source:file
+    leaf(#ptr<000013>), val:"./my_secret_fetcher.sh", source:file
 > secret_backend_timeout
-    leaf(#ptr<000026>), val:"60", source:environment-variable
+    leaf(#ptr<000018>), val:60, source:environment-variable
 > server_timeout
-    leaf(#ptr<000027>), val:30, source:default`
+    leaf(#ptr<000008>), val:30, source:default`
 	assert.Equal(t, expect, txt)
 }
 
@@ -510,7 +642,7 @@ func TestStringifyAll(t *testing.T) {
   collector:
     workers: 6
 `
-	os.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
 
 	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
 	cfg.BindEnvAndSetDefault("network_path.collector.input_chan_size", 100000)
@@ -528,7 +660,7 @@ func TestStringifyAll(t *testing.T) {
   > collector
     inner(#ptr<000002>)
     > input_chan_size
-        leaf(#ptr<000003>), val:"23456", source:environment-variable
+        leaf(#ptr<000003>), val:23456, source:environment-variable
     > workers
         leaf(#ptr<000004>), val:6, source:file
 > secret_backend_command
@@ -543,21 +675,21 @@ tree(#ptr<000006>) source=default
     > workers
         leaf(#ptr<000010>), val:4, source:default
 > secret_backend_command
-    leaf(#ptr<000011>), val:"", source:default
-tree(#ptr<000012>) source=environment-variable
+    leaf(#ptr<000005>), val:"", source:default
+tree(#ptr<000011>) source=file
 > network_path
-  inner(#ptr<000013>)
+  inner(#ptr<000012>)
   > collector
-    inner(#ptr<000014>)
-    > input_chan_size
-        leaf(#ptr<000015>), val:"23456", source:environment-variable
-tree(#ptr<000016>) source=file
-> network_path
-  inner(#ptr<000017>)
-  > collector
-    inner(#ptr<000018>)
+    inner(#ptr<000013>)
     > workers
-        leaf(#ptr<000019>), val:6, source:file`
+        leaf(#ptr<000004>), val:6, source:file
+tree(#ptr<000014>) source=environment-variable
+> network_path
+  inner(#ptr<000015>)
+  > collector
+    inner(#ptr<000016>)
+    > input_chan_size
+        leaf(#ptr<000003>), val:23456, source:environment-variable`
 	assert.Equal(t, expect, txt)
 }
 
@@ -635,11 +767,312 @@ process_config:
 	assert.Equal(t, expect, txt)
 }
 
+func TestMergeReusesNodes(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	cfg.BindEnvAndSetDefault("a.apple.one", 1)
+	cfg.BindEnvAndSetDefault("a.apple.two", 2)
+	cfg.BindEnvAndSetDefault("b.banana.color", "yellow")
+	cfg.BindEnvAndSetDefault("c.cherry.third", 3)
+	cfg.BindEnvAndSetDefault("c.cherry.fourth", 4)
+
+	configData := `b:
+  banana:
+    color: green
+c:
+  cherry:
+    third: 567
+`
+	cfg.BuildSchema()
+	err := cfg.ReadConfig(strings.NewReader(configData))
+	require.NoError(t, err)
+
+	// Validate that merged config contains nodes from default and file layer
+	// that have the same address as the corresponding nodes in the merged root
+	txt := cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=root
+> a
+  inner(#ptr<000001>)
+  > apple
+    inner(#ptr<000002>)
+    > one
+        leaf(#ptr<000003>), val:1, source:default
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"green", source:file
+> c
+  inner(#ptr<000008>)
+  > cherry
+    inner(#ptr<000009>)
+    > fourth
+        leaf(#ptr<000010>), val:4, source:default
+    > third
+        leaf(#ptr<000011>), val:567, source:file
+tree(#ptr<000012>) source=default
+> a
+  inner(#ptr<000001>)
+  > apple
+    inner(#ptr<000002>)
+    > one
+        leaf(#ptr<000003>), val:1, source:default
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000013>)
+  > banana
+    inner(#ptr<000014>)
+    > color
+        leaf(#ptr<000015>), val:"yellow", source:default
+> c
+  inner(#ptr<000016>)
+  > cherry
+    inner(#ptr<000017>)
+    > fourth
+        leaf(#ptr<000010>), val:4, source:default
+    > third
+        leaf(#ptr<000018>), val:3, source:default
+tree(#ptr<000019>) source=file
+> b
+  inner(#ptr<000020>)
+  > banana
+    inner(#ptr<000021>)
+    > color
+        leaf(#ptr<000007>), val:"green", source:file
+> c
+  inner(#ptr<000022>)
+  > cherry
+    inner(#ptr<000023>)
+    > third
+        leaf(#ptr<000011>), val:567, source:file`
+	assert.Equal(t, expect, txt)
+
+	// Validate that assigning to a node affects the merged root and also
+	// allocates nodes in the source layer, which was previously not present
+	cfg.Set("a.apple.one", 1000, model.SourceAgentRuntime)
+	txt = cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect = `tree(#ptr<000024>) source=root
+> a
+  inner(#ptr<000025>)
+  > apple
+    inner(#ptr<000026>)
+    > one
+        leaf(#ptr<000027>), val:1000, source:agent-runtime
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"green", source:file
+> c
+  inner(#ptr<000008>)
+  > cherry
+    inner(#ptr<000009>)
+    > fourth
+        leaf(#ptr<000010>), val:4, source:default
+    > third
+        leaf(#ptr<000011>), val:567, source:file
+tree(#ptr<000012>) source=default
+> a
+  inner(#ptr<000001>)
+  > apple
+    inner(#ptr<000002>)
+    > one
+        leaf(#ptr<000003>), val:1, source:default
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000013>)
+  > banana
+    inner(#ptr<000014>)
+    > color
+        leaf(#ptr<000015>), val:"yellow", source:default
+> c
+  inner(#ptr<000016>)
+  > cherry
+    inner(#ptr<000017>)
+    > fourth
+        leaf(#ptr<000010>), val:4, source:default
+    > third
+        leaf(#ptr<000018>), val:3, source:default
+tree(#ptr<000019>) source=file
+> b
+  inner(#ptr<000020>)
+  > banana
+    inner(#ptr<000021>)
+    > color
+        leaf(#ptr<000007>), val:"green", source:file
+> c
+  inner(#ptr<000022>)
+  > cherry
+    inner(#ptr<000023>)
+    > third
+        leaf(#ptr<000011>), val:567, source:file
+tree(#ptr<000028>) source=agent-runtime
+> a
+  inner(#ptr<000029>)
+  > apple
+    inner(#ptr<000030>)
+    > one
+        leaf(#ptr<000027>), val:1000, source:agent-runtime`
+	assert.Equal(t, expect, txt)
+}
+
+func TestSetWhenMerged(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	cfg.BindEnvAndSetDefault("a.apple.one", 1)
+	cfg.BindEnvAndSetDefault("a.apple.two", 2)
+	cfg.BindEnvAndSetDefault("b.banana.color", "yellow")
+
+	cfg.BuildSchema()
+
+	cfg.Set("a.apple.one", 1000, model.SourceAgentRuntime)
+
+	txt := cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=root
+> a
+  inner(#ptr<000001>)
+  > apple
+    inner(#ptr<000002>)
+    > one
+        leaf(#ptr<000003>), val:1000, source:agent-runtime
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"yellow", source:default
+tree(#ptr<000008>) source=default
+> a
+  inner(#ptr<000009>)
+  > apple
+    inner(#ptr<000010>)
+    > one
+        leaf(#ptr<000011>), val:1, source:default
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"yellow", source:default
+tree(#ptr<000012>) source=agent-runtime
+> a
+  inner(#ptr<000013>)
+  > apple
+    inner(#ptr<000014>)
+    > one
+        leaf(#ptr<000003>), val:1000, source:agent-runtime`
+	assert.Equal(t, expect, txt)
+
+	cfg.Set("a.apple.two", 2000, model.SourceAgentRuntime)
+
+	txt = cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect = `tree(#ptr<000015>) source=root
+> a
+  inner(#ptr<000016>)
+  > apple
+    inner(#ptr<000017>)
+    > one
+        leaf(#ptr<000003>), val:1000, source:agent-runtime
+    > two
+        leaf(#ptr<000018>), val:2000, source:agent-runtime
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"yellow", source:default
+tree(#ptr<000008>) source=default
+> a
+  inner(#ptr<000009>)
+  > apple
+    inner(#ptr<000010>)
+    > one
+        leaf(#ptr<000011>), val:1, source:default
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"yellow", source:default
+tree(#ptr<000012>) source=agent-runtime
+> a
+  inner(#ptr<000019>)
+  > apple
+    inner(#ptr<000020>)
+    > one
+        leaf(#ptr<000003>), val:1000, source:agent-runtime
+    > two
+        leaf(#ptr<000018>), val:2000, source:agent-runtime`
+	assert.Equal(t, expect, txt)
+
+	cfg.Set("b.banana.color", "green", model.SourceAgentRuntime)
+
+	txt = cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect = `tree(#ptr<000021>) source=root
+> a
+  inner(#ptr<000022>)
+  > apple
+    inner(#ptr<000023>)
+    > one
+        leaf(#ptr<000003>), val:1000, source:agent-runtime
+    > two
+        leaf(#ptr<000018>), val:2000, source:agent-runtime
+> b
+  inner(#ptr<000024>)
+  > banana
+    inner(#ptr<000025>)
+    > color
+        leaf(#ptr<000026>), val:"green", source:agent-runtime
+tree(#ptr<000008>) source=default
+> a
+  inner(#ptr<000009>)
+  > apple
+    inner(#ptr<000010>)
+    > one
+        leaf(#ptr<000011>), val:1, source:default
+    > two
+        leaf(#ptr<000004>), val:2, source:default
+> b
+  inner(#ptr<000005>)
+  > banana
+    inner(#ptr<000006>)
+    > color
+        leaf(#ptr<000007>), val:"yellow", source:default
+tree(#ptr<000012>) source=agent-runtime
+> a
+  inner(#ptr<000019>)
+  > apple
+    inner(#ptr<000020>)
+    > one
+        leaf(#ptr<000003>), val:1000, source:agent-runtime
+    > two
+        leaf(#ptr<000018>), val:2000, source:agent-runtime
+> b
+  inner(#ptr<000027>)
+  > banana
+    inner(#ptr<000028>)
+    > color
+        leaf(#ptr<000026>), val:"green", source:agent-runtime`
+	assert.Equal(t, expect, txt)
+}
+
 func TestUnsetForSource(t *testing.T) {
 	// env source, highest priority
-	os.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
-	os.Setenv("TEST_NETWORK_PATH_COLLECTOR_PATHTEST_CONTEXTS_LIMIT", "654321")
-	os.Setenv("TEST_NETWORK_PATH_COLLECTOR_PROCESSING_CHAN_SIZE", "78900")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_PATHTEST_CONTEXTS_LIMIT", "654321")
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_PROCESSING_CHAN_SIZE", "78900")
 	// file source, medium priority
 	configData := `network_path:
   collector:
@@ -665,11 +1098,11 @@ func TestUnsetForSource(t *testing.T) {
   > collector
     inner(#ptr<000002>)
     > input_chan_size
-        leaf(#ptr<000003>), val:"23456", source:environment-variable
+        leaf(#ptr<000003>), val:23456, source:environment-variable
     > pathtest_contexts_limit
-        leaf(#ptr<000004>), val:"654321", source:environment-variable
+        leaf(#ptr<000004>), val:654321, source:environment-variable
     > processing_chan_size
-        leaf(#ptr<000005>), val:"78900", source:environment-variable
+        leaf(#ptr<000005>), val:78900, source:environment-variable
     > workers
         leaf(#ptr<000006>), val:6, source:file`
 	assert.Equal(t, expect, txt)
@@ -697,9 +1130,9 @@ func TestUnsetForSource(t *testing.T) {
     > input_chan_size
         leaf(#ptr<000007>), val:100000, source:default
     > pathtest_contexts_limit
-        leaf(#ptr<000004>), val:"654321", source:environment-variable
+        leaf(#ptr<000004>), val:654321, source:environment-variable
     > processing_chan_size
-        leaf(#ptr<000005>), val:"78900", source:environment-variable
+        leaf(#ptr<000005>), val:78900, source:environment-variable
     > workers
         leaf(#ptr<000006>), val:6, source:file`
 	assert.Equal(t, expect, txt)
@@ -715,9 +1148,9 @@ func TestUnsetForSource(t *testing.T) {
     > input_chan_size
         leaf(#ptr<000007>), val:100000, source:default
     > pathtest_contexts_limit
-        leaf(#ptr<000004>), val:"654321", source:environment-variable
+        leaf(#ptr<000004>), val:654321, source:environment-variable
     > processing_chan_size
-        leaf(#ptr<000005>), val:"78900", source:environment-variable
+        leaf(#ptr<000005>), val:78900, source:environment-variable
     > workers
         leaf(#ptr<000008>), val:4, source:default`
 	assert.Equal(t, expect, txt)
@@ -733,7 +1166,7 @@ func TestUnsetForSource(t *testing.T) {
     > input_chan_size
         leaf(#ptr<000007>), val:100000, source:default
     > pathtest_contexts_limit
-        leaf(#ptr<000004>), val:"654321", source:environment-variable
+        leaf(#ptr<000004>), val:654321, source:environment-variable
     > processing_chan_size
         leaf(#ptr<000009>), val:45678, source:file
     > workers
@@ -751,7 +1184,7 @@ func TestUnsetForSource(t *testing.T) {
     > input_chan_size
         leaf(#ptr<000007>), val:100000, source:default
     > pathtest_contexts_limit
-        leaf(#ptr<000004>), val:"654321", source:environment-variable
+        leaf(#ptr<000004>), val:654321, source:environment-variable
     > processing_chan_size
         leaf(#ptr<000010>), val:100000, source:default
     > workers
@@ -801,6 +1234,107 @@ func TestUnsetForSource(t *testing.T) {
 	assert.Equal(t, expect, txt)
 }
 
+func TestUnsetForSourceAllLayers(t *testing.T) {
+	// env source, highest priority
+	t.Setenv("TEST_NETWORK_PATH_COLLECTOR_INPUT_CHAN_SIZE", "23456")
+	// file source, medium priority
+	configData := `network_path:
+  collector:
+    processing_chan_size: 45678`
+	// default source, lowest priority
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	cfg.BindEnvAndSetDefault("network_path.collector.input_chan_size", 100000)
+	cfg.BindEnvAndSetDefault("network_path.collector.pathtest_contexts_limit", 100000)
+	cfg.BindEnvAndSetDefault("network_path.collector.processing_chan_size", 100000)
+
+	cfg.BuildSchema()
+	err := cfg.ReadConfig(strings.NewReader(configData))
+	require.NoError(t, err)
+
+	// The merged config
+	txt := cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=root
+> network_path
+  inner(#ptr<000001>)
+  > collector
+    inner(#ptr<000002>)
+    > input_chan_size
+        leaf(#ptr<000003>), val:23456, source:environment-variable
+    > pathtest_contexts_limit
+        leaf(#ptr<000004>), val:100000, source:default
+    > processing_chan_size
+        leaf(#ptr<000005>), val:45678, source:file
+tree(#ptr<000006>) source=default
+> network_path
+  inner(#ptr<000007>)
+  > collector
+    inner(#ptr<000008>)
+    > input_chan_size
+        leaf(#ptr<000009>), val:100000, source:default
+    > pathtest_contexts_limit
+        leaf(#ptr<000004>), val:100000, source:default
+    > processing_chan_size
+        leaf(#ptr<000010>), val:100000, source:default
+tree(#ptr<000011>) source=file
+> network_path
+  inner(#ptr<000012>)
+  > collector
+    inner(#ptr<000013>)
+    > processing_chan_size
+        leaf(#ptr<000005>), val:45678, source:file
+tree(#ptr<000014>) source=environment-variable
+> network_path
+  inner(#ptr<000015>)
+  > collector
+    inner(#ptr<000016>)
+    > input_chan_size
+        leaf(#ptr<000003>), val:23456, source:environment-variable`
+	assert.Equal(t, expect, txt)
+
+	// Remove a setting from the env source, nothing in the file source, it goes to default
+	cfg.UnsetForSource("network_path.collector.input_chan_size", model.SourceEnvVar)
+
+	// NOTE: The replacement node in the root tree has a different address than the
+	// corresponding node in the original layer. Also the env tree still has inner nodes
+	// but no leaf nodes.
+	txt = cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect = `tree(#ptr<000000>) source=root
+> network_path
+  inner(#ptr<000001>)
+  > collector
+    inner(#ptr<000002>)
+    > input_chan_size
+        leaf(#ptr<000009>), val:100000, source:default
+    > pathtest_contexts_limit
+        leaf(#ptr<000004>), val:100000, source:default
+    > processing_chan_size
+        leaf(#ptr<000005>), val:45678, source:file
+tree(#ptr<000006>) source=default
+> network_path
+  inner(#ptr<000007>)
+  > collector
+    inner(#ptr<000008>)
+    > input_chan_size
+        leaf(#ptr<000009>), val:100000, source:default
+    > pathtest_contexts_limit
+        leaf(#ptr<000004>), val:100000, source:default
+    > processing_chan_size
+        leaf(#ptr<000010>), val:100000, source:default
+tree(#ptr<000011>) source=file
+> network_path
+  inner(#ptr<000012>)
+  > collector
+    inner(#ptr<000013>)
+    > processing_chan_size
+        leaf(#ptr<000005>), val:45678, source:file
+tree(#ptr<000014>) source=environment-variable
+> network_path
+  inner(#ptr<000015>)
+  > collector
+    inner(#ptr<000016>)`
+	assert.Equal(t, expect, txt)
+}
+
 func TestStringifySlice(t *testing.T) {
 	configData := `
 user:
@@ -837,7 +1371,9 @@ user:
 
 func TestUnsetForSourceRemoveIfNotPrevious(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
-	cfg.BindEnv("api_key")
+	// Enable the dynamic schema so api_key can be Set even though it has no default value,
+	// which is required to exercise the "unset with no previous value" behavior below.
+	cfg.SetTestOnlyDynamicSchema(true)
 	cfg.BuildSchema()
 
 	// api_key is not in the config (does not have a default value)
@@ -859,7 +1395,7 @@ func TestUnsetForSourceRemoveIfNotPrevious(t *testing.T) {
 	_, found = cfg.AllSettings()["api_key"]
 	assert.False(t, found)
 
-	cfg.SetWithoutSource("api_key", "0123456789abcdef")
+	cfg.SetInTest("api_key", "0123456789abcdef")
 
 	// api_key is set
 	assert.Equal(t, "0123456789abcdef", cfg.GetString("api_key"))
@@ -917,10 +1453,12 @@ func TestOnUpdate(t *testing.T) {
 
 	gotSetting := ""
 	var gotOldValue, gotNewValue interface{}
-	cfg.OnUpdate(func(setting string, oldValue, newValue any) {
+	var gotSource model.Source
+	cfg.OnUpdate(func(setting string, source model.Source, oldValue, newValue any, _ uint64, _ model.Source) {
 		gotSetting = setting
 		gotOldValue = oldValue
 		gotNewValue = newValue
+		gotSource = source
 		wg.Done()
 	})
 
@@ -931,10 +1469,44 @@ func TestOnUpdate(t *testing.T) {
 	wg.Wait()
 
 	assert.Equal(t, 2, cfg.Get("a"))
-	assert.Equal(t, model.SourceAgentRuntime, cfg.GetSource("a"))
+	assert.Equal(t, model.SourceAgentRuntime, gotSource)
 	assert.Equal(t, "a", gotSetting)
 	assert.Equal(t, 1, gotOldValue)
 	assert.Equal(t, 2, gotNewValue)
+}
+
+// TestUnsetForSourceListenerCanReadConfig reproduces a deadlock where
+// UnsetForSource notified OnUpdate subscribers while still holding the
+// write lock. Any subscriber that read the config (via the read side of
+// the RWMutex) would block against the held write lock forever.
+func TestUnsetForSourceListenerCanReadConfig(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("log_level", "info")
+	cfg.BuildSchema()
+
+	observed := []string{}
+	cfg.OnUpdate(func(_ string, _ model.Source, _, _ any, _ uint64, _ model.Source) {
+		// A realistic listener reads the current config. Before the fix
+		// this call deadlocked because UnsetForSource still held the
+		// config write lock.
+		observed = append(observed, cfg.GetString("log_level"))
+	})
+
+	cfg.Set("log_level", "debug", model.SourceRC)
+
+	done := make(chan struct{})
+	go func() {
+		cfg.UnsetForSource("log_level", model.SourceRC)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UnsetForSource deadlocked while notifying listeners")
+	}
+
+	assert.Equal(t, []string{"debug", "info"}, observed)
 }
 
 func TestSetInvalidSource(t *testing.T) {
@@ -948,12 +1520,12 @@ func TestSetInvalidSource(t *testing.T) {
 	assert.Equal(t, model.SourceDefault, cfg.GetSource("a"))
 }
 
-func TestSetWithoutSource(t *testing.T) {
+func TestSetInTest(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", nil)
 	cfg.SetDefault("a", 1)
 	cfg.BuildSchema()
 
-	cfg.SetWithoutSource("a", 2)
+	cfg.SetInTest("a", 2)
 
 	assert.Equal(t, 2, cfg.Get("a"))
 	assert.Equal(t, model.SourceUnknown, cfg.GetSource("a"))
@@ -963,8 +1535,8 @@ func TestSetWithoutSource(t *testing.T) {
 			Field string
 		}
 		assert.Panics(t, func() {
-			cfg.SetWithoutSource("b", dummyStruct{Field: "oops"})
-		}, "SetWithoutSource should panic when passed a struct")
+			cfg.SetInTest("b", dummyStruct{Field: "oops"})
+		}, "SetInTest should panic when passed a struct")
 	})
 }
 
@@ -979,16 +1551,6 @@ func TestPanicAfterBuildSchema(t *testing.T) {
 
 	assert.Equal(t, 1, cfg.Get("a"))
 	assert.Equal(t, model.SourceDefault, cfg.GetSource("a"))
-
-	assert.PanicsWithValue(t, "cannot SetKnown() once the config has been marked as ready for use", func() {
-		cfg.SetKnown("a")
-	})
-	assert.PanicsWithValue(t, "cannot BindEnv() once the config has been marked as ready for use", func() {
-		cfg.BindEnv("a")
-	})
-	assert.PanicsWithValue(t, "cannot SetEnvKeyReplacer() once the config has been marked as ready for use", func() {
-		cfg.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	})
 }
 
 func TestEnvVarTransformers(t *testing.T) {
@@ -998,32 +1560,16 @@ func TestEnvVarTransformers(t *testing.T) {
 	cfg.BindEnvAndSetDefault("tag_set", []map[string]string{}, "TEST_TAG_SET")
 	cfg.BindEnvAndSetDefault("list_keypairs", map[string]interface{}{}, "TEST_LIST_KEYPAIRS")
 
-	os.Setenv("TEST_LIST_OF_NUMS", "34,67.5,901.125")
-	os.Setenv("TEST_LIST_OF_FRUIT", "apple,banana,cherry")
-	os.Setenv("TEST_TAG_SET", `[{"cat":"meow"},{"dog":"bark"}]`)
-	os.Setenv("TEST_LIST_KEYPAIRS", `a=1,b=2,c=3`)
+	t.Setenv("TEST_LIST_OF_NUMS", "[34,67.5,901.125]")
+	t.Setenv("TEST_LIST_OF_FRUIT", "apple,banana,cherry")
+	t.Setenv("TEST_TAG_SET", `[{"cat":"meow"},{"dog":"bark"}]`)
+	t.Setenv("TEST_LIST_KEYPAIRS", `a=1,b=2,c=3`)
 
-	cfg.ParseEnvAsSlice("list_of_nums", func(in string) []interface{} {
-		vals := []interface{}{}
-		for _, str := range strings.Split(in, ",") {
-			f, err := strconv.ParseFloat(str, 64)
-			if err != nil {
-				continue
-			}
-			vals = append(vals, f)
-		}
-		return vals
-	})
+	cfg.ParseEnvJSON("list_of_nums", []float64{})
 	cfg.ParseEnvAsStringSlice("list_of_fruit", func(in string) []string {
 		return strings.Split(in, ",")
 	})
-	cfg.ParseEnvAsSliceMapString("tag_set", func(in string) []map[string]string {
-		var out []map[string]string
-		if err := json.Unmarshal([]byte(in), &out); err != nil {
-			assert.Fail(t, "failed to json.Unmarshal", err)
-		}
-		return out
-	})
+	cfg.ParseEnvJSON("tag_set", []map[string]string{})
 	cfg.ParseEnvAsMapStringInterface("list_keypairs", func(in string) map[string]interface{} {
 		parts := strings.Split(in, ",")
 		res := map[string]interface{}{}
@@ -1037,10 +1583,10 @@ func TestEnvVarTransformers(t *testing.T) {
 
 	cfg.BuildSchema()
 
-	var nums []float64 = cfg.GetFloat64Slice("list_of_nums")
+	var nums = cfg.GetFloat64Slice("list_of_nums")
 	assert.Equal(t, []float64{34, 67.5, 901.125}, nums)
 
-	var fruits []string = cfg.GetStringSlice("list_of_fruit")
+	var fruits = cfg.GetStringSlice("list_of_fruit")
 	assert.Equal(t, []string{"apple", "banana", "cherry"}, fruits)
 
 	tagsValue := cfg.Get("tag_set")
@@ -1048,18 +1594,8 @@ func TestEnvVarTransformers(t *testing.T) {
 	assert.Equal(t, true, converted)
 	assert.Equal(t, []map[string]string{{"cat": "meow"}, {"dog": "bark"}}, tags)
 
-	var kvs map[string]interface{} = cfg.GetStringMap("list_keypairs")
+	var kvs = cfg.GetStringMap("list_keypairs")
 	assert.Equal(t, map[string]interface{}{"a": 1, "b": 2, "c": 3}, kvs)
-}
-
-func TestUnmarshalKeyIsDeprecated(t *testing.T) {
-	cfg := NewNodeTreeConfig("test", "TEST", nil)
-	cfg.SetDefault("a", []string{"a", "b"})
-	cfg.BuildSchema()
-
-	var texts []string
-	err := cfg.UnmarshalKey("a", &texts)
-	assert.Error(t, err)
 }
 
 func TestSetConfigFile(t *testing.T) {
@@ -1076,8 +1612,8 @@ func TestEnvVarOrdering(t *testing.T) {
 	// Test scenario 1: DD_DD_URL set before DD_URL
 	t.Run("DD_DD_URL set first", func(t *testing.T) {
 		config := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
-		config.BindEnv("fakeapikey", "DD_API_KEY")
-		config.BindEnv("dd_url", "DD_DD_URL", "DD_URL")
+		config.BindEnvAndSetDefault("fakeapikey", "", "DD_API_KEY")
+		config.BindEnvAndSetDefault("dd_url", "", "DD_DD_URL", "DD_URL")
 		t.Setenv("DD_DD_URL", "https://app.datadoghq.dd_dd_url.eu")
 		t.Setenv("DD_URL", "https://app.datadoghq.dd_url.eu")
 		config.BuildSchema()
@@ -1089,8 +1625,8 @@ func TestEnvVarOrdering(t *testing.T) {
 	// Test scenario 2: DD_URL set before DD_DD_URL
 	t.Run("DD_URL set first", func(t *testing.T) {
 		config := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
-		config.BindEnv("fakeapikey", "DD_API_KEY")
-		config.BindEnv("dd_url", "DD_DD_URL", "DD_URL")
+		config.BindEnvAndSetDefault("fakeapikey", "", "DD_API_KEY")
+		config.BindEnvAndSetDefault("dd_url", "", "DD_DD_URL", "DD_URL")
 		t.Setenv("DD_URL", "https://app.datadoghq.dd_url.eu")
 		t.Setenv("DD_DD_URL", "https://app.datadoghq.dd_dd_url.eu")
 		config.BuildSchema()
@@ -1102,8 +1638,8 @@ func TestEnvVarOrdering(t *testing.T) {
 	// Test scenario 3: Only DD_URL is set (DD_DD_URL is missing)
 	t.Run("Only DD_URL is set", func(t *testing.T) {
 		config := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
-		config.BindEnv("fakeapikey", "DD_API_KEY")
-		config.BindEnv("dd_url", "DD_DD_URL", "DD_URL")
+		config.BindEnvAndSetDefault("fakeapikey", "", "DD_API_KEY")
+		config.BindEnvAndSetDefault("dd_url", "", "DD_DD_URL", "DD_URL")
 		t.Setenv("DD_URL", "https://app.datadoghq.dd_url.eu")
 		config.BuildSchema()
 
@@ -1114,7 +1650,7 @@ func TestEnvVarOrdering(t *testing.T) {
 
 func TestWarningLogged(t *testing.T) {
 	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
-	cfg.BindEnv("bad_key", "DD_BAD_KEY")
+	cfg.BindEnvAndSetDefault("bad_key", "", "DD_BAD_KEY")
 	t.Setenv("DD_BAD_KEY", "value")
 	original := splitKeyFunc
 	splitKeyFunc = func(_ string) []string {
@@ -1123,5 +1659,934 @@ func TestWarningLogged(t *testing.T) {
 	defer func() { splitKeyFunc = original }()
 	cfg.BuildSchema()
 	// Check that the warning was logged
-	assert.Equal(t, &model.Warnings{Errors: []error{errors.New("empty key given to Set")}}, cfg.Warnings())
+	assert.Equal(t, []string{"empty key given to Set"}, cfg.Warnings())
+}
+
+func TestSequenceID(t *testing.T) {
+	config := NewNodeTreeConfig("test", "DD", strings.NewReplacer(".", "_")) // nolint: forbidigo
+	config.SetDefault("a", 0)
+	config.BuildSchema()
+
+	assert.Equal(t, uint64(0), config.GetSequenceID())
+
+	config.Set("a", 1, model.SourceAgentRuntime)
+	assert.Equal(t, uint64(1), config.GetSequenceID())
+
+	config.Set("a", 2, model.SourceAgentRuntime)
+	assert.Equal(t, uint64(2), config.GetSequenceID())
+
+	// Setting the same value does not update the sequence ID
+	config.Set("a", 2, model.SourceAgentRuntime)
+	assert.Equal(t, uint64(2), config.GetSequenceID())
+
+	// Does not update the sequence ID since the source does not match
+	config.UnsetForSource("a", model.SourceEnvVar)
+	assert.Equal(t, uint64(2), config.GetSequenceID())
+
+	config.UnsetForSource("a", model.SourceAgentRuntime)
+	assert.Equal(t, uint64(3), config.GetSequenceID())
+}
+
+func TestParseEnvSplitComma(t *testing.T) {
+	t.Setenv("TEST_MY_LIST", "a,b,c")
+	t.Setenv("TEST_MY_LIST_2", "")
+
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BindEnvAndSetDefault("my_list", []string{"a"}, "TEST_MY_LIST")
+	cfg.BindEnvAndSetDefault("my_list_2", []string{"a"}, "TEST_MY_LIST_2")
+	cfg.ParseEnvSplitComma("my_list")
+	cfg.ParseEnvSplitComma("my_list_2")
+	cfg.BuildSchema()
+
+	assert.Equal(t, []string{"a", "b", "c"}, cfg.GetStringSlice("my_list"))
+	assert.Equal(t, model.SourceEnvVar, cfg.GetSource("my_list"))
+	assert.Equal(t, []string{"a"}, cfg.GetStringSlice("my_list_2"))
+	assert.Equal(t, model.SourceDefault, cfg.GetSource("my_list_2"))
+
+	assert.PanicsWithValue(t, "env transform for my_list already exists", func() {
+		cfg2 := NewNodeTreeConfig("test", "TEST", nil)
+		cfg2.BindEnvAndSetDefault("my_list", []string{})
+		cfg2.ParseEnvSplitComma("my_list")
+		cfg2.ParseEnvSplitComma("my_list")
+	})
+}
+
+func TestParseEnvSplitSpace(t *testing.T) {
+	t.Setenv("TEST_MY_LIST", "a b c")
+	t.Setenv("TEST_MY_LIST_2", "")
+
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BindEnvAndSetDefault("my_list", []string{"a"}, "TEST_MY_LIST")
+	cfg.BindEnvAndSetDefault("my_list_2", []string{"a"}, "TEST_MY_LIST_2")
+	cfg.ParseEnvSplitSpace("my_list")
+	cfg.ParseEnvSplitComma("my_list_2")
+	cfg.BuildSchema()
+
+	assert.Equal(t, []string{"a", "b", "c"}, cfg.GetStringSlice("my_list"))
+	assert.Equal(t, model.SourceEnvVar, cfg.GetSource("my_list"))
+	assert.Equal(t, []string{"a"}, cfg.GetStringSlice("my_list_2"))
+	assert.Equal(t, model.SourceDefault, cfg.GetSource("my_list_2"))
+
+	assert.PanicsWithValue(t, "env transform for my_list already exists", func() {
+		cfg2 := NewNodeTreeConfig("test", "TEST", nil)
+		cfg2.BindEnvAndSetDefault("my_list", []string{})
+		cfg2.ParseEnvSplitSpace("my_list")
+		cfg2.ParseEnvSplitSpace("my_list")
+	})
+}
+
+func TestParseEnvJSON(t *testing.T) {
+	t.Run("parses string slice", func(t *testing.T) {
+		t.Setenv("TEST_MY_LIST", `["a","b","c"]`)
+
+		cfg := NewNodeTreeConfig("test", "TEST", nil)
+		cfg.BindEnvAndSetDefault("my_list", []string{}, "TEST_MY_LIST")
+		cfg.ParseEnvJSON("my_list", []string{})
+		cfg.BuildSchema()
+
+		assert.Equal(t, []string{"a", "b", "c"}, cfg.GetStringSlice("my_list"))
+		assert.Equal(t, model.SourceEnvVar, cfg.GetSource("my_list"))
+	})
+
+	t.Run("parses slice of map[string]string", func(t *testing.T) {
+		t.Setenv("TEST_MY_TAGS", `[{"key":"val"},{"foo":"bar"}]`)
+
+		cfg := NewNodeTreeConfig("test", "TEST", nil)
+		cfg.BindEnvAndSetDefault("my_tags", []map[string]string{}, "TEST_MY_TAGS")
+		cfg.ParseEnvJSON("my_tags", []map[string]string{})
+		cfg.BuildSchema()
+
+		val := cfg.Get("my_tags")
+		tags, ok := val.([]map[string]string)
+		require.True(t, ok)
+		assert.Equal(t, []map[string]string{{"key": "val"}, {"foo": "bar"}}, tags)
+	})
+
+	t.Run("panics on duplicate registration", func(t *testing.T) {
+		assert.PanicsWithValue(t, "env transform for my_list already exists", func() {
+			cfg := NewNodeTreeConfig("test", "TEST", nil)
+			cfg.BindEnvAndSetDefault("my_list", []string{})
+			cfg.ParseEnvJSON("my_list", []string{})
+			cfg.ParseEnvJSON("my_list", []string{})
+		})
+	})
+}
+
+func TestMultipleTransformersRaisesError(t *testing.T) {
+	config := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_")) // nolint: forbidigo
+	config.BindEnvAndSetDefault("list_of_nums", []float64{}, "TEST_LIST_OF_NUMS")
+
+	assert.NotPanics(t, func() {
+		config.ParseEnvAsStringSlice("list_of_nums", func(in string) []string {
+			return strings.Split(in, ",")
+		})
+	}, "env transform for list_of_nums works if set once")
+
+	assert.PanicsWithValue(t, "env transform for list_of_strings already exists", func() {
+		config.ParseEnvAsStringSlice("list_of_strings", func(_ string) []string {
+			return []string{"a", "b"}
+		})
+		config.ParseEnvAsStringSlice("list_of_strings", func(in string) []string {
+			return strings.Split(in, ",")
+		})
+	})
+}
+
+func TestMergeInvalidFileData(t *testing.T) {
+	configData := `
+fruit:
+  apple:
+  banana:
+  cherry:
+  donut:
+    12
+  egg:
+    - foo: bar
+`
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	// default wins over invalid file
+	cfg.BindEnvAndSetDefault("fruit.apple.core.seeds", 2)
+	//// env wins over file
+	cfg.BindEnvAndSetDefault("fruit.cherry.seed.num", "abc")
+	// env var is defined
+	t.Setenv("TEST_FRUIT_CHERRY_SEED_NUM", "1")
+	// default setting will be overridden by invalid file data
+	cfg.BindEnvAndSetDefault("fruit.egg.yoke", "yellow")
+	cfg.BuildSchema()
+	err := cfg.ReadConfig(strings.NewReader(configData))
+	require.NoError(t, err)
+	// invalid file data is preserved in merged tree
+	// maintains compatibility with viper
+	actualEgg := cfg.Get("fruit.egg")
+	expectEgg := []interface{}{
+		map[interface{}]interface{}{
+			"foo": "bar",
+		},
+	}
+	assert.Equal(t, expectEgg, actualEgg)
+	// In the merged tree, the following appears:
+	// fruit.apple.core.seeds from default
+	// fruit.banana           from file (empty section)
+	// fruit.cherry.seed.num  from env
+	// fruit.donut            from file (unknown)
+	// fruit.egg              from file (wrong shape)
+	txt := cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=root
+> fruit
+  inner(#ptr<000001>)
+  > apple
+    inner(#ptr<000002>)
+    > core
+      inner(#ptr<000003>)
+      > seeds
+          leaf(#ptr<000004>), val:2, source:default
+  > banana
+      leaf(#ptr<000005>), val:<nil>, source:file
+  > cherry
+    inner(#ptr<000006>)
+    > seed
+      inner(#ptr<000007>)
+      > num
+          leaf(#ptr<000008>), val:"1", source:environment-variable
+  > donut
+      leaf(#ptr<000009>), val:12, source:file
+  > egg
+      leaf(#ptr<000010>), val:[map[foo:bar]], source:file
+tree(#ptr<000011>) source=default
+> fruit
+  inner(#ptr<000012>)
+  > apple
+    inner(#ptr<000002>)
+    > core
+      inner(#ptr<000003>)
+      > seeds
+          leaf(#ptr<000004>), val:2, source:default
+  > cherry
+    inner(#ptr<000013>)
+    > seed
+      inner(#ptr<000014>)
+      > num
+          leaf(#ptr<000015>), val:"abc", source:default
+  > egg
+    inner(#ptr<000016>)
+    > yoke
+        leaf(#ptr<000017>), val:"yellow", source:default
+tree(#ptr<000018>) source=file
+> fruit
+  inner(#ptr<000019>)
+  > apple
+      leaf(#ptr<000020>), val:<nil>, source:file
+  > banana
+      leaf(#ptr<000005>), val:<nil>, source:file
+  > cherry
+      leaf(#ptr<000021>), val:<nil>, source:file
+  > donut
+      leaf(#ptr<000009>), val:12, source:file
+  > egg
+      leaf(#ptr<000010>), val:[map[foo:bar]], source:file
+tree(#ptr<000022>) source=environment-variable
+> fruit
+  inner(#ptr<000023>)
+  > cherry
+    inner(#ptr<000024>)
+    > seed
+      inner(#ptr<000025>)
+      > num
+          leaf(#ptr<000008>), val:"1", source:environment-variable`
+	assert.Equal(t, expect, txt)
+}
+
+func TestComplexMapValueStringify(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "", nil)
+	cfg.SetConfigType("yaml")
+	cfg.BindEnvAndSetDefault("kubernetes_node_annotations_as_tags", map[string]string{"cluster.k8s.io/machine": "kube_machine"})
+	cfg.BuildSchema()
+
+	confYaml := `kubernetes_node_annotations_as_tags:
+  cluster.k8s.io/machine: different
+`
+	err := cfg.ReadConfig(bytes.NewBuffer([]byte(confYaml)))
+	require.NoError(t, err)
+
+	// Validate that the schema ensures the correct shape: a leaf with a map value
+	txt := cfg.(*ntmConfig).Stringify("all", model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=root
+> kubernetes_node_annotations_as_tags
+    leaf(#ptr<000001>), val:map[cluster.k8s.io/machine:different], source:file
+tree(#ptr<000002>) source=default
+> kubernetes_node_annotations_as_tags
+    leaf(#ptr<000003>), val:map[cluster.k8s.io/machine:kube_machine], source:default
+tree(#ptr<000004>) source=file
+> kubernetes_node_annotations_as_tags
+    leaf(#ptr<000001>), val:map[cluster.k8s.io/machine:different], source:file`
+	assert.Equal(t, expect, txt)
+}
+
+func TestFileLayerConvertsToDefaultType(t *testing.T) {
+	// YAML quoted string "345" for a setting that uses an int default
+	configData := `my_int_setting: "345"
+my_bool_setting: "true"
+`
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	cfg.BindEnvAndSetDefault("my_int_setting", 0)
+	cfg.BindEnvAndSetDefault("my_bool_setting", false)
+	cfg.BuildSchema()
+	err := cfg.ReadConfig(strings.NewReader(configData))
+	require.NoError(t, err)
+
+	// shows the file layer stores the correctly typed int values
+	txt := cfg.(*ntmConfig).Stringify(model.SourceFile, model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=file
+> my_bool_setting
+    leaf(#ptr<000001>), val:true, source:file
+> my_int_setting
+    leaf(#ptr<000002>), val:345, source:file`
+	assert.Equal(t, expect, txt)
+}
+
+func TestEnvVarLayerConvertsToDefaultType(t *testing.T) {
+	// env vars are always strings and they should be converted to match the default type
+	t.Setenv("TEST_MY_INT_SETTING", "789")
+	t.Setenv("TEST_MY_BOOL_SETTING", "true")
+
+	cfg := NewNodeTreeConfig("test", "TEST", strings.NewReplacer(".", "_"))
+	cfg.BindEnvAndSetDefault("my_int_setting", 0)
+	cfg.BindEnvAndSetDefault("my_bool_setting", false)
+	cfg.BuildSchema()
+
+	// shows the file layer stores the correctly typed int values
+	txt := cfg.(*ntmConfig).Stringify(model.SourceEnvVar, model.OmitPointerAddr)
+	expect := `tree(#ptr<000000>) source=environment-variable
+> my_bool_setting
+    leaf(#ptr<000001>), val:true, source:environment-variable
+> my_int_setting
+    leaf(#ptr<000002>), val:789, source:environment-variable`
+	assert.Equal(t, expect, txt)
+}
+
+// TestCheckKnownKeyConcurrentAccess verifies that concurrent getter calls with
+// unknown config keys do not crash the agent with "fatal error: concurrent map writes".
+// This reproduces the race condition where multiple goroutines call GetBool (or other
+// getters) simultaneously, each writing to the unknownKeys map under only an RLock.
+func TestCheckKnownKeyConcurrentAccess(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("known_key", true)
+	cfg.BuildSchema()
+
+	const numGoroutines = 200
+
+	// Use a barrier so all goroutines start at the same instant,
+	// maximizing the chance of concurrent map writes.
+	var ready sync.WaitGroup
+	ready.Add(1)
+
+	var done sync.WaitGroup
+	done.Add(numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer done.Done()
+			ready.Wait() // all goroutines wait here until released
+
+			// Use a mix of getters with unknown keys to trigger checkKnownKey writes
+			key := fmt.Sprintf("unknown_key_%d", id)
+			cfg.GetBool(key)
+			cfg.GetString(key)
+			cfg.GetInt(key)
+		}(i)
+	}
+
+	// Release all goroutines simultaneously
+	ready.Done()
+	// Wait for all goroutines to finish (if there's a concurrent map write, the process crashes before this)
+	done.Wait()
+
+	// If we reach here without a fatal "concurrent map writes" crash, the test passed
+	assert.True(t, cfg.GetBool("known_key"))
+}
+
+func TestClearEnvVars(t *testing.T) {
+	t.Setenv("TEST_A", "from-env")
+	t.Setenv("TEST_B", "from-env")
+
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("a", "default-a")
+	cfg.SetDefault("b", "default-b")
+	cfg.(*ntmConfig).bindEnv("a", []string{"TEST_A"}) //nolint:forbidigo // testing behavior
+	cfg.(*ntmConfig).bindEnv("b", []string{"TEST_B"}) //nolint:forbidigo // testing behavior
+	cfg.BuildSchema()
+
+	assert.Equal(t, "from-env", cfg.GetString("a"))
+	assert.Equal(t, model.SourceEnvVar, cfg.GetSource("a"))
+
+	cfg.(*ntmConfig).ClearEnvVars()
+
+	assert.Equal(t, "default-a", cfg.GetString("a"))
+	assert.Equal(t, model.SourceDefault, cfg.GetSource("a"))
+	assert.Equal(t, "default-b", cfg.GetString("b"))
+
+	cfg.Set("a", "from-stream", model.SourceFile)
+	assert.Equal(t, "from-stream", cfg.GetString("a"))
+	assert.Equal(t, model.SourceFile, cfg.GetSource("a"))
+
+	// rebuild must not repopulate the env layer once skipped
+	t.Setenv("TEST_B", "leaked-via-rebuild")
+	cfg.(*ntmConfig).buildEnvVars()
+	assert.Equal(t, "default-b", cfg.GetString("b"))
+}
+
+// TestSetDefaultAfterRevertToBuilder follows the sequence cmd/otel-agent runs: revert a built
+// config back to a builder, register more defaults, then build it again.
+func TestSetDefaultAfterRevertToBuilder(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("ns.existing", "v1")
+	cfg.BuildSchema()
+
+	cfg = cfg.RevertFinishedBackToBuilder() //nolint:forbidigo // testing behavior
+	cfg.SetDefault("ns.new", "v2")
+	cfg.BuildSchema()
+
+	assert.Equal(t, "v1", cfg.GetString("ns.existing"))
+	assert.Equal(t, "v2", cfg.GetString("ns.new"))
+}
+
+func BenchmarkMaybeRebuildUnchangedEnv(b *testing.B) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetTestOnlyDynamicSchema(true)
+	cfg.SetDefault("key", "value")
+	cfg.BuildSchema()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cfg.Get("key")
+	}
+}
+
+func TestDirectBulkSet(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("from_env", 0)
+	cfg.SetDefault("from_file", 0)
+	cfg.SetDefault("coerced", "")
+	cfg.SetDefault("outranked", 0)
+	cfg.SetDefault("a_float", 0.0)
+	cfg.BuildSchema()
+
+	cfg.Set("outranked", 9, model.SourceAgentRuntime)
+
+	var notified int
+	cfg.OnUpdate(func(_ string, _ model.Source, _, _ any, _ uint64, _ model.Source) { notified++ })
+
+	// Set would reject the env var layer outright.
+	cfg.DirectBulkSet([]model.DirectSetting{
+		{Key: "from_env", Value: 1, Source: model.SourceEnvVar},
+		{Key: "from_file", Value: 2, Source: model.SourceFile},
+		{Key: "coerced", Value: 3, Source: model.SourceEnvVar},
+		{Key: "outranked", Value: 4, Source: model.SourceFile},
+		{Key: "undeclared", Value: 5, Source: model.SourceEnvVar},
+		{Key: "a_float", Value: float64(5), Source: model.SourceEnvVar},
+	}, false)
+
+	assert.Equal(t, 1, cfg.Get("from_env"))
+	assert.Equal(t, model.SourceEnvVar, cfg.GetSource("from_env"))
+	assert.Equal(t, 2, cfg.Get("from_file"))
+	assert.Equal(t, model.SourceFile, cfg.GetSource("from_file"))
+
+	assert.Equal(t, "3", cfg.Get("coerced"), "values are coerced to the declared type, as Set does")
+
+	// A lower-priority layer written in bulk must not overtake a higher-priority one.
+	assert.Equal(t, 9, cfg.Get("outranked"))
+	assert.Equal(t, model.SourceAgentRuntime, cfg.GetSource("outranked"))
+
+	// A key absent from this process's schema is still stored, so the config mirrors the sender.
+	assert.Equal(t, 5, cfg.Get("undeclared"))
+
+	// An integral float64 must not collapse to int.
+	assert.Equal(t, float64(5), cfg.Get("a_float"))
+
+	assert.Zero(t, notified, "notifications should not fire")
+}
+
+func TestDeprecation(t *testing.T) {
+	testCases := []struct {
+		caseName     string
+		config       string
+		expectValue  int
+		expectSource model.Source
+		warnings     []string
+		envVars      map[string]string
+	}{
+		{
+			caseName:     "file_new_value_only",
+			config:       `a: 123`,
+			expectValue:  123,
+			expectSource: model.SourceFile,
+		},
+		{
+			caseName:     "file_deprecated_only",
+			config:       `b: 123`,
+			expectValue:  123,
+			expectSource: model.SourceFile,
+			warnings:     []string{"setting 'b' is deprecated, use 'a' instead"},
+		},
+		{
+			caseName: "file_newer_deprecated_only",
+			config: `
+d:
+  e:
+    f: 123`,
+			expectValue:  123,
+			expectSource: model.SourceFile,
+			warnings:     []string{"setting 'd.e.f' is deprecated, use 'a' instead"},
+		},
+		{
+			caseName: "file_multi_deprecated",
+			config: `b: 123
+d:
+  e:
+    f: 456`,
+			expectValue:  123,
+			expectSource: model.SourceFile,
+			warnings: []string{
+				"setting 'b' is deprecated, use 'a' instead",
+				"setting 'd.e.f' is deprecated, use 'a' instead (value ignored in favor of 'b')",
+			},
+		},
+		{
+			caseName: "file_deprecated_all_known_name",
+			config: `a: 21
+b: 123
+d:
+  e:
+    f: 456`,
+			expectValue:  123,
+			expectSource: model.SourceFile,
+			warnings: []string{
+				"setting 'b' is deprecated, use 'a' instead",
+				"setting 'd.e.f' is deprecated, use 'a' instead (value ignored in favor of 'b')",
+			},
+		},
+		{
+			caseName:     "env_new_value_only",
+			envVars:      map[string]string{"TEST_A": "123"},
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+		},
+		{
+			caseName:     "env_deprecated_only",
+			envVars:      map[string]string{"TEST_B": "123"},
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+			warnings:     []string{"env var 'TEST_B' is deprecated, use 'TEST_A' instead"},
+		},
+		{
+			caseName:     "env_newer_deprecated_only",
+			envVars:      map[string]string{"TEST_D_E_F": "123"},
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+			warnings:     []string{"env var 'TEST_D_E_F' is deprecated, use 'TEST_A' instead"},
+		},
+		{
+			caseName:     "env_multi_deprecated",
+			envVars:      map[string]string{"TEST_B": "123", "TEST_D_E_F": "456"},
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+			// only the env var actually used is reported: lookup stops at the highest precedence one
+			warnings: []string{"env var 'TEST_B' is deprecated, use 'TEST_A' instead"},
+		},
+		{
+			caseName:     "env_deprecated_all_known_name",
+			envVars:      map[string]string{"TEST_A": "21", "TEST_B": "123", "TEST_D_E_F": "456"},
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+			warnings:     []string{"env var 'TEST_B' is deprecated, use 'TEST_A' instead"},
+		},
+		{
+			caseName:     "env_and_config_new_in_env",
+			envVars:      map[string]string{"TEST_A": "123"},
+			config:       `b: 456`,
+			warnings:     []string{"setting 'b' is deprecated, use 'a' instead"},
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+		},
+		{
+			caseName:     "env_and_config_old_in_env",
+			envVars:      map[string]string{"TEST_B": "123"},
+			config:       `a: 456`,
+			expectValue:  123,
+			expectSource: model.SourceEnvVar,
+			warnings:     []string{"env var 'TEST_B' is deprecated, use 'TEST_A' instead"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.caseName, func(t *testing.T) {
+			for name, val := range tc.envVars {
+				t.Setenv(name, val)
+			}
+
+			cfg := NewNodeTreeConfig("test", "TEST", nil)
+			cfg.BindEnvAndSetDefaultWithDeprecation("a", 1, []string{"b", "d.e.f"})
+			cfg.BuildSchema()
+
+			// the env vars bound for 'a' are the deprecated ones plus the official one, and nothing else
+			assert.Equal(t, []string{"TEST_A", "TEST_B", "TEST_D_E_F"}, cfg.GetEnvVars())
+
+			if tc.config != "" {
+				err := cfg.ReadConfig(strings.NewReader(tc.config))
+				require.NoError(t, err)
+			}
+
+			assert.Equal(t, tc.expectValue, cfg.GetInt("a"))
+			assert.Equal(t, tc.expectSource, cfg.GetSource("a"))
+			assert.True(t, cfg.IsConfigured("a"))
+			assert.False(t, cfg.IsConfigured("b"))
+			assert.False(t, cfg.IsConfigured("d.e.f"))
+
+			assert.Equal(t, tc.warnings, cfg.Warnings())
+
+			assert.Equal(t,
+				map[string]interface{}{
+					"a": tc.expectValue,
+				},
+				cfg.AllSettings())
+			assert.Equal(t,
+				map[string]interface{}{
+					"a": tc.expectValue,
+				},
+				cfg.AllSettingsWithoutDefault())
+
+			assert.Equal(t,
+				[]string{"a"},
+				cfg.AllKeysLowercased())
+
+			flattened, _ := cfg.AllFlattenedSettingsWithSequenceID()
+			assert.Equal(t,
+				map[string]interface{}{"a": tc.expectValue},
+				flattened)
+		})
+	}
+}
+
+func TestDeprecationNestedMap(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BindEnvAndSetDefaultWithDeprecation("section.obj", map[string]string{}, []string{"old_obj"})
+	cfg.BuildSchema()
+
+	yamlConf := `
+old_obj:
+  a: test1
+  b: test2
+`
+	err := cfg.ReadConfig(strings.NewReader(yamlConf))
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{"a": "test1", "b": "test2"}, cfg.GetStringMapString("section.obj"))
+	assert.Equal(t, model.SourceFile, cfg.GetSource("section.obj"))
+	assert.True(t, cfg.IsConfigured("section.obj"))
+	assert.False(t, cfg.IsConfigured("old_obj"))
+
+	assert.Equal(t, []string{"setting 'old_obj' is deprecated, use 'section.obj' instead"}, cfg.Warnings())
+
+	assert.Equal(t,
+		map[string]interface{}{
+			"section": map[string]interface{}{
+				"obj": map[interface{}]interface{}{
+					"a": "test1",
+					"b": "test2",
+				},
+			},
+		},
+		cfg.AllSettings())
+	assert.Equal(t,
+		map[string]interface{}{
+			"section": map[string]interface{}{
+				"obj": map[interface{}]interface{}{
+					"a": "test1",
+					"b": "test2",
+				},
+			},
+		},
+		cfg.AllSettingsWithoutDefault())
+
+	assert.Equal(t,
+		[]string{"section.obj"},
+		cfg.AllKeysLowercased())
+
+	flattened, _ := cfg.AllFlattenedSettingsWithSequenceID()
+	assert.Equal(t,
+		map[string]interface{}{"section.obj": map[interface{}]interface{}{"a": "test1", "b": "test2"}},
+		flattened)
+}
+
+func TestDeprecationWithEnvVar(t *testing.T) {
+	t.Setenv("A", "a b c")
+
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BindEnvAndSetDefaultWithDeprecation("section.obj", []string{}, []string{"old_obj"}, "A", "B")
+	cfg.BuildSchema()
+
+	assert.Equal(t, []string{"a", "b", "c"}, cfg.GetStringSlice("section.obj"))
+	assert.Equal(t, model.SourceEnvVar, cfg.GetSource("section.obj"))
+	assert.True(t, cfg.IsConfigured("section.obj"))
+	assert.False(t, cfg.IsConfigured("old_obj"))
+
+	assert.Equal(t, []string(nil), cfg.Warnings())
+
+	assert.Equal(t,
+		map[string]interface{}{
+			"section": map[string]interface{}{
+				"obj": []string{
+					"a",
+					"b",
+					"c",
+				},
+			},
+		},
+		cfg.AllSettings())
+
+	assert.Equal(t,
+		map[string]interface{}{
+			"section": map[string]interface{}{
+				"obj": []string{
+					"a",
+					"b",
+					"c",
+				},
+			},
+		},
+		cfg.AllSettingsWithoutDefault())
+
+	assert.Equal(t,
+		[]string{"section.obj"},
+		cfg.AllKeysLowercased())
+
+	flattened, _ := cfg.AllFlattenedSettingsWithSequenceID()
+	assert.Equal(t,
+		map[string]interface{}{"section.obj": []string{"a", "b", "c"}},
+		flattened)
+}
+
+func TestUnknownKeysWarning(t *testing.T) {
+	yaml := `
+a: 21
+aa: 21
+b:
+  c:
+    d: "test"
+`
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.BuildSchema()
+	require.NoError(t, cfg.ReadConfig(strings.NewReader(yaml)))
+
+	res := cfg.Warnings()
+	slices.Sort(res)
+	assert.Equal(t,
+		[]string{
+			"unknown key from YAML: a",
+			"unknown key from YAML: aa",
+			"unknown key from YAML: b.c.d",
+		},
+		res)
+
+	cfg = NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("a", 0)
+	cfg.BuildSchema()
+	require.NoError(t, cfg.ReadConfig(strings.NewReader(yaml)))
+
+	res = cfg.Warnings()
+	slices.Sort(res)
+	assert.Equal(t,
+		[]string{
+			"unknown key from YAML: aa",
+			"unknown key from YAML: b.c.d",
+		},
+		res)
+
+	// testing that nested value are correctly detected
+	cfg = NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("a", 0)
+	cfg.SetDefault("b.c", map[string]string{})
+	cfg.BuildSchema()
+	require.NoError(t, cfg.ReadConfig(strings.NewReader(yaml)))
+
+	res = cfg.Warnings()
+	slices.Sort(res)
+	assert.Equal(t,
+		[]string{
+			"unknown key from YAML: aa",
+		},
+		res)
+}
+
+func TestDirectBulkSetNotifying(t *testing.T) {
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("changed", 0)
+	cfg.SetDefault("unchanged", 0)
+	cfg.SetDefault("outranked", 0)
+	cfg.BuildSchema()
+
+	setter := cfg.(interface {
+		DirectBulkSet(settings []model.DirectSetting, shouldNotify bool)
+	})
+
+	setter.DirectBulkSet([]model.DirectSetting{
+		{Key: "changed", Value: 1, Source: model.SourceEnvVar},
+		{Key: "unchanged", Value: 2, Source: model.SourceEnvVar},
+	}, false)
+	cfg.Set("outranked", 9, model.SourceAgentRuntime)
+
+	type notification struct {
+		key      string
+		source   model.Source
+		previous any
+		value    any
+	}
+	var got []notification
+	cfg.OnUpdate(func(key string, source model.Source, previous, value any, _ uint64, _ model.Source) {
+		got = append(got, notification{key, source, previous, value})
+	})
+
+	setter.DirectBulkSet([]model.DirectSetting{
+		{Key: "changed", Value: 7, Source: model.SourceEnvVar},
+		{Key: "unchanged", Value: 2, Source: model.SourceEnvVar},
+		{Key: "outranked", Value: 4, Source: model.SourceFile},
+	}, true)
+
+	// Only 'changed' moved: 'unchanged' was rewritten with the same value, and 'outranked' lost the
+	// merge to a higher-priority source, so neither is a change any receiver should hear about.
+	assert.Equal(t, []notification{{key: "changed", source: model.SourceEnvVar, previous: 1, value: 7}}, got)
+	assert.Equal(t, 9, cfg.Get("outranked"))
+}
+
+func TestUnsetNotifiesEveryLayerRemoval(t *testing.T) {
+	type event struct {
+		key            string
+		resolvedSource model.Source
+		resolvedValue  any
+		seqID          uint64
+		clearedSource  model.Source
+	}
+
+	newCfg := func() model.Config {
+		cfg := NewNodeTreeConfig("test", "TEST", nil)
+		cfg.SetDefault("shadowed", "default")
+		cfg.BuildSchema()
+		return cfg
+	}
+
+	// Attached after setup writes so only the unset under test is recorded.
+	watch := func(cfg model.Config) *[]event {
+		got := &[]event{}
+		cfg.OnUpdate(func(key string, source model.Source, _, newValue any, seqID uint64, unsetSource model.Source) {
+			*got = append(*got, event{key, source, newValue, seqID, unsetSource})
+		})
+		return got
+	}
+
+	t.Run("falls back to a lower layer", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.Set("shadowed", "from_file", model.SourceFile)
+		cfg.Set("shadowed", "from_cli", model.SourceCLI)
+		got := watch(cfg)
+
+		cfg.UnsetForSource("shadowed", model.SourceCLI)
+
+		require.Len(t, *got, 1)
+		assert.Equal(t, "shadowed", (*got)[0].key)
+		assert.Equal(t, model.SourceCLI, (*got)[0].clearedSource, "the cleared layer, not the fallback")
+		// The pair a mirror needs: without it, dropping the CLI entry leaves it on the default.
+		assert.Equal(t, model.SourceFile, (*got)[0].resolvedSource)
+		assert.Equal(t, "from_file", (*got)[0].resolvedValue)
+		assert.Equal(t, "from_file", cfg.Get("shadowed"))
+	})
+
+	t.Run("resolved value unchanged because a higher layer still wins", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.Set("shadowed", "from_file", model.SourceFile)
+		cfg.Set("shadowed", "from_cli", model.SourceCLI)
+		got := watch(cfg)
+
+		// File is outranked by CLI, so a mirror must still drop the entry or it resurfaces later.
+		cfg.UnsetForSource("shadowed", model.SourceFile)
+
+		require.Len(t, *got, 1, "a removal notifies even when nothing resolves differently")
+		assert.Equal(t, model.SourceFile, (*got)[0].clearedSource)
+		assert.Equal(t, model.SourceCLI, (*got)[0].resolvedSource, "still the winning layer")
+		assert.Equal(t, "from_cli", (*got)[0].resolvedValue)
+	})
+
+	t.Run("falls back to the default layer", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.Set("shadowed", "from_cli", model.SourceCLI)
+		got := watch(cfg)
+
+		cfg.UnsetForSource("shadowed", model.SourceCLI)
+
+		require.Len(t, *got, 1)
+		assert.Equal(t, model.SourceDefault, (*got)[0].resolvedSource)
+		assert.Equal(t, "default", (*got)[0].resolvedValue)
+	})
+
+	t.Run("nothing left to fall back to", func(t *testing.T) {
+		cfg := NewNodeTreeConfig("test", "TEST", nil)
+		cfg.BuildSchema()
+		cfg.SetTestOnlyDynamicSchema(true)
+		cfg.Set("undeclared", "from_cli", model.SourceCLI)
+		got := watch(cfg)
+
+		cfg.UnsetForSource("undeclared", model.SourceCLI)
+
+		require.Len(t, *got, 1)
+		// SourceUnknown tells a mirror to drop the key outright rather than seed a fallback.
+		assert.Equal(t, model.SourceUnknown, (*got)[0].resolvedSource)
+		assert.Nil(t, (*got)[0].resolvedValue)
+	})
+
+	t.Run("nothing in the layer to remove", func(t *testing.T) {
+		cfg := newCfg()
+		cfg.Set("shadowed", "from_file", model.SourceFile)
+		got := watch(cfg)
+
+		cfg.UnsetForSource("shadowed", model.SourceCLI)
+
+		assert.Empty(t, *got, "no removal happened, so nothing to report")
+	})
+
+	t.Run("a set carries no cleared source", func(t *testing.T) {
+		cfg := newCfg()
+		got := watch(cfg)
+
+		cfg.Set("shadowed", "from_cli", model.SourceCLI)
+
+		require.Len(t, *got, 1)
+		assert.Empty(t, (*got)[0].clearedSource)
+	})
+}
+
+func TestSetNotifiesOnlyWhenTheResolvedValueChanges(t *testing.T) {
+	type notification struct {
+		source model.Source
+		value  any
+	}
+
+	cfg := NewNodeTreeConfig("test", "TEST", nil)
+	cfg.SetDefault("shadowed", "default")
+	cfg.BuildSchema()
+	cfg.Set("shadowed", "from_cli", model.SourceCLI)
+
+	var got []notification
+	cfg.OnUpdate(func(_ string, source model.Source, _, newValue any, _ uint64, _ model.Source) {
+		got = append(got, notification{source, newValue})
+	})
+
+	// CLI outranks file, so nothing a receiver can observe has changed.
+	cfg.Set("shadowed", "from_file", model.SourceFile)
+	assert.Empty(t, got, "a write that loses the merge is not a change")
+	assert.Equal(t, "from_cli", cfg.Get("shadowed"))
+
+	// The write was still recorded, so clearing CLI surfaces it, named by the layer it came from.
+	cfg.UnsetForSource("shadowed", model.SourceCLI)
+	require.Len(t, got, 1)
+	assert.Equal(t, model.SourceFile, got[0].source)
+	assert.Equal(t, "from_file", got[0].value)
 }

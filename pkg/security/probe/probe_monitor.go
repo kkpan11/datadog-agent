@@ -18,23 +18,28 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/cgroups"
 	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/discarder"
 	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/dns"
-	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/runtime"
+	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/eventsample"
+	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/rawpacketdrop"
+	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/spanctxevent"
 	"github.com/DataDog/datadog-agent/pkg/security/probe/monitors/syscalls"
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers/path"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
+	"github.com/DataDog/datadog-agent/pkg/security/utils"
 )
 
 // EBPFMonitors regroups all the work we want to do to monitor the probes we pushed in the kernel
 type EBPFMonitors struct {
 	ebpfProbe *EBPFProbe
 
-	eventStreamMonitor *eventstream.Monitor
-	runtimeMonitor     *runtime.Monitor
-	discarderMonitor   *discarder.Monitor
-	cgroupsMonitor     *cgroups.Monitor
-	approverMonitor    *approver.Monitor
-	syscallsMonitor    *syscalls.Monitor
-	dnsMonitor         *dns.Monitor
+	eventStreamMonitor   *eventstream.Monitor
+	discarderMonitor     *discarder.Monitor
+	cgroupsMonitor       *cgroups.Monitor
+	approverMonitor      *approver.Monitor
+	syscallsMonitor      *syscalls.Monitor
+	dnsMonitor           *dns.Monitor
+	eventSampleMonitor   *eventsample.Monitor
+	rawPacketDropMonitor *rawpacketdrop.Monitor
+	spanCtxEventMonitor  *spanctxevent.Monitor
 }
 
 // NewEBPFMonitors returns a new instance of a ProbeMonitor
@@ -50,26 +55,22 @@ func (m *EBPFMonitors) Init() error {
 	p := m.ebpfProbe
 
 	// instantiate a new event statistics monitor
-	m.eventStreamMonitor, err = eventstream.NewEventStreamMonitor(p.config.Probe, p.Erpc, p.Manager, p.statsdClient, p.onEventLost, p.useRingBuffers)
+	m.eventStreamMonitor, err = eventstream.NewEventStreamMonitor(p.config.Probe, p.Erpc, p.Manager.Get(), p.statsdClient, p.onEventLost, p.useRingBuffers)
 	if err != nil {
 		return fmt.Errorf("couldn't create the events statistics monitor: %w", err)
 	}
 
-	if p.config.Probe.RuntimeMonitor {
-		m.runtimeMonitor = runtime.NewRuntimeMonitor(p.statsdClient)
-	}
-
-	m.discarderMonitor, err = discarder.NewDiscarderMonitor(p.Manager, p.statsdClient)
+	m.discarderMonitor, err = discarder.NewDiscarderMonitor(p.Manager.Get(), p.statsdClient)
 	if err != nil {
 		return fmt.Errorf("couldn't create the discarder monitor: %w", err)
 	}
-	m.approverMonitor, err = approver.NewApproverMonitor(p.Manager, p.statsdClient)
+	m.approverMonitor, err = approver.NewApproverMonitor(p.Manager.Get(), p.statsdClient)
 	if err != nil {
 		return fmt.Errorf("couldn't create the approver monitor: %w", err)
 	}
 
 	if p.opts.SyscallsMonitorEnabled {
-		m.syscallsMonitor, err = syscalls.NewSyscallsMonitor(p.Manager, p.statsdClient)
+		m.syscallsMonitor, err = syscalls.NewSyscallsMonitor(p.Manager.Get(), p.statsdClient)
 		if err != nil {
 			return fmt.Errorf("couldn't create the approver monitor: %w", err)
 		}
@@ -78,9 +79,28 @@ func (m *EBPFMonitors) Init() error {
 	m.cgroupsMonitor = cgroups.NewCgroupsMonitor(p.statsdClient, p.Resolvers.CGroupResolver)
 
 	if p.config.Probe.DNSResolutionEnabled {
-		m.dnsMonitor, err = dns.NewDNSMonitor(p.Manager, p.statsdClient)
+		m.dnsMonitor, err = dns.NewDNSMonitor(p.Manager.Get(), p.statsdClient)
 		if err != nil {
 			return fmt.Errorf("couldn't create the DNS monitor: %w", err)
+		}
+	}
+
+	m.eventSampleMonitor, err = eventsample.NewEventSampleMonitor(p.Manager.Get(), p.statsdClient)
+	if err != nil {
+		return fmt.Errorf("couldn't create the event sample monitor: %w", err)
+	}
+
+	if p.probe.IsNetworkRawPacketEnabled() {
+		m.rawPacketDropMonitor, err = rawpacketdrop.NewMonitor(p.Manager.Get(), p.statsdClient, p.getDropActionRuleIDs)
+		if err != nil {
+			return fmt.Errorf("couldn't create the raw packet drop monitor: %w", err)
+		}
+	}
+
+	if p.config.Probe.SpanTrackingEnabled {
+		m.spanCtxEventMonitor, err = spanctxevent.NewMonitor(p.Manager.Get(), p.statsdClient)
+		if err != nil {
+			return fmt.Errorf("couldn't create the span context event monitor: %w", err)
 		}
 	}
 
@@ -136,16 +156,16 @@ func (m *EBPFMonitors) SendStats() error {
 				return fmt.Errorf("failed to send process_resolver stats: %w", err)
 			}
 		}
+
+		if resolvers.FileMetadataResolver != nil {
+			if err := resolvers.FileMetadataResolver.SendStats(); err != nil {
+				return fmt.Errorf("failed to send file_resolver stats: %w", err)
+			}
+		}
 	}
 
 	if err := m.eventStreamMonitor.SendStats(); err != nil {
 		return fmt.Errorf("failed to send events stats: %w", err)
-	}
-
-	if m.ebpfProbe.config.Probe.RuntimeMonitor {
-		if err := m.runtimeMonitor.SendStats(); err != nil {
-			return fmt.Errorf("failed to send runtime monitor stats: %w", err)
-		}
 	}
 
 	if err := m.discarderMonitor.SendStats(); err != nil {
@@ -166,11 +186,42 @@ func (m *EBPFMonitors) SendStats() error {
 		}
 	}
 
+	if err := m.eventSampleMonitor.SendStats(); err != nil {
+		return fmt.Errorf("failed to send event sample stats: %w", err)
+	}
+
+	if m.rawPacketDropMonitor != nil {
+		if err := m.rawPacketDropMonitor.SendStats(); err != nil {
+			return fmt.Errorf("failed to send raw packet drop stats: %w", err)
+		}
+	}
+
+	if m.spanCtxEventMonitor != nil {
+		if err := m.spanCtxEventMonitor.SendStats(); err != nil {
+			return fmt.Errorf("failed to send span context event stats: %w", err)
+		}
+	}
+
 	return nil
 }
 
+// ResetRawPacketDropCounters clears user-space drop counters after a kernel map reset.
+func (m *EBPFMonitors) ResetRawPacketDropCounters() {
+	if m.rawPacketDropMonitor != nil {
+		m.rawPacketDropMonitor.ResetCounters()
+	}
+}
+
+// FlushRawPacketDropStats emits pending drop deltas before the kernel map is reset.
+func (m *EBPFMonitors) FlushRawPacketDropStats() error {
+	if m.rawPacketDropMonitor == nil {
+		return nil
+	}
+	return m.rawPacketDropMonitor.SendStats()
+}
+
 // ProcessEvent processes an event through the various monitors and controllers of the probe
-func (m *EBPFMonitors) ProcessEvent(event *model.Event) {
+func (m *EBPFMonitors) ProcessEvent(event *model.Event, scrubber *utils.Scrubber) {
 	if !m.ebpfProbe.config.RuntimeSecurity.InternalMonitoringEnabled {
 		return
 	}
@@ -185,23 +236,31 @@ func (m *EBPFMonitors) ProcessEvent(event *model.Event) {
 		return
 	}
 
+	opts := m.ebpfProbe.evalOpts()
+
+	if errors.Is(event.Error, model.ErrFailedDNSPacketDecoding) {
+		m.ebpfProbe.probe.DispatchCustomEvent(
+			NewFailedDNSEvent(m.ebpfProbe.GetAgentContainerContext(), events.FailedDNSRuleID, events.AbnormalPathRuleDesc, event, opts),
+		)
+	}
+
 	var pathErr *path.ErrPathResolution
 	if errors.As(event.Error, &pathErr) {
 		m.ebpfProbe.probe.DispatchCustomEvent(
-			NewAbnormalEvent(m.ebpfProbe.GetAgentContainerContext(), events.AbnormalPathRuleID, events.AbnormalPathRuleDesc, event, pathErr.Err),
+			NewAbnormalEvent(m.ebpfProbe.GetAgentContainerContext(), events.AbnormalPathRuleID, events.AbnormalPathRuleDesc, event, scrubber, pathErr.Err, opts),
 		)
 	}
 
 	if errors.Is(event.Error, model.ErrNoProcessContext) {
 		m.ebpfProbe.probe.DispatchCustomEvent(
-			NewAbnormalEvent(m.ebpfProbe.GetAgentContainerContext(), events.NoProcessContextErrorRuleID, events.NoProcessContextErrorRuleDesc, event, event.Error),
+			NewAbnormalEvent(m.ebpfProbe.GetAgentContainerContext(), events.NoProcessContextErrorRuleID, events.NoProcessContextErrorRuleDesc, event, scrubber, event.Error, opts),
 		)
 	}
 
 	var brokenLineageErr *model.ErrProcessBrokenLineage
 	if errors.As(event.Error, &brokenLineageErr) {
 		m.ebpfProbe.probe.DispatchCustomEvent(
-			NewAbnormalEvent(m.ebpfProbe.GetAgentContainerContext(), events.BrokenProcessLineageErrorRuleID, events.BrokenProcessLineageErrorRuleDesc, event, event.Error),
+			NewAbnormalEvent(m.ebpfProbe.GetAgentContainerContext(), events.BrokenProcessLineageErrorRuleID, events.BrokenProcessLineageErrorRuleDesc, event, scrubber, event.Error, opts),
 		)
 	}
 }

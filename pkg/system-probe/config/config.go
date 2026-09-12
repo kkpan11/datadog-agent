@@ -14,11 +14,10 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/DataDog/datadog-agent/comp/core/secrets"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/system-probe/config/types"
-	"github.com/DataDog/datadog-agent/pkg/util/option"
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 const (
@@ -42,6 +41,12 @@ const (
 	TracerouteModule             types.ModuleName = "traceroute"
 	DiscoveryModule              types.ModuleName = "discovery"
 	GPUMonitoringModule          types.ModuleName = "gpu"
+	SoftwareInventoryModule      types.ModuleName = "software_inventory"
+	NotableEventsModule          types.ModuleName = "notable_events"
+	PrivilegedLogsModule         types.ModuleName = "privileged_logs"
+	InjectorModule               types.ModuleName = "injector"
+	NoisyNeighborModule          types.ModuleName = "noisy_neighbor"
+	LogonDurationModule          types.ModuleName = "logon_duration"
 )
 
 // New creates a config object for system-probe. It assumes no configuration has been loaded as this point.
@@ -50,22 +55,25 @@ func New(configPath string, fleetPoliciesDirPath string) (*types.Config, error) 
 }
 
 func newSysprobeConfig(configPath string, fleetPoliciesDirPath string) (*types.Config, error) {
-	pkgconfigsetup.SystemProbe().SetConfigName("system-probe")
+	cfg := pkgconfigsetup.GlobalSystemProbeConfigBuilder()
+
+	cfg.SetConfigName("system-probe")
 	// set the paths where a config file is expected
 	if len(configPath) != 0 {
 		// if the configuration file path was supplied on the command line,
 		// add that first, so it's first in line
-		pkgconfigsetup.SystemProbe().AddConfigPath(configPath)
+		cfg.AddConfigPath(configPath)
 		// If they set a config file directly, let's try to honor that
 		if strings.HasSuffix(configPath, ".yaml") {
-			pkgconfigsetup.SystemProbe().SetConfigFile(configPath)
+			cfg.SetConfigFile(configPath)
 		}
 	} else {
 		// only add default if a custom configPath was not supplied
-		pkgconfigsetup.SystemProbe().AddConfigPath(defaultConfigDir)
+		cfg.AddConfigPath(defaultConfigDir)
 	}
 	// load the configuration
-	err := pkgconfigsetup.LoadCustom(pkgconfigsetup.SystemProbe(), pkgconfigsetup.Datadog().GetEnvVars())
+	ddcfg := pkgconfigsetup.Datadog()
+	err := pkgconfigsetup.LoadSystemProbe(cfg, ddcfg.GetEnvVars())
 	if err != nil {
 		if errors.Is(err, fs.ErrPermission) {
 			// special-case permission-denied with a clearer error message
@@ -75,28 +83,28 @@ func newSysprobeConfig(configPath string, fleetPoliciesDirPath string) (*types.C
 			return nil, fmt.Errorf("cannot access the system-probe config file (%w); try running the command under the same user as the Datadog Agent", err)
 		}
 
-		var e pkgconfigmodel.ConfigFileNotFoundError
-		if !errors.As(err, &e) && !errors.Is(err, os.ErrNotExist) {
+		if !errors.Is(err, pkgconfigmodel.ErrConfigFileNotFound) && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("unable to load system-probe config file: %w", err)
 		}
 	}
 
-	// Load the remote configuration
-	if fleetPoliciesDirPath == "" {
-		fleetPoliciesDirPath = pkgconfigsetup.SystemProbe().GetString("fleet_policies_dir")
-	}
+	// if fleetPoliciesDirPath was provided in the command line, copy it to the config
 	if fleetPoliciesDirPath != "" {
-		err := pkgconfigsetup.SystemProbe().MergeFleetPolicy(path.Join(fleetPoliciesDirPath, "system-probe.yaml"))
-		if err != nil {
-			return nil, err
-		}
+		cfg.Set("fleet_policies_dir", fleetPoliciesDirPath, pkgconfigmodel.SourceAgentRuntime)
+	}
+	// apply remote fleet policy to the config
+	err = applyFleetPolicy(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load fleet policy: %w", err)
 	}
 
 	return load()
 }
 
 func load() (*types.Config, error) {
-	cfg := pkgconfigsetup.SystemProbe()
+	cfg := pkgconfigsetup.GlobalSystemProbeConfigBuilder()
+	coreCfg := pkgconfigsetup.Datadog()
+
 	Adjust(cfg)
 
 	c := &types.Config{
@@ -117,11 +125,17 @@ func load() (*types.Config, error) {
 	npmEnabled := cfg.GetBool(netNS("enabled"))
 	usmEnabled := cfg.GetBool(smNS("enabled"))
 	ccmEnabled := cfg.GetBool(ccmNS("enabled"))
+	eudmEnabled := coreCfg.GetString("infrastructure_mode") == "end_user_device"
 	csmEnabled := cfg.GetBool(secNS("enabled"))
 	gpuEnabled := cfg.GetBool(gpuNS("enabled"))
+	// The GPU module only consumes process events when its eBPF probes are
+	// loaded, so the event monitor is only needed for that combination.
+	gpuEBPFProbesEnabled := gpuEnabled && cfg.GetBool(gpuNS("enable_ebpf_probes"))
 	diEnabled := cfg.GetBool(diNS("enabled"))
+	swEnabled := coreCfg.GetBool(swNS("enabled"))
+	discoveryServiceMapEnabled := cfg.GetBool(discoveryNS("service_map", "enabled"))
 
-	if npmEnabled || usmEnabled || ccmEnabled || (csmEnabled && cfg.GetBool(secNS("network_monitoring.enabled"))) {
+	if npmEnabled || usmEnabled || ccmEnabled || eudmEnabled || discoveryServiceMapEnabled || (csmEnabled && cfg.GetBool(secNS("network_monitoring.enabled"))) {
 		c.EnabledModules[NetworkTracerModule] = struct{}{}
 	}
 	if cfg.GetBool(spNS("enable_tcp_queue_length")) {
@@ -132,14 +146,25 @@ func load() (*types.Config, error) {
 	}
 	if csmEnabled ||
 		cfg.GetBool(secNS("fim_enabled")) ||
-		cfg.GetBool(evNS("process.enabled")) ||
+		coreCfg.GetBool("sbom.enrichment.usage.enabled") ||
 		(usmEnabled && cfg.GetBool(smNS("enable_event_stream"))) ||
 		(c.ModuleIsEnabled(NetworkTracerModule) && cfg.GetBool(evNS("network_process.enabled"))) ||
-		gpuEnabled ||
+		gpuEBPFProbesEnabled ||
 		diEnabled {
 		c.EnabledModules[EventMonitorModule] = struct{}{}
 	}
-	if cfg.GetBool(secNS("enabled")) && cfg.GetBool(secNS("compliance_module.enabled")) {
+	complianceEnabled := coreCfg.GetBool(compNS("enabled"))
+	complianceRunInSystemProbe := coreCfg.GetBool(compNS("run_in_system_probe"))
+	complianceDBBenchmarksEnabled := cfg.GetBool(compNS("database_benchmarks.enabled"))
+	complianceLegacyCWSEnabled := cfg.GetBool(secNS("enabled")) && cfg.GetBool(secNS("compliance_module.enabled"))
+
+	// Enable compliance module if:
+	// 1. Full compliance is enabled AND should run in system-probe, OR
+	// 2. Only DB benchmarks handler is needed (regardless of run_in_system_probe), OR
+	// 3. Legacy CWS config enables compliance module
+	shouldEnableComplianceModule := (complianceEnabled && complianceRunInSystemProbe) || complianceDBBenchmarksEnabled || complianceLegacyCWSEnabled
+
+	if shouldEnableComplianceModule {
 		c.EnabledModules[ComplianceModule] = struct{}{}
 	}
 	if cfg.GetBool(spNS("process_config.enabled")) {
@@ -157,7 +182,12 @@ func load() (*types.Config, error) {
 	if cfg.GetBool(pngNS("enabled")) {
 		c.EnabledModules[PingModule] = struct{}{}
 	}
-	if cfg.GetBool(tracerouteNS("enabled")) {
+	if tracerouteEnabled(cfg, coreCfg, npmEnabled) {
+		if !cfg.IsConfigured(tracerouteNS("enabled")) {
+			// Expose the effective value through the runtime config so inventory and
+			// diagnostics report the module that is actually running.
+			cfg.Set(tracerouteNS("enabled"), true, pkgconfigmodel.SourceAgentRuntime)
+		}
 		c.EnabledModules[TracerouteModule] = struct{}{}
 	}
 	if cfg.GetBool(discoveryNS("enabled")) {
@@ -166,15 +196,51 @@ func load() (*types.Config, error) {
 	if gpuEnabled {
 		c.EnabledModules[GPUMonitoringModule] = struct{}{}
 	}
+	if cfg.GetBool(privilegedLogsNS("enabled")) {
+		c.EnabledModules[PrivilegedLogsModule] = struct{}{}
+	}
+	if cfg.GetBool(NSkey("noisy_neighbor", "enabled")) {
+		c.EnabledModules[NoisyNeighborModule] = struct{}{}
+	}
+	// Read from the core config (datadog.yaml), not the system-probe config, so that
+	// enabling logon_duration in the core agent (e.g. via infrastructure_mode:
+	// end_user_device) also starts the system-probe module.
+	if runtime.GOOS == "darwin" && coreCfg.GetBool(logonDurationNS("enabled")) {
+		c.EnabledModules[LogonDurationModule] = struct{}{}
+	}
 
 	if cfg.GetBool(wcdNS("enabled")) {
 		c.EnabledModules[WindowsCrashDetectModule] = struct{}{}
 	}
+
 	if runtime.GOOS == "windows" {
 		if c.ModuleIsEnabled(NetworkTracerModule) || c.ModuleIsEnabled(EventMonitorModule) {
 			// enable the windows crash detection module if the network tracer
 			// module is enabled, to allow the core agent to detect our own crash
 			c.EnabledModules[WindowsCrashDetectModule] = struct{}{}
+		}
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		if swEnabled {
+			c.EnabledModules[SoftwareInventoryModule] = struct{}{}
+		}
+		if runtime.GOOS == "darwin" && coreCfg.GetBool("notable_events.enabled") {
+			c.EnabledModules[NotableEventsModule] = struct{}{}
+		}
+
+		// injector telemetry is enabled by default, disable only if explicitly configured by the user
+		injectorDefaultEnabled := false
+		if !cfg.IsConfigured("injector.enable_telemetry") {
+			injectorDefaultEnabled = true
+		} else if cfg.GetBool("injector.enable_telemetry") {
+			c.EnabledModules[InjectorModule] = struct{}{}
+		}
+
+		// This check must be last for any default modules on Windows,
+		// Only add default modules if other explicit modules have been enabled
+		// because the count of enabled modules will implicitly enable system probe.
+		if len(c.EnabledModules) > 0 && injectorDefaultEnabled {
+			c.EnabledModules[InjectorModule] = struct{}{}
 		}
 	}
 
@@ -185,28 +251,36 @@ func load() (*types.Config, error) {
 	return c, nil
 }
 
-// SetupOptionalDatadogConfigWithDir loads the datadog.yaml config file from a given config directory but will not fail on a missing file
-func SetupOptionalDatadogConfigWithDir(configDir, configFile string) error {
-	pkgconfigsetup.Datadog().AddConfigPath(configDir)
-	if configFile != "" {
-		pkgconfigsetup.Datadog().SetConfigFile(configFile)
+// tracerouteEnabled reports whether the traceroute module should be enabled.
+// An explicit traceroute.enabled value always takes precedence. When the setting
+// is unset, CNM Dynamic Tests enable traceroute only when CNM is also enabled.
+// It logs a warning when Dynamic Tests require traceroute but it was explicitly disabled.
+func tracerouteEnabled(cfg, coreCfg pkgconfigmodel.Reader, npmEnabled bool) bool {
+	dynamicTestsEnabled := coreCfg.GetBool("network_path.connections_monitoring.enabled") ||
+		coreCfg.GetBool("network_path.connections_monitoring.basic_tests_enabled")
+	enabled := cfg.GetBool(tracerouteNS("enabled"))
+
+	if !enabled && !cfg.IsConfigured(tracerouteNS("enabled")) {
+		return npmEnabled && dynamicTestsEnabled
 	}
-	// load the configuration
-	_, err := pkgconfigsetup.LoadDatadogCustom(pkgconfigsetup.Datadog(), "datadog.yaml", option.None[secrets.Component](), pkgconfigsetup.SystemProbe().GetEnvVars())
-	// If `!failOnMissingFile`, do not issue an error if we cannot find the default config file.
-	var e pkgconfigmodel.ConfigFileNotFoundError
-	if err != nil && !errors.As(err, &e) {
-		// special-case permission-denied with a clearer error message
-		if errors.Is(err, fs.ErrPermission) {
-			if runtime.GOOS == "windows" {
-				err = fmt.Errorf(`cannot access the Datadog config file (%w); try running the command in an Administrator shell"`, err)
-			} else {
-				err = fmt.Errorf("cannot access the Datadog config file (%w); try running the command under the same user as the Datadog Agent", err)
-			}
-		} else {
-			err = fmt.Errorf("unable to load Datadog config file: %w", err)
+	if !enabled && cfg.IsConfigured(tracerouteNS("enabled")) && npmEnabled && dynamicTestsEnabled {
+		log.Warn("Network Path Dynamic Tests are enabled, but system-probe traceroute was explicitly disabled")
+	}
+	return enabled
+}
+
+func applyFleetPolicy(cfg pkgconfigmodel.Config) error {
+	// Apply overrides for local config options (e.g. fleet_policies_dir)
+	pkgconfigsetup.FleetConfigOverride(cfg)
+
+	// Load the remote configuration
+	fleetPoliciesDirPath := cfg.GetString("fleet_policies_dir")
+	if fleetPoliciesDirPath != "" {
+		err := cfg.MergeFleetPolicy(path.Join(fleetPoliciesDirPath, "system-probe.yaml"))
+		if err != nil {
+			return fmt.Errorf("failed to merge fleet policy: %w", err)
 		}
-		return err
 	}
+
 	return nil
 }

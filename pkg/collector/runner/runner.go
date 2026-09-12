@@ -7,6 +7,7 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/collector/scheduler"
 	"github.com/DataDog/datadog-agent/pkg/collector/worker"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -45,17 +47,28 @@ type Runner struct {
 	isRunning           *atomic.Bool
 	id                  int                           // Globally unique identifier for the Runner
 	workers             map[int]*worker.Worker        // Workers currrently under this Runner's management
+	shadowWorkers       map[int]*worker.Worker        // Shadow workers currently under this Runner's management
 	workersLock         sync.Mutex                    // Lock to prevent concurrent worker changes
 	isStaticWorkerCount bool                          // Flag indicating if numWorkers is dynamically updated
 	pendingChecksChan   chan check.Check              // The channel where checks come from
+	shadowChecksChan    chan check.Check              // The channel where shadow checks come from
 	checksTracker       *tracker.RunningChecksTracker // Tracker in charge of maintaining the running check list
 	scheduler           *scheduler.Scheduler          // Scheduler runner operates on
 	schedulerLock       sync.RWMutex                  // Lock around operations on the scheduler
+	utilizationMonitor  *worker.UtilizationMonitor    // Monitor in charge of checking the worker utilization
+	utilizationLogLimit *log.Limit                    // Log limiter for utilization warnings
+	stopWG              sync.WaitGroup                // Goroutines Stop waits for: monitor and checks
+	// ctx is cancelled when the runner stops, providing a cancellation signal
+	// to any context-aware operation inside workers (e.g. hostname resolution).
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewRunner takes the number of desired goroutines processing incoming checks.
 func NewRunner(senderManager sender.SenderManager, haAgent haagent.Component) *Runner {
 	numWorkers := pkgconfigsetup.Datadog().GetInt("check_runners")
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	r := &Runner{
 		senderManager:       senderManager,
@@ -63,16 +76,25 @@ func NewRunner(senderManager sender.SenderManager, haAgent haagent.Component) *R
 		id:                  int(runnerIDGenerator.Inc()),
 		isRunning:           atomic.NewBool(true),
 		workers:             make(map[int]*worker.Worker),
+		shadowWorkers:       make(map[int]*worker.Worker),
 		isStaticWorkerCount: numWorkers != 0,
 		pendingChecksChan:   make(chan check.Check),
+		shadowChecksChan:    make(chan check.Check),
 		checksTracker:       tracker.NewRunningChecksTracker(),
+		utilizationMonitor:  worker.NewUtilizationMonitor(pkgconfigsetup.Datadog().GetFloat64("check_runner_utilization_threshold")),
+		utilizationLogLimit: log.NewLogLimit(1, pkgconfigsetup.Datadog().GetDuration("check_runner_utilization_warning_cooldown")),
+		ctx:                 ctx,
+		cancel:              cancel,
 	}
 
 	if !r.isStaticWorkerCount {
-		numWorkers = pkgconfigsetup.DefaultNumWorkers
+		numWorkers = constants.DefaultNumWorkers
 	}
 
 	r.ensureMinWorkers(numWorkers)
+
+	// Start monitoring worker utilization
+	r.stopWG.Go(r.monitorWorkerUtilization)
 
 	return r
 }
@@ -91,7 +113,7 @@ func (r *Runner) ensureMinWorkers(desiredNumWorkers int) {
 
 	workersToAdd := desiredNumWorkers - currentWorkers
 	for idx := 0; idx < workersToAdd; idx++ {
-		worker, err := r.newWorker()
+		worker, err := r.newWorker(r.pendingChecksChan, false)
 		if err == nil {
 			r.workers[worker.ID] = worker
 		}
@@ -110,22 +132,41 @@ func (r *Runner) AddWorker() {
 	r.workersLock.Lock()
 	defer r.workersLock.Unlock()
 
-	worker, err := r.newWorker()
+	worker, err := r.newWorker(r.pendingChecksChan, false)
 	if err == nil {
 		r.workers[worker.ID] = worker
 	}
 }
 
-// addWorker adds a new worker running in a separate goroutine
-func (r *Runner) newWorker() (*worker.Worker, error) {
-	worker, err := worker.NewWorker(
+// AddShadowWorker adds a single shadow worker to the runner.
+func (r *Runner) AddShadowWorker() {
+	r.workersLock.Lock()
+	defer r.workersLock.Unlock()
+
+	worker, err := r.newWorker(r.shadowChecksChan, true)
+	if err == nil {
+		r.shadowWorkers[worker.ID] = worker
+	}
+}
+
+// newWorker adds a new worker running in a separate goroutine
+func (r *Runner) newWorker(pendingChecksChan chan check.Check, isShadowWorker bool) (*worker.Worker, error) {
+	watchdogWarningTimeout := pkgconfigsetup.Datadog().GetDuration("check_watchdog_warning_timeout")
+
+	newWorker := worker.NewWorker
+	if isShadowWorker {
+		newWorker = worker.NewShadowWorker
+	}
+
+	worker, err := newWorker(
 		r.senderManager,
 		r.haAgent,
 		r.id,
 		int(workerIDGenerator.Inc()),
-		r.pendingChecksChan,
+		pendingChecksChan,
 		r.checksTracker,
 		r.ShouldAddCheckStats,
+		watchdogWarningTimeout,
 	)
 	if err != nil {
 		log.Errorf("Runner %d was unable to instantiate a worker: %s", r.id, err)
@@ -133,18 +174,22 @@ func (r *Runner) newWorker() (*worker.Worker, error) {
 	}
 
 	go func() {
-		defer r.removeWorker(worker.ID)
+		defer r.removeWorker(worker.ID, isShadowWorker)
 
-		worker.Run()
+		worker.Run(r.ctx)
 	}()
 
 	return worker, nil
 }
 
-func (r *Runner) removeWorker(id int) {
+func (r *Runner) removeWorker(id int, isShadowWorker bool) {
 	r.workersLock.Lock()
 	defer r.workersLock.Unlock()
 
+	if isShadowWorker {
+		delete(r.shadowWorkers, id)
+		return
+	}
 	delete(r.workers, id)
 }
 
@@ -168,7 +213,7 @@ func (r *Runner) UpdateNumWorkers(numChecks int64) {
 	case numChecks <= 25:
 		desiredNumWorkers = 20
 	default:
-		desiredNumWorkers = pkgconfigsetup.MaxNumWorkers
+		desiredNumWorkers = constants.MaxNumWorkers
 	}
 
 	r.ensureMinWorkers(desiredNumWorkers)
@@ -182,10 +227,14 @@ func (r *Runner) Stop() {
 		return
 	}
 
+	// Cancel the runner context to unblock any context-aware operations in workers
+	// (e.g. hostname resolution via EC2 IMDS) that may be waiting on I/O, and to
+	// wake up monitorWorkerUtilization immediately instead of on its next tick.
+	r.cancel()
+
 	log.Infof("Runner %d is shutting down...", r.id)
 	close(r.pendingChecksChan)
-
-	wg := sync.WaitGroup{}
+	close(r.shadowChecksChan)
 
 	// Stop running checks
 	r.checksTracker.WithRunningChecks(func(runningChecks map[checkid.ID]check.Check) {
@@ -193,22 +242,19 @@ func (r *Runner) Stop() {
 		terminateChecksRunningProcesses()
 
 		for _, c := range runningChecks {
-			wg.Add(1)
-			go func(ch check.Check) {
-				err := r.StopCheck(ch.ID())
+			r.stopWG.Go(func() {
+				err := r.StopCheck(c.ID())
 				if err != nil {
-					log.Warnf("Check %v not responding after %v: %s", ch, stopCheckTimeout, err)
+					log.Warnf("Check %v not responding after %v: %s", c, stopCheckTimeout, err)
 				}
-
-				wg.Done()
-			}(c)
+			})
 		}
 	})
 
 	globalDone := make(chan struct{})
 	go func() {
 		log.Debugf("Runner %d waiting for all the workers to exit...", r.id)
-		wg.Wait()
+		r.stopWG.Wait()
 
 		log.Debugf("All runner %d workers have been shut down", r.id)
 		close(globalDone)
@@ -231,6 +277,11 @@ func (r *Runner) GetChan() chan<- check.Check {
 	return r.pendingChecksChan
 }
 
+// GetShadowChan returns a write-only version of the pending shadow check channel.
+func (r *Runner) GetShadowChan() chan<- check.Check {
+	return r.shadowChecksChan
+}
+
 // SetScheduler sets the scheduler for the runner
 func (r *Runner) SetScheduler(s *scheduler.Scheduler) {
 	r.schedulerLock.Lock()
@@ -251,8 +302,10 @@ func (r *Runner) ShouldAddCheckStats(id checkid.ID) bool {
 	r.schedulerLock.RLock()
 	defer r.schedulerLock.RUnlock()
 
-	sc := r.getScheduler()
-	if sc == nil || sc.IsCheckScheduled(id) {
+	// Access r.scheduler directly; calling getScheduler() here would try to
+	// acquire schedulerLock.RLock() a second time on the same goroutine, which
+	// deadlocks when a writer is waiting for the lock.
+	if r.scheduler == nil || r.scheduler.IsCheckScheduled(id) {
 		return true
 	}
 
@@ -283,5 +336,35 @@ func (r *Runner) StopCheck(id checkid.ID) error {
 		return nil
 	case <-time.After(stopCheckTimeout):
 		return fmt.Errorf("timeout during stop operation on check id %s", id)
+	}
+}
+
+func (r *Runner) logWorkerUtilization() {
+	overview, err := r.utilizationMonitor.GetWorkerOverview()
+	if err != nil {
+		log.Warnf("Error getting worker utilization data: %v", err)
+		return
+	}
+
+	averageUtilization := fmt.Sprintf("%.3f", overview.AverageUtilization)
+	log.Debugf("Average worker utilization: %v", averageUtilization)
+
+	if len(overview.WorkersOverThreshold) > 0 && r.utilizationLogLimit.ShouldLog() {
+		log.Warnf("Workers over utilization threshold: %v", overview.WorkersOverThreshold)
+	}
+}
+
+func (r *Runner) monitorWorkerUtilization() {
+	interval := pkgconfigsetup.Datadog().GetDuration("check_runner_utilization_monitor_interval")
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-ticker.C:
+			r.logWorkerUtilization()
+		}
 	}
 }

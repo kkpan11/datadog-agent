@@ -28,17 +28,20 @@ func Unix(t *testing.T, client ExecutorWithRetry, options ...installparams.Optio
 
 	if params.PipelineID != "" && params.MajorVersion != "5" {
 		testEnvVars := []string{}
-		testEnvVars = append(testEnvVars, "TESTING_APT_URL=s3.amazonaws.com/apttesting.datad0g.com")
+		testEnvVars = append(testEnvVars, fmt.Sprintf("TESTING_APT_URL=s3.amazonaws.com/apttesting.datad0g.com/datadog-agent/pipeline-%v-a%v", params.PipelineID, params.MajorVersion))
+		if params.TestingKeysURL != "" {
+			testEnvVars = append(testEnvVars, "TESTING_KEYS_URL="+params.TestingKeysURL)
+		}
 		// apt testing repo
 		// TESTING_APT_REPO_VERSION="pipeline-xxxxx-ay y"
-		testEnvVars = append(testEnvVars, fmt.Sprintf(`TESTING_APT_REPO_VERSION="pipeline-%v-a%v-%s %v"`, params.PipelineID, params.MajorVersion, params.Arch, params.MajorVersion))
+		testEnvVars = append(testEnvVars, fmt.Sprintf(`TESTING_APT_REPO_VERSION="stable-%v %v"`, params.Arch, params.MajorVersion))
 		testEnvVars = append(testEnvVars, "TESTING_YUM_URL=s3.amazonaws.com/yumtesting.datad0g.com")
 		// yum testing repo
 		// TESTING_YUM_VERSION_PATH="testing/pipeline-xxxxx-ay/y"
 		testEnvVars = append(testEnvVars, fmt.Sprintf(`TESTING_YUM_VERSION_PATH="testing/pipeline-%v-a%v/%v"`, params.PipelineID, params.MajorVersion, params.MajorVersion))
 		commandLine = strings.Join(testEnvVars, " ")
 	} else {
-		commandLine = fmt.Sprintf("DD_AGENT_MAJOR_VERSION=%s", params.MajorVersion)
+		commandLine = "DD_AGENT_MAJOR_VERSION=" + params.MajorVersion
 	}
 
 	if params.Flavor != "" {
@@ -64,7 +67,7 @@ func Unix(t *testing.T, client ExecutorWithRetry, options ...installparams.Optio
 		var source string
 		if params.MajorVersion != "5" {
 			source = "S3"
-			downloadCmd = fmt.Sprintf(`curl -L  https://install.datadoghq.com/scripts/install_script_agent%v.sh > installscript.sh`, params.MajorVersion)
+			downloadCmd = fmt.Sprintf(`curl -L  https://s3.amazonaws.com/dd-agent/scripts/install_script_agent%v.sh > installscript.sh`, params.MajorVersion)
 		} else {
 			source = "dd-agent repository"
 			downloadCmd = "curl -L https://raw.githubusercontent.com/DataDog/dd-agent/master/packaging/datadog-agent/source/install_agent.sh > installscript.sh"
@@ -77,5 +80,36 @@ func Unix(t *testing.T, client ExecutorWithRetry, options ...installparams.Optio
 		output, err := client.ExecuteWithRetry(cmd)
 		tt.Log(output)
 		require.NoError(tt, err, "agent installation should not return any error: ", err)
+	})
+}
+
+// MacOS install the agent from install script, by default will install the agent 7 build corresponding to the CI if running in the CI, else the latest Agent 7 version
+func MacOS(t *testing.T, client ExecutorWithRetry, options ...installparams.Option) {
+	params := installparams.NewParams(options...)
+	exports := []string{}
+
+	scriptURL := "https://install.datadoghq.com/scripts/install_mac_os.sh"
+	if params.PipelineID != "" {
+		repoURL := fmt.Sprintf("https://dd-agent-macostesting.s3.amazonaws.com/ci/datadog-agent/pipeline-%s-%s", params.PipelineID, params.Arch)
+		exports = append(exports, "DD_REPO_URL="+repoURL)
+		scriptURL = repoURL + "/install_mac_os.sh"
+	}
+
+	apikey := params.APIKey
+	if apikey == "" {
+		apikey = "aaaaaaaaaa"
+	}
+	exports = append(exports, "DD_API_KEY="+apikey)
+	env := strings.Join(exports, " ")
+	// Download the install script (up to 5 attempts), then run it (up to 3 attempts), with exponential backoff.
+	cmd := fmt.Sprintf(`
+for i in {1..5}; do curl -fsSL %s -o install-script.sh && break || sleep $((2**i)); done
+for i in {1..3}; do %s bash install-script.sh && exit 0 || sleep $((2**i)); done
+exit 1
+`, scriptURL, env)
+
+	t.Run("Installing the agent", func(tt *testing.T) {
+		_, err := client.ExecuteWithRetry(cmd)
+		require.NoError(tt, err, "failed to install the agent: ", err)
 	})
 }
